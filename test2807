@@ -1,0 +1,90 @@
+# Define your clusters (example list)
+$clusters = @(
+    @{ id = "cluster1-id"; name = "Cluster-A" },
+    @{ id = "cluster2-id"; name = "Cluster-B" },
+    @{ id = "cluster3-id"; name = "Cluster-C" }
+)
+
+$apiBase = 'https://your-api'
+$apiKey  = 'YOUR_API_KEY'
+$headers = @{ apiKey = $apiKey; Accept = 'application/json' }
+
+# Collect all Protection Groups across clusters (with object details)
+$allProtectionGroups = @()
+foreach ($cluster in $clusters) {
+    $clusterId       = $cluster.id
+    $clusterName     = $cluster.name
+    $pgUrl           = "$apiBase/clusters/$clusterId/protection-groups?includeObjectDetails=true"
+    $pgResponse      = Invoke-RestMethod -Uri $pgUrl -Headers $headers -Method Get
+    $pgs             = $pgResponse.protectionGroups
+    foreach ($pg in $pgs) {
+        $allProtectionGroups += [PSCustomObject]@{
+            ClusterId         = $clusterId
+            ClusterName       = $clusterName
+            ProtectionGroupId = $pg.id
+            ProtectionGroup   = $pg.name
+            ObjectDetails     = $pg.objectDetails
+        }
+    }
+}
+
+# Analyze runs and extract failures per DB without later success
+$allFailures = @()
+foreach ($entry in $allProtectionGroups) {
+    $clusterName = $entry.ClusterName
+    $pgId        = $entry.ProtectionGroupId
+    $pgName      = $entry.ProtectionGroup
+
+    # Build DB status mapping (if needed separately)
+    $dbStatuses = ''
+    if ($entry.ObjectDetails) {
+        $dbStatuses = ($entry.ObjectDetails | ForEach-Object { "$($_.name):$($_.status)" }) -join '; '
+    }
+
+    # Fetch recent runs
+    $runUrl = "$apiBase/protection-groups/$pgId/runs?numRuns=10"
+    $runs   = (Invoke-RestMethod -Uri $runUrl -Headers $headers -Method Get).runs
+    if (-not $runs) { continue }
+
+    # Flatten backup info per DB
+    $flatRuns = foreach ($run in $runs) {
+        $objs       = $run.objects.object
+        $serverName = if ($objs.Count -ge 1) { $objs[0].name } else { '' }
+        foreach ($obj in $objs) {
+            $infos = $run.localBackupInfo | Where-Object { $_.objectId -eq $obj.id }
+            foreach ($info in $infos) {
+                [PSCustomObject]@{
+                    Cluster         = $clusterName
+                    ProtectionGroup = $pgName
+                    ServerName      = $serverName
+                    DBName          = $obj.name
+                    RunType         = $info.runType
+                    Status          = $info.status
+                    Message         = $info.message
+                    StartTime       = ([datetime]"1970-01-01".AddMilliseconds($info.startTimeUsecs/1000)).ToString("yyyy-MM-dd HH:mm")
+                    EndTime         = ([datetime]"1970-01-01".AddMilliseconds($info.endTimeUsecs/1000)).ToString("yyyy-MM-dd HH:mm")
+                }
+            }
+        }
+    }
+
+    # Identify failures without later success on same DB and run type
+    $successes      = $flatRuns | Where-Object { $_.Status -in @('Succeeded','SucceededWithWarning') }
+    $failures       = $flatRuns | Where-Object { $_.Status -notin @('Succeeded','SucceededWithWarning') }
+    $sortedFailures = $failures | Sort-Object EndTime -Descending
+    foreach ($fail in $sortedFailures) {
+        $hasLater = $successes | Where-Object {
+            $_.RunType -eq $fail.RunType -and $_.DBName -eq $fail.DBName -and ([datetime]$_.StartTime) -gt ([datetime]$fail.EndTime)
+        }
+        if (-not $hasLater) {
+            $allFailures += $fail
+        }
+    }
+}
+
+# Output final table
+if ($allFailures.Count -gt 0) {
+    $allFailures | Format-Table Cluster, ProtectionGroup, ServerName, DBName, RunType, Status, Message, StartTime, EndTime -AutoSize
+} else {
+    Write-Host 'No unresolved backup failures found.'
+}
