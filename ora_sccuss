@@ -1,43 +1,92 @@
-# Inputs
-$dir = 'C:\drop'
-$t1  = Import-Csv (Join-Path $dir 'first.csv')
-$t2  = Import-Csv (Join-Path $dir 'second.csv')
+$apikey = Read-Host "Enter Your API Key"
+$clustersAvailable = @(
+    "8823423-23423-23423-23434 whatever"
+    "052248592834423 whatever"
+)
 
-# Case-insensitive lookup on DBName for table 2
-$ix = New-Object System.Collections.Hashtable ([StringComparer]::OrdinalIgnoreCase)
-$t2 | ForEach-Object { if ($_.DBName) { $ix[$_.DBName] = $_ } }
+$results = @()
+$oneGiB = 1073741824
+$apiURLHostId = "https://helios.cohesity.com/v2/data-protect/objects/$hostId"
 
-# LEFT JOIN, skipping DBName from t2 to avoid t2_DBName
-$merged =
-$t1 | ForEach-Object {
-  $b = if ($_.DBName) { $ix[$_.DBName] }
-
-  $h = [ordered]@{}
-  $_.psobject.Properties | ForEach-Object { $h[$_.Name] = $_.Value }
-
-  if ($b) {
-    $b.psobject.Properties | ForEach-Object {
-      if ($_.Name -eq 'DBName') { return } # <-- skip DBName from t2
-      if ($h.Contains($_.Name)) { $h["t2_$($_.Name)"] = $_.Value } else { $h[$_.Name] = $_.Value }
+foreach ($cluster in $clustersAvailable) {
+    $cluster_id, $cluster_name = $cluster -split " "
+    $headers = @{
+        "apiKey"        = $apikey
+        "accessClusterId" = $cluster_id
     }
-  }
 
-  [pscustomobject]$h
+    # ---------- PART 1: Registration Info ----------
+    $body = @{
+        environments               = "Oracle"
+        includeDBApplicationInfo   = "true"
+        includeApplicationsTreeInfo = "true"
+        allUnderHierarchy          = "true"
+        includeData = "true"
+    }
+
+    $response = Invoke-WebRequest -Method Get -Uri "https://helios.cohesity.com/irisservices/api/v1/public/protectionSources/registrationInfo" -Headers $headers -Body $body
+    $json = $response.Content | ConvertFrom-Json
+    $db_name_test = $json.rootNodes.applications.applicationTreeInfo.protectionSource.oracleProtectionSource
+
+    foreach ($node in $db_name_test) {
+        $results += [PSCustomObject]@{
+            DBName         = $node.databaseUniqueName
+            DBVersion      = $node.version
+            ArchiveLog_Enabled = $node.archiveLogEnabled
+            DB_Type        = $node.dbType
+            DB_Size_in_GB  = [math]::Round($node.size / $oneGiB, 4)
+            DB_Instances   = $node.dbInstanceId
+            CPU_Count      = $node.hosts.sessions.systemIdentifier
+            System_Location = $node.hosts.sessions.location
+            SharedPool_Size = $node.sgaTargetSize
+            Fragment_Size   = $node.sharedPoolSize
+            FRA_Size_in_GB  = [math]::Round($node.fraSize / $oneGiB, 4)
+        }
+    }
+
+    # ---------- PART 2: Protection Groups ----------
+    $body = @{
+        environments = "Oracle"
+        isDeleted    = "False"
+        isActive     = "True"
+        includesLastRunInfo = "True"
+    }
+
+    $response = Invoke-WebRequest -Method Get -Uri "https://helios.cohesity.com/v2/data-protect/protection-groups" -Headers $headers -Body $body
+    $json = $response.Content | ConvertFrom-Json
+
+    foreach ($dbd in $json.protectionGroups) {
+        foreach ($channels in $dbd.oracleParams.objects) {
+            foreach ($channel in $channels.dbParams.dbChannels) {
+                $policyName = (
+                    Invoke-RestMethod -Uri "https://helios.cohesity.com/v2/data-protect/policies?ids=$($dbd.policyId)" -Headers $headers -Method Get -ErrorAction Stop
+                ).policies | Where-Object { $_.id -eq $dbd.policyId } | Select-Object -ExpandProperty name -First 1
+
+                $hostId = $channel.databaseNodeList.hostId
+                $sipApiUrl = "https://helios.cohesity.com/v2/data-protect/objects/$hostId"
+                $sipResponse = Invoke-WebRequest -Uri $sipApiUrl -Headers $headers
+                $sipJson = $sipResponse.Content | ConvertFrom-Json
+                $hostName = $sipJson.name
+
+                $results += [PSCustomObject]@{
+                    Cluster          = $cluster_name
+                    PGName           = $dbd.name
+                    PolicyName       = $policyName
+                    SourceName       = $channels.SourceName
+                    DBName           = $channel.databaseUniqueName
+                    PersistMountPoints = $dbd.oracleParams.persistMountPoints
+                    LogRetentionDays = $channel.archiveLogRetentionDays
+                    ChannelCount     = $channel.databaseNodeList.ChannelCount
+                    Port             = $channel.databaseNodeList.port
+                    HostName         = $hostName
+                    RunType          = $dbd.lastRun.localBackup.runType
+                    Status           = $dbd.lastRun.localBackup.status
+                    Messages         = $dbd.lastRun.localBackup.messages -join "; "
+                }
+            }
+        }
+    }
 }
 
-# Build a column order with DBName as the SECOND column
-$props = ($merged | Select-Object -First 1 | Get-Member -MemberType NoteProperty | Select-Object -ExpandProperty Name)
-$first = ($props | Where-Object { $_ -ne 'DBName' } | Select-Object -First 1)
-$order = @()
-if ($first) { $order += $first }
-$order += 'DBName'
-$order += ($props | Where-Object { $_ -ne $first -and $_ -ne 'DBName' -and $_ -ne 't2_DBName' })
-
-# Show nicely and export
-$merged |
-  Select-Object $order |
-  Tee-Object -Variable mergedOut |
-  Export-Csv (Join-Path $dir 'merged.csv') -NoTypeInformation
-
-Write-Host "Done → $(Join-Path $dir 'merged.csv')" -ForegroundColor Green
-$mergedOut | Format-Table -AutoSize
+$results | Sort-Object Cluster, PGName | Format-Table -AutoSize
+$reportDate = Get-Date -Format "yyyy-MM-dd"
