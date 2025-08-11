@@ -1,121 +1,48 @@
-# Define your clusters list explicitly (example with multiple clusters)
-$clusters = @(
-    @{ id = "cluster1-id"; name = "Cluster-A" },
-    @{ id = "cluster2-id"; name = "Cluster-B" },
-    @{ id = "cluster3-id"; name = "Cluster-C" }
-)
-
-$apiBase = 'https://your-api'
-$apiKey  = 'YOUR_API_KEY'
-$headers = @{ apiKey = $apiKey; Accept = 'application/json' }
-
-# Store all latest successful backups per DB
-$allSuccesses = @()
-
-# Iterate through clusters and their protection groups
-foreach ($cluster in $clusters) {
-    $clusterId   = $cluster.id
-    $clusterName = $cluster.name
-
-    # Fetch Protection Groups with object details
-    $pgUrl      = "$apiBase/clusters/$clusterId/protection-groups?includeObjectDetails=true"
-    $pgResponse = Invoke-RestMethod -Uri $pgUrl -Headers $headers -Method Get
-    $pgs        = $pgResponse.protectionGroups
-
-    foreach ($pg in $pgs) {
-        $pgId   = $pg.id
-        $pgName = $pg.name
-
-        # Fetch recent runs for this PG
-        $runUrl = "$apiBase/protection-groups/$pgId/runs?numRuns=10"
-        $runs   = (Invoke-RestMethod -Uri $runUrl -Headers $headers -Method Get).runs
-        if (-not $runs) { continue }
-
-        # Flatten backup info per DB, capturing server and database names
-        $flatRuns = foreach ($run in $runs) {
-            $objs       = $run.objects.object
-            $serverName = if ($objs.Count -ge 1) { $objs[0].name } else { '' }
-            foreach ($obj in $objs) {
-                if ($obj.name -eq $serverName) { continue }
-                foreach ($info in $run.localBackupInfo | Where-Object { $_.objectId -eq $obj.id }) {
-                    [PSCustomObject]@{
-                        Cluster         = $clusterName
-                        ProtectionGroup = $pgName
-                        ServerName      = $serverName
-                        DBName          = $obj.name
-                        RunType         = $info.runType
-                        Status          = $info.status
-                        StartTime       = ([datetime]"1970-01-01".AddMilliseconds($info.startTimeUsecs/1000)).ToString("yyyy-MM-dd HH:mm")
-                        EndTime         = ([datetime]"1970-01-01".AddMilliseconds($info.endTimeUsecs/1000)).ToString("yyyy-MM-dd HH:mm")
-                    }
-                }
-            }
-        }
-
-        # Select only successful runs
-        $successes = $flatRuns | Where-Object { $_.Status -in @('Succeeded','SucceededWithWarning') }
-        if (-not $successes) { continue }
-
-        # Group by DBName and RunType and pick the latest
-        $grouped = $successes | Group-Object DBName, RunType
-        foreach ($g in $grouped) {
-            $latest = $g.Group | Sort-Object EndTime -Descending | Select-Object -First 1
-            $allSuccesses += $latest
-        }
-    }
-}
-
-# Output latest successful backups per DB
-if ($allSuccesses.Count -gt 0) {
-    Write-Host "=== Latest Successful Backups per DB ==="
-    $allSuccesses | Format-Table Cluster, ProtectionGroup, ServerName, DBName, RunType, Status, StartTime, EndTime -AutoSize
-} else {
-    Write-Host "No successful backups found."
-}
-
-
-# Inputs
 $dir = 'C:\drop'
 $t1  = Import-Csv (Join-Path $dir 'first.csv')
 $t2  = Import-Csv (Join-Path $dir 'second.csv')
 
-# Case-insensitive lookup on DBName for table 2
-$ix = New-Object System.Collections.Hashtable ([StringComparer]::OrdinalIgnoreCase)
-$t2 | ForEach-Object { if ($_.DBName) { $ix[$_.DBName] = $_ } }
+# normalize keys (trim + case-insensitive); skip rows missing DBName
+$t1 = $t1 | ForEach-Object { if ($_.DBName) { $_ | Add-Member _Key ($_.DBName.Trim().ToLower()) -Force }; $_ }
+$t2 = $t2 | ForEach-Object { if ($_.DBName) { $_ | Add-Member _Key ($_.DBName.Trim().ToLower()) -Force }; $_ }
 
-# LEFT JOIN, skipping DBName from t2 to avoid t2_DBName
-$merged =
-$t1 | ForEach-Object {
-  $b = if ($_.DBName) { $ix[$_.DBName] }
+# index by key
+$ix1 = @{}; $t1 | Where-Object { $_._Key } | ForEach-Object { $ix1[$_._Key] = $_ }
+$ix2 = @{}; $t2 | Where-Object { $_._Key } | ForEach-Object { $ix2[$_._Key] = $_ }
 
+# union of keys (FULL OUTER)
+$keys = @{}
+$ix1.Keys | ForEach-Object { $keys[$_] = $true }
+$ix2.Keys | ForEach-Object { $keys[$_] = $true }
+
+# merge rows; keep DBName once; keep all other columns; collisions from t2 → t2_<name>
+$merged = foreach ($k in $keys.Keys) {
+  $a = $ix1[$k]; $b = $ix2[$k]
   $h = [ordered]@{}
-  $_.psobject.Properties | ForEach-Object { $h[$_.Name] = $_.Value }
 
+  # Prefer DBName from t1 if present, else from t2
+  $h['DBName'] = if ($a) { $a.DBName } else { $b.DBName }
+
+  if ($a) {
+    $a.psobject.Properties | ForEach-Object {
+      if ($_.Name -notin @('_Key','DBName')) { $h[$_.Name] = $_.Value }
+    }
+  }
   if ($b) {
     $b.psobject.Properties | ForEach-Object {
-      if ($_.Name -eq 'DBName') { return } # <-- skip DBName from t2
+      if ($_.Name -in @('_Key','DBName')) { return }
       if ($h.Contains($_.Name)) { $h["t2_$($_.Name)"] = $_.Value } else { $h[$_.Name] = $_.Value }
     }
   }
-
   [pscustomobject]$h
 }
 
-# Build a column order with DBName as the SECOND column
-$props = ($merged | Select-Object -First 1 | Get-Member -MemberType NoteProperty | Select-Object -ExpandProperty Name)
-$first = ($props | Where-Object { $_ -ne 'DBName' } | Select-Object -First 1)
-$order = @()
-if ($first) { $order += $first }
-$order += 'DBName'
-$order += ($props | Where-Object { $_ -ne $first -and $_ -ne 'DBName' -and $_ -ne 't2_DBName' })
+# Show EVERYTHING on screen (no columns hidden) and still export full CSV if you want
+$csvPath = Join-Path $dir 'merged.csv'
+$merged | Tee-Object -Variable mergedOut | Export-Csv $csvPath -NoTypeInformation
+Write-Host "Merged → $csvPath" -ForegroundColor Green
 
-# Show nicely and export
-$merged |
-  Select-Object $order |
-  Tee-Object -Variable mergedOut |
-  Export-Csv (Join-Path $dir 'merged.csv') -NoTypeInformation
-
-Write-Host "Done → $(Join-Path $dir 'merged.csv')" -ForegroundColor Green
-$mergedOut | Format-Table -AutoSize
-
- 
+# Display: vertical per row so all properties are visible in console
+$mergedOut | Sort-Object DBName | Format-List *
+# Optional GUI grid (shows all columns clearly on Windows):
+# $mergedOut | Out-GridView -Title 'Merged by DBName'
