@@ -1,104 +1,35 @@
-# --- helper: cache the Oracle app tree per cluster and index by DB name ---
-$OracleTreeCache = @{}
+# 1) Get the DB names from your results (objects, not the formatted text)
+$dbNames = $results | Where-Object { $_.DBName } | Select-Object -Expand DBName -Unique
 
-function Get-OracleDbIndex {
-    param(
-        [string]$ClusterId,
-        [hashtable]$Headers
-    )
+# 2) Call your secondary API once per DB and cache the details
+$detailByDb = @{}
+foreach ($db in $dbNames) {
+    $uri = "$baseUrl/your-endpoint?dbName=$([System.Web.HttpUtility]::UrlEncode($db))"
+    $resp = Invoke-WebRequest -Uri $uri -Headers $headers -Method Get -UseBasicParsing
+    $j    = $resp.Content | ConvertFrom-Json
 
-    if ($OracleTreeCache.ContainsKey($ClusterId)) {
-        return $OracleTreeCache[$ClusterId]
+    # adapt these fields to your API response
+    $detailByDb[$db] = [pscustomobject]@{
+        ObjectId   = $j.id
+        ServerName = $j.serverName
+        Status     = $j.status
     }
-
-    # <-- use the exact endpoint from your 2nd picture -->
-    $treeUrl = "https://helios.cohesity.com/v2/data-protect/applications"  # adjust if yours differs
-    $bodyObj = @{
-        environments               = @("kOracle")
-        includeEntityPermissionInfo = $true
-        includeApplicationsTreeInfo = $true
-        allUnderHierarchy           = $true
-        useCachedData               = $true
-        accessClusterId             = $ClusterId  # if required by your setup
-    }
-
-    # NOTE: if your endpoint needs GET with query, convert to querystring.
-    # Most Cohesity “search”/tree endpoints accept POST; we’ll Post JSON:
-    $resp  = Invoke-WebRequest -Method Post -Uri $treeUrl -Headers $Headers -Body ($bodyObj | ConvertTo-Json -Depth 6)
-    $json  = $resp.Content | ConvertFrom-Json
-
-    # Build an index: DBName -> details
-    $index = @{}
-
-    # Walk what your screenshot shows; adapt if your path differs.
-    # Many responses look like: rootNodes[].applications[].applicationTreeInfo[].protectionSource
-    foreach ($root in @($json.rootNodes)) {
-        foreach ($app  in @($root.applications)) {
-            foreach ($node in @($app.applicationTreeInfo)) {
-                $ps = $node.protectionSource
-                if (-not $ps) { continue }
-
-                # Try to resolve name/dbname/status/id from protectionSource
-                $dbName  = $ps.oracleProtectionSource.databaseName
-                if ([string]::IsNullOrWhiteSpace($dbName)) { $dbName = $ps.name }  # fallback
-
-                $status  = $ps.status
-                $objId   = $ps.id
-                $server  = $ps.parentSourceName  # adjust if your JSON exposes server differently
-
-                if (-not [string]::IsNullOrWhiteSpace($dbName)) {
-                    $index[$dbName] = [pscustomobject]@{
-                        Id          = $objId
-                        Name        = $ps.name
-                        DBName      = $dbName
-                        ServerName  = $server
-                        Status      = $status
-                    }
-                }
-            }
-        }
-    }
-
-    $OracleTreeCache[$ClusterId] = $index
-    return $index
 }
 
-# --- inside your existing foreach ($channel in $channels.dbParams.dbChannels) loop ---
-# assume you already have $cluster_id/$cluster_name/$headers and $dbd, $channel as in your first picture
-
-# get the DB index for this cluster once (cached after first call)
-$DbIndex = Get-OracleDbIndex -ClusterId $cluster_id -Headers $headers
-
-# your current DB name from the channel
-$dbName = $channel.databaseUniqueName
-
-# try match in the tree
-$dbNode = $null
-if ($DbIndex.ContainsKey($dbName)) { $dbNode = $DbIndex[$dbName] }
-
-# now build your result object (snippet)
-$results += [PSCustomObject]@{
-    Cluster        = $cluster_name
-    PGName         = $dbd.name
-    SourceName     = $channels.SourceName
-    DBName         = $dbName
-    # … your other fields …
-
-    # Details pulled from the 2nd call (if found)
-    AppObjectId    = if ($dbNode) { $dbNode.Id } else { '' }
-    ServerName     = if ($dbNode) { $dbNode.ServerName } else { '' }
-    DBStatus       = if ($dbNode) { $dbNode.Status } else { 'NotFound' }
-
-    # Example: your existing host/IP → reverse DNS block can stay as-is
-    HostName = $(
-        try {
-            $hostId     = $channel.databaseNodeList.hostId
-            $ipAPIUrl   = "https://helios.cohesity.com/v2/data-protect/objects/$hostId"
-            $ipResponse = Invoke-WebRequest -Method Get -Uri $ipAPIUrl -Headers $headers
-            $ip         = ($ipResponse.Content | ConvertFrom-Json).name
-            ([System.Net.Dns]::GetHostEntry($ip)).HostName
-        } catch {
-            $ip
-        }
-    )
+# 3) Join the details back onto your original rows
+$augmented = $results | ForEach-Object {
+    $d = $detailByDb[$_.DBName]
+    [pscustomobject]@{
+        Cluster   = $_.Cluster
+        PGName    = $_.PGName
+        Source    = $_.SourceName
+        DBName    = $_.DBName
+        ObjectId  = $d.ObjectId
+        Server    = $d.ServerName
+        DBStatus  = $d.Status
+    }
 }
+
+# 4) NOW format for display (or export)
+$augmented | Format-Table -AutoSize
+# $augmented | Export-Csv .\db_with_details.csv -NoTypeInformation
