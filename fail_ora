@@ -1,17 +1,13 @@
 <#
-  Cohesity Oracle – PG DB Failures by DBName (stand‑alone)
-  --------------------------------------------------------
-  Goal:
-    • Extract **DB names** from Oracle Protection Groups (kOracle):
-      pgs.oracleParams.objects.dbParams.dbChannels.databaseUniqueName
-    • List **only failures** for those DBs from recent PG runs.
-    • If there is a **more recent success** for a DB, **suppress older failures** for that DB.
+  Cohesity Oracle – PG DB Failures (Failed-only, DB-level, RunType-aware)
+  ----------------------------------------------------------------------
+  • Lists ONLY object-level failures where status == 'Failed'
+  • Suppresses an older Failed for a DB **if there is a more recent Success/Succeeded of the SAME runType**
+    (e.g., a kLog success hides older kLog failures for that DB, but not kRegular failures)
+  • Adds DBName and RunType columns
+  • Looks back over the last N runs per PG (default: 10)
 
-  Notes:
-    • Read‑only (GET requests)
-    • Multi‑cluster via accessClusterId header
-    • Uses includeObjectDetails=true when fetching runs
-    • Wide, single‑line table; CSV/Grid helpers provided (commented)
+  Read-only. Multi-cluster via accessClusterId. Wide, single-line output.
 #>
 
 param(
@@ -27,188 +23,109 @@ $Clusters = @(
   "052248592834423 Cluster-B"
 )
 
-# --- Helpers ---
-function Get-PolicyName {
-  param($Headers, $PolicyId)
-  if (-not $PolicyId) { return $null }
-  try {
-    $p = (Invoke-RestMethod -Headers $Headers -Method Get -Uri "https://helios.cohesity.com/v2/data-protect/policies?ids=$PolicyId").policies
-    return ($p | Where-Object id -eq $PolicyId | Select-Object -ExpandProperty name -First 1)
-  } catch { return $null }
+function UsecsToLocal {
+  param([Nullable[Int64]]$Usecs)
+  if (-not $Usecs) { return $null }
+  try { [DateTimeOffset]::FromUnixTimeMilliseconds([int64]($Usecs/1000)).LocalDateTime } catch { $null }
 }
 
-function Get-PgDbNames {
+function JoinNonEmpty { param([object[]]$Items) (($Items | Where-Object { $_ }) -join '; ') }
+
+function GetObjectName {
+  param($o)
+  return (
+    $o.databaseUniqueName,
+    $o.dbName,
+    $o.databaseName,
+    $o.name
+  ) | Where-Object { $_ } | Select-Object -First 1
+}
+
+function GetObjectError {
+  param($o)
+  $msgs = @()
+  if ($o.messages) { $msgs += $o.messages }
+  if ($o.events)   { $msgs += ($o.events | ForEach-Object { $_.message }) }
+  if ($o.localBackupInfo -and $o.localBackupInfo.messages) { $msgs += $o.localBackupInfo.messages }
+  foreach ($m in ($msgs | Where-Object { $_ })) { if ($m -is [string] -and $m -match 'error_msg:(.+)$') { return $matches[1].Trim() } }
+  return (JoinNonEmpty $msgs)
+}
+
+function GetPgDbNamesFromConfig {
   param($Pg)
   $names = @()
   foreach ($obj in ($Pg.oracleParams.objects | Where-Object { $_ })) {
     foreach ($ch in ($obj.dbParams.dbChannels | Where-Object { $_ })) {
-      $candidates = @(
-        $ch.databaseUniqueName,
-        $ch.dbName,
-        $ch.databaseName
-      ) | Where-Object { $_ }
-      $names += $candidates
+      if ($ch.databaseUniqueName) { $names += $ch.databaseUniqueName }
     }
   }
-  # unique, case-insensitive
-  return ($names | Where-Object { $_ } | Sort-Object -Unique)
-}
-
-function UsecsToLocal {
-  param([Nullable[Int64]]$Usecs)
-  if (-not $Usecs) { return $null }
-  try {
-    $epoch = [DateTimeOffset]::FromUnixTimeMilliseconds([int64]($Usecs/1000))
-    return $epoch.LocalDateTime
-  } catch { return $null }
-}
-
-function JoinNonEmpty {
-  param([object[]]$Items)
-  return (($Items | Where-Object { $_ -ne $null -and $_ -ne '' }) -join '; ')
-}
-
-function Get-ObjectName {
-  param($Obj)
-  # Try several common locations for object/database name
-  return (
-    $Obj.databaseUniqueName,
-    $Obj.dbName,
-    $Obj.databaseName,
-    $Obj.name,
-    $Obj.objectName,
-    $Obj.object.name,
-    $Obj.source.name
-  ) | Where-Object { $_ } | Select-Object -First 1
-}
-
-function Get-ObjectStatus {
-  param($Obj)
-  return (
-    $Obj.status,
-    $Obj.localStatus,
-    $Obj.runStatus,
-    $Obj.backupStatus
-  ) | Where-Object { $_ } | Select-Object -First 1
-}
-
-function Get-ObjectMessages {
-  param($Obj)
-  $msgs = @()
-  if ($Obj.messages) { $msgs += $Obj.messages }
-  if ($Obj.events)   { $msgs += ($Obj.events | ForEach-Object { $_.message }) }
-  if ($Obj.localBackupInfo -and $Obj.localBackupInfo.messages) { $msgs += $Obj.localBackupInfo.messages }
-  # Extract error_msg: details when available
-  $detail = $null
-  foreach ($m in ($msgs | Where-Object { $_ })) {
-    if ($m -is [string] -and $m -match 'error_msg:(.+)$') { $detail = $matches[1].Trim(); break }
-  }
-  if ($detail) { return $detail }
-  return (JoinNonEmpty $msgs)
-}
-
-function IsSuccessStatus {
-  param([string]$Status)
-  if (-not $Status) { return $false }
-  $s = $Status.ToString()
-  return ($s -match 'Success|Succeeded|FinishedWithSuccess|FinishedSuccessfully|kSuccess')
-}
-
-function IsFailureStatus {
-  param([string]$Status)
-  if (-not $Status) { return $false }
-  $s = $Status.ToString()
-  return ($s -match 'Fail|Error|FinishedWithError|kFailure')  # (exclude mere Warnings)
+  return ($names | Sort-Object -Unique)
 }
 
 $rows = @()
 
 foreach ($c in $Clusters) {
-  $cluster_id, $cluster_name = $c -split " ", 2
+  $cluster_id, $cluster_name = $c -split ' ', 2
   $headers = @{ apiKey = $ApiKey; accessClusterId = $cluster_id }
 
-  # --- Fetch Oracle PGs ---
-  $pgUri = "https://helios.cohesity.com/v2/data-protect/protection-groups" +
-           "?environments=kOracle&isDeleted=false&isActive=true&includeLastRunInfo=true"
+  # Active Oracle PGs
+  $pgUri = "https://helios.cohesity.com/v2/data-protect/protection-groups?environments=kOracle&isDeleted=false&isActive=true&includeLastRunInfo=true"
   $pgs = (Invoke-WebRequest -Headers $headers -Method Get -Uri $pgUri).Content | ConvertFrom-Json
   $pgs = $pgs.protectionGroups | Where-Object { $_ }
 
   foreach ($pg in $pgs) {
-    $policyName = Get-PolicyName -Headers $headers -PolicyId $pg.policyId
-    $pgDbNames  = Get-PgDbNames -Pg $pg
+    $pgDbNames = GetPgDbNamesFromConfig $pg
 
-    # Track whether we've seen a newer success for each DB in this PG
-    $successByDb = New-Object 'System.Collections.Hashtable' ([System.StringComparer]::OrdinalIgnoreCase)
+    # Suppression map: most-recent success by (DBName|RunType)
+    $successByKey = New-Object 'System.Collections.Hashtable' ([System.StringComparer]::OrdinalIgnoreCase)
 
-    # --- Fetch recent runs (include object details if supported) ---
+    # Fetch last N runs (newest -> oldest)
     $runUri = "https://helios.cohesity.com/v2/data-protect/protection-groups/$($pg.id)/runs?numRuns=$MaxRuns&includeObjectDetails=true"
     $runs   = (Invoke-WebRequest -Headers $headers -Method Get -Uri $runUri).Content | ConvertFrom-Json
-
-    # Ensure newest -> oldest processing so a recent success suppresses older failures
     $runList = @($runs.runs | Where-Object { $_ }) | Sort-Object startTimeUsecs -Descending
 
     foreach ($run in $runList) {
       $start    = UsecsToLocal $run.startTimeUsecs
-      $end      = UsecsToLocal $run.endTimeUsecs
-      $duration = if ($run.endTimeUsecs -and $run.startTimeUsecs) { [math]::Round(($run.endTimeUsecs - $run.startTimeUsecs)/1e6,2) } else { $null }
+      $duration = if ($run.endTimeUsecs -and $run.startTimeUsecs) { [math]::Round(($run.endTimeUsecs - $run.startTimeUsecs)/1e6, 2) } else { $null }
 
-      # Collect object entries from multiple possible fields
+      # Determine run type (e.g., kLog, kRegular)
+      $runType = $run.localBackupInfo.runType
+      if (-not $runType) { $runType = $run.runType }
+      if (-not $runType -and $run.localRun) { $runType = $run.localRun.runType }
+
+      # Object list (prefer localRun.objects, then others)
       $objList = @()
-      if ($run.objects)           { $objList += $run.objects }
-      if ($run.objectRuns)        { $objList += $run.objectRuns }
-      if ($run.localBackupInfo -and $run.localBackupInfo.objects) { $objList += $run.localBackupInfo.objects }
+      if ($run.localRun -and $run.localRun.objects)                 { $objList += $run.localRun.objects }
+      elseif ($run.objects)                                         { $objList += $run.objects }
+      elseif ($run.objectRuns)                                      { $objList += $run.objectRuns }
+      elseif ($run.localBackupInfo -and $run.localBackupInfo.objects) { $objList += $run.localBackupInfo.objects }
 
-      if ($objList.Count -gt 0) {
-        foreach ($o in $objList) {
-          $name   = Get-ObjectName $o
-          if (-not $name) { continue }
+      if ($objList.Count -eq 0) { continue }  # DB-level only
 
-          $status = Get-ObjectStatus $o
+      foreach ($o in $objList) {
+        $name = GetObjectName $o
+        if (-not $name) { continue }
 
-          # Maintain suppression map based on most-recent success
-          if (IsSuccessStatus $status) {
-            $successByDb[$name] = $true
-            continue  # we don't output successes
-          }
+        $stat = $o.status
 
-          if ((IsFailureStatus $status) -and -not $successByDb.ContainsKey($name) -and ($pgDbNames -contains $name)) {
-            $msg = Get-ObjectMessages $o
-            $rows += [pscustomobject]@{
-              Cluster     = $cluster_name
-              PGName      = $pg.name
-              PolicyName  = $policyName
-              DBName      = $name
-              Status      = $status
-              Error       = $msg
-              RunId       = $run.id
-              StartTime   = $start
-              DurationSec = $duration
-            }
-          }
-        }
-      } else {
-        # No object details returned; use PG run status for *all* DBs
-        $runStatus = $run.status
-
-        if (IsSuccessStatus $runStatus) {
-          foreach ($name in $pgDbNames) { $successByDb[$name] = $true }
+        # Success marks suppression key for this DB+RunType
+        if ($stat -eq 'Success' -or $stat -eq 'Succeeded') {
+          $successByKey["$name|$runType"] = $true
           continue
         }
-        if (IsFailureStatus $runStatus) {
-          foreach ($name in $pgDbNames) {
-            if (-not $successByDb.ContainsKey($name)) {
-              $rows += [pscustomobject]@{
-                Cluster     = $cluster_name
-                PGName      = $pg.name
-                PolicyName  = $policyName
-                DBName      = $name
-                Status      = $runStatus
-                Error       = (JoinNonEmpty @($run.messages, ($run.events | ForEach-Object { $_.message })))
-                RunId       = $run.id
-                StartTime   = $start
-                DurationSec = $duration
-              }
-            }
+
+        # Only exact 'Failed', and only if not superseded by newer success of the SAME runType
+        if ($stat -eq 'Failed' -and -not $successByKey.ContainsKey("$name|$runType") -and ($pgDbNames -contains $name)) {
+          $rows += [pscustomobject]@{
+            Cluster     = $cluster_name
+            PGName      = $pg.name
+            DBName      = $name
+            RunType     = $runType
+            Status      = $stat
+            Error       = (GetObjectError $o)
+            RunId       = $run.id
+            StartTime   = $start
+            DurationSec = $duration
           }
         }
       }
@@ -216,15 +133,14 @@ foreach ($c in $Clusters) {
   }
 }
 
-# --- Output ---
-$rows = $rows | Sort-Object Cluster, PGName, DBName, StartTime
-
-$cols = @('Cluster','PGName','DBName','Status','Error','RunId','StartTime','DurationSec','PolicyName')
+# Output
+$rows = $rows | Sort-Object Cluster, PGName, DBName, RunType, StartTime
+$cols = @('Cluster','PGName','DBName','RunType','Status','Error','RunId','StartTime','DurationSec')
 
 try { $raw = $Host.UI.RawUI; $raw.BufferSize = New-Object Management.Automation.Host.Size (10000, $raw.BufferSize.Height) } catch {}
 $rows | Select-Object $cols | Format-Table -AutoSize | Out-String -Width 10000
 
 # Optional helpers
-# $rows | Select-Object $cols | Out-GridView -Title 'Oracle PG DB Failures (latest-success-suppressed)'
+# $rows | Select-Object $cols | Out-GridView -Title 'Oracle PG DB Failures (Failed-only, RunType-aware)'
 # $stamp = Get-Date -Format 'yyyy-MM-dd_HHmm'
-# $rows | Select-Object $cols | Export-Csv "C:\Cohesity_API\Oracle_PG_DB_Failures_$stamp.csv" -NoTypeInformation
+# $rows | Select-Object $cols | Export-Csv "C:\Cohesity_API\Oracle_PG_DB_Failures_RunType_$stamp.csv" -NoTypeInformation
