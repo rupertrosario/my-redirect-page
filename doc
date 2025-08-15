@@ -1,33 +1,228 @@
-. Map the drive from File Explorer
+Big picture (with components, paths, and logs)
+[ Solaris Host ]                                                [ Cohesity Cluster ]
+┌──────────────────────────────────────────────────────────────────────────────────────────────┐
+│  A) Credentials setup (script #1)                                                              │
+│     storepassword.py  → writes secret to:                                                      │
+│     /apps/oracle/.pyhesity/<vip>-<domain>-<username>-<True|False>                             │
+│     (created/used by pyhesity.py)                                                              │
+│     LOG: <pyhesity.py dir>/pyhesity-debug.log                                                  │
+│                                                                                               │
+│  B) Backup to NFS (script #3 – big bash)                                                      │
+│     RMAN writes pieces to Cohesity View exported via NFS:                                      │
+│       Mount on Solaris:  /opt/cohest/poracle_nfs  (your case)                                  │
+│     Folder structure (example):                                                                │
+│       /opt/cohest/poracle_nfs/<host>/<dbname>/datafile                                         │
+│     LOGS (local):                                                                              │
+│       <script_dir>/log/<host>/<dbname>.*.{log,rcv,std}                                         │
+│                                                                                               │
+│  C) View folder clone (script #2 – cloneDirectory.py) → Cohesity API                           │
+│     Source (Cohesity path):  /poracle_nfs/<host>/<dbname>/datafile      (View path)            │
+│     Target clone:              /poracle_nfs/<host>/<dbname>/datafile.<timestamp>               │
+│     LOGS:                                                                                      │
+│       cloneLog-*.txt  (in -l <logdir>)                                                         │
+│       <pyhesity.py dir>/pyhesity-debug.log  (API errors)                                       │
+└──────────────────────────────────────────────────────────────────────────────────────────────┘
 
-Open File Explorer.
+What each script does (and the levers you can turn)
+1) storepassword.py (your small Python)
 
-Click This PC in the left pane.
+Purpose: preload auth so later scripts never prompt.
 
-On the top ribbon, click Map network drive.
+Calls storePasswordFromInput() from pyhesity.py.
 
-Choose Drive: X:.
+Creates /apps/oracle/.pyhesity/<vip>-<domain>-<username>-<useApiKey> for the OS user running the job.
 
-In Folder, paste your network path:
-2. Map the drive from File Explorer
+Example (local user, password mode):
+/apps/oracle/.pyhesity/remote1-local-oracle_phython-False
 
-Open File Explorer.
+Uses exact vip string you’ll pass later (e.g., remote1 vs remote1.domain.com creates different files).
 
-Click This PC in the left pane.
+If you rotate the password or switch clusters, run this again for the matching -v.
 
-On the top ribbon, click Map network drive.
+Where to look when it breaks
 
-Choose Drive: X:.
+File missing/misspelled dir: /apps/oracle/.pyhesity/…
 
-In Folder, paste your network path:
+Wrong vip casing/alias: stored for remote2, job runs with remote1.
 
-\\ServerOrTenant\ShareNameOrPath
+Debug log: <pyhesity.py dir>/pyhesity-debug.log
+
+2) cloneDirectory.py (View directory → cloned directory)
+
+Purpose: snapshot‑clone the folder inside the View so you keep a frozen copy of that run’s backup.
+
+Auth: apiauth(..., prompt=(not noprompt))
+Use -np to force non‑interactive.
+
+If you’re not on Helios/MCM, call it with the cluster FQDN/IP via -v.
+
+Paths:
+
+It expects Cohesity View paths, not the Solaris mount path.
+
+You pass:
+
+-s (sourcepath): /<View>/<host>/<dbname>/datafile
+
+-t (targetpath): /<View>/<host>/<dbname>/datafile.<timestamp>
+
+The script splits target into:
+
+destinationParentDirectoryPath = /<View>/<host>/<dbname>
+
+destinationDirectoryName = datafile.<timestamp>
+
+What it returns/logs:
+
+Writes cloneLog-YYYY-MM-DD-HH-MM-SS.txt in your -l <logdir>.
+
+Typical error fingerprints (from result['error']):
+
+KAccessDenied → RBAC/scope to the View is missing.
+
+KNotFound / 404 → wrong View or folder path.
+
+KViewAlreadyExists → target already there (the script ignores this and keeps going).
+
+Debug log: <pyhesity.py dir>/pyhesity-debug.log
+
+3) Big bash script (RMAN + snapshot + catalog + cleanup)
+
+Purpose: orchestrates end‑to‑end:
+
+RMAN backup to the NFS View.
+
+Calls cloneDirectory.py to freeze that run’s folder.
+
+Catalogs cloned files into RMAN.
+
+Cleans old artifacts by retention.
+
+Key variables you’ll use while troubleshooting
+
+Mounts (NFS on Solaris):
+-m (mount prefix) and -n (count). The script expects numbered mounts:
+e.g., -m /mnt/ora -n 2 → /mnt/ora1, /mnt/ora2.
+If you pass -m /opt/cohest/poracle_nfs -n 1, the script looks for /opt/cohest/poracle_nfs1. Make sure your mount naming matches this expectation (or adjust the script).
+
+Paths it builds:
+
+backup_dir=$host/$dbname (default)
+If incremental-merge is in play and it detects a prior full on a different host/dbname, it may switch to orighost/origdbname.
+
+Clone source it computes:
+src_datafile_dir="/$view/${backup_dir}/datafile"
+⇒ On your Cohesity, that’s /poracle_nfs/<host or orighost>/<dbname or origdbname>/datafile
+
+Clone target it computes:
+/$view/${backup_dir}/datafile.$DATE_SUFFIX
+
+Generated logs & files (look here!):
+
+Runner logs:
+<script_dir>/log/<host>/<dbname>.<timestamp>.log (main)
+<script_dir>/log/<host>/<dbname>.r.<timestamp>.log (arch only)
+Plus RMAN scripts/outputs (*.rcv, *.rman*.log, *.std)
+
+Catalog script it generates & runs (when needed):
+<script_dir>/log/<host>/<dbname>_catalog.<timestamp>.bash and .log
+
+Control files saved to View:
+${mount}1/$host/$dbname/controlfile/… and spfile/…
+
+Retention cleaner: deletes old files under the View path per -e (days) and datafile.* directories older than N days.
+
+Where failures usually happen (and the one‑glance fixes)
+Symptom / Log Text	Root cause	Fix fast
+prompting for password… in pyhesity-debug.log	No matching secret file, or expired password	Create /apps/oracle/.pyhesity/… with exact vip/domain/user/mode (password vs API key). Use -np.
+KAccessDenied / 403 in clone log	User lacks RBAC to View (even if DB object is in scope)	Add the View (e.g., poracle_nfs) to the user’s Selected Objects.
+Invalid api call / 404 / KNotFound for views/cloneDirectory	Wrong View path (e.g., /opt… instead of /<View>/…)	Use Cohesity path: /<View>/<host>/<dbname>/datafile.
+Clone silently “works” but nothing new shows	Target already exists (KViewAlreadyExists ignored)	Use a unique suffix (timestamp) or delete old datafile.<ts> targets.
+“No such file or directory” Python traceback	Looking for ~/.pyhesity but you typo’d .phyhesity	Ensure /apps/oracle/.pyhesity/ exists and is 700; store secret again.
+Works for some DBs, fails for others	Those DBs write to a different View or orighost/origdbname path	Add each actual View to the user scope; confirm path in run log (src_datafile_dir).
+After ~365 days auth breaks	Cluster password policy on local users	Disable rotation for service acct, or rotate & re‑store, or switch to API key (--useApiKey).
+Clone list/dirList returns None	Path wrong or user can’t list View	Confirm exact path via UI; test with api('get','views/dirList?path=/View/…')
+Quick “prove it” tests you can run anytime
+0) Confirm which pyhesity.py is in use & where pyhesity-debug.log is
+sudo -u oracle python3 - <<'PY'
+import pyhesity, os
+print("pyhesity module:", pyhesity.__file__)
+from inspect import getsource
+import re
+import os.path as p
+import importlib
+# Extract LOGFILE constant
+import importlib.util
+mod = importlib.import_module('pyhesity')
+print("debug log path (computed):", p.join(p.dirname(mod.__file__), 'pyhesity-debug.log'))
+print("CONFIGDIR (~/.pyhesity):", os.path.expanduser("~") + "/.pyhesity")
+PY
+
+1) Check the secret file is present (and for the right vip)
+ls -l /apps/oracle/.pyhesity/
+# Expect something like:
+# remote1-local-oracle_phython-False
+# remote2-local-oracle_phython-False (if you also stored for the DR site)
+
+2) Smoke‑test auth + list the source folder
+sudo -u oracle python3 - <<'PY'
+from pyhesity import apiauth, api
+vip='remote1'            # EXACTLY what your job uses with -v
+username='oracle_phython'
+domain='local'
+apiauth(vip=vip, username=username, domain=domain, prompt=False)  # reads stored secret
+src='/poracle_nfs/<host>/<dbname>/datafile'                       # Cohesity path, not /opt/...
+print("dirList:", api('get', f'views/dirList?path={src}'))
+PY
 
 
-Check Reconnect at sign-in if you want it persistent.
+If this returns a list, RBAC+path are good.
 
-Check Connect using different credentials if it’s not your Windows account.
+If it’s None/403/KAccessDenied, fix View access.
 
-Click Finish.
+If it 404s, the path is wrong (View name/host/dbname).
 
-If prompted, enter your username/password.
+3) One‑off clone test (no RMAN required)
+sudo -u oracle python3 - <<'PY'
+from pyhesity import apiauth, api
+vip='remote1'; username='oracle_phython'; domain='local'
+apiauth(vip=vip, username=username, domain=domain, prompt=False)
+src='/poracle_nfs/<host>/<dbname>/datafile'
+tgt='/poracle_nfs/<host>/<dbname>/datafile.TEST'
+res = api('post','views/cloneDirectory',{
+  'destinationDirectoryName': tgt.split('/')[-1],
+  'destinationParentDirectoryPath': '/' + '/'.join(tgt.split('/')[1:-1]),
+  'sourceDirectoryPath': src
+})
+print("clone result:", res)
+PY
+
+The “why we clone” (tied to your exact paths)
+
+Your RMAN writes to a stable path on Solaris:
+/opt/cohest/poracle_nfs/<host>/<dbname>/datafile
+
+On Cohesity, that exact folder is /<View>/… i.e.:
+/poracle_nfs/<host>/<dbname>/datafile
+
+If you reused that folder for tomorrow’s run, yesterday’s files could be rotated/overwritten.
+
+Cloning …/datafile → …/datafile.<timestamp> inside the View gives you a point‑in‑time, space‑efficient copy:
+
+Next run can reuse …/datafile
+
+Yesterday lives safely under …/datafile.20250815…
+
+You can restore/mount/replicate the clone without touching the active path.
+
+Tiny checklist before every rollout
+
+ Secret stored for each vip you will use (e.g., remote1, remote2), under the same OS user.
+
+ cloneDirectory.py is called with -np, correct -v, and Cohesity paths for -s and -t.
+
+ User’s role includes the View(s) (poracle_nfs, etc.) under Selected Objects.
+
+ If using the big bash script, your -m/-n reflect numbered mounts (e.g., /mnt/ora1). Adjust if your environment uses a single unnumbered mount.
+
+If you want, I can also tweak your bash to support unnumbered mount paths (so -m /opt/cohest/poracle_nfs works without appending 1). That removes a whole class of false negatives when checking mounts.
