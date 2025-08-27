@@ -1,0 +1,115 @@
+# --- SETTINGS ---
+$environments = @('kOracle','kSQL','kVMware')   # add/remove as needed
+$reportDate   = Get-Date -Format "yyyy-MM-dd_HHmm"
+$excelFile    = "BackupFailures_AllClusters_$reportDate.xlsx"
+$firstSheet   = $true
+
+# one Excel per run; delete if you want a fresh file
+if (Test-Path $excelFile) { Remove-Item $excelFile -Force }
+
+foreach ($env in $environments) {
+    Write-Host "`n=== Environment: $env ==="
+    $globalFailures = @()
+
+    foreach ($cluster in $clusters) {
+        $clusterId   = $cluster.id
+        $clusterName = $cluster.name
+        $pgUrl       = "https://your-api/clusters/$clusterId/protection-groups"
+
+        # Your existing call; normalize whether Invoke-RestMethod returned parsed JSON or a .Content string
+        $respPG = Invoke-RestMethod -Uri $pgUrl -Headers $headers -Method Get
+        $pgResponse = if ($respPG -and $respPG.PSObject.Properties['Content']) {
+            if ($respPG.Content) { $respPG.Content | ConvertFrom-Json } else { $respPG }
+        } else { $respPG }
+
+        $pgs = $pgResponse.protectionGroups | Where-Object { $_.environment -eq $env }
+        if (-not $pgs) { continue }
+
+        foreach ($pg in $pgs) {
+            $pgId   = $pg.id
+            $pgName = $pg.name
+            $runUrl = "https://your-api/protection-groups/$pgId/runs?numRuns=10"
+
+            try {
+                $respRuns = Invoke-RestMethod -Uri $runUrl -Headers $headers -Method Get
+                $runs = if ($respRuns -and $respRuns.runs) { $respRuns.runs } else { @() }
+                if (-not $runs) { continue }
+
+                # flatten with environment filter and object name
+                $flatRuns = foreach ($run in $runs) {
+                    if ($run.localBackupInfo) {
+                        foreach ($info in $run.localBackupInfo) {
+                            if ($info.object.environment -ne "kPhysical") {   # exclude kPhysical
+                                [pscustomobject]@{
+                                    RunType         = $info.runType
+                                    Status          = $info.status
+                                    Message         = $info.message
+                                    StartTimeUsecs  = $info.startTimeUsecs
+                                    EndTimeUsecs    = $info.endTimeUsecs
+                                    Cluster         = $clusterName
+                                    ProtectionGroup = $pgName
+                                    ObjectName      = $info.object.name   # capture object name
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if (-not $flatRuns) { continue }
+
+                # your “failure with no later success” logic per RunType
+                $grouped = $flatRuns | Group-Object RunType
+                foreach ($g in $grouped) {
+                    $latestFailed = $g.Group | Where-Object { $_.Status -eq "Failed" } |
+                                    Sort-Object EndTimeUsecs -Descending | Select-Object -First 1
+                    if ($null -ne $latestFailed) {
+                        $hasLaterSuccess = $g.Group | Where-Object {
+                            $_.Status -eq "Succeeded" -and $_.StartTimeUsecs -gt $latestFailed.EndTimeUsecs
+                        }
+                        if (-not $hasLaterSuccess) {
+                            $estZone = [System.TimeZoneInfo]::FindSystemTimeZoneById("Eastern Standard Time")
+                            $startUtc = [datetime]"1970-01-01".AddMilliseconds($latestFailed.StartTimeUsecs / 1000)
+                            $endUtc   = [datetime]"1970-01-01".AddMilliseconds($latestFailed.EndTimeUsecs   / 1000)
+
+                            $globalFailures += [pscustomobject]@{
+                                Cluster         = $latestFailed.Cluster
+                                ProtectionGroup = $latestFailed.ProtectionGroup
+                                ObjectName      = $latestFailed.ObjectName   # include in final output
+                                RunType         = $latestFailed.RunType
+                                Status          = $latestFailed.Status
+                                Message         = $latestFailed.Message
+                                StartTime       = [System.TimeZoneInfo]::ConvertTimeFromUtc($startUtc, $estZone).ToString("dd/MM/yyyy HH:mm:ss")
+                                EndTime         = [System.TimeZoneInfo]::ConvertTimeFromUtc($endUtc,   $estZone).ToString("dd/MM/yyyy HH:mm:ss")
+                            }
+                        }
+                    }
+                }
+            } catch {
+                Write-Warning "Failed to get runs for PG $pgName ($pgId) on $clusterName"
+            }
+        }
+    }
+
+    # Export a worksheet per environment
+    if ($globalFailures.Count -gt 0) {
+        $sheet = switch ($env) {
+            'kOracle' { 'Oracle' }
+            'kSQL'    { 'SQL' }
+            'kVMware' { 'VMware' }
+            default   { $env }
+        }
+
+        if ($firstSheet) {
+            $globalFailures | Export-Excel -Path $excelFile -WorksheetName $sheet -AutoSize
+            $firstSheet = $false
+        } else {
+            $globalFailures | Export-Excel -Path $excelFile -WorksheetName $sheet -AutoSize -Append
+        }
+
+        Write-Host "✔ Exported $($globalFailures.Count) rows to worksheet '$sheet'"
+    } else {
+        Write-Host "No unresolved failures found for $env"
+    }
+}
+
+Write-Host "`nSaved Excel report with per-environment tabs: $excelFile"
