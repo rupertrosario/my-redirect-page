@@ -1,15 +1,11 @@
 # --- robust epoch -> UTC converter (ms first; fallback to µs) ---
 function Convert-ToUtcFromEpoch($v) {
     if ($null -eq $v -or $v -eq 0) { return $null }
-    try {
-        return [DateTimeOffset]::FromUnixTimeMilliseconds([int64]$v).UtcDateTime   # milliseconds path
-    } catch {
-        return [DateTimeOffset]::FromUnixTimeMilliseconds([int64]([double]$v / 1000)).UtcDateTime  # microseconds
-    }
+    return [DateTimeOffset]::FromUnixTimeMilliseconds([int64]$v).UtcDateTime   # assumes ms, adjust if needed
 }
 
 # --- SETTINGS ---
-$environments = @('kOracle','kSQL','kVMware')   # add/remove as needed
+$environments = @('kOracle','kSQL','kVMware')   # removed kPhysical
 $reportDate   = Get-Date -Format "yyyy-MM-dd_HHmm"
 $excelFile    = "BackupFailures_AllClusters_$reportDate.xlsx"
 $firstSheet   = $true
@@ -22,9 +18,9 @@ foreach ($env in $environments) {
     $globalFailures = @()
 
     foreach ($cluster in $clusters) {
-        $clusterId   = $cluster.id
-        $clusterName = $cluster.name
-        $pgUrl       = "https://your-api/clusters/$clusterId/protection-groups"
+        $clusterId     = $cluster.id
+        $cluster_name  = $cluster.name
+        $pgUrl         = "https://your-api/clusters/$clusterId/protection-groups"
 
         $respPG = Invoke-RestMethod -Uri $pgUrl -Headers $headers -Method Get
         $pgResponse = if ($respPG -and $respPG.PSObject.Properties['Content']) {
@@ -35,66 +31,63 @@ foreach ($env in $environments) {
         if (-not $pgs) { continue }
 
         foreach ($pg in $pgs) {
-            $pgId   = $pg.id
-            $pgName = $pg.name
-            $runUrl = "https://your-api/protection-groups/$pgId/runs?numRuns=10"
+            $pgId          = $pg.id
+            $pgName        = $pg.name
+            $runUrl        = "https://your-api/protection-groups/$pgId/runs?numRuns=10"
 
-            try {
-                $respRuns = Invoke-RestMethod -Uri $runUrl -Headers $headers -Method Get
-                $runs = if ($respRuns -and $respRuns.runs) { $respRuns.runs } else { @() }
-                if (-not $runs) { continue }
+            $respRuns = Invoke-RestMethod -Uri $runUrl -Headers $headers -Method Get
+            $runs = if ($respRuns -and $respRuns.runs) { $respRuns.runs } else { @() }
+            if (-not $runs) { continue }
 
-                $flatRuns = foreach ($run in $runs) {
-                    if ($run.localBackupInfo -and $run.objects) {
-                        foreach ($info in $run.localBackupInfo) {
-                            foreach ($obj in $run.objects | Where-Object { $_.object.environment -ne "kPhysical" -and $_.localSnapshotInfo.failedAttempts -and $_.localSnapshotInfo.failedAttempts.Count -gt 0 }) {
-                                foreach ($fail in $obj.localSnapshotInfo.failedAttempts | Where-Object { $_ -ne $null -and $_.message -ne $null -and $_.message -ne "" }) {
-                                    [pscustomobject]@{
-                                        RunType         = $info.runType
-                                        Status          = $info.status
-                                        Message         = $fail.message
-                                        StartTimeUsecs  = $info.startTimeUsecs
-                                        EndTimeUsecs    = $info.endTimeUsecs
-                                        Cluster         = $clusterName
-                                        ProtectionGroup = $pgName
-                                        ObjectName      = $obj.object.name
-                                    }
+            $flatRuns = foreach ($run in $runs) {
+                if ($run.localBackupInfo -and $run.objects) {
+                    foreach ($info in $run.localBackupInfo) {
+                        [pscustomobject]@{
+                            RunType          = $info.runType
+                            Status           = $info.status
+                            StartTimeUsecs   = $info.startTimeUsecs
+                            EndTimeUsecs     = $info.endTimeUsecs
+                            Cluster          = $cluster_name
+                            ProtectionGroup  = $pgName
+                            Objects          = $run.objects | Where-Object { $_.localSnapshotInfo.failedAttempts -and $_.localSnapshotInfo.failedAttempts.Count -gt 0 }
+                        }
+                    }
+                }
+            }
+
+            if (-not $flatRuns) { continue }
+
+            $grouped = $flatRuns | Group-Object RunType
+            foreach ($g in $grouped) {
+                $latestFailed = $g.Group | Where-Object { $_.Status -eq "Failed" } |
+                                Sort-Object EndTimeUsecs -Descending | Select-Object -First 1
+                if ($null -ne $latestFailed) {
+                    $hasLaterSuccess = $g.Group | Where-Object {
+                        $_.Status -eq "Succeeded" -and $_.StartTimeUsecs -gt $latestFailed.EndTimeUsecs
+                    }
+                    if (-not $hasLaterSuccess) {
+                        $estZone = [System.TimeZoneInfo]::FindSystemTimeZoneById("Eastern Standard Time")
+                        $startUtc = Convert-ToUtcFromEpoch $latestFailed.StartTimeUsecs
+                        $endUtc   = Convert-ToUtcFromEpoch $latestFailed.EndTimeUsecs
+
+                        foreach ($obj in $latestFailed.Objects) {
+                            foreach ($fail in $obj.localSnapshotInfo.failedAttempts | Where-Object { $_ -ne $null -and $_.message -ne $null -and $_.message -ne "" }) {
+                                $globalFailures += [pscustomobject]@{
+                                    Cluster          = $latestFailed.Cluster
+                                    ProtectionGroup  = $latestFailed.ProtectionGroup
+                                    ObjectName       = $obj.object.name
+                                    RunType          = $latestFailed.RunType
+                                    Status           = $latestFailed.Status
+                                    Message          = $fail.message
+                                    StartTime        = if ($startUtc) { [System.TimeZoneInfo]::ConvertTimeFromUtc($startUtc, $estZone).ToString("dd/MM/yyyy HH:mm:ss") } else { "" }
+                                    EndTime          = if ($endUtc) { [System.TimeZoneInfo]::ConvertTimeFromUtc($endUtc, $estZone).ToString("dd/MM/yyyy HH:mm:ss") } else { "" }
                                 }
+
+                                Write-Host "DB/Host: $($obj.object.name) | Message: $($fail.message)"
                             }
                         }
                     }
                 }
-
-                if (-not $flatRuns) { continue }
-
-                $grouped = $flatRuns | Group-Object RunType
-                foreach ($g in $grouped) {
-                    $latestFailed = $g.Group | Where-Object { $_.Status -eq "Failed" } |
-                                    Sort-Object EndTimeUsecs -Descending | Select-Object -First 1
-                    if ($null -ne $latestFailed) {
-                        $hasLaterSuccess = $g.Group | Where-Object {
-                            $_.Status -eq "Succeeded" -and $_.StartTimeUsecs -gt $latestFailed.EndTimeUsecs
-                        }
-                        if (-not $hasLaterSuccess) {
-                            $estZone = [System.TimeZoneInfo]::FindSystemTimeZoneById("Eastern Standard Time")
-                            $startUtc = Convert-ToUtcFromEpoch $latestFailed.StartTimeUsecs
-                            $endUtc   = Convert-ToUtcFromEpoch $latestFailed.EndTimeUsecs
-
-                            $globalFailures += [pscustomobject]@{
-                                Cluster         = $latestFailed.Cluster
-                                ProtectionGroup = $latestFailed.ProtectionGroup
-                                ObjectName      = $latestFailed.ObjectName
-                                RunType         = $latestFailed.RunType
-                                Status          = $latestFailed.Status
-                                Message         = $latestFailed.Message
-                                StartTime       = if ($startUtc) { [System.TimeZoneInfo]::ConvertTimeFromUtc($startUtc, $estZone).ToString("dd/MM/yyyy HH:mm:ss") } else { "" }
-                                EndTime         = if ($endUtc) { [System.TimeZoneInfo]::ConvertTimeFromUtc($endUtc, $estZone).ToString("dd/MM/yyyy HH:mm:ss") } else { "" }
-                            }
-                        }
-                    }
-                }
-            } catch {
-                Write-Warning "Failed to get runs for PG $pgName ($pgId) on $clusterName"
             }
         }
     }
