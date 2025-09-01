@@ -1,155 +1,149 @@
-# Cohesity – Physical Servers: Object-level Failures per PG (Collapsed)
-# - Enumerates PGs and their configured objects (physicalParams.fileProtectionTypeParams.objects.name)
-# - Fetches last 10 runs with object details
-# - For each Object+RunType: keeps the latest Failed only if there is NO later Succeeded/SucceededWithWarning
-# - Collapses per PG to a comma-joined list of failed object names
-
-$ErrorActionPreference = 'Stop'
-
-# =========================
-# 0) Setup & Helpers
-# =========================
 $logDirectory = "X:\PowerShell\Data\Cohesity\BackupFailures"
-if (-not (Test-Path -Path $logDirectory -PathType Container)) { New-Item -Path $logDirectory -ItemType Directory | Out-Null }
 
-function Convert-ToUTCFromEpoch($v) {
-  if ($null -eq $v -or $v -eq 0) { return $null }
-  try { return [DateTimeOffset]::FromUnixTimeMilliseconds([int64]$v).UtcDateTime }
-  catch { return [DateTimeOffset]::FromUnixTimeMilliseconds([int64]([double]$v/1000)).UtcDateTime }
+$fileCount = (Get-ChildItem -Path $logDirectory -File).Count
+
+if ($fileCount -gt 50) {
+    $filesToDelete = Get-ChildItem -Path $logDirectory -File | Sort-Object CreationTime | Select-Object -First ($fileCount - 50)
+    if ($filesToDelete) { Remove-Item $filesToDelete -Force
+        Write-Host "$($filesToDelete.Count) files Deleted." }
+    else { Write-Host "No Files to delete." }
 }
-$tz = [System.TimeZoneInfo]::FindSystemTimeZoneById('Asia/Kolkata')
+elseif (-not (Test-Path -Path $logDirectory -PathType Container)) {
+    New-Item -Path $logDirectory -ItemType Directory
+}
 
-# API key
+# 0) API key from your path
+
 $apikeypath = "X:\PowerShell\Cohesity_API_Scripts\DO_NOT_Delete\apikey.txt"
 if (-not (Test-Path $apikeypath)) { throw "API key file not found at $apikeypath" }
 $ApiKey = (Get-Content -Path $apikeypath -Raw).Trim()
-$commonHeaders = @{ apikey = $ApiKey }
+$commonHeaders = @{ "apikey" = $ApiKey }
 
-# =========================
-# 1) Get Clusters
-# =========================
-$clustersUrl = "https://helios.cohesity.com/v2/mcm/cluster-mgmt/info"
-$clustersResp = Invoke-WebRequest -Method Get -Uri $clustersUrl -Headers $commonHeaders
-$clustersJson = $clustersResp.Content | ConvertFrom-Json
-$clusters = $clustersJson.cohesityClusters
+# 1) Get Clusters (ClusterName + ClusterId)
 
-# =========================
-# 2) Iterate Clusters -> PGs (Physical) -> Objects
-# =========================
+$url = "https://helios.cohesity.com/v2/mcm/cluster-mgmt/info"
+$response = Invoke-WebRequest -Method Get -Uri $url -Headers $commonHeaders
+$json_clu = $response.Content | ConvertFrom-Json
+$json_clu = $json_clu.cohesityClusters
+
+# Store all final results across clusters
+
 $globalFailures = @()
 
-foreach ($clus in $clusters) {
-  $cluster_name = $clus.ClusterName
-  $cluster_id   = $clus.ClusterId
-  $headers = @{ apikey = $ApiKey; accessClusterId = "$cluster_id" }
+# Collect all Protection Groups from clusters and process one cluster at a time
+foreach ($clus in $json_clu) {
+    $cluster_name = $clus.ClusterName
+    $cluster_id = $clus.ClusterId
 
-  # Get all PGs (we will focus on physical ones below)
-  $pgUrl = "https://helios.cohesity.com/v2/data-protect/protection-groups"
-  $pgResp = Invoke-WebRequest -Method Get -Uri $pgUrl -Headers $headers
-  $pgs = ($pgResp.Content | ConvertFrom-Json)
-  if (-not $pgs -or -not $pgs.protectionGroups) { continue }
-
-  foreach ($pg in $pgs.protectionGroups) {
-    # Only Physical PGs; adjust if you need more environments later
-    if (-not $pg.physicalParams) { continue }
-
-    $pgId   = $pg.id
-    $pgName = $pg.name
-
-    # Collect configured object names from PG definition
-    $configuredObjNames = @()
-    $objNodes = $pg.physicalParams.fileProtectionTypeParams.objects
-    if ($objNodes) {
-      foreach ($obj in $objNodes) {
-        if ($obj.name) { $configuredObjNames += [string]$obj.name }
-      }
+    $headers = @{ 
+        "apikey" = $ApiKey
+        "accessClusterId" = "$cluster_id" 
     }
 
-    # Fetch last 10 runs with object details
-    $runUrl = "https://helios.cohesity.com/v2/data-protect/protection-groups/$pgId/runs?numRuns=10&includeObjectDetails=true&excludeNonRestorableRuns=false"
-    $rResp  = Invoke-WebRequest -Method Get -Uri $runUrl -Headers $headers
-    $rJson  = $rResp.Content | ConvertFrom-Json
-    $runs   = if ($rJson -and $rJson.runs) { $rJson.runs } else { @() }
-    if (-not $runs) { continue }
+    $body = @{ 
+        environments = "kPhysical"
+        isDeleted = "False"
+        isPaused = "False"
+        isActive = "True"
+    }
 
-    # Build flat rows with object names (filter to PG's configured objects when known)
-    $flatRuns = @()
-    foreach ($run in $runs) {
-      if ($run.localBackupInfo) {
-        foreach ($info in $run.localBackupInfo) {
-          # Resolve object name
-          $objName = $info.objectName
-          if (-not $objName -and $info.object) { $objName = $info.object.name }
-          if (-not $objName -and $info.entity) { $objName = $info.entity.displayName }
-          if (-not $objName) { $objName = '<unknown>' }
+    $pgurl = "https://helios.cohesity.com/v2/data-protect/protection-groups"
 
-          # If PG has explicit object list, keep only those
-          if ($configuredObjNames.Count -gt 0 -and ($configuredObjNames -notcontains $objName)) { continue }
+    $response = Invoke-WebRequest -Method Get -Uri $pgurl -Headers $headers -Body $body
+    $pgs = $response.Content | ConvertFrom-Json
+    $pgs = $pgsResponse
 
-          $flatRuns += [pscustomobject]@{
-            Cluster         = $cluster_name
-            ProtectionGroup = $pgName
-            RunType         = $run.runType
-            ObjectName      = $objName
-            Status          = $info.status
-            Message         = ($info.messages -join '; ')
-            StartTimeUsecs  = $info.startTimeUsecs
-            EndTimeUsecs    = $info.endTimeUsecs
-          }
+    foreach ($pg in $pgs.protectionGroups) {
+        $pgId = $pg.id
+        $pgName = $pg.name
+        $hn.name
+        $headers = @{ 
+            "apikey" = "$ApiKey"
+            "accessClusterId" = "$cluster_id" 
         }
-      }
-    }
 
-    if (-not $flatRuns) { continue }
-
-    # Object-level suppression (per RunType & Object)
-    $survivors = @()
-    $byRtObj = $flatRuns | Group-Object RunType, ObjectName
-    foreach ($g in $byRtObj) {
-      $latestFailed = $g.Group | Where-Object { $_.Status -eq 'Failed' } |
-                      Sort-Object EndTimeUsecs -Descending | Select-Object -First 1
-      if ($null -ne $latestFailed) {
-        $hasLaterSuccess = $g.Group | Where-Object {
-          ( $_.Status -eq 'Succeeded' -or $_.Status -eq 'SucceededWithWarning' ) -and
-          $_.StartTimeUsecs -gt $latestFailed.EndTimeUsecs
+        $body = @{ 
+            environments = "kPhysical"
+            isDeleted = "False"
+            isPaused = "False"
+            isActive = "True"
+            numRuns = "10"
+            excludeNonRestorableRuns= "false"
+            includeObjectDetails = "true" 
         }
-        if (-not $hasLaterSuccess) { $survivors += $latestFailed }
-      }
-    }
 
-    if (-not $survivors) { continue }
+        $runurl = "https://helios.cohesity.com/v2/data-protect/protection-groups/$pgId/runs"
 
-    # Collapse to one row per PG (comma-join failed object names)
-    $groupedPg = $survivors | Group-Object Cluster, ProtectionGroup, RunType
-    foreach ($gp in $groupedPg) {
-      $grp = $gp.Group
-      $latest = $grp | Sort-Object EndTimeUsecs -Descending | Select-Object -First 1
-      $startUtc = Convert-ToUTCFromEpoch $latest.StartTimeUsecs
-      $endUtc   = Convert-ToUTCFromEpoch $latest.EndTimeUsecs
-      $globalFailures += [pscustomobject]@{
-        Cluster         = $latest.Cluster
-        ProtectionGroup = $latest.ProtectionGroup
-        RunType         = $latest.RunType
-        FailedObjects   = ($grp.ObjectName | Sort-Object -Unique) -join ', '
-        Message         = $latest.Message
-        StartTime       = if ($startUtc) { [System.TimeZoneInfo]::ConvertTimeFromUtc($startUtc, $tz) } else { $null }
-        EndTime         = if ($endUtc)   { [System.TimeZoneInfo]::ConvertTimeFromUtc($endUtc,   $tz) } else { $null }
-      }
+        $response = Invoke-WebRequest -Method Get -Uri $runurl -Headers $headers -Body $body
+        $json = $response | ConvertFrom-Json
+        $runs = if ($json -and $json.runs) { $json.runs } else { @() }
+
+        $runs = if ($response -and $response.runs) { $response.runs } else { @() }
+        #Write-Host " → PG: $pgName - Runs fetched: $($runs.Count)"
+
+        if (-not $runs) {
+            Write-Host " ⚠️ No runs found for PG: $pgName in Cluster: $cluster_name"
+            continue
+        }
+
+        $flatRuns = @()
+        foreach ($run in $runs) {
+            if ($run.localBackupInfo) {
+                foreach ($info in $run.localBackupInfo) {
+                    $flatRuns += [pscustomobject]@{
+                        RunType       = $run.runType
+                        Status        = $info.status
+                        Message       = $info.messages
+                        StartTimeUsecs= $info.startTimeUsecs
+                        EndTimeUsecs  = $info.endTimeUsecs
+                        Cluster       = $cluster_name
+                        ProtectionGroup = $pgName
+                    }
+                }
+            }
+        }
+
+        function Convert-ToUTCFromEpoch($v) {
+            if ($null -eq $v -or $v -eq 0) { return $null }
+            try { 
+                return [DateTimeOffset]::FromUnixTimeMilliseconds([int64]$v).UtcDateTime
+            } catch { 
+                return [DateTimeOffset]::FromUnixTimeMilliseconds([int64]([double]$v / 1000)).UtcDateTime 
+            }
+        }
+
+        $grouped = $flatRuns | Group-Object RunType
+        foreach ($g in $grouped) {
+            $latestFailed = $g.Group | Where-Object { $_.Status -eq "Failed" } | Sort-Object EndTimeUsecs -Descending | Select-Object -First 1
+            if ($null -ne $latestFailed) {
+                $hasLaterSuccess = $g.Group | Where-Object { $_.Status -eq "Succeeded" -and $_.StartTimeUsecs -gt $latestFailed.EndTimeUsecs }
+                if (-not $hasLaterSuccess) {
+                    $tzZone = [System.TimeZoneInfo]::FindSystemTimeZoneById("Eastern Standard Time")
+                    $startUtc = Convert-ToUTCFromEpoch $latestFailed.StartTimeUsecs
+                    $endUtc = Convert-ToUTCFromEpoch $latestFailed.EndTimeUsecs
+
+                    $globalFailures += [pscustomobject]@{
+                        Cluster        = $latestFailed.Cluster
+                        ProtectionGroup= $latestFailed.ProtectionGroup
+                        RunType        = $latestFailed.RunType
+                        Status         = $latestFailed.Status
+                        Message        = $latestFailed.Message -join '; '
+                        StartTime      = if ($startUtc) { [System.TimeZoneInfo]::ConvertTimeFromUtc($startUtc, $tzZone) } else { $null }
+                        EndTime        = if ($endUtc) { [System.TimeZoneInfo]::ConvertTimeFromUtc($endUtc, $tzZone) } else { $null }
+                    }
+                }
+            }
+        }
     }
-  }
 }
 
-# =========================
-# 3) Final Output
-# =========================
+# Print one header and all failures + HTML export combined across clusters
 if ($globalFailures.Count -gt 0) {
-  Write-Host "=== Physical PGs: Object-level Failures Without Later Success ==="
-  $globalFailures |
-    Sort-Object EndTime -Descending |
-    Select-Object Cluster, ProtectionGroup, RunType, FailedObjects, Message,
-      @{n='StartTime';e={ if ($_.StartTime) { $_.StartTime.ToString('dd/MM/yyyy HH:mm:ss') } }},
-      @{n='EndTime';e={ if ($_.EndTime)   { $_.EndTime.ToString('dd/MM/yyyy HH:mm:ss') } }} |
-    Format-Table -AutoSize
-} else {
-  Write-Host "No qualifying failures found."
+    Write-Host "=== Backup Failures Without Later Success Across All Clusters ==="
+    $globalFailures |
+      Sort-Object EndTime -Descending |
+      Select-Object Cluster, ProtectionGroup, RunType, Status, Message,
+        @{Name='StartTime'; Expression={ $_.StartTime.ToString("dd/MM/yyyy HH:mm:ss") }},
+        @{Name='EndTime'; Expression={ $_.EndTime.ToString("dd/MM/yyyy HH:mm:ss") }} |
+      Format-Table -AutoSize
 }
