@@ -1,15 +1,56 @@
-# Basic text email (no attachment)
-$from = 'alerts@yourdomain.com'
-$to   = 'you@yourdomain.com'
-$srv  = 'smtp.yourdomain.com'   # relay or mail server
-$subj = 'Job done'
-$body = 'Hello, the task completed successfully.'
+# --- safe epoch -> UTC converter (handles ms or µs) ---
+function Convert-ToUtcFromEpoch($v) {
+    if ($null -eq $v -or $v -eq 0) { return $null }
+    try   { [DateTimeOffset]::FromUnixTimeMilliseconds([int64]$v).UtcDateTime }
+    catch { [DateTimeOffset]::FromUnixTimeMilliseconds([int64]([double]$v/1000)).UtcDateTime }
+}
 
-Send-MailMessage -From $from -To $to -Subject $subj -Body $body -SmtpServer $srv
+$globalFailures = @()  # INIT
 
-# With creds, TLS, HTML, and attachment
-$cred = Get-Credential  # or load from a secret vault
-Send-MailMessage -From $from -To $to -Subject 'Report' `
-  -Body "<b>See attached</b>" -BodyAsHtml `
-  -Attachments 'C:\Reports\report.csv' `
-  -SmtpServer $srv -UseSsl -Credential $cred -Port 587
+$grouped = $flatRuns | Group-Object RunType
+foreach ($g in $grouped) {
+    $latestFailed = $g.Group | Where-Object { $_.Status -eq "Failed" } |
+                    Sort-Object EndTimeUsecs -Descending | Select-Object -First 1
+    if ($latestFailed) {
+        $hasLaterSuccess = $g.Group | Where-Object {
+            $_.Status -eq "Succeeded" -and $_.StartTimeUsecs -gt $latestFailed.EndTimeUsecs
+        }
+        if (-not $hasLaterSuccess) {
+            $estZone  = [System.TimeZoneInfo]::FindSystemTimeZoneById("Eastern Standard Time")
+            $startUtc = Convert-ToUtcFromEpoch $latestFailed.StartTimeUsecs
+            $endUtc   = Convert-ToUtcFromEpoch $latestFailed.EndTimeUsecs
+            $globalFailures += [pscustomobject]@{
+                Cluster         = $latestFailed.Cluster
+                ProtectionGroup = $latestFailed.ProtectionGroup
+                RunType         = $latestFailed.RunType
+                Status          = $latestFailed.Status
+                Message         = $latestFailed.Message
+                StartTime       = if ($startUtc) { [System.TimeZoneInfo]::ConvertTimeFromUtc($startUtc, $estZone) }
+                EndTime         = if ($endUtc)   { [System.TimeZoneInfo]::ConvertTimeFromUtc($endUtc,   $estZone) }
+            }
+        }
+    }
+}
+
+# Build a plain-text table (single string)
+$sn = 0
+$reportText =
+    if ($globalFailures.Count) {
+        $globalFailures |
+          Sort-Object EndTime -Descending |
+          Select-Object @{n='S.No';e={ $script:sn++; $script:sn }},
+                        Cluster, ProtectionGroup, RunType, Status, Message,
+                        @{n='StartTime';e={ $_.StartTime?.ToString("dd/MM/yyyy HH:mm:ss") }},
+                        @{n='EndTime'  ;e={ $_.EndTime  ?.ToString("dd/MM/yyyy HH:mm:ss") }} |
+          Format-Table -AutoSize | Out-String -Width 4096
+    } else {
+        "No pending failures without a later success."
+    }
+
+# Show on screen
+$reportText
+
+# Email the same text
+Send-MailMessage -From "you@yourdomain.com" -To "you@yourdomain.com" `
+  -Subject "Cohesity Failures (Text)" -Body $reportText `
+  -SmtpServer "smtp.office365.com" -Port 587 -UseSsl -Credential (Get-Credential)
