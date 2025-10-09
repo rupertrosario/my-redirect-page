@@ -45,7 +45,6 @@ function Analyze-RunsForJob {
     param(
         [Parameter(Mandatory=$true)]$Job,
         [Parameter(Mandatory=$true)][string]$RunTypesCsv,
-        [Parameter(Mandatory=$true)][string]$Label,
         [Parameter(Mandatory=$true)][int64]$StartUsecs,
         [Parameter(Mandatory=$true)][int]$NumRuns,
         [Parameter(Mandatory=$true)][int]$FailureCount,
@@ -53,7 +52,8 @@ function Analyze-RunsForJob {
         [Parameter(Mandatory=$true)]$Messages,
         [Parameter(Mandatory=$true)]$FailureTime,
         [Parameter(Mandatory=$true)]$LatestSuccessUsecs,
-        [Parameter(Mandatory=$true)]$ConsecutiveFails
+        [Parameter(Mandatory=$true)]$ConsecutiveFails,
+        [Parameter(Mandatory=$true)]$SourceMap
     )
 
     $uri = "data-protect/protection-groups/$($Job.id)/runs?numRuns=$NumRuns&startTimeUsecs=$StartUsecs&includeObjectDetails=true&runTypes=$RunTypesCsv"
@@ -63,48 +63,65 @@ function Analyze-RunsForJob {
     $jobName = $Job.name
     $env = $Job.environment
 
-    # newest to oldest
-    $runsSorted = $runs.runs | Sort-Object { $_.localBackupInfo.startTimeUsecs } -Descending
-    $stillCounting = @{}
+    # oldest to newest for accurate streak detection
+    $runsSorted = $runs.runs | Sort-Object { $_.localBackupInfo.startTimeUsecs } -Ascending
+
+    foreach($objectGroup in $runsSorted.objects){ continue } # safety placeholder
+
+    $streakData = @{}
 
     foreach($run in $runsSorted){
         foreach($object in $run.objects){
             if($object.object.environment -ne $env){ continue }
 
             $objName = $object.object.name
-            $sourceName = if($object.object.PSObject.Properties['sourceId']){ $object.object.sourceId } else { $objName }
-            $key = "$jobName;;$objName;;$sourceName;;$Label"
+            $sourceName = if($object.object.PSObject.Properties['sourceId']){
+                $id = $object.object.sourceId
+                if($SourceMap.ContainsKey($id)){ $SourceMap[$id] } else { $id }
+            } else { $objName }
 
-            if(-not $ConsecutiveFails.ContainsKey($key)){ $ConsecutiveFails[$key] = 0; $stillCounting[$key] = $true }
-            if(-not $LatestSuccessUsecs.ContainsKey($key)){ $LatestSuccessUsecs[$key] = $null }
+            $key = "$jobName;;$objName;;$sourceName;;$RunTypesCsv"
+
+            if(-not $streakData.ContainsKey($key)){
+                $streakData[$key] = [ordered]@{
+                    ConsecutiveFails = 0
+                    LastSuccessUsecs = $null
+                    LatestFailureUsecs = $null
+                    Message = $null
+                }
+            }
 
             $status = $object.localSnapshotInfo.snapshotInfo.status
 
             switch ($status) {
-                'kSuccess' { 
-                    if($null -eq $LatestSuccessUsecs[$key]){ $LatestSuccessUsecs[$key] = $run.localBackupInfo.startTimeUsecs }
-                    $stillCounting[$key] = $false
+                'kSuccess' {
+                    $streakData[$key].ConsecutiveFails = 0
+                    $streakData[$key].LastSuccessUsecs = $run.localBackupInfo.startTimeUsecs
                 }
                 'kWarning' {
-                    if($null -eq $LatestSuccessUsecs[$key]){ $LatestSuccessUsecs[$key] = $run.localBackupInfo.startTimeUsecs }
-                    $stillCounting[$key] = $false
+                    $streakData[$key].ConsecutiveFails = 0
+                    $streakData[$key].LastSuccessUsecs = $run.localBackupInfo.startTimeUsecs
                 }
                 'kFailed' {
-                    if($stillCounting[$key]){ $ConsecutiveFails[$key]++ }
-                    $Failures[$key] = $true
-                    $FailureTime[$key] = (usecsToDate $run.localBackupInfo.startTimeUsecs)
-                    $Messages[$key] = $object.localSnapshotInfo.failedAttempts[0].message
+                    $streakData[$key].ConsecutiveFails++
+                    $streakData[$key].LatestFailureUsecs = $run.localBackupInfo.startTimeUsecs
+                    $streakData[$key].Message = $object.localSnapshotInfo.failedAttempts[0].message
                 }
             }
         }
     }
 
-    # keep only failures >= threshold
-    foreach($k in @($Failures.Keys)){
-        if($ConsecutiveFails[$k] -lt $FailureCount){
-            $Failures.Remove($k) | Out-Null
-            $FailureTime.Remove($k) | Out-Null
-            if($Messages.ContainsKey($k)){ $Messages.Remove($k) | Out-Null }
+    foreach($k in $streakData.Keys){
+        $data = $streakData[$k]
+        if($data.ConsecutiveFails -ge $FailureCount){
+            # only report if no success after last failure
+            if(($null -eq $data.LastSuccessUsecs) -or ($data.LastSuccessUsecs -lt $data.LatestFailureUsecs)){
+                $Failures[$k] = $true
+                $Messages[$k] = $data.Message
+                $FailureTime[$k] = $data.LatestFailureUsecs
+                $LatestSuccessUsecs[$k] = $data.LastSuccessUsecs
+                $ConsecutiveFails[$k] = $data.ConsecutiveFails
+            }
         }
     }
 }
@@ -116,20 +133,25 @@ $outfile  = "consecutiveFailureReport-$($cluster.name)-$outStamp.csv"
 
 "Job Name,Last Successful Backup,Backup Type,Source,Object,ConsecutiveFailures,Message" | Out-File $outfile -Encoding UTF8
 
-# --- get jobs & timeframe ---
+# --- get jobs, sources, timeframe ---
 $jobs = api get -v2 "data-protect/protection-groups?isDeleted=false&isActive=true"
+$rootNodes = api get "protectionSources/registrationInfo"
+$sourceMap = @{}
+foreach($node in $rootNodes.rootNodes){ $sourceMap[$node.rootNode.id] = $node.rootNode.name }
+
 $startUsecs = timeAgo $days 'days'
 $total = 0
 $consoleReport = @()
 
 foreach($job in $jobs.protectionGroups){
     $f = @{}; $m = @{}; $ft = @{}; $s = @{}; $cf = @{}
-    Analyze-RunsForJob -Job $job -RunTypesCsv "kSystem,kFull,kIncremental" -Label "Backup" `
+    Analyze-RunsForJob -Job $job -RunTypesCsv "kSystem,kFull,kIncremental" `
         -StartUsecs $startUsecs -NumRuns $numRuns -FailureCount $failureCount `
-        -Failures $f -Messages $m -FailureTime $ft -LatestSuccessUsecs $s -ConsecutiveFails $cf
-    Analyze-RunsForJob -Job $job -RunTypesCsv "kLog" -Label "Log Backup" `
+        -Failures $f -Messages $m -FailureTime $ft -LatestSuccessUsecs $s -ConsecutiveFails $cf -SourceMap $sourceMap
+
+    Analyze-RunsForJob -Job $job -RunTypesCsv "kLog" `
         -StartUsecs $startUsecs -NumRuns $numRuns -FailureCount $failureCount `
-        -Failures $f -Messages $m -FailureTime $ft -LatestSuccessUsecs $s -ConsecutiveFails $cf
+        -Failures $f -Messages $m -FailureTime $ft -LatestSuccessUsecs $s -ConsecutiveFails $cf -SourceMap $sourceMap
 
     foreach($k in $f.Keys){
         $total++
@@ -157,7 +179,7 @@ Write-Host "Consecutive Failure Report saved to: $outfile`n"
 
 if($consoleReport.Count -gt 0){
     Write-Host "--- Summary of Consecutive Failures (3 or more in a row) ---" -ForegroundColor Cyan
-    $consoleReport | Sort-Object -Property ConsecutiveFails -Descending | Format-Table -AutoSize
+    $consoleReport | Sort-Object -Property ConsecutiveFails -Descending, JobName | Format-Table -AutoSize
 }
 
 # --- email if configured ---
