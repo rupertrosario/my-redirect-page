@@ -1,0 +1,190 @@
+# process commandline arguments
+[CmdletBinding()]
+param (
+    [Parameter()][string]$vip = 'helios.cohesity.com',
+    [Parameter()][string]$username = 'helios',
+    [Parameter()][string]$domain = 'local',
+    [Parameter()][string]$tenant = $null,
+    [Parameter()][switch]$useApiKey,
+    [Parameter()][string]$password = $null,
+    [Parameter()][switch]$noPrompt,
+    [Parameter()][switch]$mcm,
+    [Parameter()][string]$mfaCode = $null,
+    [Parameter()][string]$clusterName = $null,
+    [Parameter()][int]$numRuns = 1000,     # number of runs to inspect
+    [Parameter()][int]$days = 7,
+    [Parameter()][int]$failureCount = 1,   # consecutive-failure threshold
+    [Parameter()][string]$smtpServer,      # outbound smtp server '192.168.1.95'
+    [Parameter()][string]$smtpPort = 25,   # outbound smtp port
+    [Parameter()][array]$sendTo,           # send to address(es)
+    [Parameter()][string]$sendFrom         # send from address
+)
+
+# source the cohesity-api helper code
+. $(Join-Path -Path $PSScriptRoot -ChildPath cohesity-api.ps1)
+
+# authenticate
+apiauth -vip $vip -username $username -domain $domain -passwd $password `
+    -apiKeyAuthentication $useApiKey -mfaCode $mfaCode `
+    -heliosAuthentication $mcm -tenant $tenant -noPromptForPassword $noPrompt
+
+# select helios/mcm managed cluster
+if($USING_HELIOS){
+    if($clusterName){
+        $thisCluster = heliosCluster $clusterName
+    }else{
+        Write-Host "Please provide -clusterName when connecting through helios" -ForegroundColor Yellow
+        exit 1
+    }
+}
+
+if(!$cohesity_api.authorized){
+    Write-Host "Not authenticated" -ForegroundColor Yellow
+    exit 1
+}
+
+# helper: analyze runs (consecutive failures + latest success)
+function Analyze-RunsForJob {
+    param(
+        [Parameter(Mandatory=$true)]$Job,
+        [Parameter(Mandatory=$true)][string]$RunTypesCsv,   # "kSystem,kFull,kIncremental" or "kLog"
+        [Parameter(Mandatory=$true)][string]$Label,         # "Backup" or "Log Backup"
+        [Parameter(Mandatory=$true)]$RootNodes,
+        [Parameter(Mandatory=$true)][int64]$StartUsecs,
+        [Parameter(Mandatory=$true)][int]$NumRuns,
+        [Parameter(Mandatory=$true)][int]$FailureCount,
+        [Parameter(Mandatory=$true)]$Failures,              # hashtable to mark keys to emit
+        [Parameter(Mandatory=$true)]$Messages,
+        [Parameter(Mandatory=$true)]$FailureTime,           # stores DateTime for latest analyzed run
+        [Parameter(Mandatory=$true)]$LatestSuccessUsecs,    # per key: latest success usecs
+        [Parameter(Mandatory=$true)]$ConsecutiveFails       # per key: integer
+    )
+
+    $uri = "data-protect/protection-groups/$($Job.id)/runs?numRuns=$NumRuns&startTimeUsecs=$StartUsecs&includeTenants=true&includeObjectDetails=true&runTypes=$RunTypesCsv"
+    $runs = api get -v2 $uri
+    if(-not $runs.runs -or $runs.runs.Count -eq 0){ return }
+
+    # True latest run time among the returned set
+    $latestStartUsecs = ($runs.runs.localBackupInfo.startTimeUsecs | Measure-Object -Maximum).Maximum
+    $jobLatestStartTime = usecsToDate $latestStartUsecs
+
+    # newest → oldest so consecutive failures are counted from most recent backward
+    $runsSorted = $runs.runs | Sort-Object { $_.localBackupInfo.startTimeUsecs } -Descending
+
+    # track whether still in initial fail streak per key
+    $stillCounting = @{}
+
+    foreach($run in $runsSorted){
+        foreach($object in $run.objects | Where-Object { $_.object.environment -eq $Job.environment }){
+            $objectName = $object.object.name
+            if($object.object.PSObject.Properties['sourceId']){
+                $source = $RootNodes.rootNodes | Where-Object { $_.rootNode.id -eq $object.object.sourceId }
+                $sourceName = $source.rootNode.name
+            } else {
+                $sourceName = $objectName
+            }
+
+            $key = "$($Job.name);;$($objectName);;$($sourceName);;$Label"
+
+            if(-not $ConsecutiveFails.ContainsKey($key)){ $ConsecutiveFails[$key] = 0 }
+            if(-not $stillCounting.ContainsKey($key)){ $stillCounting[$key] = $true }
+            if(-not $LatestSuccessUsecs.ContainsKey($key)){ $LatestSuccessUsecs[$key] = $null }
+
+            $snapInfo = $object.localSnapshotInfo
+            $objStatus = $snapInfo.snapshotInfo.status  # 'kSuccess','kFailed','kWarning', etc.
+
+            # latest success capture (first success/warn we see in newest→oldest is the latest one)
+            if($objStatus -eq 'kSuccess' -or $objStatus -eq 'kWarning'){
+                if($null -eq $LatestSuccessUsecs[$key]){
+                    $LatestSuccessUsecs[$key] = $run.localBackupInfo.startTimeUsecs
+                }
+                if($stillCounting[$key]){ $stillCounting[$key] = $false } # break the fail streak
+            }
+            elseif($objStatus -eq 'kFailed'){
+                if($stillCounting[$key]){ $ConsecutiveFails[$key]++ }
+                if($snapInfo.failedAttempts){
+                    $Messages[$key] = $snapInfo.failedAttempts[0].message
+                }
+                $Failures[$key] = $true
+                $FailureTime[$key] = $jobLatestStartTime
+            }
+        }
+    }
+
+    # apply threshold: keep only keys with enough consecutive failures
+    foreach($k in @($Failures.Keys)){
+        if($ConsecutiveFails[$k] -lt $FailureCount){
+            $Failures.Remove($k) | Out-Null
+            $FailureTime.Remove($k) | Out-Null
+            if($Messages.ContainsKey($k)){ $Messages.Remove($k) | Out-Null }
+        }
+    }
+}
+
+# outfile
+$cluster = api get cluster
+$dateString = (Get-Date).ToString('yyyy-MM-dd')
+$outfileName = "strikeReport-$($cluster.name)-$dateString.csv"
+
+# headings
+"Job Name,Latest Backup,Backup Type,Source Name,Object Name,ConsecutiveFailures,LatestSuccess,Message" | Out-File -FilePath $outfileName
+
+# data pulls
+$jobs = api get -v2 "data-protect/protection-groups?isDeleted=false&isActive=true&includeTenants=true"
+$rootNodes = api get "protectionSources/registrationInfo"
+$startUsecs = timeAgo $days 'days'
+
+$totalStrikeouts = 0
+
+foreach($job in $jobs.protectionGroups | Sort-Object -Property name){
+    $failures        = @{} # keys to emit
+    $messages        = @{}
+    $failureTime     = @{} # DateTime (true latest run time among analyzed set)
+    $latestSuccessU  = @{} # int64 usecs
+    $consecFails     = @{} # int
+
+    # Analyze standard backups
+    Analyze-RunsForJob -Job $job -RunTypesCsv "kSystem,kFull,kIncremental" -Label "Backup" `
+        -RootNodes $rootNodes -StartUsecs $startUsecs -NumRuns $numRuns -FailureCount $failureCount `
+        -Failures $failures -Messages $messages -FailureTime $failureTime `
+        -LatestSuccessUsecs $latestSuccessU -ConsecutiveFails $consecFails
+
+    # Analyze log backups
+    Analyze-RunsForJob -Job $job -RunTypesCsv "kLog" -Label "Log Backup" `
+        -RootNodes $rootNodes -StartUsecs $startUsecs -NumRuns $numRuns -FailureCount $failureCount `
+        -Failures $failures -Messages $messages -FailureTime $failureTime `
+        -LatestSuccessUsecs $latestSuccessU -ConsecutiveFails $consecFails
+
+    foreach($failureKey in $failures.Keys | Sort-Object){
+        $totalStrikeouts += 1
+        $jobName, $objectName, $sourceName, $runType = $failureKey -split ';;'
+
+        $msg = [string]$messages[$failureKey]
+        if($msg){
+            $msg = $msg.Replace("`n"," ").Replace("`r"," ").Replace(",",";")
+            if($msg.Length -gt 150){ $msg = $msg.Substring(0,150) }
+        } else {
+            $msg = ""
+        }
+
+        $latestSuccess =
+            if($latestSuccessU[$failureKey]){
+                (usecsToDate $latestSuccessU[$failureKey]).ToString('yyyy-MM-dd HH:mm:ss')
+            } else {
+                'Never'
+            }
+
+        # emit CSV row
+        "{0},{1},{2},{3},{4},{5},{6},{7}" -f `
+            $jobName, `
+            $failureTime[$failureKey].ToString('yyyy-MM-dd HH:mm:ss'), `
+            $runType, `
+            $sourceName, `
+            $objectName, `
+            $consecFails[$failureKey], `
+            $latestSuccess, `
+            $msg | Out-File -FilePath $outfileName -Append
+    }
+}
+
+"`nTotal
