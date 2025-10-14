@@ -1,216 +1,202 @@
-# Enable strict mode for safer scripting
+# =====================================================================
+#  Cohesity Consecutive Failure Report (Backup + Log Backup)
+#  Auth: Helios API key only (no username/password)
+#  Mode: Read-only, supports single or all clusters
+# =====================================================================
+
 Set-StrictMode -Version Latest
 
-# process commandline arguments
 [CmdletBinding()]
 param (
     [Parameter()][string]$vip = 'helios.cohesity.com',
-    [Parameter()][string]$username = 'helios',
-    [Parameter()][string]$domain = 'local',
-    [Parameter()][string]$tenant = $null,
-    [Parameter()][switch]$useApiKey,
-    [Parameter()][string]$password = $null,
-    [Parameter()][switch]$noPrompt,
-    [Parameter()][switch]$mcm,
-    [Parameter()][string]$mfaCode = $null,
-    [Parameter()][string]$clusterName = $null,
-
+    [Parameter()][switch]$mcm,                       # Helios (MCM) mode
+    [Parameter()][string]$clusterName = $null,       # one cluster
+    [Parameter()][switch]$allClusters,               # all clusters
     [Parameter()][int]$numRuns = 100,
     [Parameter()][int]$days = 35,
     [Parameter()][int]$failureCount = 3,
-
-    # NEW: API key file path for passwordless auth
     [Parameter()][string]$apiKeyPath = 'X:\PowerShell\Cohesity_API_Scripts\DO_NOT_Delete\apikey.txt',
-
     [Parameter()][string]$smtpServer,
-    [Parameter()][string]$smtpPort = 25,
+    [Parameter()][string]$smtpPort = '25',
     [Parameter()][array]$sendTo,
     [Parameter()][string]$sendFrom
 )
 
-# --- cohesity API helper ---
+# ---- helper
 . $(Join-Path -Path $PSScriptRoot -ChildPath cohesity-api.ps1)
 
-# --- Automatic API Key authentication (read-only) ---
-# If the key file exists, use it for auth and suppress password prompts.
-if (Test-Path $apiKeyPath) {
-    $ApiKey = (Get-Content -Path $apiKeyPath -Raw).Trim()
-    if ([string]::IsNullOrWhiteSpace($ApiKey)) {
-        throw "API key file is empty at $apiKeyPath"
-    }
-    $useApiKey = $true
-    $password  = $ApiKey   # cohesity-api.ps1 expects -passwd to carry the API key when -apiKeyAuthentication is true
-    $noPrompt  = $true      # avoid interactive prompt entirely
-    # For raw REST (not used here), headers would be:
-    # $commonHeaders = @{ apiKey = $ApiKey }
-} else {
-    throw "API key file not found at $apiKeyPath"
-}
+# ---- read API key
+if (!(Test-Path $apiKeyPath)) { throw "API key file not found at $apiKeyPath" }
+$ApiKey = (Get-Content -Path $apiKeyPath -Raw).Trim()
+if ([string]::IsNullOrWhiteSpace($ApiKey)) { throw "API key file is empty at $apiKeyPath" }
 
-# --- authenticate ---
-apiauth -vip $vip -username $username -domain $domain -passwd $password `
-    -apiKeyAuthentication $useApiKey -mfaCode $mfaCode `
-    -heliosAuthentication $mcm -tenant $tenant -noPromptForPassword $noPrompt
+$useApiKey = $true
+$noPrompt  = $true
+$password  = $ApiKey
+$commonHeaders = @{ apiKey = $ApiKey }
 
-if($USING_HELIOS -and -not $clusterName){
-    Write-Host "Please provide -clusterName when connecting through helios" -ForegroundColor Yellow
-    exit 1
-}
+# ---- authenticate
+apiauth -vip $vip -username 'helios' -domain 'local' -passwd $password `
+    -apiKeyAuthentication:$useApiKey -heliosAuthentication:$mcm -noPromptForPassword:$noPrompt
 
 if(!$cohesity_api.authorized){
-    Write-Host "Not authenticated" -ForegroundColor Yellow
+    Write-Host "Authentication failed. Check your API key or network access." -ForegroundColor Red
     exit 1
 }
 
-# --- main analysis function ---
-function Analyze-RunsForJob {
-    param(
-        [Parameter(Mandatory=$true)]$Job,
-        [Parameter(Mandatory=$true)][string]$RunTypesCsv,
-        [Parameter(Mandatory=$true)][int64]$StartUsecs,
-        [Parameter(Mandatory=$true)][int]$NumRuns,
-        [Parameter(Mandatory=$true)][int]$FailureCount,
-        [Parameter(Mandatory=$true)]$Failures,
-        [Parameter(Mandatory=$true)]$Messages,
-        [Parameter(Mandatory=$true)]$FailureTime,
-        [Parameter(Mandatory=$true)]$LatestSuccessUsecs,
-        [Parameter(Mandatory=$true)]$ConsecutiveFails,
-        [Parameter(Mandatory=$true)]$SourceMap
-    )
+# =====================================================================
+#  Function: Core logic for one cluster
+# =====================================================================
+function Run-ConsecutiveFailureReport {
+    param([string]$ClusterName)
 
-    $uri = "data-protect/protection-groups/$($Job.id)/runs?numRuns=$NumRuns&startTimeUsecs=$StartUsecs&includeObjectDetails=true&runTypes=$RunTypesCsv"
-    $runs = api get -v2 $uri
-    if(-not $runs.runs){ return }
+    Write-Host "`nProcessing cluster: $ClusterName" -ForegroundColor Cyan
+    $null = heliosCluster $ClusterName
 
-    $jobName = $Job.name
-    $env = $Job.environment
+    $cluster  = api get cluster
+    $outStamp = (Get-Date).ToString('yyyy-MM-dd_HHmmss')
+    $outfile  = "consecutiveFailureReport-$($cluster.name)-$outStamp.csv"
+    $startUsecs = timeAgo $days 'days'
 
-    # sort oldest to newest for accurate streak detection
-    $runsSorted = $runs.runs | Sort-Object -Property @{ Expression = { $_.localBackupInfo.startTimeUsecs } } -Ascending
+    $rootNodes = api get "protectionSources/registrationInfo"
+    $sourceMap = @{}
+    foreach($node in $rootNodes.rootNodes){ $sourceMap[$node.rootNode.id] = $node.rootNode.name }
 
-    $streakData = @{}
+    $jobs = api get -v2 "data-protect/protection-groups?isDeleted=false&isActive=true"
+    $reportRows = @()
 
-    foreach($run in $runsSorted){
-        foreach($object in $run.objects){
-            if($object.object.environment -ne $env){ continue }
+    function Analyze-RunsForJobType {
+        param(
+            [Parameter(Mandatory=$true)]$Job,
+            [Parameter(Mandatory=$true)][string]$RunTypesCsv,
+            [Parameter(Mandatory=$true)][string]$TypeLabel
+        )
 
-            $objName = $object.object.name
-            $sourceName = if($object.object.PSObject.Properties['sourceId']){
-                $id = $object.object.sourceId
-                if($SourceMap.ContainsKey($id)){ $SourceMap[$id] } else { $id }
-            } else { $objName }
+        $uri = "data-protect/protection-groups/$($Job.id)/runs?numRuns=$numRuns&startTimeUsecs=$startUsecs&includeObjectDetails=true&includeTenants=true&runTypes=$RunTypesCsv"
+        $runs = api get -v2 $uri
+        if(-not $runs.runs){ return }
 
-            $key = "$jobName;;$objName;;$sourceName;;$RunTypesCsv"
+        $env = $Job.environment
+        $runsSorted = $runs.runs | Sort-Object -Property @{ Expression = { $_.localBackupInfo.startTimeUsecs } } -Ascending
+        $state = @{}
 
-            if(-not $streakData.ContainsKey($key)){
-                $streakData[$key] = [ordered]@{
-                    ConsecutiveFails = 0
-                    LastSuccessUsecs = $null
-                    LatestFailureUsecs = $null
-                    Message = $null
+        foreach($run in $runsSorted){
+            foreach($o in $run.objects){
+                if($o.object.environment -ne $env){ continue }
+                $objName = $o.object.name
+                $sourceName = if($o.object.PSObject.Properties['sourceId']){
+                    $id = $o.object.sourceId
+                    if($sourceMap.ContainsKey($id)){ $sourceMap[$id] } else { $id }
+                } else { $objName }
+
+                $key = "$($Job.name);;$objName;;$sourceName;;$TypeLabel"
+                if(-not $state.ContainsKey($key)){
+                    $state[$key] = [ordered]@{
+                        ConsecutiveFails = 0
+                        LastSuccessUsecs = $null
+                        LatestFailureUsecs = $null
+                        Message = $null
+                    }
+                }
+
+                $status = $o.localSnapshotInfo.snapshotInfo.status
+                if($status -eq 'kSuccess' -or $status -eq 'kWarning'){
+                    $state[$key].ConsecutiveFails = 0
+                    $state[$key].LastSuccessUsecs = $run.localBackupInfo.startTimeUsecs
+                }
+                elseif($status -eq 'kFailed'){
+                    $state[$key].ConsecutiveFails++
+                    $state[$key].LatestFailureUsecs = $run.localBackupInfo.startTimeUsecs
+                    if($o.localSnapshotInfo.failedAttempts){
+                        $state[$key].Message = $o.localSnapshotInfo.failedAttempts[0].message
+                    }
                 }
             }
+        }
 
-            $status = $object.localSnapshotInfo.snapshotInfo.status
+        foreach($k in $state.Keys){
+            $d = $state[$k]
+            if($d.ConsecutiveFails -ge $failureCount){
+                if(($null -eq $d.LastSuccessUsecs) -or ($d.LastSuccessUsecs -lt $d.LatestFailureUsecs)){
+                    $jobName, $objectName, $sourceName, $typeLabel = $k -split ';;'
+                    $lastSuccess = if($d.LastSuccessUsecs){ (usecsToDate $d.LastSuccessUsecs).ToString('yyyy-MM-dd HH:mm:ss') } else { 'Never' }
+                    $msg = [string]$d.Message
+                    if($msg){ $msg = ($msg -replace '[\\r\\n,]', ';'); if($msg.Length -gt 150){ $msg = $msg.Substring(0,150) } }
 
-            switch ($status) {
-                'kSuccess' {
-                    $streakData[$key].ConsecutiveFails = 0
-                    $streakData[$key].LastSuccessUsecs = $run.localBackupInfo.startTimeUsecs
-                }
-                'kWarning' {
-                    $streakData[$key].ConsecutiveFails = 0
-                    $streakData[$key].LastSuccessUsecs = $run.localBackupInfo.startTimeUsecs
-                }
-                'kFailed' {
-                    $streakData[$key].ConsecutiveFails++
-                    $streakData[$key].LatestFailureUsecs = $run.localBackupInfo.startTimeUsecs
-                    $streakData[$key].Message = $object.localSnapshotInfo.failedAttempts[0].message
+                    $reportRows += [pscustomobject]@{
+                        JobName = $jobName
+                        LastSuccessfulBackup = $lastSuccess
+                        BackupType = $typeLabel
+                        Source = $sourceName
+                        Object = $objectName
+                        ConsecutiveFailures = $d.ConsecutiveFails
+                        Message = $msg
+                    }
                 }
             }
         }
     }
 
-    foreach($k in $streakData.Keys){
-        $data = $streakData[$k]
-        if($data.ConsecutiveFails -ge $FailureCount){
-            # only report if no success after last failure
-            if(($null -eq $data.LastSuccessUsecs) -or ($data.LastSuccessUsecs -lt $data.LatestFailureUsecs)){
-                $Failures[$k] = $true
-                $Messages[$k] = $data.Message
-                $FailureTime[$k] = $data.LatestFailureUsecs
-                $LatestSuccessUsecs[$k] = $data.LastSuccessUsecs
-                $ConsecutiveFails[$k] = $data.ConsecutiveFails
+    foreach($job in $jobs.protectionGroups){
+        Analyze-RunsForJobType -Job $job -RunTypesCsv "kSystem,kFull,kIncremental" -TypeLabel "Backup"
+        Analyze-RunsForJobType -Job $job -RunTypesCsv "kLog" -TypeLabel "Log Backup"
+    }
+
+    $total = $reportRows.Count
+    Write-Host "Total Consecutive Failures (≥$failureCount): $total" -ForegroundColor Gray
+
+    if($total -gt 0){
+        $consoleReport = $reportRows | Select-Object JobName, BackupType, Source, Object, ConsecutiveFailures, LastSuccessfulBackup
+        $consoleReport = $consoleReport | Sort-Object -Property @{Expression={ $_.ConsecutiveFailures };Descending=$true}, @{Expression={ $_.JobName };Descending=$false}
+        $consoleReport | Format-Table -AutoSize
+        $reportRows | Export-Csv -Path $outfile -NoTypeInformation -Encoding UTF8
+        Write-Host "Report saved to: $outfile" -ForegroundColor Cyan
+    } else {
+        Write-Host "No unresolved consecutive failures found in last $days days." -ForegroundColor Green
+    }
+
+    if($smtpServer -and $sendFrom -and $sendTo -and (Test-Path $outfile)){
+        foreach($to in $sendTo){
+            Send-MailMessage -From $sendFrom -To $to -SmtpServer $smtpServer -Port $smtpPort `
+                -Subject "$ClusterName Consecutive Failure Report ($total failures)" `
+                -Body "Total Consecutive Failures (≥$failureCount): $total" `
+                -Attachments $outfile -WarningAction SilentlyContinue
+        }
+    }
+}
+
+# =====================================================================
+#  Cluster selection (Helios)
+# =====================================================================
+if ($mcm) {
+    try {
+        $url = 'https://helios.cohesity.com/v2/mcm/cluster-mgmt/info'
+        $resp = Invoke-WebRequest -Uri $url -Headers $commonHeaders -UseBasicParsing -Method GET
+        $json = $resp.Content | ConvertFrom-Json
+        $clusters = @($json.cohesityClusters)
+        if ($allClusters) {
+            foreach ($c in $clusters) {
+                Run-ConsecutiveFailureReport -ClusterName $c.name
+            }
+            exit
+        }
+        elseif (-not $clusterName) {
+            if ($clusters.Count -eq 1) {
+                $clusterName = $clusters[0].name
+                Write-Host "Detected single cluster: $clusterName" -ForegroundColor Cyan
+            } else {
+                Write-Host "Multiple clusters found. Use -clusterName or -allClusters" -ForegroundColor Yellow
+                $clusters | ForEach-Object { Write-Host "  - $($_.name)" }
+                exit 1
             }
         }
+    } catch {
+        Write-Host "Unable to fetch cluster list. Check API key or Helios access." -ForegroundColor Red
+        exit 1
     }
 }
 
-# --- output prep ---
-$cluster  = api get cluster
-$outStamp = (Get-Date).ToString('yyyy-MM-dd_HHmmss')
-$outfile  = "consecutiveFailureReport-$($cluster.name)-$outStamp.csv"
-
-"Job Name,Last Successful Backup,Backup Type,Source,Object,ConsecutiveFailures,Message" | Out-File $outfile -Encoding UTF8
-
-# --- get jobs, sources, timeframe ---
-$jobs = api get -v2 "data-protect/protection-groups?isDeleted=false&isActive=true"
-$rootNodes = api get "protectionSources/registrationInfo"
-$sourceMap = @{}
-foreach($node in $rootNodes.rootNodes){ $sourceMap[$node.rootNode.id] = $node.rootNode.name }
-
-$startUsecs = timeAgo $days 'days'
-$total = 0
-$consoleReport = @()
-
-foreach($job in $jobs.protectionGroups){
-    $f = @{}; $m = @{}; $ft = @{}; $s = @{}; $cf = @{}
-    Analyze-RunsForJob -Job $job -RunTypesCsv "kSystem,kFull,kIncremental" `
-        -StartUsecs $startUsecs -NumRuns $numRuns -FailureCount $failureCount `
-        -Failures $f -Messages $m -FailureTime $ft -LatestSuccessUsecs $s -ConsecutiveFails $cf -SourceMap $sourceMap
-
-    Analyze-RunsForJob -Job $job -RunTypesCsv "kLog" `
-        -StartUsecs $startUsecs -NumRuns $numRuns -FailureCount $failureCount `
-        -Failures $f -Messages $m -FailureTime $ft -LatestSuccessUsecs $s -ConsecutiveFails $cf -SourceMap $sourceMap
-
-    foreach($k in $f.Keys){
-        $total++
-        $jobName, $objName, $srcName, $rtype = $k -split ';;'
-        $msg = ($m[$k] -replace '[\r\n,]', ';')
-        if($msg.Length -gt 120){ $msg = $msg.Substring(0,120) }
-        $lastSuccess = if($s[$k]){ (usecsToDate $s[$k]).ToString('yyyy-MM-dd HH:mm:ss') } else { 'Never' }
-
-        "{0},{1},{2},{3},{4},{5},{6}" -f $jobName,$lastSuccess,$rtype,$srcName,$objName,$cf[$k],$msg | `
-            Out-File -FilePath $outfile -Append -Encoding UTF8
-
-        $consoleReport += [pscustomobject]@{
-            JobName = $jobName
-            Object = $objName
-            Source = $srcName
-            Type = $rtype
-            ConsecutiveFails = $cf[$k]
-            LastSuccess = $lastSuccess
-        }
-    }
-}
-
-Write-Host "`nTotal Consecutive Failures (3 or more in a row): $total"
-Write-Host "Consecutive Failure Report saved to: $outfile`n"
-
-if($consoleReport.Count -gt 0){
-    Write-Host "--- Summary of Consecutive Failures (3 or more in a row) ---" -ForegroundColor Cyan
-    $consoleReport = $consoleReport | Sort-Object `
-        -Property @{Expression = { $_.ConsecutiveFails }; Descending = $true}, `
-                  @{Expression = { $_.JobName }; Descending = $false}
-    $consoleReport | Format-Table -AutoSize
-}
-
-# --- email if configured ---
-if($smtpServer -and $sendFrom -and $sendTo){
-    foreach($to in $sendTo){
-        Send-MailMessage -From $sendFrom -To $to -SmtpServer $smtpServer -Port $smtpPort `
-            -Subject "$clusterName Consecutive Failure Report ($total failures)" `
-            -Body "Total Consecutive Failures (3 or more in a row): $total" `
-            -Attachments $outfile -WarningAction SilentlyContinue
-    }
-}
+# =====================================================================
+#  Execute for chosen cluster
+# =====================================================================
+Run-ConsecutiveFailureReport -ClusterName $clusterName
