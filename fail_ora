@@ -1,48 +1,209 @@
-# --- safe epoch -> UTC converter (handles ms or µs) ---
-function Convert-ToUtcFromEpoch($v) {
-    if ($null -eq $v -or $v -eq 0) { return $null }
-    try {
-        return [DateTimeOffset]::FromUnixTimeMilliseconds([int64]$v).UtcDateTime
-    } catch {
-        return [DateTimeOffset]::FromUnixTimeMilliseconds([int64]([double]$v / 1000)).UtcDateTime
+# Cohesity Backup Failure Report (unresolved failures with no later success)
+# - Scans only a tight history window (default: last 30 runs per job/runType)
+# - Reports an object only when the newest streak is failed and has not been followed by a success
+# - Compatible with Helios/MCM or direct cluster auth via cohesity-api.ps1
+
+# ============================
+# process commandline arguments
+# ============================
+[CmdletBinding()]
+param (
+    [Parameter()][string]$vip = 'helios.cohesity.com',
+    [Parameter()][string]$username = 'helios',
+    [Parameter()][string]$domain = 'local',
+    [Parameter()][string]$tenant = $null,
+    [Parameter()][switch]$useApiKey,
+    [Parameter()][string]$password = $null,
+    [Parameter()][switch]$noPrompt,
+    [Parameter()][switch]$mcm,
+    [Parameter()][string]$mfaCode = $null,
+    [Parameter()][string]$clusterName = $null,
+    [Parameter()][int]$numRuns = 30,           # only scan last 30 runs per job
+    [Parameter()][int]$days = 7,               # look back 7 days
+    [Parameter()][int]$failureCount = 1,       # min consecutive failures to report
+    [Parameter()][string]$smtpServer,
+    [Parameter()][string]$smtpPort = '25',
+    [Parameter()][array]$sendTo,
+    [Parameter()][string]$sendFrom
+)
+
+# ============================
+# load cohesity-api helper
+# ============================
+. $(Join-Path -Path $PSScriptRoot -ChildPath cohesity-api.ps1)
+
+# ============================
+# authenticate
+# ============================
+apiauth -vip $vip -username $username -domain $domain -passwd $password -apiKeyAuthentication $useApiKey -mfaCode $mfaCode -heliosAuthentication $mcm -tenant $tenant -noPromptForPassword $noPrompt
+
+# select helios/mcm managed cluster
+if($USING_HELIOS){
+    if($clusterName){
+        $thisCluster = heliosCluster $clusterName
+    }else{
+        Write-Host "Please provide -clusterName when connecting through helios" -ForegroundColor Yellow
+        exit 1
     }
 }
 
-$grouped = $flatRuns | Group-Object RunType
-foreach ($g in $grouped) {
-    $latestFailed = $g.Group | Where-Object { $_.Status -eq "Failed" } | Sort-Object EndTimeUsecs -Descending | Select-Object -First 1
-    if ($null -ne $latestFailed) {
-        $hasLaterSuccess = $g.Group | Where-Object {
-            $_.Status -eq "Succeeded" -and $_.StartTimeUsecs -gt $latestFailed.EndTimeUsecs
-        }
-        if (-not $hasLaterSuccess) {
-            $estZone  = [System.TimeZoneInfo]::FindSystemTimeZoneById("Eastern Standard Time")
-            $startUtc = Convert-ToUtcFromEpoch $latestFailed.StartTimeUsecs
-            $endUtc   = Convert-ToUtcFromEpoch $latestFailed.EndTimeUsecs
+if(!$cohesity_api.authorized){
+    Write-Host "Not authenticated" -ForegroundColor Yellow
+    exit 1
+}
 
-            $globalFailures += [pscustomobject]@{
-                Cluster         = $latestFailed.Cluster
-                ProtectionGroup = $latestFailed.ProtectionGroup
-                RunType         = $latestFailed.RunType
-                Status          = $latestFailed.Status
-                Message         = $latestFailed.Message
-                StartTime       = if ($startUtc) { [System.TimeZoneInfo]::ConvertTimeFromUtc($startUtc, $estZone) } else { $null }
-                EndTime         = if ($endUtc)   { [System.TimeZoneInfo]::ConvertTimeFromUtc($endUtc,   $estZone) } else { $null }
+# ============================
+# helper function
+# ============================
+function Add-UnresolvedFailuresForRunTypes {
+    param(
+        [Parameter(Mandatory)]$job,
+        [Parameter(Mandatory)][string]$runTypeLabel, 
+        [Parameter(Mandatory)][string[]]$runTypes,
+        [Parameter(Mandatory)]$rootNodes,
+        [Parameter(Mandatory)][hashtable]$reportFailures,
+        [Parameter(Mandatory)][hashtable]$failureTime,
+        [Parameter(Mandatory)][int]$numRuns,
+        [Parameter(Mandatory)]$startUsecs,
+        [Parameter(Mandatory)][int]$failureCount
+    )
+
+    $query = "data-protect/protection-groups/$($job.id)/runs?numRuns=$numRuns&startTimeUsecs=$startUsecs&includeTenants=true&includeObjectDetails=true&runTypes=$([string]::Join(',', $runTypes))"
+    $runs = api get -v2 $query
+    if(!$runs.runs){ return }
+
+    # newest first
+    $ordered = $runs.runs | Sort-Object { $_.localBackupInfo.startTimeUsecs } -Descending
+
+    foreach($run in $ordered){
+        foreach($obj in $run.objects | Where-Object { $_.object.environment -eq $job.environment }){
+            $objectName = $obj.object.name
+            if($obj.object.PSObject.Properties['sourceId']){
+                $src = $rootNodes.rootNodes | Where-Object { $_.rootNode.id -eq $obj.object.sourceId }
+                $sourceName = $src.rootNode.name
+            } else {
+                $sourceName = $objectName
+            }
+
+            $key = "$($job.name);;$objectName;;$sourceName;;$runTypeLabel"
+            $hash = $key.GetHashCode()
+            $decidedVar = "__decided_$hash"
+            if (Get-Variable -Name $decidedVar -Scope Local -ErrorAction SilentlyContinue){ continue }
+
+            $status = $obj.localSnapshotInfo.snapshotInfo.status
+            $runStartTime = usecsToDate $run.localBackupInfo.startTimeUsecs
+
+            $streakVar    = "__streak_$hash"
+            $firstMsgVar  = "__firstFailMsg_$hash"
+            $firstTimeVar = "__firstFailTime_$hash"
+
+            if(-not (Get-Variable -Name $streakVar -Scope Local -ErrorAction SilentlyContinue)){
+                Set-Variable -Name $streakVar -Value 0 -Scope Local
+                Set-Variable -Name $firstMsgVar -Value $null -Scope Local
+                Set-Variable -Name $firstTimeVar -Value $null -Scope Local
+            }
+
+            $streak    = (Get-Variable -Name $streakVar -Scope Local).Value
+            $firstMsg  = (Get-Variable -Name $firstMsgVar -Scope Local).Value
+            $firstTime = (Get-Variable -Name $firstTimeVar -Scope Local).Value
+
+            if($status -eq 'kFailed'){
+                $streak++
+                if(-not $firstMsg){
+                    $msg = $null
+                    if($obj.localSnapshotInfo.failedAttempts -and $obj.localSnapshotInfo.failedAttempts.Count -gt 0){
+                        $msg = $obj.localSnapshotInfo.failedAttempts[0].message
+                    }
+                    $firstMsg  = $msg
+                    $firstTime = $runStartTime
+                }
+
+                if($streak -ge $failureCount){
+                    $reportFailures[$key] = $firstMsg
+                    $failureTime[$key]    = $firstTime
+                }
+
+                Set-Variable -Name $streakVar -Value $streak -Scope Local
+                Set-Variable -Name $firstMsgVar -Value $firstMsg -Scope Local
+                Set-Variable -Name $firstTimeVar -Value $firstTime -Scope Local
+            }
+            else {
+                if($reportFailures.ContainsKey($key)){ $reportFailures.Remove($key) }
+                if($failureTime.ContainsKey($key)){ $failureTime.Remove($key) }
+                Set-Variable -Name $decidedVar -Value $true -Scope Local
             }
         }
     }
 }
 
-# Sort on real datetime, format only at output
-# Reset serial counter
-$sn = 0
+# ============================
+# collect job and failure data
+# ============================
+$cluster    = api get cluster
+$dateString = (Get-Date).ToString('yyyy-MM-dd')
+$outfileName = "backupFailureReport-$($cluster.name)-$dateString.csv"
+"Job Name,Latest Backup,Backup Type,Source Name,Object Name,Message" | Out-File -FilePath $outfileName -Encoding utf8
 
-$globalFailures |
-    Sort-Object EndTime -Descending |
-    Select-Object @{Name='S.No';Expression={ $sn++; $sn }},
-                  Cluster, ProtectionGroup, RunType, Status, Message,
-                  @{Name='StartTime';Expression={ if ($_.StartTime) { $_.StartTime.ToString("dd/MM/yyyy HH:mm:ss") } }},
-                  @{Name='EndTime'  ;Expression={ if ($_.EndTime)   { $_.EndTime  .ToString("dd/MM/yyyy HH:mm:ss") } }} |
-    Format-Table -AutoSize
-Send-MailMessage -From "you@yourdomain.com" -To "you@yourdomain.com" -Subject "Test Email" -Body "This is a test from PowerShell." -SmtpServer "smtp.office365.com" -Port 587 -UseSsl -Credential (Get-Credential)
- 
+$jobs      = api get -v2 "data-protect/protection-groups?isDeleted=false&isActive=true&includeTenants=true"
+$rootNodes = api get "protectionSources/registrationInfo"
+$startUsecs = timeAgo $days 'days'
+
+$totalFailures = 0
+
+foreach($job in $jobs.protectionGroups | Sort-Object -Property name){
+    $reportFailures = @{}
+    $failureTime    = @{}
+
+    Add-UnresolvedFailuresForRunTypes -job $job -runTypeLabel 'Backup' `
+        -runTypes @('kSystem','kFull','kIncremental') `
+        -rootNodes $rootNodes `
+        -reportFailures $reportFailures `
+        -failureTime $failureTime `
+        -numRuns $numRuns `
+        -startUsecs $startUsecs `
+        -failureCount $failureCount
+
+    Add-UnresolvedFailuresForRunTypes -job $job -runTypeLabel 'Log Backup' `
+        -runTypes @('kLog') `
+        -rootNodes $rootNodes `
+        -reportFailures $reportFailures `
+        -failureTime $failureTime `
+        -numRuns $numRuns `
+        -startUsecs $startUsecs `
+        -failureCount $failureCount
+
+    foreach($failureKey in $reportFailures.Keys | Sort-Object){
+        $totalFailures += 1
+        $jobName, $objectName, $sourceName, $runType = $failureKey -split ';;'
+        $message = [string]$reportFailures[$failureKey]
+        if($message){ $message = $message.Replace("`n", ' ').Replace(',', ';') }
+        if($message.Length -gt 150){ $message = $message.Substring(0,150) }
+        $runStartTime = $failureTime[$failureKey]
+
+        if($sourceName -eq $objectName){
+            Write-Host ("    {0} ({1}) [{2}] {3}" -f $jobName, $runStartTime, $runType, $objectName)
+        } else {
+            Write-Host ("    {0} ({1}) [{2}] {3}/{4}" -f $jobName, $runStartTime, $runType, $sourceName, $objectName)
+        }
+
+        "{0},{1},{2},{3},{4},{5}" -f $jobName, $runStartTime, $runType, $sourceName, $objectName, $message | Out-File -FilePath $outfileName -Append -Encoding utf8
+    }
+}
+
+Write-Host "`nTotal Failures: $totalFailures`nOutput saved to $outfileName`n" -ForegroundColor Cyan
+
+# ============================
+# optional email
+# ============================
+if($smtpServer -and $sendFrom -and $sendTo){
+    Write-Host "sending report to $([string]::Join(', ', $sendTo))" -ForegroundColor Cyan
+    foreach($toaddr in $sendTo){
+        try {
+            Send-MailMessage -From $sendFrom -To $toaddr -SmtpServer $smtpServer -Port $smtpPort `
+                -Subject "${clusterName} Backup Failure Report ($totalFailures)" `
+                -Body "Total Failures: $totalFailures`n`n" -Attachments $outfileName -WarningAction SilentlyContinue
+        } catch {
+            Write-Warning "Failed to send mail to $toaddr: $($_.Exception.Message)"
+        }
+    }
+}
