@@ -1,131 +1,193 @@
 # =====================================================================
-#  Cohesity Helios: Consecutive Failures Report (All Clusters)
+#  Cohesity Helios: Consecutive Failures Report (All or Selected Clusters)
 #  Auth: API key only (no username/password)
 #  Mode: Read-only (GET only)
-#  Output: Combined CSV + Console Table
+#  Output: Combined CSV + Console Table (sorted alphabetically by Cluster)
 # =====================================================================
 
 # ---- Fixed Settings ----
-$ApiKeyPath   = "X:\PowerShell\Cohesity_API_Scripts\DO_NOT_Delete\apikey.txt"
-$numRuns      = 100
-$days         = 35
-$failureCount = 3
-$CsvFolder    = "."
-$ShowTable    = $true
+$ApiKeyPath      = "X:\PowerShell\Cohesity_API_Scripts\DO_NOT_Delete\apikey.txt"
+$ClusterListFile = "X:\PowerShell\Cohesity_API_Scripts\clusters.txt"
+$numRuns         = 50              # reduced for faster execution
+$days            = 35
+$failureCount    = 3
+$CsvFolder       = "."
+$ShowTable       = $true
 $ErrorActionPreference = 'Stop'
 
-if(-not (Test-Path $ApiKeyPath)){ throw "API key file not found: $ApiKeyPath" }
+# ---- Load API key ----
+if (-not (Test-Path $ApiKeyPath)) { throw "API key file not found: $ApiKeyPath" }
 $ApiKey = (Get-Content -Path $ApiKeyPath -Raw).Trim()
-if([string]::IsNullOrWhiteSpace($ApiKey)){ throw "API key file is empty" }
+if ([string]::IsNullOrWhiteSpace($ApiKey)) { throw "API key file is empty" }
 
 $BaseUri = "https://helios.cohesity.com"
 $Headers = @{ apiKey = $ApiKey }
 
-function Invoke-HeliosGet {
-    param($Path, $ClusterId)
-    $uri = if($Path -like "http*"){ $Path } else { "$BaseUri$Path" }
-    $h = @{}
-    $Headers.GetEnumerator() | ForEach-Object { $h[$_.Key] = $_.Value }
-    if($ClusterId){ $h['clusterId'] = $ClusterId }
-
-    $resp = Invoke-WebRequest -Uri $uri -Headers $h -Method GET
-    if($resp -and $resp.Content){
-        try { ($resp.Content | ConvertFrom-Json) } catch { $null }
-    } else { $null }
+# ---- Load optional cluster list ----
+$TargetClusters = @()
+if (Test-Path $ClusterListFile) {
+    $TargetClusters = Get-Content $ClusterListFile |
+        Where-Object { $_ -and $_ -notmatch '^#' } |
+        ForEach-Object { $_.Trim() }
+    if ($TargetClusters.Count -gt 0) {
+        Write-Host "`nUsing cluster list from $ClusterListFile:`n$($TargetClusters -join ', ')" -ForegroundColor Cyan
+    }
 }
 
-function UsecsToDate([long]$u){ if($u){ [DateTimeOffset]::FromUnixTimeMilliseconds([int64]([double]$u/1000)).UtcDateTime } }
-function TimeAgoUsecs([int]$n){ $d=(Get-Date).ToUniversalTime().AddDays(-[double]$n); [int64]([DateTimeOffset]$d).ToUnixTimeMilliseconds()*1000 }
+# ---- API GET Wrapper ----
+function Invoke-HeliosGet {
+    param($Path, $ClusterId)
+    $uri = if ($Path -like "http*") { $Path } else { "$BaseUri$Path" }
+    $h = @{}
+    $Headers.GetEnumerator() | ForEach-Object { $h[$_.Key] = $_.Value }
+    if ($ClusterId) { $h['clusterId'] = $ClusterId }
 
+    try {
+        $resp = Invoke-WebRequest -Uri $uri -Headers $h -Method GET -TimeoutSec 60 -ErrorAction Stop
+        if ($resp -and $resp.Content) {
+            try { return ($resp.Content | ConvertFrom-Json) } catch { return $null }
+        } else { return $null }
+    }
+    catch {
+        Write-Host "   ⚠️  Unable to reach cluster API for $ClusterId ($Path). Skipping..." -ForegroundColor Yellow
+        return $null
+    }
+}
+
+# ---- Helper Functions ----
+function UsecsToDate([long]$u) { if ($u) { [DateTimeOffset]::FromUnixTimeMilliseconds([int64]([double]$u / 1000)).UtcDateTime } }
+function TimeAgoUsecs([int]$n) { $d = (Get-Date).ToUniversalTime().AddDays(-[double]$n); [int64]([DateTimeOffset]$d).ToUnixTimeMilliseconds() * 1000 }
+
+# ---- Get all clusters ----
 $cluInfo = Invoke-HeliosGet "/v2/mcm/cluster-mgmt/info"
-$clusters = $cluInfo.cohesityClusters
-if(-not $clusters){ Write-Host "No clusters found from Helios."; exit }
+$clusters = $cluInfo.cohesityClusters | Sort-Object name
+if (-not $clusters) { Write-Host "No clusters found from Helios."; exit }
 
+# ---- Filter by target list if specified ----
+if ($TargetClusters.Count -gt 0) {
+    $clusters = $clusters | Where-Object { $TargetClusters -contains $_.name }
+    if (-not $clusters) { Write-Host "No matching clusters found in target list."; exit }
+}
+
+# ---- Initialize ----
 $rows = @()
 $startUsecs = TimeAgoUsecs $days
 
+# ---- Job Analyzer ----
 function Analyze-RunsForJob {
     param($Job,$RunTypesCsv,$Label,$ClusterId,$RootNodes,[int64]$StartUsecs,[int]$NumRuns,[int]$FailureCount,$Failures,$Messages,$LastSuccessUsecs,$ConsecutiveFails)
-    $path="/v2/data-protect/protection-groups/$($Job.id)/runs?numRuns=$NumRuns&startTimeUsecs=$StartUsecs&includeTenants=true&includeObjectDetails=true&runTypes=$RunTypesCsv"
-    $runs=Invoke-HeliosGet $path $ClusterId
-    if(-not $runs.runs){return}
+    $path = "/v2/data-protect/protection-groups/$($Job.id)/runs?numRuns=$NumRuns&startTimeUsecs=$StartUsecs&includeTenants=true&includeObjectDetails=true&runTypes=$RunTypesCsv"
+    $runs = Invoke-HeliosGet $path $ClusterId
+    if (-not $runs.runs) { return }
 
-    $runsSorted=$runs.runs|Sort-Object {$_.localBackupInfo.startTimeUsecs}-Descending
-    $stillCounting=@{}
+    $runsSorted = $runs.runs | Sort-Object { $_.localBackupInfo.startTimeUsecs } -Descending
+    $stillCounting = @{}
 
-    foreach($run in $runsSorted){
-        foreach($object in ($run.objects|Where-Object{$_.object.environment -eq $Job.environment})){
-            $objectName=$object.object.name
-            $sourceName=if($object.object.PSObject.Properties['sourceId']){
-                ($RootNodes.rootNodes|Where-Object{$_.rootNode.id -eq $object.object.sourceId}).rootNode.name
-            }else{$objectName}
-            $key="$ClusterId;;$($Job.name);;$objectName;;$sourceName;;$Label"
-            if(-not $ConsecutiveFails.ContainsKey($key)){$ConsecutiveFails[$key]=0}
-            if(-not $stillCounting.ContainsKey($key)){$stillCounting[$key]=$true}
-            if(-not $LastSuccessUsecs.ContainsKey($key)){$LastSuccessUsecs[$key]=$null}
-            $snap=$object.localSnapshotInfo
-            $st=$snap.snapshotInfo.status
-            if($st -eq 'kSuccess' -or $st -eq 'kWarning'){
-                if(-not $LastSuccessUsecs[$key]){$LastSuccessUsecs[$key]=$run.localBackupInfo.startTimeUsecs}
-                if($stillCounting[$key]){$stillCounting[$key]=$false}
-            }elseif($st -eq 'kFailed'){
-                if($stillCounting[$key]){$ConsecutiveFails[$key]++}
-                if($snap.failedAttempts){$Messages[$key]=$snap.failedAttempts[0].message}
-                $Failures[$key]=$true
+    foreach ($run in $runsSorted) {
+        foreach ($object in ($run.objects | Where-Object { $_.object.environment -eq $Job.environment })) {
+            $objectName = $object.object.name
+            $sourceName = if ($object.object.PSObject.Properties['sourceId']) {
+                ($RootNodes.rootNodes | Where-Object { $_.rootNode.id -eq $object.object.sourceId }).rootNode.name
+            } else { $objectName }
+
+            $key = "$ClusterId;;$($Job.name);;$objectName;;$sourceName;;$Label"
+            if (-not $ConsecutiveFails.ContainsKey($key)) { $ConsecutiveFails[$key] = 0 }
+            if (-not $stillCounting.ContainsKey($key)) { $stillCounting[$key] = $true }
+            if (-not $LastSuccessUsecs.ContainsKey($key)) { $LastSuccessUsecs[$key] = $null }
+
+            $snap = $object.localSnapshotInfo
+            $st = $snap.snapshotInfo.status
+
+            if ($st -eq 'kSuccess' -or $st -eq 'kWarning') {
+                if (-not $LastSuccessUsecs[$key]) { $LastSuccessUsecs[$key] = $run.localBackupInfo.startTimeUsecs }
+                if ($stillCounting[$key]) { $stillCounting[$key] = $false }
+            }
+            elseif ($st -eq 'kFailed') {
+                if ($stillCounting[$key]) { $ConsecutiveFails[$key]++ }
+                if ($snap.failedAttempts) { $Messages[$key] = $snap.failedAttempts[0].message }
+                $Failures[$key] = $true
             }
         }
     }
-    foreach($k in @($Failures.Keys)){
-        if($ConsecutiveFails[$k] -lt $FailureCount){
-            $Failures.Remove($k)|Out-Null
-            if($Messages.ContainsKey($k)){$Messages.Remove($k)|Out-Null}
+
+    foreach ($k in @($Failures.Keys)) {
+        if ($ConsecutiveFails[$k] -lt $FailureCount) {
+            $Failures.Remove($k) | Out-Null
+            if ($Messages.ContainsKey($k)) { $Messages.Remove($k) | Out-Null }
         }
     }
 }
 
-foreach($c in $clusters){
-    $cid=$c.clusterId; $cname=$c.name
+# ---- Iterate clusters ----
+foreach ($c in $clusters) {
+    $cid = $c.clusterId
+    $cname = $c.name
     Write-Host "`nAnalyzing cluster: $cname"
-    $pgs=Invoke-HeliosGet "/v2/data-protect/protection-groups?isDeleted=false&isActive=true&includeTenants=true" $cid
-    if(-not $pgs.protectionGroups){continue}
-    $rootNodes=Invoke-HeliosGet "/protectionSources/registrationInfo" $cid
-    foreach($job in ($pgs.protectionGroups|Sort-Object name)){
-        $failures=@{};$messages=@{};$lastSuccessU=@{};$consecFails=@{}
+
+    try {
+        $pgs = Invoke-HeliosGet "/v2/data-protect/protection-groups?isDeleted=false&isActive=true&includeTenants=true" $cid
+        if (-not $pgs.protectionGroups) { continue }
+        $rootNodes = Invoke-HeliosGet "/protectionSources/registrationInfo" $cid
+        if (-not $rootNodes) { continue }
+    }
+    catch {
+        Write-Host "   ⚠️  Error accessing $cname, skipping..." -ForegroundColor Yellow
+        continue
+    }
+
+    foreach ($job in ($pgs.protectionGroups | Sort-Object name)) {
+        $failures = @{}; $messages = @{}; $lastSuccessU = @{}; $consecFails = @{}
         Analyze-RunsForJob $job "kSystem,kFull,kIncremental" "Backup" $cid $rootNodes $startUsecs $numRuns $failureCount $failures $messages $lastSuccessU $consecFails
         Analyze-RunsForJob $job "kLog" "Log Backup" $cid $rootNodes $startUsecs $numRuns $failureCount $failures $messages $lastSuccessU $consecFails
-        foreach($k in $failures.Keys|Sort-Object){
-            $clusterId,$jobName,$objectName,$sourceName,$runType=$k -split ';;'
-            $msg=[string]$messages[$k]
-            if($msg){$msg=$msg.Replace("`n"," ").Replace("`r"," ").Replace(",",";");if($msg.Length -gt 150){$msg=$msg.Substring(0,150)}}else{$msg=""}
-            $lastSuccessTxt=if($lastSuccessU[$k]){(UsecsToDate $lastSuccessU[$k]).ToString('yyyy-MM-dd HH:mm:ss')}else{'Never'}
-            $rows+=[pscustomobject]@{
-                ClusterName=$cname;JobName=$jobName;BackupType=$runType;SourceName=$sourceName;ObjectName=$objectName;
-                ConsecutiveFailures=[int]$consecFails[$k];LastSuccessfulBackup=$lastSuccessTxt;Message=$msg
+
+        foreach ($k in $failures.Keys | Sort-Object) {
+            $clusterId, $jobName, $objectName, $sourceName, $runType = $k -split ';;'
+            $msg = [string]$messages[$k]
+            if ($msg) {
+                $msg = $msg.Replace("`n", " ").Replace("`r", " ").Replace(",", ";")
+                if ($msg.Length -gt 150) { $msg = $msg.Substring(0, 150) }
+            } else { $msg = "" }
+            $lastSuccessTxt = if ($lastSuccessU[$k]) { (UsecsToDate $lastSuccessU[$k]).ToString('yyyy-MM-dd HH:mm:ss') } else { 'Never' }
+
+            $rows += [pscustomobject]@{
+                ClusterName          = $cname
+                JobName              = $jobName
+                BackupType           = $runType
+                SourceName           = $sourceName
+                ObjectName           = $objectName
+                ConsecutiveFailures  = [int]$consecFails[$k]
+                LastSuccessfulBackup = $lastSuccessTxt
+                Message              = $msg
             }
         }
     }
 }
 
-$stamp=(Get-Date).ToString('yyyy-MM-dd_HHmmss')
-$csv=Join-Path $CsvFolder "Helios-ConsecutiveFailures-$stamp.csv"
-$rows|Select-Object ClusterName,JobName,BackupType,SourceName,ObjectName,ConsecutiveFailures,LastSuccessfulBackup,Message|
+# ---- Final Output ----
+$stamp = (Get-Date).ToString('yyyy-MM-dd_HHmmss')
+$csv   = Join-Path $CsvFolder "Helios-ConsecutiveFailures-$stamp.csv"
+
+$rows = $rows | Sort-Object ClusterName, JobName, BackupType, SourceName, ObjectName
+$rows | Select-Object ClusterName, JobName, BackupType, SourceName, ObjectName, ConsecutiveFailures, LastSuccessfulBackup, Message |
     Export-Csv -Path $csv -NoTypeInformation -Encoding UTF8
 
-Write-Host "Wrote: $csv"
+Write-Host "`nWrote: $csv"
 Write-Host "Rows: $($rows.Count)"
 
-if($ShowTable){
-    if($rows.Count -gt 0){
-        $rows|Sort-Object ClusterName,JobName,BackupType,SourceName,ObjectName|
+if ($ShowTable) {
+    if ($rows.Count -gt 0) {
+        $rows |
             Format-Table `
-            @{Label='Cluster';Expression={$_.ClusterName}},`
-            @{Label='Job';Expression={$_.JobName}},`
-            @{Label='Type';Expression={$_.BackupType}},`
-            @{Label='Source/Object';Expression={"$($_.SourceName)/$($_.ObjectName)"}},`
-            @{Label='Streak';Expression={$_.ConsecutiveFailures}},`
-            @{Label='Last Success';Expression={$_.LastSuccessfulBackup}},`
-            @{Label='Message';Expression={$_.Message}} -AutoSize|Out-String -Width 220|Write-Host
-    }else{
-        Write-Host ("No consecutive failures ≥ {0} found in the last {1} runs (since {2})." -f $failureCount,$numRuns,(UsecsToDate $startUsecs).ToString('yyyy-MM-dd'))
+            @{Label='Cluster'; Expression={$_.ClusterName}}, `
+            @{Label='Job'; Expression={$_.JobName}}, `
+            @{Label='Type'; Expression={$_.BackupType}}, `
+            @{Label='Source/Object'; Expression={"$($_.SourceName)/$($_.ObjectName)"}}, `
+            @{Label='Streak'; Expression={$_.ConsecutiveFailures}}, `
+            @{Label='Last Success'; Expression={$_.LastSuccessfulBackup}}, `
+            @{Label='Message'; Expression={$_.Message}} -AutoSize |
+            Out-String -Width 220 | Write-Host
+    }
+    else {
+        Write-Host ("No consecutive failures ≥ {0} found in the last {1} runs (since {2})." -f $failureCount, $numRuns, (UsecsToDate $startUsecs).ToString('yyyy-MM-dd'))
     }
 }
