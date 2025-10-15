@@ -1,0 +1,154 @@
+<#
+.SYNOPSIS
+    Cohesity Backup Strike Report (CSV version with on-screen table and -Top control)
+
+.DESCRIPTION
+    Collects failed backup objects from one or more Cohesity clusters or Helios tenants.
+    Generates a CSV file of failures with cluster, job, and error info.
+    Optionally displays a summary table in console and sends via email.
+
+.EXAMPLE
+    ./strikeReport.ps1 -vips helios.cohesity.com -username helios
+
+.EXAMPLE
+    ./strikeReport.ps1 -vips helios.cohesity.com -username helios `
+        -smtpServer 192.168.1.95 -sendFrom backupreport@domain.net `
+        -sendTo admin@domain.net -ShowTable -Top 50
+#>
+
+[CmdletBinding()]
+param (
+    [Parameter(Mandatory = $true)][array]$vips,
+    [Parameter(Mandatory = $true)][string]$username,
+    [Parameter()][string]$domain = 'local',
+    [Parameter()][string]$smtpServer,
+    [Parameter()][int]$smtpPort = 25,
+    [Parameter()][array]$sendTo,
+    [Parameter()][string]$sendFrom,
+    [Parameter()][int]$days = 30,
+    [Parameter()][int]$failureCount = 1,
+    [Parameter()][switch]$ShowTable,
+    [Parameter()][int]$Top = 20
+)
+
+# ===================================================
+# Load Cohesity API helper
+# ===================================================
+. "$(Join-Path $PSScriptRoot cohesity-api.ps1)"
+
+Write-Host ""
+Write-Host "============================================="
+Write-Host "🚀  Cohesity Backup Strike Report (CSV Only)"
+Write-Host "============================================="
+Write-Host "Collecting failures from last $days days..."
+Write-Host ""
+
+# ===================================================
+# Initialize
+# ===================================================
+$reportData = @()
+$totalJobs = 0
+$totalFailures = 0
+
+# ===================================================
+# Process each cluster
+# ===================================================
+foreach ($vip in $vips) {
+    Write-Host "Connecting to cluster: $vip ..."
+    try {
+        apiauth -vip $vip -username $username -domain $domain
+    } catch {
+        Write-Host "⚠️  Failed to connect to $vip : $_"
+        continue
+    }
+
+    $cluster = (api get cluster).name
+    Write-Host "Connected to cluster: $cluster"
+    $jobs = api get "protectionJobs?isDeleted=false&isActive=true"
+
+    foreach ($job in $jobs) {
+        $totalJobs++
+        $runs = api get "/backupjobruns?id=$($job.id)&startTimeUsecs=$(timeAgo $days days)&numRuns=200"
+        if (-not $runs.backupJobRuns) { continue }
+
+        foreach ($prun in $runs.backupJobRuns.protectionRuns) {
+            foreach ($task in $prun.backupRun.latestFinishedTasks) {
+                $objName = $task.base.sources[0].source.displayName
+                $status  = $task.base.publicStatus
+                $errMsg  = $task.base.error.errorMsg
+                $lastGood = if ($status -eq 'kSuccess') { (usecsToDate $prun.backupRun.base.endTimeUsecs) } else { '-' }
+
+                if ($status -eq 'kFailure') {
+                    $totalFailures++
+                    $reportData += [pscustomobject]@{
+                        Cluster        = $cluster
+                        ObjectName     = $objName
+                        JobName        = $job.name
+                        ObjectType     = ($job.environment -replace '^k','')
+                        FailureCount   = "$failureCount+"
+                        LastGoodBackup = $lastGood
+                        LastError      = $errMsg
+                    }
+                }
+            }
+        }
+    }
+}
+
+# ===================================================
+# Write CSV
+# ===================================================
+if ($reportData.Count -eq 0) {
+    Write-Host "✅ No failures found in last $days days across all clusters."
+    return
+}
+
+$timestamp = (Get-Date).ToString("yyyy-MM-dd_HHmm")
+$outfile = "$PSScriptRoot\strikeReport_$timestamp.csv"
+$reportData | Export-Csv -NoTypeInformation -Path $outfile -Encoding UTF8
+
+Write-Host ""
+Write-Host "============================================="
+Write-Host "📊  Report Summary"
+Write-Host "============================================="
+Write-Host ("Clusters Scanned   : {0}" -f ($vips -join ', '))
+Write-Host ("Jobs Processed     : {0}" -f $totalJobs)
+Write-Host ("Failed Objects     : {0}" -f $totalFailures)
+Write-Host ("CSV Report Saved   : {0}" -f $outfile)
+Write-Host "============================================="
+Write-Host ""
+
+# ===================================================
+# Show Table (optional)
+# ===================================================
+if ($ShowTable) {
+    $countToShow = [Math]::Min($Top, $reportData.Count)
+    Write-Host "Top $countToShow Failed Objects:"
+    Write-Host "---------------------------------------------"
+    $reportData |
+        Select-Object Cluster, ObjectName, JobName, ObjectType, LastError -First $countToShow |
+        Format-Table -AutoSize
+    Write-Host "---------------------------------------------"
+    Write-Host "Showing top $countToShow of total $($reportData.Count) failures."
+    Write-Host ""
+}
+
+# ===================================================
+# Optional Email
+# ===================================================
+if ($smtpServer -and $sendFrom -and $sendTo) {
+    Write-Host "✉️  Sending report to $($sendTo -join ', ')..."
+    try {
+        Send-MailMessage -From $sendFrom -To $sendTo `
+            -Subject "Cohesity Backup Strike Report (CSV)" `
+            -SmtpServer $smtpServer -Port $smtpPort `
+            -Body "Attached is your Cohesity Backup Strike Report (CSV format)." `
+            -Attachments $outfile -WarningAction SilentlyContinue
+        Write-Host "✅ Email sent successfully."
+    }
+    catch {
+        Write-Host "⚠️  Failed to send email: $_"
+    }
+}
+
+Write-Host "✅ Done."
