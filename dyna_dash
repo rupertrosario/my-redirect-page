@@ -1,4 +1,107 @@
-const cred = workflow.credential("cohesity-helios-api-key");
-const apiKey = cred?.value || cred?.token || cred?.password;
-log.info(`workflow object: ${typeof workflow}, http: ${typeof http}, apiKey loaded: ${!!apiKey}`);
-return { ok: !!apiKey };
+// --- Import Dynatrace SDK modules ---
+import { execution } from '@dynatrace-sdk/automation-utils';
+import { http, log, metrics } from '@dynatrace-sdk/app-utils';
+
+// --- Main workflow function ---
+export default async function () {
+  log.info("🚀 Starting Cohesity Helios Capacity + Garbage Data Workflow");
+
+  // 1️⃣ Load secure API key from Dynatrace Credentials Vault
+  const creds = await execution.credentials.get('cohesity-helios-api-key');
+  const apiKey = creds?.value || creds?.token || creds?.password;
+
+  if (!apiKey) throw new Error("❌ Cohesity Helios API key not found or inaccessible.");
+
+  const baseUrl = "https://helios.cohesity.com";
+  const oneTiB = 1099511627776;
+  const headers = { accept: "application/json", apiKey };
+
+  // 2️⃣ Fetch cluster list
+  log.info("🔹 Fetching Cohesity cluster list from Helios...");
+  const clusterResp = await http.get(`${baseUrl}/v2/mcm/cluster-mgmt/info`, { headers });
+  if (clusterResp.status !== 200) throw new Error(`Failed to fetch clusters: ${clusterResp.status}`);
+
+  const clusters = clusterResp.data?.cohesityClusters ?? [];
+  log.info(`✅ Found ${clusters.length} clusters.`);
+
+  const results = [];
+
+  // 3️⃣ Process each cluster
+  for (const c of clusters) {
+    const clusterName = c.ClusterName;
+    const clusterId = c.ClusterId;
+    log.info(`📊 Processing cluster: ${clusterName}`);
+
+    const h = {
+      accept: "application/json",
+      apiKey,
+      accessClusterId: clusterId
+    };
+
+    // --- Get Garbage Data ---
+    const garbageBody = {
+      schemaName: "ApolloV2ClusterStats",
+      metricName: "EstimatedGarbageBytes",
+      startTimeMsecs: "2",
+      entityId: `cluster name (ID ${clusterId})`,
+      rollupFunction: "latest",
+      rollupIntervalSecs: "30",
+      metricUnitType: "0",
+      range: "day"
+    };
+
+    const garbageResp = await http.post(`${baseUrl}/irisservices/api/v1/public/statistics/timeSeriesStats`, {
+      headers: h,
+      body: JSON.stringify(garbageBody)
+    });
+
+    if (garbageResp.status !== 200) {
+      log.warn(`⚠️ Garbage data fetch failed for ${clusterName}`);
+      continue;
+    }
+
+    const gdata = garbageResp.data;
+    const latestPoint = gdata.dataPointVec?.slice(-1)[0];
+    const bytes = latestPoint?.data?.int64Value ?? 0;
+    const gb = +(bytes / (1024 ** 3)).toFixed(2);
+    const tb = +(bytes / (1024 ** 4)).toFixed(4);
+
+    // --- Get Capacity Data ---
+    const storageResp = await http.get(`${baseUrl}/irisservices/api/v1/public/stats/storage`, { headers: h });
+    if (storageResp.status !== 200) {
+      log.warn(`⚠️ Storage stats fetch failed for ${clusterName}`);
+      continue;
+    }
+
+    const s = storageResp.data;
+    const totalTiB = +(s.totalCapacityBytes / oneTiB).toFixed(1);
+    const usedTiB = +(s.localUsageBytes / oneTiB).toFixed(1);
+    const availTiB = +(s.localAvailableBytes / oneTiB).toFixed(1);
+    const consumed = +((s.localUsageBytes / s.totalCapacityBytes) * 100).toFixed(1);
+
+    results.push({
+      Cluster: clusterName,
+      Garbage_Data_GB: gb,
+      Garbage_Data_TB: tb,
+      Total_TiB: totalTiB,
+      Used_TiB: usedTiB,
+      Available_TiB: availTiB,
+      Consumed_Percent: consumed
+    });
+
+    // Emit custom metrics for dashboards
+    await metrics.emit('custom.cohesity.cluster.garbageData.GB', gb, { cluster: clusterName });
+    await metrics.emit('custom.cohesity.cluster.garbageData.TB', tb, { cluster: clusterName });
+    await metrics.emit('custom.cohesity.cluster.capacity.totalTiB', totalTiB, { cluster: clusterName });
+    await metrics.emit('custom.cohesity.cluster.capacity.usedTiB', usedTiB, { cluster: clusterName });
+    await metrics.emit('custom.cohesity.cluster.capacity.availableTiB', availTiB, { cluster: clusterName });
+    await metrics.emit('custom.cohesity.cluster.capacity.percentUsed', consumed, { cluster: clusterName });
+
+    log.info(`✅ ${clusterName}: ${consumed}% used (${usedTiB}/${totalTiB} TiB), Garbage: ${gb} GB`);
+  }
+
+  log.info("📄 Final Summary Table:");
+  log.info(JSON.stringify(results, null, 2));
+
+  return { clusters: results };
+}
