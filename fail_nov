@@ -1,12 +1,14 @@
-# Cohesity Helios – STRIKE Report (Single Cluster, RunType in Table, EST Time Format)
-# ----------------------------------------------------------------------------------
-# - Reads Helios API key from file
-# - Runs on one cluster (set ID + Name below)
+# Cohesity Helios – STRIKE Report (Single Cluster, v2 runs, no tasks dependency)
+# ------------------------------------------------------------------------------
+# - Reads API key from file
+# - Single cluster (set cluster_id + cluster_name)
 # - GET-only, no try/catch
-# - Does NOT call runTypes= in URL
-# - Extracts RunType locally, displays in table
-# - Converts Start/End time to EST, dd/MM/yyyy HH:mm:ss
-# - Only shows failures with no later success
+# - Uses /v2/data-protect/protection-groups/{id}/runs with:
+#     ?numRuns=15&excludeNonRestorableRuns=true&includeObjectDetails=true
+# - Does NOT pass runTypes= in URL
+# - Extracts per-object Status/Message even when 'latestFinishedTasks' is absent
+# - Shows only failures with no later success (Strike logic)
+# - Start/End times in EST, format dd/MM/yyyy HH:mm:ss
 
 # =========================
 # 0) API Key from your path
@@ -14,7 +16,12 @@
 $apikeypath = "X:\PowerShell\Cohesity_API_Scripts\DO_NOT_Delete\apikey.txt"
 if (-not (Test-Path $apikeypath)) { throw "API key file not found at $apikeypath" }
 $ApiKey = (Get-Content -Path $apikeypath -Raw).Trim()
-$commonHeaders = @{ "apiKey" = $ApiKey; "accept" = "application/json" }
+
+# Helios requires accessClusterId in the HEADER for on-prem cluster calls
+$baseHeaders = @{
+    "apiKey" = $ApiKey
+    "accept" = "application/json"
+}
 
 Write-Host ""
 Write-Host "============================================="
@@ -26,7 +33,7 @@ Write-Host ""
 # =========================
 # 1) Choose your Cluster
 # =========================
-# Get clusterId from: https://helios.cohesity.com/v2/mcm/cluster-mgmt/info
+# Get clusterId via: GET https://helios.cohesity.com/v2/mcm/cluster-mgmt/info
 $cluster_id   = "<PASTE-YOUR-CLUSTER-ID-HERE>"
 $cluster_name = "<YOUR-CLUSTER-NAME>"
 
@@ -34,89 +41,189 @@ if (-not $cluster_id -or $cluster_id -eq "<PASTE-YOUR-CLUSTER-ID-HERE>") {
     throw "⚠️ Please set your cluster_id before running."
 }
 
+$headers = $baseHeaders.Clone()
+$headers["accessClusterId"] = $cluster_id
+
 Write-Host "🔍 Scanning cluster: $cluster_name ($cluster_id)..."
 Write-Host ""
 
 # =========================================================
-# 2) Helper – Convert usecs → EST datetime (dd/MM/yyyy HH:mm:ss)
+# 2) Helpers
 # =========================================================
-function Convert-UsecsToEST($usecs) {
+function UsecsToEST([long]$usecs){
     if (-not $usecs) { return "-" }
     $estZone = [System.TimeZoneInfo]::FindSystemTimeZoneById("Eastern Standard Time")
-    $utcDate = [datetime]"1970-01-01"
-    $utcDate = $utcDate.AddMilliseconds($usecs / 1000)
-    return [System.TimeZoneInfo]::ConvertTimeFromUtc($utcDate, $estZone).ToString("dd/MM/yyyy HH:mm:ss")
+    $utcEpoch = [datetime]"1970-01-01"
+    $utcTime = $utcEpoch.AddMilliseconds($usecs / 1000)
+    return [System.TimeZoneInfo]::ConvertTimeFromUtc($utcTime, $estZone).ToString("dd/MM/yyyy HH:mm:ss")
 }
 
-# =========================================================
-# 3) Collect strike data for this cluster
-# =========================================================
-$AllRows = @()
-$numRuns = 10  # fetch last few runs only
+# Normalize Cohesity status enums to Succeeded/Failed/Other
+function Normalize-Status($val){
+    if (-not $val) { return $null }
+    switch -Regex ($val) {
+        '^k?Success(ed)?(WithWarning)?$' { 'Succeeded'; break }
+        '^k?Failure$'                    { 'Failed';    break }
+        '^Succeeded$'                    { 'Succeeded'; break }
+        '^Failed$'                       { 'Failed';    break }
+        default                          { $val }
+    }
+}
 
-# --- Get Protection Groups ---
-$pgUrl = "https://helios.cohesity.com/v2/mcm/data-protect/protection-groups?clusterId=$cluster_id"
-$pgResp = Invoke-WebRequest -Uri $pgUrl -Headers $commonHeaders -Method Get -UseBasicParsing
-$pgs = ($pgResp.Content | ConvertFrom-Json).protectionGroups
+# Extract per-object rows from a single protectionRun object,
+# even if there is no 'latestFinishedTasks'. We try several common shapes.
+function Get-ObjectRowsFromRun($run, $cluster_name, $pgName, $envType){
+    $rows = @()
 
-foreach ($pg in $pgs) {
-    $pgName  = $pg.name
-    $envType = $pg.environment -replace '^k',''
+    # Timestamps & run type at the run level
+    $startUs = $run.backupRun.base.startTimeUsecs
+    $endUs   = $run.backupRun.base.endTimeUsecs
+    $runType = ($run.backupRun.base.RunType -replace '^k','')
 
-    # --- Get recent runs (no runTypes in URL) ---
-    $runsUrl  = "https://helios.cohesity.com/v2/mcm/data-protect/protection-groups/$($pg.id)/runs?clusterId=$cluster_id&numRuns=$numRuns"
-    $runsResp = Invoke-WebRequest -Uri $runsUrl -Headers $commonHeaders -Method Get -UseBasicParsing
-    $runs     = ($runsResp.Content | ConvertFrom-Json).protectionRuns
-    if (-not $runs) { continue }
+    # 1) Most common (when present)
+    $candidate = $run.backupRun.latestFinishedTasks
+    if ($candidate) {
+        foreach($t in $candidate){
+            $obj  = $t.base.sources[0].source.displayName
+            $stat = Normalize-Status $t.base.publicStatus
+            $msg  = $t.base.error.errorMsg
+            $rows += [pscustomobject]@{
+                Cluster         = $cluster_name
+                ProtectionGroup = $pgName
+                ObjectName      = $obj
+                ObjectType      = $envType
+                RunType         = $runType
+                Status          = $stat
+                Message         = $msg
+                StartTimeUsecs  = $startUs
+                EndTimeUsecs    = $endUs
+            }
+        }
+        return $rows
+    }
 
-    $flatRuns = @()
+    # 2) Some payloads expose object details on .objects (when includeObjectDetails=true)
+    $candidate = $run.objects
+    if ($candidate) {
+        foreach($o in $candidate){
+            # Try common name fields
+            $objName = $o.objectName
+            if (-not $objName -and $o.source) { $objName = $o.source.displayName }
+            if (-not $objName -and $o.entity) { $objName = $o.entity.displayName }
 
-    foreach ($r in $runs) {
-        $runType = $r.backupRun.base.RunType -replace '^k',''
-        $startUs = $r.backupRun.base.startTimeUsecs
-        $endUs   = $r.backupRun.base.endTimeUsecs
-        $tasks   = $r.backupRun.latestFinishedTasks
-        if (-not $tasks) { continue }
+            # Try various status/error locations
+            $stat = $o.status
+            if (-not $stat -and $o.localBackupInfo) { $stat = $o.localBackupInfo.status }
+            if (-not $stat -and $o.objectStatus)    { $stat = $o.objectStatus }
 
-        foreach ($t in $tasks) {
-            $objName = $t.base.sources[0].source.displayName
-            $status  = $t.base.publicStatus
-            $err     = $t.base.error.errorMsg
+            $stat = Normalize-Status $stat
 
-            $flatRuns += [PSCustomObject]@{
+            $msg = $o.errorMessage
+            if (-not $msg -and $o.error)                 { $msg = $o.error.errorMsg }
+            if (-not $msg -and $o.localBackupInfo)       { $msg = $o.localBackupInfo.errorMessage }
+            if (-not $msg -and $o.failureMessage)        { $msg = $o.failureMessage }
+
+            $rows += [pscustomobject]@{
                 Cluster         = $cluster_name
                 ProtectionGroup = $pgName
                 ObjectName      = $objName
                 ObjectType      = $envType
                 RunType         = $runType
-                Status          = if ($status -eq 'kSuccess') { 'Succeeded' } elseif ($status -eq 'kFailure') { 'Failed' } else { $status }
-                Message         = $err
+                Status          = $stat
+                Message         = $msg
                 StartTimeUsecs  = $startUs
                 EndTimeUsecs    = $endUs
             }
         }
+        return $rows
     }
 
-    # --- Group by RunType (to check per-runType recovery) ---
-    $grouped = $flatRuns | Group-Object RunType
-    foreach ($g in $grouped) {
-        $latestFailed = $g.Group | Where-Object { $_.Status -eq "Failed" } | Sort-Object EndTimeUsecs -Descending | Select-Object -First 1
-        if ($null -ne $latestFailed) {
-            $hasLaterSuccess = $g.Group | Where-Object {
-                $_.Status -eq "Succeeded" -and $_.StartTimeUsecs -gt $latestFailed.EndTimeUsecs
+    # 3) Some payloads use different naming for object-level results
+    $candidate = $run.objectRuns
+    if ($candidate) {
+        foreach($o in $candidate){
+            $objName = $o.objectName
+            if (-not $objName -and $o.entity) { $objName = $o.entity.displayName }
+
+            $stat = Normalize-Status $o.status
+            $msg  = $o.errorMessage
+            if (-not $msg -and $o.error) { $msg = $o.error.errorMsg }
+
+            $rows += [pscustomobject]@{
+                Cluster         = $cluster_name
+                ProtectionGroup = $pgName
+                ObjectName      = $objName
+                ObjectType      = $envType
+                RunType         = $runType
+                Status          = $stat
+                Message         = $msg
+                StartTimeUsecs  = $startUs
+                EndTimeUsecs    = $endUs
             }
-            if (-not $hasLaterSuccess) {
-                $AllRows += [PSCustomObject]@{
-                    Cluster         = $latestFailed.Cluster
-                    ProtectionGroup = $latestFailed.ProtectionGroup
-                    ObjectName      = $latestFailed.ObjectName
-                    ObjectType      = $latestFailed.ObjectType
-                    RunType         = $latestFailed.RunType
-                    Status          = $latestFailed.Status
-                    Message         = $latestFailed.Message
-                    StartTime       = Convert-UsecsToEST $latestFailed.StartTimeUsecs
-                    EndTime         = Convert-UsecsToEST $latestFailed.EndTimeUsecs
-                }
+        }
+        return $rows
+    }
+
+    # If nothing matched, return empty
+    return $rows
+}
+
+# =========================================================
+# 3) Collect strike data
+# =========================================================
+$AllRows = @()
+$numRuns = 15  # few recent runs per PG; adjust as you like
+
+# 3a) List Protection Groups on this cluster
+$pgUrl  = "https://helios.cohesity.com/v2/data-protect/protection-groups"
+$pgResp = Invoke-WebRequest -Uri $pgUrl -Headers $headers -Method Get -UseBasicParsing
+$pgs    = ($pgResp.Content | ConvertFrom-Json).protectionGroups
+
+foreach ($pg in $pgs) {
+    $pgName  = $pg.name
+    $envType = $pg.environment -replace '^k',''
+
+    # 3b) Fetch runs for this PG (with includeObjectDetails)
+    $runsUrl  = "https://helios.cohesity.com/v2/data-protect/protection-groups/$($pg.id)/runs?numRuns=$numRuns&excludeNonRestorableRuns=true&includeObjectDetails=true"
+    $runsResp = Invoke-WebRequest -Uri $runsUrl -Headers $headers -Method Get -UseBasicParsing
+    $runs     = ($runsResp.Content | ConvertFrom-Json).protectionRuns
+    if (-not $runs) { continue }
+
+    # 3c) Flatten per-object entries (robust to different shapes)
+    $flat = @()
+    foreach ($r in $runs) {
+        $flat += Get-ObjectRowsFromRun -run $r -cluster_name $cluster_name -pgName $pgName -envType $envType
+    }
+
+    # Filter out entries where we couldn't resolve an object name
+    $flat = $flat | Where-Object { $_.ObjectName }
+
+    # 3d) Strike logic per (ObjectName + RunType)
+    $keyed = $flat | Group-Object @{Expression = { $_.ObjectName + '||' + $_.RunType }}
+    foreach ($k in $keyed) {
+        $rowsForKey = $k.Group | Sort-Object EndTimeUsecs -Descending
+        if (-not $rowsForKey) { continue }
+
+        # Latest failed instance for this object+runType
+        $latestFailed = $rowsForKey | Where-Object { $_.Status -eq 'Failed' } | Select-Object -First 1
+        if (-not $latestFailed) { continue }
+
+        # Any later success?
+        $hasLaterSuccess = $rowsForKey | Where-Object {
+            $_.Status -eq 'Succeeded' -and $_.StartTimeUsecs -gt $latestFailed.EndTimeUsecs
+        }
+
+        if (-not $hasLaterSuccess) {
+            $AllRows += [pscustomobject]@{
+                Cluster         = $latestFailed.Cluster
+                ProtectionGroup = $latestFailed.ProtectionGroup
+                ObjectName      = $latestFailed.ObjectName
+                ObjectType      = $latestFailed.ObjectType
+                RunType         = $latestFailed.RunType
+                Status          = $latestFailed.Status
+                Message         = $latestFailed.Message
+                StartTime       = UsecsToEST $latestFailed.StartTimeUsecs
+                EndTime         = UsecsToEST $latestFailed.EndTimeUsecs
             }
         }
     }
@@ -130,7 +237,7 @@ if ($AllRows.Count -eq 0) {
     return
 }
 
-$AllRows | Sort-Object ProtectionGroup,ObjectName | Format-Table -AutoSize
+$AllRows | Sort-Object ProtectionGroup,ObjectName,RunType | Format-Table -AutoSize
 
 # =========================================================
 # 5) Summary
