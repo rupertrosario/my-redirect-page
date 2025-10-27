@@ -1,9 +1,10 @@
-# Cohesity Helios – STRIKE Report (Single Cluster, GET-only)
-# ----------------------------------------------------------
-# - Reads Helios API key from file path.
-# - Runs only on ONE cluster (specified manually below).
-# - 100% GET-only, safe to run.
-# - Detects failed backups with no later success.
+# Cohesity Helios – STRIKE Report (Single Cluster, RunType-correct)
+# -----------------------------------------------------------------
+# - Reads API key from file path
+# - Runs on one cluster only
+# - GET-only, safe, no try/catch
+# - Fetches Full + Incremental + Log (when applicable)
+# - Uses the correct property name: RunType
 
 # =========================
 # 0) API Key from your path
@@ -13,27 +14,23 @@ if (-not (Test-Path $apikeypath)) { throw "API key file not found at $apikeypath
 $ApiKey = (Get-Content -Path $apikeypath -Raw).Trim()
 $commonHeaders = @{ "apiKey" = $ApiKey; "accept" = "application/json" }
 
-Write-Host ""
+Write-Host "`n============================================="
+Write-Host "🚨  Cohesity Helios STRIKE REPORT (Single Cluster)"
 Write-Host "============================================="
-Write-Host "🚨 Cohesity Helios STRIKE REPORT (Single Cluster)"
-Write-Host "============================================="
-Write-Host "READ-ONLY MODE — GET requests only"
-Write-Host ""
+Write-Host "READ-ONLY MODE — GET requests only`n"
 
 # =========================
 # 1) Choose your Cluster
 # =========================
-# You can fetch ClusterId via: https://helios.cohesity.com/v2/mcm/cluster-mgmt/info
-# Example: "1234567890123456789:1111111111111111111"
-$cluster_id = "<PASTE-YOUR-CLUSTER-ID-HERE>"
+# Get clusterId from:  https://helios.cohesity.com/v2/mcm/cluster-mgmt/info
+$cluster_id   = "<PASTE-YOUR-CLUSTER-ID-HERE>"
 $cluster_name = "<YOUR-CLUSTER-NAME>"
 
 if (-not $cluster_id -or $cluster_id -eq "<PASTE-YOUR-CLUSTER-ID-HERE>") {
-    throw "⚠️ Please set your cluster_id before running."
+    throw "⚠️  Please set your cluster_id before running."
 }
 
-Write-Host "🔍 Scanning cluster: $cluster_name ($cluster_id)..."
-Write-Host ""
+Write-Host "🔍  Scanning cluster: $cluster_name ($cluster_id)...`n"
 
 # =========================================================
 # 2) Helper – Convert usecs → readable date
@@ -44,9 +41,10 @@ function Convert-UsecsToDate($usecs) {
 }
 
 # =========================================================
-# 3) Collect strike data for this cluster
+# 3) Collect strike data
 # =========================================================
 $AllRows = @()
+$numRuns = 10   # only recent runs for speed
 
 # --- Get Protection Groups ---
 $pgUrl = "https://helios.cohesity.com/v2/mcm/data-protect/protection-groups?clusterId=$cluster_id"
@@ -54,33 +52,44 @@ $pgResp = Invoke-WebRequest -Uri $pgUrl -Headers $commonHeaders -Method Get -Use
 $pgs = ($pgResp.Content | ConvertFrom-Json).protectionGroups
 
 foreach ($pg in $pgs) {
-    $pgName = $pg.name
+    $pgName  = $pg.name
     $envType = $pg.environment -replace '^k',''
-    $runsUrl = "https://helios.cohesity.com/v2/mcm/data-protect/protection-groups/runs?clusterId=$cluster_id&protectionGroupIds=$($pg.id)&numRuns=100"
-    $runsResp = Invoke-WebRequest -Uri $runsUrl -Headers $commonHeaders -Method Get -UseBasicParsing
-    $runs = ($runsResp.Content | ConvertFrom-Json).protectionRuns
-    if (-not $runs) { continue }
+
+    # include all relevant run types
+    $runTypes = @("kRegular")
+    if ($envType -in @("SQL","Oracle")) {
+        $runTypes = @("kRegular","kIncremental","kLog")
+    }
 
     $flat = @()
-    foreach ($r in $runs) {
-        $runTime = $r.backupRun.base.startTimeUsecs
-        $tasks = $r.backupRun.latestFinishedTasks
-        if (-not $tasks) { continue }
 
-        foreach ($t in $tasks) {
-            $objName = $t.base.sources[0].source.displayName
-            $status  = $t.base.publicStatus
-            $err     = $t.base.error.errorMsg
-            $flat += [PSCustomObject]@{
-                ObjectName = $objName
-                Status     = $status
-                Error      = $err
-                StartTime  = $runTime
+    foreach ($rt in $runTypes) {
+        $runsUrl  = "https://helios.cohesity.com/v2/mcm/data-protect/protection-groups/$($pg.id)/runs?clusterId=$cluster_id&numRuns=$numRuns&runTypes=$rt"
+        $runsResp = Invoke-WebRequest -Uri $runsUrl -Headers $commonHeaders -Method Get -UseBasicParsing
+        $runs     = ($runsResp.Content | ConvertFrom-Json).protectionRuns
+        if (-not $runs) { continue }
+
+        foreach ($r in $runs) {
+            $runTime = $r.backupRun.base.startTimeUsecs
+            $tasks   = $r.backupRun.latestFinishedTasks
+            if (-not $tasks) { continue }
+
+            foreach ($t in $tasks) {
+                $objName = $t.base.sources[0].source.displayName
+                $status  = $t.base.publicStatus
+                $err     = $t.base.error.errorMsg
+                $flat += [PSCustomObject]@{
+                    ObjectName = $objName
+                    Status     = $status
+                    Error      = $err
+                    StartTime  = $runTime
+                    RunType    = $r.backupRun.base.RunType -replace '^k',''
+                }
             }
         }
     }
 
-    # --- Strike Logic ---
+    # --- Strike Logic (failure without later success) ---
     $grouped = $flat | Group-Object ObjectName
     foreach ($g in $grouped) {
         $runsForObj = $g.Group | Sort-Object StartTime -Descending
@@ -99,6 +108,7 @@ foreach ($pg in $pgs) {
                 ProtectionGroup  = $pgName
                 ObjectName       = $g.Name
                 ObjectType       = $envType
+                RunType          = $latestFailure.RunType
                 LastFailureTime  = (Convert-UsecsToDate $latestFailure.StartTime)
                 ErrorMessage     = $latestFailure.Error
             }
@@ -110,7 +120,7 @@ foreach ($pg in $pgs) {
 # 4) Print Full Table
 # ==============================
 if ($AllRows.Count -eq 0) {
-    Write-Host "✅ No unrecovered failures found on $cluster_name." -ForegroundColor Green
+    Write-Host "✅  No unrecovered failures found on $cluster_name." -ForegroundColor Green
     return
 }
 
@@ -121,19 +131,17 @@ $AllRows | Sort-Object ProtectionGroup,ObjectName | Format-Table -AutoSize
 # =========================================================
 Write-Host "`nSummary for Cluster: $cluster_name" -ForegroundColor Green
 Write-Host "=========================" -ForegroundColor Green
-
-$pgCount = ($AllRows.ProtectionGroup | Select-Object -Unique | Measure-Object).Count
-$objCount = ($AllRows.ObjectName | Select-Object -Unique | Measure-Object).Count
-
-Write-Host "  Failed PGs      : $pgCount"
-Write-Host "  Failed Objects  : $objCount"
+$pgCount  = ($AllRows.ProtectionGroup | Select-Object -Unique | Measure-Object).Count
+$objCount = ($AllRows.ObjectName      | Select-Object -Unique | Measure-Object).Count
+Write-Host "  Failed PGs     : $pgCount"
+Write-Host "  Failed Objects : $objCount"
 Write-Host "----------------------------------------"
 
 # =========================================================
 # 6) Export CSV
 # =========================================================
 $timestamp = (Get-Date).ToString("yyyy-MM-dd_HHmm")
-$outfile = "$PSScriptRoot\Helios_StrikeReport_${cluster_name}_$timestamp.csv"
-$AllRows | Export-Csv -NoTypeInformation -Path $outfile -Encoding UTF8
-Write-Host "`n📁 CSV report saved to: $outfile" -ForegroundColor Yellow
-Write-Host "`n✅ Strike Report complete for cluster $cluster_name — Read-only and GET-only." -ForegroundColor Green
+$outfile   = "$PSScriptRoot\Helios_StrikeReport_${cluster_name}_$timestamp.csv"
+$AllRows | Export-Csv -NoTypeInformation -Encoding UTF8 -Path $outfile
+Write-Host "`n📁  CSV saved to: $outfile" -ForegroundColor Yellow
+Write-Host "`n✅  Strike Report complete for $cluster_name — GET-only, safe." -ForegroundColor Green
