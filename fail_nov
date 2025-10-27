@@ -1,11 +1,12 @@
-# Cohesity Helios – STRIKE Report (Single Cluster, RunType in Output)
-# -------------------------------------------------------------------
-# - Reads API key from file
-# - Runs only on one cluster (set ID + Name below)
-# - Uses correct Helios endpoints
+# Cohesity Helios – STRIKE Report (Single Cluster, RunType in Table, EST Time Format)
+# ----------------------------------------------------------------------------------
+# - Reads Helios API key from file
+# - Runs on one cluster (set ID + Name below)
+# - GET-only, no try/catch
 # - Does NOT call runTypes= in URL
-# - Extracts RunType locally and shows it in table/CSV
-# - 100% GET-only, safe, no try/catch
+# - Extracts RunType locally, displays in table
+# - Converts Start/End time to EST, dd/MM/yyyy HH:mm:ss
+# - Only shows failures with no later success
 
 # =========================
 # 0) API Key from your path
@@ -37,18 +38,21 @@ Write-Host "🔍 Scanning cluster: $cluster_name ($cluster_id)..."
 Write-Host ""
 
 # =========================================================
-# 2) Helper – Convert usecs → readable date
+# 2) Helper – Convert usecs → EST datetime (dd/MM/yyyy HH:mm:ss)
 # =========================================================
-function Convert-UsecsToDate($usecs) {
+function Convert-UsecsToEST($usecs) {
     if (-not $usecs) { return "-" }
-    [DateTimeOffset]::FromUnixTimeMilliseconds([math]::Round($usecs / 1000)).LocalDateTime.ToString("yyyy-MM-dd HH:mm:ss")
+    $estZone = [System.TimeZoneInfo]::FindSystemTimeZoneById("Eastern Standard Time")
+    $utcDate = [datetime]"1970-01-01"
+    $utcDate = $utcDate.AddMilliseconds($usecs / 1000)
+    return [System.TimeZoneInfo]::ConvertTimeFromUtc($utcDate, $estZone).ToString("dd/MM/yyyy HH:mm:ss")
 }
 
 # =========================================================
 # 3) Collect strike data for this cluster
 # =========================================================
 $AllRows = @()
-$numRuns = 10  # Only recent runs for speed
+$numRuns = 10  # fetch last few runs only
 
 # --- Get Protection Groups ---
 $pgUrl = "https://helios.cohesity.com/v2/mcm/data-protect/protection-groups?clusterId=$cluster_id"
@@ -59,17 +63,18 @@ foreach ($pg in $pgs) {
     $pgName  = $pg.name
     $envType = $pg.environment -replace '^k',''
 
-    # --- Get last few runs (no runType in URL) ---
+    # --- Get recent runs (no runTypes in URL) ---
     $runsUrl  = "https://helios.cohesity.com/v2/mcm/data-protect/protection-groups/$($pg.id)/runs?clusterId=$cluster_id&numRuns=$numRuns"
     $runsResp = Invoke-WebRequest -Uri $runsUrl -Headers $commonHeaders -Method Get -UseBasicParsing
     $runs     = ($runsResp.Content | ConvertFrom-Json).protectionRuns
     if (-not $runs) { continue }
 
-    $flat = @()
+    $flatRuns = @()
 
     foreach ($r in $runs) {
-        $runTime = $r.backupRun.base.startTimeUsecs
         $runType = $r.backupRun.base.RunType -replace '^k',''
+        $startUs = $r.backupRun.base.startTimeUsecs
+        $endUs   = $r.backupRun.base.endTimeUsecs
         $tasks   = $r.backupRun.latestFinishedTasks
         if (-not $tasks) { continue }
 
@@ -78,38 +83,40 @@ foreach ($pg in $pgs) {
             $status  = $t.base.publicStatus
             $err     = $t.base.error.errorMsg
 
-            $flat += [PSCustomObject]@{
-                ObjectName = $objName
-                Status     = $status
-                Error      = $err
-                StartTime  = $runTime
-                RunType    = $runType
+            $flatRuns += [PSCustomObject]@{
+                Cluster         = $cluster_name
+                ProtectionGroup = $pgName
+                ObjectName      = $objName
+                ObjectType      = $envType
+                RunType         = $runType
+                Status          = if ($status -eq 'kSuccess') { 'Succeeded' } elseif ($status -eq 'kFailure') { 'Failed' } else { $status }
+                Message         = $err
+                StartTimeUsecs  = $startUs
+                EndTimeUsecs    = $endUs
             }
         }
     }
 
-    # --- Strike Logic (failure without later success) ---
-    $grouped = $flat | Group-Object ObjectName
+    # --- Group by RunType (to check per-runType recovery) ---
+    $grouped = $flatRuns | Group-Object RunType
     foreach ($g in $grouped) {
-        $runsForObj = $g.Group | Sort-Object StartTime -Descending
-        if (-not $runsForObj) { continue }
-
-        $latestFailure = $runsForObj | Where-Object { $_.Status -eq 'kFailure' } | Select-Object -First 1
-        if (-not $latestFailure) { continue }
-
-        $laterSuccess = $runsForObj | Where-Object {
-            $_.Status -eq 'kSuccess' -and $_.StartTime -gt $latestFailure.StartTime
-        }
-
-        if (-not $laterSuccess) {
-            $AllRows += [PSCustomObject]@{
-                Cluster          = $cluster_name
-                ProtectionGroup  = $pgName
-                ObjectName       = $g.Name
-                ObjectType       = $envType
-                RunType          = $latestFailure.RunType
-                LastFailureTime  = (Convert-UsecsToDate $latestFailure.StartTime)
-                ErrorMessage     = $latestFailure.Error
+        $latestFailed = $g.Group | Where-Object { $_.Status -eq "Failed" } | Sort-Object EndTimeUsecs -Descending | Select-Object -First 1
+        if ($null -ne $latestFailed) {
+            $hasLaterSuccess = $g.Group | Where-Object {
+                $_.Status -eq "Succeeded" -and $_.StartTimeUsecs -gt $latestFailed.EndTimeUsecs
+            }
+            if (-not $hasLaterSuccess) {
+                $AllRows += [PSCustomObject]@{
+                    Cluster         = $latestFailed.Cluster
+                    ProtectionGroup = $latestFailed.ProtectionGroup
+                    ObjectName      = $latestFailed.ObjectName
+                    ObjectType      = $latestFailed.ObjectType
+                    RunType         = $latestFailed.RunType
+                    Status          = $latestFailed.Status
+                    Message         = $latestFailed.Message
+                    StartTime       = Convert-UsecsToEST $latestFailed.StartTimeUsecs
+                    EndTime         = Convert-UsecsToEST $latestFailed.EndTimeUsecs
+                }
             }
         }
     }
