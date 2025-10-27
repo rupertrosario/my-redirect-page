@@ -1,0 +1,171 @@
+<#
+.SYNOPSIS
+    Cohesity Helios Strike Report (API Key version)
+
+.DESCRIPTION
+    Uses a Helios API key (read-only) to collect only those backup objects
+    which have failed and have no later successful run across all clusters.
+#>
+
+[CmdletBinding()]
+param(
+    [Parameter()][string]$ApiKeyPath = "X:\PowerShell\Cohesity_API_Scripts\DO_NOT_Delete\apikey.txt",
+    [Parameter()][int]$days = 14,
+    [Parameter()][switch]$ShowTable,
+    [Parameter()][int]$Top = 20
+)
+
+# =========================================================
+# 0) API Key from your path
+# =========================================================
+if (-not (Test-Path $ApiKeyPath)) { throw "API key file not found at $ApiKeyPath" }
+$ApiKey = (Get-Content -Path $ApiKeyPath -Raw).Trim()
+$Headers = @{ "apiKey" = $ApiKey; "accept" = "application/json" }
+$BaseUrl = "https://helios.cohesity.com"
+
+Write-Host ""
+Write-Host "============================================="
+Write-Host "⚠️  Cohesity Helios STRIKE REPORT"
+Write-Host "============================================="
+Write-Host "READ-ONLY MODE — Using API Key authentication"
+Write-Host "Collecting jobs and failures for last $days days..."
+Write-Host ""
+
+# =========================================================
+# 1) Get Cluster Inventory
+# =========================================================
+$url = "$BaseUrl/v2/mcm/cluster-mgmt/info"
+$response  = Invoke-WebRequest -Uri $url -Headers $Headers -Method Get
+$json_clus = ($response.Content | ConvertFrom-Json).cohesityClusters
+if (-not $json_clus) { throw "❌ No clusters found under Helios account." }
+
+Write-Host ("Found {0} clusters under Helios." -f $json_clus.Count)
+Write-Host ""
+
+# =========================================================
+# 2) Helper – Convert microseconds to readable time
+# =========================================================
+function Convert-UsecsToDate($usecs) {
+    if (-not $usecs) { return "-" }
+    try { [DateTimeOffset]::FromUnixTimeMilliseconds([math]::Round($usecs/1000)).LocalDateTime.ToString("yyyy-MM-dd HH:mm:ss") }
+    catch { "-" }
+}
+
+# =========================================================
+# 3) Loop through clusters and collect persistent failures
+# =========================================================
+$strikeFailures = @()
+
+foreach ($cluster in $json_clus) {
+    $clusterName = $cluster.name
+    $clusterId   = $cluster.clusterId
+    Write-Host "🔍 Checking cluster: $clusterName ($clusterId)..."
+
+    # --- Get Protection Groups ---
+    $pgUrl = "$BaseUrl/v2/mcm/data-protect/protection-groups?clusterId=$clusterId"
+    try {
+        $pgResp = Invoke-WebRequest -Uri $pgUrl -Headers $Headers -Method Get
+        $pgs = ($pgResp.Content | ConvertFrom-Json).protectionGroups
+    } catch {
+        Write-Host "⚠️ Failed to fetch PGs for $clusterName"
+        continue
+    }
+
+    foreach ($pg in $pgs) {
+        $pgName = $pg.name
+        $envType = $pg.environment -replace '^k',''
+        $runsUrl = "$BaseUrl/v2/mcm/data-protect/protection-groups/runs?clusterId=$clusterId&protectionGroupIds=$($pg.id)&numRuns=100"
+
+        try {
+            $runsResp = Invoke-WebRequest -Uri $runsUrl -Headers $Headers -Method Get
+            $runs = ($runsResp.Content | ConvertFrom-Json).protectionRuns
+        } catch {
+            Write-Host "⚠️  Skipping PG $pgName (fetch error)"
+            continue
+        }
+
+        if (-not $runs) { continue }
+
+        # --- Flatten all task-level data per object ---
+        $flat = @()
+        foreach ($r in $runs) {
+            $runTime = $r.backupRun.base.startTimeUsecs
+            $tasks = $r.backupRun.latestFinishedTasks
+            if (-not $tasks) { continue }
+
+            foreach ($t in $tasks) {
+                $obj = $t.base.sources[0].source.displayName
+                $status = $t.base.publicStatus
+                $err = $t.base.error.errorMsg
+                $flat += [pscustomobject]@{
+                    ObjectName = $obj
+                    Status     = $status
+                    Error      = $err
+                    StartTime  = $runTime
+                }
+            }
+        }
+
+        # --- Group by ObjectName to find strikes ---
+        $grouped = $flat | Group-Object ObjectName
+        foreach ($g in $grouped) {
+            $runsForObj = $g.Group | Sort-Object StartTime -Descending
+            if (-not $runsForObj) { continue }
+
+            $latestFailure = $runsForObj | Where-Object { $_.Status -eq 'kFailure' } | Select-Object -First 1
+            if (-not $latestFailure) { continue }
+
+            # check if any later success exists after failure
+            $laterSuccess = $runsForObj | Where-Object {
+                $_.Status -eq 'kSuccess' -and $_.StartTime -gt $latestFailure.StartTime
+            }
+
+            if (-not $laterSuccess) {
+                # persistent failure — still not recovered
+                $strikeFailures += [pscustomobject]@{
+                    Cluster        = $clusterName
+                    ProtectionGroup= $pgName
+                    ObjectName     = $g.Name
+                    ObjectType     = $envType
+                    LastFailure    = (Convert-UsecsToDate $latestFailure.StartTime)
+                    ErrorMessage   = $latestFailure.Error
+                }
+            }
+        }
+    }
+}
+
+# =========================================================
+# 4) Output
+# =========================================================
+if ($strikeFailures.Count -eq 0) {
+    Write-Host "✅ No persistent failures found in last $days days."
+    return
+}
+
+$timestamp = (Get-Date).ToString("yyyy-MM-dd_HHmm")
+$outFile = "$PSScriptRoot\Helios_StrikeReport_$timestamp.csv"
+$strikeFailures | Export-Csv -NoTypeInformation -Encoding UTF8 -Path $outFile
+
+Write-Host ""
+Write-Host "============================================="
+Write-Host "📊  STRIKE REPORT SUMMARY"
+Write-Host "============================================="
+Write-Host ("Clusters Scanned   : {0}" -f $json_clus.Count)
+Write-Host ("Unrecovered Failures: {0}" -f $strikeFailures.Count)
+Write-Host ("CSV Report Saved   : {0}" -f $outFile)
+Write-Host "============================================="
+Write-Host ""
+
+# Optional table
+if ($ShowTable) {
+    $countToShow = [Math]::Min($Top, $strikeFailures.Count)
+    Write-Host "Top $countToShow Unrecovered Failures:"
+    Write-Host "---------------------------------------------"
+    $strikeFailures | Select-Object Cluster, ProtectionGroup, ObjectName, ObjectType, LastFailure, ErrorMessage -First $countToShow | Format-Table -AutoSize
+    Write-Host "---------------------------------------------"
+    Write-Host "Showing top $countToShow of total $($strikeFailures.Count) failures."
+    Write-Host ""
+}
+
+Write-Host "✅ Strike Report complete — read-only and safe."
