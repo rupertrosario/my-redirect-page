@@ -1,26 +1,35 @@
-# Assuming you already have $runs from:
-# $runs = ($response.Content | ConvertFrom-Json).protectionRuns
+# Assuming $objs holds what you showed (from $run.objects)
+# Example:
+# $objs = @(
+#     @{ id = 1886; name = "hostname"; objectType = "kPhysical" },
+#     @{ id = 1889; name = "db"; objectType = "kDatabase"; sourceId = 1886 }
+# )
 
-$databaseObjects = @()
+$results = @()
 
-foreach ($run in $runs) {
-    if (-not $run.objects) { continue }
+# Build a lookup: Physical host ID → Host name
+$hostMap = @{}
+foreach ($item in $objs) {
+    if ($item.objectType -eq 'kPhysical') {
+        $hostMap[$item.id] = $item.name
+    }
+}
 
-    foreach ($obj in $run.objects) {
-        # handle nested .object safely
-        $objNode = if ($obj.object) { $obj.object } else { $obj }
+# Map DB → Host using sourceId
+foreach ($item in $objs) {
+    if ($item.objectType -eq 'kDatabase') {
+        $hostName = if ($hostMap.ContainsKey($item.sourceId)) {
+            $hostMap[$item.sourceId]
+        } else {
+            "(unknown host)"
+        }
 
-        # pick only kDatabase
-        if ($objNode.objectType -eq "kDatabase") {
-            $databaseObjects += [pscustomobject]@{
-                ObjectName = $objNode.name
-                ObjectType = $objNode.objectType
-                ProtectionGroup = $pgName
-                Cluster = $cluster_name
-            }
+        $results += [pscustomobject]@{
+            HostName     = $hostName
+            DatabaseName = $item.name
         }
     }
 }
 
-# display or export
-$databaseObjects | Sort-Object ObjectName | Format-Table -AutoSize
+# Display
+$results | Format-Table -AutoSize
