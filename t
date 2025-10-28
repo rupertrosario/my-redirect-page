@@ -1,21 +1,22 @@
 # assume $objs = $run.objects
 
-# Extract physical hosts from inside .object
-$hosts = $objs | Where-Object { $_.object.environment -eq 'kPhysical' }
+# Step 1: Get all physical hosts (objectType = kPhysical)
+$physicalHosts = $objs | Where-Object { $_.object.objectType -eq 'kPhysical' }
 
-# Extract databases from inside .object
-$dbs   = $objs | Where-Object { $_.object.environment -eq 'kDatabase' }
+# Step 2: Get all databases (objectType = kDatabase)
+$databases = $objs | Where-Object { $_.object.objectType -eq 'kDatabase' }
 
-# Build Host–DB mapping
-$results = foreach ($db in $dbs) {
-    $host = $hosts | Where-Object { $_.object.id -eq $db.object.sourceId } | Select-Object -First 1
-    if ($host) {
+# Step 3: Map each DB to its physical host via sourceId
+$results = foreach ($db in $databases) {
+    $hostEntry = $physicalHosts | Where-Object { $_.object.id -eq $db.object.sourceId } | Select-Object -First 1
+
+    if ($hostEntry) {
         [pscustomobject]@{
-            HostName     = $host.object.name
+            HostName     = $hostEntry.object.name
             DatabaseName = $db.object.name
         }
     }
 }
 
-# Show results
+# Step 4: Display clean results
 $results
