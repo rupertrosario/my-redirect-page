@@ -1,23 +1,18 @@
-# Assuming $objs holds what you showed (from $run.objects)
-# Example:
-# $objs = @(
-#     @{ id = 1886; name = "hostname"; objectType = "kPhysical" },
-#     @{ id = 1889; name = "db"; objectType = "kDatabase"; sourceId = 1886 }
-# )
+# assume $objs is your collection (from $run.objects)
 
 $results = @()
 
-# Build a lookup: Physical host ID → Host name
+# Step 1: collect all physical hosts (environment = kPhysical)
 $hostMap = @{}
 foreach ($item in $objs) {
-    if ($item.objectType -eq 'kPhysical') {
+    if ($item.environment -eq 'kPhysical') {
         $hostMap[$item.id] = $item.name
     }
 }
 
-# Map DB → Host using sourceId
+# Step 2: collect all databases (environment = kDatabase)
 foreach ($item in $objs) {
-    if ($item.objectType -eq 'kDatabase') {
+    if ($item.environment -eq 'kDatabase') {
         $hostName = if ($hostMap.ContainsKey($item.sourceId)) {
             $hostMap[$item.sourceId]
         } else {
@@ -31,5 +26,5 @@ foreach ($item in $objs) {
     }
 }
 
-# Display
-$results | Format-Table -AutoSize
+# Step 3: show or export
+$results | Sort-Object HostName,DatabaseName | Format-Table -AutoSize
