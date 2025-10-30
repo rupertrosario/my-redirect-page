@@ -1,14 +1,7 @@
 # -------------------------------------------------------------
-# Cohesity Oracle – Unresolved Failures (Host + DB level)
-# -------------------------------------------------------------
-# Detects:
-#   1. Host discovery failures ("Failed to discover databases")
-#   2. Host or DB backup failures via failedAttempts[].message
-# Filters:
-#   • Excludes runs that have a later successful backup of same type
+# Cohesity Oracle – Unresolved Failures (Host + DB level, Latest Only)
 # -------------------------------------------------------------
 
-# --- CONFIG ---
 $cluster_name = "YourClusterName"
 $cluster_id   = "YourClusterID"
 $baseUrl      = "https://helios.cohesity.com"
@@ -20,7 +13,6 @@ if (-not (Test-Path $apiKeyPath)) { throw "API key file not found: $apiKeyPath" 
 $apiKey   = (Get-Content -Path $apiKeyPath -Raw).Trim()
 $headers  = @{ apiKey = $apiKey; accessClusterId = $cluster_id }
 
-# --- Time Conversion ---
 function Convert-ToUtcFromEpoch($v) {
     if ($null -eq $v -or $v -eq 0) { return $null }
     try { [DateTimeOffset]::FromUnixTimeMilliseconds([int64]$v).UtcDateTime }
@@ -28,7 +20,6 @@ function Convert-ToUtcFromEpoch($v) {
 }
 $tz = [System.TimeZoneInfo]::FindSystemTimeZoneById("Eastern Standard Time")
 
-# --- Get Oracle Protection Groups ---
 Write-Host "`n🔍 Fetching Oracle protection groups..." -ForegroundColor Cyan
 $pgResp = Invoke-WebRequest -Uri "$baseUrl/v2/data-protect/protection-groups" -Headers $headers -Body @{
     environments = "kOracle"; isDeleted = "False"; isPaused = "False"; isActive = "True"
@@ -38,9 +29,6 @@ if (-not $pgs) { throw "No Oracle protection groups found!" }
 
 $globalFailures = @()
 
-# =============================================================
-# MAIN LOOP: Go through each protection group
-# =============================================================
 foreach ($pg in $pgs) {
 
     $pgId   = $pg.id
@@ -64,9 +52,6 @@ foreach ($pg in $pgs) {
 
     $runs = $json.runs | Sort-Object { $_.localBackupInfo[0].startTimeUsecs }
 
-    # =========================================================
-    # Loop through each run and its localBackupInfo[]
-    # =========================================================
     foreach ($run in $runs) {
         foreach ($info in $run.localBackupInfo) {
 
@@ -79,7 +64,6 @@ foreach ($pg in $pgs) {
             $startLocal = [System.TimeZoneInfo]::ConvertTimeFromUtc((Convert-ToUtcFromEpoch $runStartUs), $tz)
             $endLocal   = [System.TimeZoneInfo]::ConvertTimeFromUtc((Convert-ToUtcFromEpoch $runEndUs),   $tz)
 
-            # --- Skip if later success exists ---
             $laterSuccess = $runs | Where-Object {
                 $_.localBackupInfo[0].runType -eq $runType -and
                 $_.localBackupInfo[0].status  -eq "Succeeded" -and
@@ -87,17 +71,13 @@ foreach ($pg in $pgs) {
             }
             if ($laterSuccess) { continue }
 
-            # =========================================================
-            # 1️⃣ HOST-LEVEL DISCOVERY FAILURES (e.g. "Failed to discover databases")
-            # =========================================================
+            # --- Host-level discovery failure ---
             if ($info.messages) {
                 foreach ($msg in $info.messages) {
                     if ($msg -match "Failed to discover databases") {
-
-                        $hostObjs = @()
-                        if ($run.objects) {
-                            $hostObjs = $run.objects | Where-Object { $_.object.environment -eq 'kPhysical' }
-                        }
+                        $hostObjs = if ($run.objects) {
+                            $run.objects | Where-Object { $_.object.environment -eq 'kPhysical' }
+                        } else { @() }
 
                         if ($hostObjs.Count -eq 0) {
                             $globalFailures += [pscustomobject]@{
@@ -128,14 +108,11 @@ foreach ($pg in $pgs) {
                 }
             }
 
-            # =========================================================
-            # 2️⃣ OBJECT-LEVEL FAILURES (DB + Host backup failures)
-            # =========================================================
+            # --- Object-level failures ---
             if ($run.objects) {
                 $dbObjs    = $run.objects | Where-Object { $_.object.objectType  -eq 'kDatabase' }
                 $hostObjs  = $run.objects | Where-Object { $_.object.environment -eq 'kPhysical' }
 
-                # --- DB-level failures ---
                 foreach ($db in $dbObjs) {
                     $attempts = $db.localSnapshotInfo.failedAttempts
                     if (-not $attempts) { continue }
@@ -164,7 +141,6 @@ foreach ($pg in $pgs) {
                     }
                 }
 
-                # --- Host-level backup failures (not discovery) ---
                 $phyObjs = $run.objects | Where-Object { $_.object.objectType -eq 'kPhysical' -and $_.localSnapshotInfo.failedAttempts }
                 foreach ($phy in $phyObjs) {
                     foreach ($fa in $phy.localSnapshotInfo.failedAttempts) {
@@ -186,17 +162,24 @@ foreach ($pg in $pgs) {
 }
 
 # =============================================================
-# OUTPUT SECTION
+# FINAL OUTPUT (show latest failure per PG only)
 # =============================================================
 if ($globalFailures.Count -gt 0) {
-    Write-Host "`n🔥 Unresolved Failures (No Later Success):`n" -ForegroundColor Cyan
-    $globalFailures | Sort-Object ProtectionGroup, Hosts, DatabaseName |
+
+    ### NEW: group by ProtectionGroup, keep latest StartTime
+    $latestFailures = $globalFailures |
+        Sort-Object ProtectionGroup, StartTime -Descending |
+        Group-Object ProtectionGroup |
+        ForEach-Object { $_.Group | Select-Object -First 1 }
+
+    Write-Host "`n🔥 Latest Unresolved Failures (No Later Success):`n" -ForegroundColor Cyan
+    $latestFailures | Sort-Object ProtectionGroup |
         Format-Table ProtectionGroup, Hosts, DatabaseName, RunType, StartTime, EndTime, FailedMessage -AutoSize
 
-    # Optional CSV export
+    # --- CSV export (latest only) ---
     $timestamp = Get-Date -Format "yyyyMMdd_HHmm"
     $csvPath = "X:\PowerShell\Cohesity_Reports\BackupFailures_Oracle_$timestamp.csv"
-    $globalFailures | Export-Csv -Path $csvPath -NoTypeInformation -Encoding UTF8
+    $latestFailures | Export-Csv -Path $csvPath -NoTypeInformation -Encoding UTF8
     Write-Host "`n📁 CSV exported to: $csvPath" -ForegroundColor Green
 } else {
     Write-Host "`n✅ No unresolved DB/Host failures found." -ForegroundColor Green
