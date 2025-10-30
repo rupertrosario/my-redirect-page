@@ -1,5 +1,5 @@
 # -------------------------------------------------------------
-# Cohesity Oracle – Unresolved DB/Host Level Failures (Single Cluster)
+# Cohesity Oracle – Unresolved DB/Host-Level Failures (Hybrid Logic)
 # -------------------------------------------------------------
 
 # --- Config ---
@@ -37,13 +37,13 @@ $pgs    = ($pgResp.Content | ConvertFrom-Json).protectionGroups
 
 $unresolved = @()
 
-# --- Loop through each Protection Group ---
+# --- Loop through each PG ---
 foreach ($pg in $pgs) {
 
     $pgId   = $pg.id
     $pgName = $pg.name
 
-    # --- Get recent runs (with object details) ---
+    # --- Get runs with object details ---
     $runUrl = "$baseUrl/v2/data-protect/protection-groups/$pgId/runs"
     $runBody = @{
         environments             = "kOracle"
@@ -58,60 +58,52 @@ foreach ($pg in $pgs) {
     $json    = $runResp | ConvertFrom-Json
     if (-not $json.runs) { continue }
 
-    # Sort runs chronologically by start time for accurate lookahead
+    # sort chronologically
     $runs = $json.runs | Sort-Object { $_.localBackupInfo[0].startTimeUsecs }
 
-    # --- Loop through each run ---
+    # --- Step 1: Find all failed runs ---
     foreach ($run in $runs) {
-        $runType = $run.localBackupInfo[0].runType
-        $runStartUsecs = $run.localBackupInfo[0].startTimeUsecs
-        $runEndUsecs   = $run.localBackupInfo[0].endTimeUsecs
-        $runStart      = Convert-ToUtcFromEpoch $runStartUsecs
-        $runEnd        = Convert-ToUtcFromEpoch $runEndUsecs
+        foreach ($info in $run.localBackupInfo) {
+            if ($info.status -eq "Failed") {
 
-        if ($run.objects) {
-            $dbObjs = $run.objects | Where-Object { $_.object.objectType -eq 'kDatabase' }
+                $runType = $info.runType
+                $runStartUsecs = $info.startTimeUsecs
+                $runEndUsecs   = $info.endTimeUsecs
+                $runStart = Convert-ToUtcFromEpoch $runStartUsecs
+                $runEnd   = Convert-ToUtcFromEpoch $runEndUsecs
 
-            foreach ($db in $dbObjs) {
-                $fails = $db.localSnapshotInfo.failedAttempts
-                if ($fails -and $fails.Count -gt 0) {
+                # --- Step 2: Check for later success ---
+                $laterSuccess = $runs | Where-Object {
+                    $_.localBackupInfo[0].runType -eq $runType -and
+                    $_.localBackupInfo[0].status -eq "Succeeded" -and
+                    $_.localBackupInfo[0].startTimeUsecs -gt $runEndUsecs
+                }
 
-                    foreach ($f in $fails) {
-                        if ($f.message) {
-                            $dbId = $db.object.id
-                            $hostsMatch = $run.objects | Where-Object { $_.object.id -eq $db.object.sourceId -and $_.object.environment -eq 'kPhysical' } | Select-Object -First 1
-                            $hostId   = if ($hostsMatch) { $hostsMatch.object.id } else { $null }
-                            $hostName = if ($hostsMatch) { $hostsMatch.object.name } else { 'N/A' }
+                if (-not $laterSuccess) {
+                    # --- Step 3: Drill into objects ---
+                    if ($run.objects) {
+                        $dbs      = $run.objects | Where-Object { $_.object.objectType -eq 'kDatabase' }
+                        $hostsObj = $run.objects | Where-Object { $_.object.environment -eq 'kPhysical' }
 
-                            # --- Check for any LATER success for this DB or host ---
-                            $laterSuccess = $false
-                            foreach ($r2 in $runs) {
-                                if ($r2.localBackupInfo[0].startTimeUsecs -le $runEndUsecs) { continue }  # skip earlier runs
-                                if ($r2.objects) {
-                                    foreach ($o2 in $r2.objects) {
-                                        if (
-                                            ($o2.object.id -eq $dbId -or $o2.object.id -eq $hostId) -and
-                                            $o2.localSnapshotInfo.status -eq "kSuccess"
-                                        ) {
-                                            $laterSuccess = $true
-                                            break
+                        foreach ($db in $dbs) {
+                            $fails = $db.localSnapshotInfo.failedAttempts
+                            if ($fails -and $fails.Count -gt 0) {
+                                foreach ($f in $fails) {
+                                    if ($f.message) {
+                                        $hostMatch = $hostsObj | Where-Object { $_.object.id -eq $db.object.sourceId } | Select-Object -First 1
+                                        $hostName = if ($hostMatch) { $hostMatch.object.name } else { 'N/A' }
+
+                                        $unresolved += [pscustomobject]@{
+                                            Cluster         = $cluster_name
+                                            ProtectionGroup = $pgName
+                                            Hosts           = $hostName
+                                            DatabaseName    = $db.object.name
+                                            RunType         = $runType
+                                            StartTime       = [System.TimeZoneInfo]::ConvertTimeFromUtc($runStart, $estZone)
+                                            EndTime         = [System.TimeZoneInfo]::ConvertTimeFromUtc($runEnd, $estZone)
+                                            FailedMessage   = $f.message
                                         }
                                     }
-                                }
-                                if ($laterSuccess) { break }
-                            }
-
-                            # --- Only record if no later success exists ---
-                            if (-not $laterSuccess) {
-                                $unresolved += [pscustomobject]@{
-                                    Cluster         = $cluster_name
-                                    ProtectionGroup = $pgName
-                                    Hosts           = $hostName
-                                    DatabaseName    = $db.object.name
-                                    RunType         = $runType
-                                    StartTime       = if ($runStart) { [System.TimeZoneInfo]::ConvertTimeFromUtc($runStart, $estZone) } else { $null }
-                                    EndTime         = if ($runEnd)   { [System.TimeZoneInfo]::ConvertTimeFromUtc($runEnd, $estZone) } else { $null }
-                                    FailedMessage   = $f.message
                                 }
                             }
                         }
