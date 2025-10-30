@@ -2,7 +2,7 @@
 # Cohesity Oracle Failures – Multi-Cluster (Helios)
 # Strictly READ-ONLY (GET-only)
 # Adds Host–DB mapping from $run.objects
-# Safe timestamp conversion
+# Safe timestamp conversion + guaranteed Cluster column
 # -------------------------------------------------------------
 
 $logDirectory = "X:\PowerShell\Data\Cohesity\BackupFailures"
@@ -33,9 +33,7 @@ $commonHeaders = @{ "apiKey" = $apiKey }
 # -------------------------------------------------------------
 $url = "https://helios.cohesity.com/v2/mcm/cluster-mgmt/info"
 $response = Invoke-WebRequest -Method Get -Uri $url -Headers $commonHeaders
-$json_clu = $response.Content | ConvertFrom-Json
-$json_clu = $json_clu.cohesityClusters
-
+$json_clu = ($response.Content | ConvertFrom-Json).cohesityClusters
 if (-not $json_clu) { throw "No clusters returned from Helios." }
 
 # -------------------------------------------------------------
@@ -45,14 +43,9 @@ function Convert-ToLocalFromEpoch($v, $tz) {
     if (-not $v -or $v -eq 0) { return $null }
     try {
         $utc = [DateTimeOffset]::FromUnixTimeMilliseconds([int64]($v / 1000)).UtcDateTime
-        if ($tz) {
-            return [System.TimeZoneInfo]::ConvertTimeFromUtc($utc, $tz)
-        } else {
-            return $utc.ToLocalTime()
-        }
-    } catch {
-        return $null
-    }
+        if ($tz) { return [System.TimeZoneInfo]::ConvertTimeFromUtc($utc, $tz) }
+        else { return $utc.ToLocalTime() }
+    } catch { return $null }
 }
 
 $tz = [System.TimeZoneInfo]::FindSystemTimeZoneById("Eastern Standard Time")
@@ -63,8 +56,14 @@ $globalFailures = @()
 # 3️⃣ Iterate through each cluster
 # -------------------------------------------------------------
 foreach ($cluster in $json_clu) {
+
+    # --- Cluster name fallback logic ---
     $cluster_name = $cluster.name
-    $cluster_id   = $cluster.clusterId
+    if ([string]::IsNullOrWhiteSpace($cluster_name)) { $cluster_name = $cluster.clusterName }
+    if ([string]::IsNullOrWhiteSpace($cluster_name)) { $cluster_name = $cluster.displayName }
+    if ([string]::IsNullOrWhiteSpace($cluster_name)) { $cluster_name = "Unknown-$($cluster.clusterId)" }
+
+    $cluster_id = $cluster.clusterId
     Write-Host "`n🔹 Processing cluster: $cluster_name" -ForegroundColor Cyan
 
     $headers = @{ apiKey = $apiKey; accessClusterId = $cluster_id }
@@ -95,8 +94,14 @@ foreach ($cluster in $json_clu) {
             includeObjectDetails     = "True"
         }
 
-        $runResp = Invoke-WebRequest -Uri $runUrl -Headers $headers -Body $runBody -Method Get
-        $jsonRuns = $runResp | ConvertFrom-Json
+        try {
+            $runResp = Invoke-WebRequest -Uri $runUrl -Headers $headers -Body $runBody -Method Get
+            $jsonRuns = $runResp | ConvertFrom-Json
+        } catch {
+            Write-Host "⚠️ Failed to fetch runs for PG: $pgName on $cluster_name. Skipping..." -ForegroundColor Yellow
+            continue
+        }
+
         if (-not $jsonRuns.runs) { continue }
 
         $runs = $jsonRuns.runs | Sort-Object { $_.localBackupInfo[0].startTimeUsecs }
@@ -110,10 +115,8 @@ foreach ($cluster in $json_clu) {
             $info = $latestRun.localBackupInfo[0]
             $status = $info.status
             $runType = $info.runType
-            $runStartUs = [int64]$info.startTimeUsecs
-            $runEndUs   = [int64]$info.endTimeUsecs
-            $startLocal = Convert-ToLocalFromEpoch $runStartUs $tz
-            $endLocal   = Convert-ToLocalFromEpoch $runEndUs   $tz
+            $startLocal = Convert-ToLocalFromEpoch $info.startTimeUsecs $tz
+            $endLocal   = Convert-ToLocalFromEpoch $info.endTimeUsecs   $tz
 
             if ($status -eq "Succeeded" -or $status -eq "SucceededWithWarning") {
                 Write-Host "✅ $cluster_name → $pgName [$rType] – Latest run succeeded" -ForegroundColor Green
@@ -133,13 +136,13 @@ foreach ($cluster in $json_clu) {
                         foreach ($fa in $attempts) {
                             $msgClean = ($fa.message -replace '[\r\n]+',' ' -replace ',',' ' -replace '"','''').Trim()
                             $parentHost = $hostObjs | Where-Object { $_.object.id -eq $db.object.sourceId } | Select-Object -First 1
-                            $hostName = if ($parentHost) { $parentHost.object.name } else { "N/A" }
+                            $hosts = if ($parentHost) { $parentHost.object.name } else { "N/A" }
 
                             $globalFailures += [pscustomobject]@{
                                 Cluster         = $cluster_name
                                 ProtectionGroup = $pgName
                                 RunType         = $runType
-                                Hosts           = $hostName
+                                Hosts           = $hosts
                                 DatabaseName    = $db.object.name
                                 StartTime       = $startLocal
                                 EndTime         = $endLocal
