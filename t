@@ -1,16 +1,14 @@
 # -------------------------------------------------------------
 # Cohesity Oracle Failures – Multi-Cluster (Helios)
-# Strictly READ-ONLY (GET-only)
-# Adds Host–DB mapping from $run.objects
+# Unified Host–DB–Failure Table (using object.objectType)
 # -------------------------------------------------------------
 
 $logDirectory = "X:\PowerShell\Data\Cohesity\BackupFailures"
 
-# Ensure folder exists and clean up if more than 50 files
+# Ensure folder exists and cleanup old logs
 if (-not (Test-Path -Path $logDirectory -PathType Container)) {
     New-Item -Path $logDirectory -ItemType Directory
 }
-
 $fileCount = (Get-ChildItem -Path $logDirectory -File).Count
 if ($fileCount -gt 50) {
     $filesToDelete = Get-ChildItem -Path $logDirectory -File |
@@ -20,7 +18,7 @@ if ($fileCount -gt 50) {
 }
 
 # -------------------------------------------------------------
-# 0️⃣ API key from your path
+# API Key setup
 # -------------------------------------------------------------
 $apikeypath = "X:\PowerShell\Cohesity_API_Scripts\DO_NOT_Delete\apikey.txt"
 if (-not (Test-Path $apikeypath)) { throw "API key file not found at $apikeypath" }
@@ -28,21 +26,16 @@ $apiKey = (Get-Content -Path $apikeypath -Raw).Trim()
 $commonHeaders = @{ "apiKey" = $apiKey }
 
 # -------------------------------------------------------------
-# 1️⃣ Get Clusters (ClusterName + ClusterId)
+# Get all clusters from Helios
 # -------------------------------------------------------------
 $url = "https://helios.cohesity.com/v2/mcm/cluster-mgmt/info"
 $response = Invoke-WebRequest -Method Get -Uri $url -Headers $commonHeaders
-$json_clu = $response.Content | ConvertFrom-Json
-$json_clu = $json_clu.cohesityClusters
+$json_clu = ($response.Content | ConvertFrom-Json).cohesityClusters
 
-# -------------------------------------------------------------
-# Initialize containers
-# -------------------------------------------------------------
 $globalFailures = @()
-$globalHostDb   = @()
 
 # -------------------------------------------------------------
-# 2️⃣ Loop through all clusters and collect protection groups
+# Process all clusters
 # -------------------------------------------------------------
 foreach ($clus in $json_clu) {
 
@@ -62,9 +55,8 @@ foreach ($clus in $json_clu) {
     }
 
     $pgUrl = "https://helios.cohesity.com/v2/data-protect/protection-groups"
-    $response = Invoke-WebRequest -Method Get -Uri $pgUrl -Headers $headers -Body $body
-    $pgResponse = $response.Content | ConvertFrom-Json
-    $pgs = $pgResponse.protectionGroups
+    $pgResponse = Invoke-WebRequest -Method Get -Uri $pgUrl -Headers $headers -Body $body
+    $pgs = ($pgResponse.Content | ConvertFrom-Json).protectionGroups
 
     foreach ($pg in $pgs) {
         $pgId   = $pg.id
@@ -85,61 +77,53 @@ foreach ($clus in $json_clu) {
         }
 
         $runUrl = "https://helios.cohesity.com/v2/data-protect/protection-groups/$pgId/runs"
-        $response = Invoke-WebRequest -Method Get -Uri $runUrl -Headers $headers -Body $body
-        $json = $response | ConvertFrom-Json
-
+        $runResponse = Invoke-WebRequest -Method Get -Uri $runUrl -Headers $headers -Body $body
+        $json = $runResponse | ConvertFrom-Json
         if ($null -eq $json -or -not $json.runs) { continue }
-        $runs = $json.runs
 
-        # ---------------------------------------------------------
-        # Flatten all run-level backup info
-        # ---------------------------------------------------------
+        $runs = $json.runs
         $flatRuns = @()
+
         foreach ($run in $runs) {
+
+            # 🔹 Map Host–DB relationships (if present)
+            $hostName = $null
+            $dbName   = $null
+            if ($run.objects) {
+                $objs  = $run.objects
+                $hosts = $objs | Where-Object { $_.object.objectType -eq 'kPhysical' }
+                $dbs   = $objs | Where-Object { $_.object.objectType -eq 'kDatabase' }
+
+                foreach ($db in $dbs) {
+                    $host = $hosts | Where-Object { $_.object.id -eq $db.object.sourceId } | Select-Object -First 1
+                    if ($host) {
+                        $hostName = $host.object.name
+                        $dbName   = $db.object.name
+                    }
+                }
+            }
+
+            # 🔹 Capture backup run info
             if ($run.localBackupInfo) {
                 foreach ($info in $run.localBackupInfo) {
                     $flatRuns += [pscustomobject]@{
-                        RunType          = $info.runType
-                        Status           = $info.status
-                        Message          = $info.messages
-                        StartTimeUsecs   = $info.startTimeUsecs
-                        EndTimeUsecs     = $info.endTimeUsecs
                         Cluster          = $cluster_name
                         ProtectionGroup  = $pgName
+                        HostName         = $hostName
+                        DatabaseName     = $dbName
+                        RunType          = $info.runType
+                        Status           = $info.status
+                        Message          = ($info.messages -join " ")
+                        StartTimeUsecs   = $info.startTimeUsecs
+                        EndTimeUsecs     = $info.endTimeUsecs
                     }
                 }
-            }
-
-            # -----------------------------------------------------
-            # 🔹 NEW: Extract Host–DB mapping from run.objects
-            # -----------------------------------------------------
-            if ($run.objects) {
-                $objs  = $run.objects
-                $hosts = $objs | Where-Object { $_.object.environment -eq 'kPhysical' }
-                $dbs   = $objs | Where-Object { $_.object.environment -eq 'kDatabase' }
-
-                $hostDbMappings = foreach ($db in $dbs) {
-                    $host = $hosts | Where-Object { $_.object.id -eq $db.object.sourceId } | Select-Object -First 1
-                    if ($host) {
-                        [pscustomobject]@{
-                            Cluster       = $cluster_name
-                            ProtectionJob = $pgName
-                            HostName      = $host.object.name
-                            DatabaseName  = $db.object.name
-                        }
-                    }
-                }
-
-                if ($hostDbMappings) { $globalHostDb += $hostDbMappings }
             }
         }
 
-        # Skip if no runs
         if ($flatRuns.Count -eq 0) { continue }
 
-        # ---------------------------------------------------------
-        # Convert Epoch to UTC helper
-        # ---------------------------------------------------------
+        # --- Convert Epoch Helper ---
         function Convert-ToUtcFromEpoch($v) {
             if ($null -eq $v -or $v -eq 0) { return $null }
             try {
@@ -149,9 +133,7 @@ foreach ($clus in $json_clu) {
             }
         }
 
-        # ---------------------------------------------------------
-        # Group by RunType and detect last failure without success
-        # ---------------------------------------------------------
+        # --- Group by RunType and detect failed without later success ---
         $grouped = $flatRuns | Group-Object RunType
         foreach ($g in $grouped) {
             $latestFailed = $g.Group | Where-Object { $_.Status -eq "Failed" } |
@@ -170,11 +152,13 @@ foreach ($clus in $json_clu) {
                 $globalFailures += [pscustomobject]@{
                     Cluster         = $latestFailed.Cluster
                     ProtectionGroup = $latestFailed.ProtectionGroup
+                    HostName        = $latestFailed.HostName
+                    DatabaseName    = $latestFailed.DatabaseName
                     RunType         = $latestFailed.RunType
                     Status          = $latestFailed.Status
-                    Message         = $latestFailed.Message -join ' '
-                    StartTime       = if ($startUtc) { [System.TimeZoneInfo]::ConvertTimeFromUtc($startUtc, $estZone) } else { $null }
-                    EndTime         = if ($endUtc)   { [System.TimeZoneInfo]::ConvertTimeFromUtc($endUtc, $estZone) } else { $null }
+                    Message         = $latestFailed.Message
+                    StartTime       = if ($startUtc) { [System.TimeZoneInfo]::ConvertTimeFromUtc($startUtc, $estZone) }
+                    EndTime         = if ($endUtc)   { [System.TimeZoneInfo]::ConvertTimeFromUtc($endUtc, $estZone) }
                 }
             }
         }
@@ -182,33 +166,18 @@ foreach ($clus in $json_clu) {
 }
 
 # -------------------------------------------------------------
-# Print backup failures summary
+# 📊 Unified Output: Failures + Host–DB Info
 # -------------------------------------------------------------
 if ($globalFailures.Count -gt 0) {
-    Write-Host "`n🔥 Backup Failures Without Later Success Across All Clusters ---`n"
+    Write-Host "`n🔥 Backup Failures with Host–DB Mapping ---`n"
     $globalFailures |
         Sort-Object Cluster, EndTime -Descending |
-        Format-Table Cluster, StartTime, EndTime, ProtectionGroup, RunType, Status, Message -AutoSize
+        Format-Table Cluster, ProtectionGroup, HostName, DatabaseName, RunType, Status, Message, StartTime, EndTime -AutoSize
 
-    # Export failures to CSV
     $reportDate = Get-Date -Format "yyyy-MM-dd_HHmm"
-    $excelFile = "$logDirectory\BackupFailures_AllClusters_ORA_$reportDate.csv"
-    $globalFailures | Export-Csv -Path $excelFile -NoTypeInformation -Encoding UTF8
-    Write-Host "`n✅ Saved failures CSV report to $excelFile"
+    $csvFile = "$logDirectory\Cohesity_ORA_Failures_WithHostDB_$reportDate.csv"
+    $globalFailures | Export-Csv -Path $csvFile -NoTypeInformation -Encoding UTF8
+    Write-Host "`n✅ Saved unified report to $csvFile"
 } else {
     Write-Host "`n✅ No failed backups without later success found."
-}
-
-# -------------------------------------------------------------
-# Export Host–DB Mapping Summary
-# -------------------------------------------------------------
-if ($globalHostDb.Count -gt 0) {
-    Write-Host "`n💾 Host–Database Mapping Summary ---`n"
-    $globalHostDb | Format-Table Cluster, ProtectionJob, HostName, DatabaseName -AutoSize
-
-    $csvPath = "$logDirectory\Host_DB_Mapping.csv"
-    $globalHostDb | Export-Csv -Path $csvPath -NoTypeInformation -Encoding UTF8
-    Write-Host "✅ Saved Host–DB mapping to $csvPath"
-} else {
-    Write-Host "`n⚠️ No Host–Database mapping details found."
 }
