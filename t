@@ -1,12 +1,12 @@
 # -------------------------------------------------------------
-# Cohesity Oracle – Latest Run Status (Full + Log, DB + Host Shown)
+# Cohesity Oracle – Latest Failures (Sorted by PG + EndTime)
 # -------------------------------------------------------------
 # ✅ Single cluster
 # ✅ Checks latest localBackupInfo per runType
-# ✅ Shows DB + Host names when latest run failed
-# ✅ Ignores PGs where latest runType succeeded
-# ✅ Sorted by EndTime descending
-# ✅ No CSV export (path retained for future)
+# ✅ Shows DB + Host names for failures
+# ✅ Skips successful runTypes
+# ✅ Sorted by ProtectionGroup + EndTime descending
+# ✅ Console-only output (no CSV)
 # -------------------------------------------------------------
 
 $cluster_name = "YourClusterName"
@@ -66,7 +66,8 @@ foreach ($pg in $pgs) {
     # --- Group by runType (kFull, kLog, etc.) ---
     $runTypes = $runs.localBackupInfo.runType | Select-Object -Unique
     foreach ($rType in $runTypes) {
-        $latestRun = $runs | Where-Object { $_.localBackupInfo[0].runType -eq $rType } | Sort-Object { $_.localBackupInfo[0].endTimeUsecs } -Descending | Select-Object -First 1
+        $latestRun = $runs | Where-Object { $_.localBackupInfo[0].runType -eq $rType } |
+            Sort-Object { $_.localBackupInfo[0].endTimeUsecs } -Descending | Select-Object -First 1
         if (-not $latestRun) { continue }
 
         $info = $latestRun.localBackupInfo[0]
@@ -82,10 +83,10 @@ foreach ($pg in $pgs) {
             continue
         }
 
-        Write-Host "❌ PG: $pgName [$rType] – Latest run failed, checking details..." -ForegroundColor Red
+        Write-Host "❌ PG: $pgName [$rType] – Latest run failed, collecting details..." -ForegroundColor Red
 
         # =========================================================
-        # If latest run failed → collect DB & Host level messages
+        # Collect DB and Host failures
         # =========================================================
         $run = $latestRun
         if ($run.objects) {
@@ -104,9 +105,9 @@ foreach ($pg in $pgs) {
                         $globalFailures += [pscustomobject]@{
                             Cluster         = $cluster_name
                             ProtectionGroup = $pgName
+                            RunType         = $runType
                             Hosts           = $hostName
                             DatabaseName    = $db.object.name
-                            RunType         = $runType
                             StartTime       = $startLocal
                             EndTime         = $endLocal
                             FailedMessage   = $msgClean
@@ -124,9 +125,9 @@ foreach ($pg in $pgs) {
                         $globalFailures += [pscustomobject]@{
                             Cluster         = $cluster_name
                             ProtectionGroup = $pgName
+                            RunType         = $runType
                             Hosts           = $phy.object.name
                             DatabaseName    = "No DBs Discovered"
-                            RunType         = $runType
                             StartTime       = $startLocal
                             EndTime         = $endLocal
                             FailedMessage   = $msgClean
@@ -139,17 +140,20 @@ foreach ($pg in $pgs) {
 }
 
 # =============================================================
-# OUTPUT SECTION (Console only)
+# OUTPUT SECTION
 # =============================================================
 if ($globalFailures.Count -gt 0) {
     Write-Host "`n🔥 Latest Failed Oracle Runs (Cluster: $cluster_name):`n" -ForegroundColor Cyan
-    $sorted = $globalFailures | Sort-Object EndTime -Descending
+
+    # --- Sort by PG + EndTime (Descending) ---
+    $sorted = $globalFailures | Sort-Object ProtectionGroup, EndTime -Descending
+
     $sorted | Format-Table ProtectionGroup, RunType, Hosts, DatabaseName, StartTime, EndTime, FailedMessage -AutoSize
 } else {
     Write-Host "`n✅ All latest Oracle runs succeeded on $cluster_name." -ForegroundColor Green
 }
 
-# Retain CSV path reference
+# Reference CSV path (disabled for now)
 $timestamp = Get-Date -Format "yyyyMMdd_HHmm"
 $csvPath = "X:\PowerShell\Data\Choesity\BackupFailures\BackupFailures_Oracle_AllClusters_$timestamp.csv"
 Write-Host "`n📂 (CSV path ready if needed later): $csvPath" -ForegroundColor Gray
