@@ -1,14 +1,15 @@
 # -------------------------------------------------------------
 # Cohesity Oracle Failures – Multi-Cluster (Helios)
-# Unified Host–DB–Failure Table (using object.objectType)
+# Unified Host–DB–Failure Table (corrected brackets)
 # -------------------------------------------------------------
 
 $logDirectory = "X:\PowerShell\Data\Cohesity\BackupFailures"
 
 # Ensure folder exists and cleanup old logs
 if (-not (Test-Path -Path $logDirectory -PathType Container)) {
-    New-Item -Path $logDirectory -ItemType Directory
+    New-Item -Path $logDirectory -ItemType Directory | Out-Null
 }
+
 $fileCount = (Get-ChildItem -Path $logDirectory -File).Count
 if ($fileCount -gt 50) {
     $filesToDelete = Get-ChildItem -Path $logDirectory -File |
@@ -21,7 +22,10 @@ if ($fileCount -gt 50) {
 # API Key setup
 # -------------------------------------------------------------
 $apikeypath = "X:\PowerShell\Cohesity_API_Scripts\DO_NOT_Delete\apikey.txt"
-if (-not (Test-Path $apikeypath)) { throw "API key file not found at $apikeypath" }
+if (-not (Test-Path $apikeypath)) {
+    throw "API key file not found at $apikeypath"
+}
+
 $apiKey = (Get-Content -Path $apikeypath -Raw).Trim()
 $commonHeaders = @{ "apiKey" = $apiKey }
 
@@ -35,7 +39,19 @@ $json_clu = ($response.Content | ConvertFrom-Json).cohesityClusters
 $globalFailures = @()
 
 # -------------------------------------------------------------
-# Process all clusters
+# Helper: Convert epoch to UTC
+# -------------------------------------------------------------
+function Convert-ToUtcFromEpoch($v) {
+    if ($null -eq $v -or $v -eq 0) { return $null }
+    try {
+        return [DateTimeOffset]::FromUnixTimeMilliseconds([int64]$v).UtcDateTime
+    } catch {
+        return [DateTimeOffset]::FromUnixTimeMilliseconds([int64]([double]$v / 1000)).UtcDateTime
+    }
+}
+
+# -------------------------------------------------------------
+# Process each cluster
 # -------------------------------------------------------------
 foreach ($clus in $json_clu) {
 
@@ -59,6 +75,7 @@ foreach ($clus in $json_clu) {
     $pgs = ($pgResponse.Content | ConvertFrom-Json).protectionGroups
 
     foreach ($pg in $pgs) {
+
         $pgId   = $pg.id
         $pgName = $pg.name
 
@@ -79,16 +96,20 @@ foreach ($clus in $json_clu) {
         $runUrl = "https://helios.cohesity.com/v2/data-protect/protection-groups/$pgId/runs"
         $runResponse = Invoke-WebRequest -Method Get -Uri $runUrl -Headers $headers -Body $body
         $json = $runResponse | ConvertFrom-Json
-        if ($null -eq $json -or -not $json.runs) { continue }
+
+        if ($null -eq $json -or -not $json.runs) {
+            continue
+        }
 
         $runs = $json.runs
         $flatRuns = @()
 
         foreach ($run in $runs) {
 
-            # 🔹 Map Host–DB relationships (if present)
+            # --- Host–DB mapping ---
             $hostName = $null
             $dbName   = $null
+
             if ($run.objects) {
                 $objs  = $run.objects
                 $hosts = $objs | Where-Object { $_.object.objectType -eq 'kPhysical' }
@@ -103,7 +124,7 @@ foreach ($clus in $json_clu) {
                 }
             }
 
-            # 🔹 Capture backup run info
+            # --- Backup run info ---
             if ($run.localBackupInfo) {
                 foreach ($info in $run.localBackupInfo) {
                     $flatRuns += [pscustomobject]@{
@@ -119,25 +140,19 @@ foreach ($clus in $json_clu) {
                     }
                 }
             }
-        }
+        } # end foreach $run
 
         if ($flatRuns.Count -eq 0) { continue }
 
-        # --- Convert Epoch Helper ---
-        function Convert-ToUtcFromEpoch($v) {
-            if ($null -eq $v -or $v -eq 0) { return $null }
-            try {
-                return [DateTimeOffset]::FromUnixTimeMilliseconds([int64]$v).UtcDateTime
-            } catch {
-                return [DateTimeOffset]::FromUnixTimeMilliseconds([int64]([double]$v / 1000)).UtcDateTime
-            }
-        }
-
         # --- Group by RunType and detect failed without later success ---
         $grouped = $flatRuns | Group-Object RunType
+
         foreach ($g in $grouped) {
-            $latestFailed = $g.Group | Where-Object { $_.Status -eq "Failed" } |
-                Sort-Object EndTimeUsecs -Descending | Select-Object -First 1
+            $latestFailed = $g.Group |
+                Where-Object { $_.Status -eq "Failed" } |
+                Sort-Object EndTimeUsecs -Descending |
+                Select-Object -First 1
+
             if ($null -eq $latestFailed) { continue }
 
             $hasLaterSuccess = $g.Group | Where-Object {
@@ -157,16 +172,16 @@ foreach ($clus in $json_clu) {
                     RunType         = $latestFailed.RunType
                     Status          = $latestFailed.Status
                     Message         = $latestFailed.Message
-                    StartTime       = if ($startUtc) { [System.TimeZoneInfo]::ConvertTimeFromUtc($startUtc, $estZone) }
-                    EndTime         = if ($endUtc)   { [System.TimeZoneInfo]::ConvertTimeFromUtc($endUtc, $estZone) }
+                    StartTime       = if ($startUtc) { [System.TimeZoneInfo]::ConvertTimeFromUtc($startUtc, $estZone) } else { $null }
+                    EndTime         = if ($endUtc)   { [System.TimeZoneInfo]::ConvertTimeFromUtc($endUtc, $estZone) } else { $null }
                 }
             }
-        }
-    }
-}
+        } # end foreach group
+    } # end foreach PG
+} # end foreach cluster
 
 # -------------------------------------------------------------
-# 📊 Unified Output: Failures + Host–DB Info
+# Output results
 # -------------------------------------------------------------
 if ($globalFailures.Count -gt 0) {
     Write-Host "`n🔥 Backup Failures with Host–DB Mapping ---`n"
@@ -178,6 +193,7 @@ if ($globalFailures.Count -gt 0) {
     $csvFile = "$logDirectory\Cohesity_ORA_Failures_WithHostDB_$reportDate.csv"
     $globalFailures | Export-Csv -Path $csvFile -NoTypeInformation -Encoding UTF8
     Write-Host "`n✅ Saved unified report to $csvFile"
-} else {
+}
+else {
     Write-Host "`n✅ No failed backups without later success found."
 }
