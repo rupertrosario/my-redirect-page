@@ -1,23 +1,22 @@
 # -------------------------------------------------------------
-# Cohesity Oracle — Unresolved DB/Host failures (run-first + object drill)
+# Cohesity Oracle – Unresolved DB/Host Failures (Run-first + Object drill, Task-ID matched)
 # -------------------------------------------------------------
 
-# ==== CONFIG (single cluster) ====
+# --- Config ---
 $cluster_name = "YourClusterName"
 $cluster_id   = "YourClusterID"
 $baseUrl      = "https://helios.cohesity.com"
 $apikeypath   = "X:\PowerShell\Cohesity_API_Scripts\DO_NOT_Delete\apikey.txt"
-$numRuns      = 30  # increase if you need a deeper lookback
+$numRuns      = 30
 $logDirectory = "X:\PowerShell\Data\Cohesity\BackupFailures"
 
-# ==== PREP ====
+# --- Prep ---
 if (-not (Test-Path $apikeypath)) { throw "API key file not found: $apikeypath" }
 $apiKey = (Get-Content -Path $apikeypath -Raw).Trim()
-
 if (-not (Test-Path $logDirectory)) { New-Item -Path $logDirectory -ItemType Directory | Out-Null }
 
-function Convert-ToUtcFromEpoch($v){
-    if($null -eq $v -or $v -eq 0){ return $null }
+function Convert-ToUtcFromEpoch($v) {
+    if ($null -eq $v -or $v -eq 0) { return $null }
     try   { [DateTimeOffset]::FromUnixTimeMilliseconds([int64]$v).UtcDateTime }
     catch { [DateTimeOffset]::FromUnixTimeMilliseconds([int64]([double]$v / 1000)).UtcDateTime }
 }
@@ -28,7 +27,7 @@ $headers = @{
     accessClusterId = "$cluster_id"
 }
 
-# ==== Get Oracle PGs ====
+# --- Get Oracle PGs ---
 $pgResp = Invoke-WebRequest -Method GET -Uri "$baseUrl/v2/data-protect/protection-groups" -Headers $headers -Body @{
     environments = "kOracle"
     isDeleted    = "False"
@@ -44,7 +43,7 @@ foreach ($pg in $pgs) {
     $pgId   = $pg.id
     $pgName = $pg.name
 
-    # Get runs (must include object details!)
+    # --- Get runs (with object details) ---
     $runsResp = Invoke-WebRequest -Method GET -Uri "$baseUrl/v2/data-protect/protection-groups/$pgId/runs" -Headers $headers -Body @{
         environments             = "kOracle"
         isDeleted                = "False"
@@ -57,10 +56,9 @@ foreach ($pg in $pgs) {
     $runsJson = $runsResp | ConvertFrom-Json
     if (-not $runsJson.runs) { continue }
 
-    # Sort ascending by run start (so "later" means greater startTimeUsecs)
     $runs = $runsJson.runs | Sort-Object { $_.localBackupInfo[0].startTimeUsecs }
 
-    # --- STEP 1: Identify failed runs (at run level) ---
+    # --- Step 1: Find all failed runs ---
     $failedRunRecords = foreach ($run in $runs) {
         foreach ($info in ($run.localBackupInfo | Where-Object { $_ })) {
             if ($info.status -eq "Failed") {
@@ -79,7 +77,7 @@ foreach ($pg in $pgs) {
 
     foreach ($fail in $failedRunRecords) {
 
-        # --- STEP 2: Check for any LATER success for this runType ---
+        # --- Step 2: Check for later success for same runType ---
         $laterSuccessExists = $false
         foreach ($r2 in $runs) {
             foreach ($i2 in ($r2.localBackupInfo | Where-Object { $_ })) {
@@ -92,9 +90,9 @@ foreach ($pg in $pgs) {
             }
             if ($laterSuccessExists) { break }
         }
-        if ($laterSuccessExists) { continue }  # resolved; skip
+        if ($laterSuccessExists) { continue }  # skip resolved runs
 
-        # --- STEP 3: Drill into the objects[] of THIS failed run ONLY ---
+        # --- Step 3: Drill into this failed run's objects[] ---
         $run = $fail.RunObj
         if (-not $run.objects) { continue }
 
@@ -106,53 +104,49 @@ foreach ($pg in $pgs) {
 
         foreach ($db in $dbObjs) {
             $failedAttempts = $db.localSnapshotInfo.failedAttempts
+            if (-not $failedAttempts) { continue }
 
-            if ($failedAttempts -and $failedAttempts.Count -gt 0) {
-
-                # Optional progressTaskId match at object level (only show if it matches when present)
-                $matchingAttempts = @()
-                foreach ($fa in $failedAttempts) {
-                    $objPT = $fa.progressTaskId
-                    if ($null -ne $objPT -and $null -ne $fail.ProgressTaskId) {
-                        if ($objPT -eq $fail.ProgressTaskId) { $matchingAttempts += $fa }
-                    } else {
-                        # If either side lacks progressTaskId, we accept (keeps behavior sane across API variants)
-                        $matchingAttempts += $fa
-                    }
+            # Optional task-ID filter for precise match
+            $matchingAttempts = foreach ($fa in $failedAttempts) {
+                $objPT = $fa.progressTaskId
+                if ($null -ne $objPT -and $null -ne $fail.ProgressTaskId) {
+                    if ($objPT -eq $fail.ProgressTaskId) { $fa }
                 }
+                else { $fa }  # accept if taskId not present on one side
+            }
 
-                foreach ($fa in $matchingAttempts) {
-                    if (-not $fa.message) { continue }
+            foreach ($fa in $matchingAttempts) {
+                if (-not $fa.message) { continue }
 
-                    $host = $hostsObjs | Where-Object { $_.object.id -eq $db.object.sourceId } | Select-Object -First 1
-                    $hostName = if ($host) { $host.object.name } else { 'N/A' }
+                $hostObj = $hostsObjs | Where-Object { $_.object.id -eq $db.object.sourceId } | Select-Object -First 1
+                $hostName = if ($hostObj) { $hostObj.object.name } else { 'N/A' }
 
-                    $rows += [pscustomobject]@{
-                        Cluster         = $cluster_name
-                        ProtectionGroup = $pgName
-                        Hosts           = $hostName
-                        DatabaseName    = $db.object.name
-                        RunType         = $fail.RunType
-                        StartTime       = $startLocal
-                        EndTime         = $endLocal
-                        FailedMessage   = $fa.message
-                        ProgressTaskId  = $fail.ProgressTaskId
-                    }
+                $rows += [pscustomobject]@{
+                    Cluster         = $cluster_name
+                    ProtectionGroup = $pgName
+                    Hosts           = $hostName
+                    DatabaseName    = $db.object.name
+                    RunType         = $fail.RunType
+                    StartTime       = $startLocal
+                    EndTime         = $endLocal
+                    FailedMessage   = $fa.message
+                    ProgressTaskId  = $fail.ProgressTaskId
                 }
             }
         }
     }
 }
 
-# ==== OUTPUT ====
+# --- Output unresolved only ---
 if ($rows.Count -gt 0) {
-    Write-Host "`n🔥 Unresolved DB/Host Failures (run-filtered, taskId-matched) ---`n"
+    Write-Host "`n🔥 Unresolved DB/Host Failures (Run-first, Task-ID matched) ---`n"
     $rows | Sort-Object Cluster, ProtectionGroup, Hosts, DatabaseName |
         Format-Table Cluster, ProtectionGroup, Hosts, DatabaseName, RunType, StartTime, EndTime, FailedMessage, ProgressTaskId -AutoSize
 
-    $csv = Join-Path $logDirectory ("Cohesity_Unresolved_DBHost_Failures_{0}.csv" -f (Get-Date -Format "yyyy-MM-dd_HHmm"))
-    $rows | Export-Csv -Path $csv -NoTypeInformation -Encoding UTF8
-    Write-Host "`n✅ Saved: $csv"
-} else {
-    Write-Host "`n✅ No unresolved DB/Host failures found."
+    $csvFile = Join-Path $logDirectory ("Cohesity_Unresolved_DBHost_Failures_{0}.csv" -f (Get-Date -Format "yyyy-MM-dd_HHmm"))
+    $rows | Export-Csv -Path $csvFile -NoTypeInformation -Encoding UTF8
+    Write-Host "`n✅ Saved report to $csvFile"
+}
+else {
+    Write-Host "`n✅ No unresolved DB/Host failures found on cluster $cluster_name."
 }
