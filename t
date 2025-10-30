@@ -1,11 +1,12 @@
 # -------------------------------------------------------------
-# Cohesity Oracle – Latest Unresolved Failures (Single Cluster)
+# Cohesity Oracle – Unresolved Failures (DB + Host Shown, No CSV)
 # -------------------------------------------------------------
-# ✅ Shows only latest unresolved failure per Protection Group
-# ✅ Handles DB & Host failures
+# ✅ Single cluster only
+# ✅ Shows all unresolved (no later success) failures
+# ✅ Displays both Host and DB names
 # ✅ Marks missing DBs clearly
-# ✅ UTF8 CSV (no BOM)
-# ✅ Keeps your exact CSV path
+# ✅ Sorted by EndTime descending
+# ✅ CSV disabled (path retained for later use)
 # -------------------------------------------------------------
 
 $cluster_name = "YourClusterName"
@@ -80,13 +81,13 @@ foreach ($pg in $pgs) {
             if ($laterSuccess) { continue }
 
             # =========================================================
-            # Object-level failures
+            # Object-level failures (Hosts + DBs)
             # =========================================================
             if ($run.objects) {
                 $dbObjs   = $run.objects | Where-Object { $_.object.objectType  -eq 'kDatabase' }
                 $hostObjs = $run.objects | Where-Object { $_.object.environment -eq 'kPhysical' }
 
-                # --- DB failures ---
+                # --- DB-level failures ---
                 foreach ($db in $dbObjs) {
                     $attempts = $db.localSnapshotInfo.failedAttempts
                     if ($attempts) {
@@ -109,21 +110,39 @@ foreach ($pg in $pgs) {
                     }
                 }
 
-                # --- Host failures ---
+                # --- Host-level failures ---
                 foreach ($phy in $hostObjs) {
                     $attempts = $phy.localSnapshotInfo.failedAttempts
                     if ($attempts) {
                         foreach ($fa in $attempts) {
                             $msgClean = ($fa.message -replace '[\r\n]+',' ' -replace ',',' ' -replace '"','''').Trim()
-                            $globalFailures += [pscustomobject]@{
-                                Cluster         = $cluster_name
-                                ProtectionGroup = $pgName
-                                Hosts           = $phy.object.name
-                                DatabaseName    = "No DBs Discovered (Host-Level Failure)"
-                                RunType         = $runType
-                                StartTime       = $startLocal
-                                EndTime         = $endLocal
-                                FailedMessage   = $msgClean
+
+                            # check if DBs under this host exist
+                            $dbsUnderHost = $dbObjs | Where-Object { $_.object.sourceId -eq $phy.object.id }
+                            if ($dbsUnderHost.Count -gt 0) {
+                                foreach ($db in $dbsUnderHost) {
+                                    $globalFailures += [pscustomobject]@{
+                                        Cluster         = $cluster_name
+                                        ProtectionGroup = $pgName
+                                        Hosts           = $phy.object.name
+                                        DatabaseName    = $db.object.name
+                                        RunType         = $runType
+                                        StartTime       = $startLocal
+                                        EndTime         = $endLocal
+                                        FailedMessage   = $msgClean
+                                    }
+                                }
+                            } else {
+                                $globalFailures += [pscustomobject]@{
+                                    Cluster         = $cluster_name
+                                    ProtectionGroup = $pgName
+                                    Hosts           = $phy.object.name
+                                    DatabaseName    = "No DBs Discovered"
+                                    RunType         = $runType
+                                    StartTime       = $startLocal
+                                    EndTime         = $endLocal
+                                    FailedMessage   = $msgClean
+                                }
                             }
                         }
                     }
@@ -134,23 +153,17 @@ foreach ($pg in $pgs) {
 }
 
 # =============================================================
-# OUTPUT SECTION
+# OUTPUT SECTION (Console only)
 # =============================================================
 if ($globalFailures.Count -gt 0) {
-
-    # --- keep only latest failure per PG ---
-    $latestFailures = $globalFailures | Sort-Object EndTime -Descending |
-        Group-Object ProtectionGroup | ForEach-Object { $_.Group | Select-Object -First 1 }
-
-    Write-Host "`n🔥 Latest Unresolved Oracle Failures (Cluster: $cluster_name):`n" -ForegroundColor Cyan
-    $latestFailures | Sort-Object EndTime -Descending |
-        Format-Table ProtectionGroup, Hosts, DatabaseName, RunType, StartTime, EndTime, FailedMessage -AutoSize
-
-    $timestamp = Get-Date -Format "yyyyMMdd_HHmm"
-    $csvPath = "X:\PowerShell\Data\Choesity\BackupFailutes\BackupFailures_Oracle_AllClusters_$timestamp.csv"
-    $latestFailures | Export-Csv -Path $csvPath -NoTypeInformation -Encoding UTF8
-
-    Write-Host "`n📁 CSV exported to: $csvPath" -ForegroundColor Green
+    Write-Host "`n🔥 Oracle Failures (Cluster: $cluster_name):`n" -ForegroundColor Cyan
+    $sorted = $globalFailures | Sort-Object EndTime -Descending
+    $sorted | Format-Table ProtectionGroup, Hosts, DatabaseName, RunType, StartTime, EndTime, FailedMessage -AutoSize
 } else {
     Write-Host "`n✅ No unresolved DB/Host failures found on $cluster_name." -ForegroundColor Green
 }
+
+# CSV path placeholder if needed later
+$timestamp = Get-Date -Format "yyyyMMdd_HHmm"
+$csvPath = "X:\PowerShell\Data\Choesity\BackupFailures\BackupFailures_Oracle_AllClusters_$timestamp.csv"
+Write-Host "`n📂 (CSV export path retained for later use): $csvPath" -ForegroundColor Gray
