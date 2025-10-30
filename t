@@ -1,5 +1,5 @@
 # -------------------------------------------------------------
-# Cohesity Oracle – Unresolved DB/Host Level Failures
+# Cohesity Oracle – Unresolved DB/Host Level Failures (Single Cluster)
 # -------------------------------------------------------------
 
 # --- Config ---
@@ -43,7 +43,7 @@ foreach ($pg in $pgs) {
     $pgId   = $pg.id
     $pgName = $pg.name
 
-    # --- Get recent runs ---
+    # --- Get recent runs (with object details) ---
     $runUrl = "$baseUrl/v2/data-protect/protection-groups/$pgId/runs"
     $runBody = @{
         environments             = "kOracle"
@@ -52,6 +52,7 @@ foreach ($pg in $pgs) {
         isActive                 = "True"
         numRuns                  = "10"
         excludeNonRestorableRuns = "False"
+        includeObjectDetails     = "True"
     }
     $runResp = Invoke-WebRequest -Method Get -Uri $runUrl -Headers $headers -Body $runBody
     $json    = $runResp | ConvertFrom-Json
@@ -59,10 +60,10 @@ foreach ($pg in $pgs) {
 
     $runs = $json.runs
 
-    # --- Build host ↔ DB mapping from all runs.objects ---
-    $objs  = $runs.objects
-    $hosts = $objs | Where-Object { $_.object.environment -eq 'kPhysical' }
-    $dbs   = $objs | Where-Object { $_.object.objectType  -eq 'kDatabase' }
+    # --- Build hosts ↔ DB mapping from all runs.objects ---
+    $objs     = $runs.objects
+    $hostsObj = $objs | Where-Object { $_.object.environment -eq 'kPhysical' }
+    $dbs      = $objs | Where-Object { $_.object.objectType  -eq 'kDatabase' }
 
     # --- Loop through DB objects with failedAttempts ---
     foreach ($db in $dbs) {
@@ -72,9 +73,9 @@ foreach ($pg in $pgs) {
             foreach ($f in $fails) {
                 if ($f.message) {
                     $dbId = $db.object.id
-                    $host = $hosts | Where-Object { $_.object.id -eq $db.object.sourceId } | Select-Object -First 1
-                    $hostId   = if ($host) { $host.object.id } else { $null }
-                    $hostName = if ($host) { $host.object.name } else { 'N/A' }
+                    $hostsMatch = $hostsObj | Where-Object { $_.object.id -eq $db.object.sourceId } | Select-Object -First 1
+                    $hostId   = if ($hostsMatch) { $hostsMatch.object.id } else { $null }
+                    $hostName = if ($hostsMatch) { $hostsMatch.object.name } else { 'N/A' }
 
                     # --- Find the run this failure came from ---
                     $runForFail = $runs | Where-Object { $_.objects.object.id -contains $dbId } | Select-Object -First 1
@@ -104,11 +105,11 @@ foreach ($pg in $pgs) {
                         $unresolved += [pscustomobject]@{
                             Cluster         = $cluster_name
                             ProtectionGroup = $pgName
-                            HostName        = $hostName
+                            Hosts           = $hostName
                             DatabaseName    = $db.object.name
-                            FailedMessage   = $f.message
                             StartTime       = if ($runStart) { [System.TimeZoneInfo]::ConvertTimeFromUtc($runStart, $estZone) } else { $null }
                             EndTime         = if ($runEnd)   { [System.TimeZoneInfo]::ConvertTimeFromUtc($runEnd, $estZone) } else { $null }
+                            FailedMessage   = $f.message
                         }
                     }
                 }
@@ -120,8 +121,8 @@ foreach ($pg in $pgs) {
 # --- Output unresolved failures ---
 if ($unresolved.Count -gt 0) {
     Write-Host "`n🔥 Unresolved DB/Host Failures ---`n"
-    $unresolved | Sort-Object Cluster, ProtectionGroup, HostName, DatabaseName |
-        Format-Table Cluster, ProtectionGroup, HostName, DatabaseName, FailedMessage, StartTime, EndTime -AutoSize
+    $unresolved | Sort-Object Cluster, ProtectionGroup, Hosts, DatabaseName |
+        Format-Table Cluster, ProtectionGroup, Hosts, DatabaseName, StartTime, EndTime, FailedMessage -AutoSize
 
     $reportDate = Get-Date -Format "yyyy-MM-dd_HHmm"
     $csvFile = "$logDirectory\Cohesity_Unresolved_DBHost_Failures_$reportDate.csv"
