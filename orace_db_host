@@ -1,53 +1,67 @@
 # -------------------------------------------------------------
-# Cohesity Oracle – Latest Failures (All Clusters, Old Logic Retained)
-# -------------------------------------------------------------
-# ✅ Uses your previous working logic for per-cluster calls
-# ✅ Loops through all clusters from Helios
-# ✅ Shows DB + Host names
-# ✅ Skips if latest runType succeeded
-# ✅ Sorted by Cluster, ProtectionGroup, EndTime (desc)
-# ✅ Console-only (CSV path retained)
+# Cohesity Oracle Failures – Multi-Cluster (Helios)
+# Strictly READ-ONLY (GET-only)
+# Adds Host–DB mapping from $run.objects
 # -------------------------------------------------------------
 
-$baseUrl      = "https://helios.cohesity.com"
-$apiKeyPath   = "X:\PowerShell\Cohesity_API_Scripts\DO_NOT_Delete\apikey.txt"
-$ErrorActionPreference = 'Stop'
+$logDirectory = "X:\PowerShell\Data\Cohesity\BackupFailures"
 
-# --- Load API Key ---
-if (-not (Test-Path $apiKeyPath)) { throw "API key file not found: $apiKeyPath" }
-$apiKey   = (Get-Content -Path $apiKeyPath -Raw).Trim()
-$headers  = @{ apiKey = $apiKey }
+# Ensure folder exists and clean up if more than 50 files
+if (-not (Test-Path -Path $logDirectory -PathType Container)) {
+    New-Item -Path $logDirectory -ItemType Directory | Out-Null
+}
 
-# --- Timezone and helper ---
-$tz = [System.TimeZoneInfo]::FindSystemTimeZoneById("Eastern Standard Time")
+$fileCount = (Get-ChildItem -Path $logDirectory -File).Count
+if ($fileCount -gt 50) {
+    $filesToDelete = Get-ChildItem -Path $logDirectory -File |
+        Sort-Object CreationTime | Select-Object -First ($fileCount - 50)
+    $filesToDelete | Remove-Item -Force
+    Write-Host "$($filesToDelete.Count) old log files deleted."
+}
+
+# -------------------------------------------------------------
+# 0️⃣ API key from your path
+# -------------------------------------------------------------
+$apikeypath = "X:\PowerShell\Cohesity_API_Scripts\DO_NOT_Delete\apikey.txt"
+if (-not (Test-Path $apikeypath)) { throw "API key file not found at $apikeypath" }
+$apiKey = (Get-Content -Path $apikeypath -Raw).Trim()
+$commonHeaders = @{ "apiKey" = $apiKey }
+
+# -------------------------------------------------------------
+# 1️⃣ Get Clusters (ClusterName + ClusterId)
+# -------------------------------------------------------------
+$url = "https://helios.cohesity.com/v2/mcm/cluster-mgmt/info"
+$response = Invoke-WebRequest -Method Get -Uri $url -Headers $commonHeaders
+$json_clu = $response.Content | ConvertFrom-Json
+$json_clu = $json_clu.cohesityClusters
+
+if (-not $json_clu) { throw "No clusters returned from Helios." }
+
+# -------------------------------------------------------------
+# 2️⃣ Helper + Setup
+# -------------------------------------------------------------
 function Convert-ToUtcFromEpoch($v) {
     if ($null -eq $v -or $v -eq 0) { return $null }
     try { [DateTimeOffset]::FromUnixTimeMilliseconds([int64]$v).UtcDateTime }
     catch { [DateTimeOffset]::FromUnixTimeMilliseconds([int64]([double]$v / 1000)).UtcDateTime }
 }
+$tz = [System.TimeZoneInfo]::FindSystemTimeZoneById("Eastern Standard Time")
 
-# --- Get all clusters from Helios ---
-Write-Host "`n🌍 Fetching clusters from Helios..." -ForegroundColor Cyan
-$clusterListUrl = "$baseUrl/v2/mcm/cluster-mgmt/info"
-$clusterList = (Invoke-WebRequest -Uri $clusterListUrl -Headers $headers -Method Get).Content | ConvertFrom-Json
-$clusters = $clusterList.cohesityClusters | Where-Object { $_.isConnected -eq $true }
-
-if (-not $clusters) { throw "No connected clusters found in Helios." }
-
+$baseUrl = "https://helios.cohesity.com"
 $globalFailures = @()
 
-# =============================================================
-# LOOP THROUGH CLUSTERS (using old working logic)
-# =============================================================
-foreach ($cluster in $clusters) {
+# -------------------------------------------------------------
+# 3️⃣ Iterate through each cluster
+# -------------------------------------------------------------
+foreach ($cluster in $json_clu) {
     $cluster_name = $cluster.name
     $cluster_id   = $cluster.clusterId
-    $headersPerCluster = @{ apiKey = $apiKey; accessClusterId = $cluster_id }
-
     Write-Host "`n🔹 Processing cluster: $cluster_name" -ForegroundColor Cyan
 
+    $headers = @{ apiKey = $apiKey; accessClusterId = $cluster_id }
+
     # --- Fetch Oracle PGs ---
-    $pgResp = Invoke-WebRequest -Uri "$baseUrl/v2/data-protect/protection-groups" -Headers $headersPerCluster -Body @{
+    $pgResp = Invoke-WebRequest -Uri "$baseUrl/v2/data-protect/protection-groups" -Headers $headers -Body @{
         environments = "kOracle"; isDeleted = "False"; isPaused = "False"; isActive = "True"
     } -Method Get
     $pgs = ($pgResp.Content | ConvertFrom-Json).protectionGroups
@@ -56,9 +70,6 @@ foreach ($cluster in $clusters) {
         continue
     }
 
-    # =========================================================
-    # For each PG, use previous per-cluster logic exactly
-    # =========================================================
     foreach ($pg in $pgs) {
         $pgId   = $pg.id
         $pgName = $pg.name
@@ -75,11 +86,11 @@ foreach ($cluster in $clusters) {
             includeObjectDetails     = "True"
         }
 
-        $runResp = Invoke-WebRequest -Uri $runUrl -Headers $headersPerCluster -Body $runBody -Method Get
-        $json    = $runResp | ConvertFrom-Json
-        if (-not $json.runs) { continue }
+        $runResp = Invoke-WebRequest -Uri $runUrl -Headers $headers -Body $runBody -Method Get
+        $jsonRuns = $runResp | ConvertFrom-Json
+        if (-not $jsonRuns.runs) { continue }
 
-        $runs = $json.runs | Sort-Object { $_.localBackupInfo[0].startTimeUsecs }
+        $runs = $jsonRuns.runs | Sort-Object { $_.localBackupInfo[0].startTimeUsecs }
         $runTypes = $runs.localBackupInfo.runType | Select-Object -Unique
 
         foreach ($rType in $runTypes) {
@@ -100,13 +111,11 @@ foreach ($cluster in $clusters) {
                 continue
             }
 
-            Write-Host "❌ $cluster_name → $pgName [$rType] – Latest run failed, checking details..." -ForegroundColor Red
+            Write-Host "❌ $cluster_name → $pgName [$rType] – Latest run failed, collecting details..." -ForegroundColor Red
 
-            # --- Collect DB + Host failures ---
-            $run = $latestRun
-            if ($run.objects) {
-                $dbObjs   = $run.objects | Where-Object { $_.object.objectType  -eq 'kDatabase' }
-                $hostObjs = $run.objects | Where-Object { $_.object.environment -eq 'kPhysical' }
+            if ($latestRun.objects) {
+                $dbObjs   = $latestRun.objects | Where-Object { $_.object.objectType  -eq 'kDatabase' }
+                $hostObjs = $latestRun.objects | Where-Object { $_.object.environment -eq 'kPhysical' }
 
                 # DB-level
                 foreach ($db in $dbObjs) {
@@ -155,9 +164,9 @@ foreach ($cluster in $clusters) {
     }
 }
 
-# =============================================================
-# OUTPUT SECTION
-# =============================================================
+# -------------------------------------------------------------
+# 4️⃣ Output Section
+# -------------------------------------------------------------
 if ($globalFailures.Count -gt 0) {
     Write-Host "`n🔥 Latest Failed Oracle Runs (All Clusters):`n" -ForegroundColor Cyan
     $sorted = $globalFailures | Sort-Object Cluster, ProtectionGroup, EndTime -Descending
@@ -166,7 +175,7 @@ if ($globalFailures.Count -gt 0) {
     Write-Host "`n✅ All latest Oracle runs succeeded across all clusters." -ForegroundColor Green
 }
 
-# CSV reference (no export for now)
+# CSV reference path (no export yet)
 $timestamp = Get-Date -Format "yyyyMMdd_HHmm"
-$csvPath = "X:\PowerShell\Data\Choesity\BackupFailures\BackupFailures_Oracle_AllClusters_$timestamp.csv"
+$csvPath = "X:\PowerShell\Data\Cohesity\BackupFailures\BackupFailures_Oracle_AllClusters_$timestamp.csv"
 Write-Host "`n📂 (CSV path ready if needed later): $csvPath" -ForegroundColor Gray
