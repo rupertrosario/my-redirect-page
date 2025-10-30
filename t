@@ -1,5 +1,5 @@
 # -------------------------------------------------------------
-# Cohesity Oracle – Unresolved DB/Host Failures (Debug: Show Failed Runs)
+# Cohesity Oracle – Unresolved DB/Host Failures (Simplified & Working)
 # -------------------------------------------------------------
 
 # --- Config ---
@@ -41,7 +41,7 @@ foreach ($pg in $pgs) {
         isDeleted                = "False"
         isPaused                 = "False"
         isActive                 = "True"
-        numRuns                  = "10"     # <= only 10 runs, as you wanted
+        numRuns                  = "10"
         excludeNonRestorableRuns = "False"
         includeObjectDetails     = "True"
     }
@@ -52,29 +52,22 @@ foreach ($pg in $pgs) {
 
     $runs = $json.runs | Sort-Object { $_.localBackupInfo[0].startTimeUsecs }
 
-    # --- Find Failed Runs ---
+    # --- STEP 1: Identify failed runs ---
     foreach ($run in $runs) {
         foreach ($info in $run.localBackupInfo) {
             if ($info.status -eq "Failed") {
 
-                $runType     = $info.runType
+                $runType = $info.runType
                 $runStartUsecs = $info.startTimeUsecs
                 $runEndUsecs   = $info.endTimeUsecs
-                $progressId    = $info.progressTaskId
                 $runStart      = Convert-ToUtcFromEpoch $runStartUsecs
                 $runEnd        = Convert-ToUtcFromEpoch $runEndUsecs
 
-                # --- DEBUG: Print each failed run detected ---
-                Write-Host "`n--- Detected Failed Run ---" -ForegroundColor Yellow
-                Write-Host "Protection Group : $pgName"
-                Write-Host "RunType          : $runType"
-                Write-Host "Status           : $($info.status)"
-                Write-Host "StartTime        : $runStart"
-                Write-Host "EndTime          : $runEnd"
-                Write-Host "ProgressTaskId   : $progressId"
-                Write-Host "----------------------------------------------`n"
+                # --- Print detected failed run (for confirmation) ---
+                Write-Host "`nDetected failed run:" -ForegroundColor Yellow
+                Write-Host "PG: $pgName  RunType: $runType  Start: $runStart  End: $runEnd"
 
-                # --- Check if later success exists ---
+                # --- STEP 2: Check if later success exists ---
                 $laterSuccess = $runs | Where-Object {
                     $_.localBackupInfo[0].runType -eq $runType -and
                     $_.localBackupInfo[0].status  -eq "Succeeded" -and
@@ -83,7 +76,7 @@ foreach ($pg in $pgs) {
 
                 if (-not $laterSuccess) {
 
-                    # --- Now drill into failed run for DBs + Hosts ---
+                    # --- STEP 3: Drill into unresolved failed run ---
                     if ($run.objects) {
                         $dbObjs    = $run.objects | Where-Object { $_.object.objectType  -eq 'kDatabase' }
                         $hostsObjs = $run.objects | Where-Object { $_.object.environment -eq 'kPhysical' }
@@ -92,8 +85,7 @@ foreach ($pg in $pgs) {
                             $failedAttempts = $db.localSnapshotInfo.failedAttempts
                             if ($failedAttempts) {
                                 foreach ($fa in $failedAttempts) {
-                                    # Match by progressTaskId if available
-                                    if ($fa.progressTaskId -and $progressId -and $fa.progressTaskId -ne $progressId) { continue }
+                                    if (-not $fa.message) { continue }
 
                                     $hostObj = $hostsObjs | Where-Object { $_.object.id -eq $db.object.sourceId } | Select-Object -First 1
                                     $hostName = if ($hostObj) { $hostObj.object.name } else { 'N/A' }
@@ -118,9 +110,9 @@ foreach ($pg in $pgs) {
     }
 }
 
-# --- Output ---
+# --- OUTPUT ---
 if ($globalFailures.Count -gt 0) {
-    Write-Host "`n🔥 Unresolved Failures (no later success)`n" -ForegroundColor Cyan
+    Write-Host "`n🔥 Failed runs without any later success:`n" -ForegroundColor Cyan
     $globalFailures | Sort-Object ProtectionGroup, Hosts, DatabaseName |
         Format-Table ProtectionGroup, Hosts, DatabaseName, RunType, StartTime, EndTime, FailedMessage -AutoSize
 } else {
