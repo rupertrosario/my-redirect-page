@@ -1,5 +1,5 @@
 # -------------------------------------------------------------
-# Cohesity Oracle – Unresolved DB/Host-Level Failures (Hybrid Logic)
+# Cohesity Oracle – Unresolved DB/Host-Level Failures (Task-ID Aligned)
 # -------------------------------------------------------------
 
 # --- Config ---
@@ -69,8 +69,9 @@ foreach ($pg in $pgs) {
                 $runType = $info.runType
                 $runStartUsecs = $info.startTimeUsecs
                 $runEndUsecs   = $info.endTimeUsecs
-                $runStart = Convert-ToUtcFromEpoch $runStartUsecs
-                $runEnd   = Convert-ToUtcFromEpoch $runEndUsecs
+                $progressId    = $info.progressTaskId
+                $runStart      = Convert-ToUtcFromEpoch $runStartUsecs
+                $runEnd        = Convert-ToUtcFromEpoch $runEndUsecs
 
                 # --- Step 2: Check for later success ---
                 $laterSuccess = $runs | Where-Object {
@@ -80,7 +81,7 @@ foreach ($pg in $pgs) {
                 }
 
                 if (-not $laterSuccess) {
-                    # --- Step 3: Drill into objects ---
+                    # --- Step 3: Drill into objects and match progressTaskId ---
                     if ($run.objects) {
                         $dbs      = $run.objects | Where-Object { $_.object.objectType -eq 'kDatabase' }
                         $hostsObj = $run.objects | Where-Object { $_.object.environment -eq 'kPhysical' }
@@ -89,7 +90,8 @@ foreach ($pg in $pgs) {
                             $fails = $db.localSnapshotInfo.failedAttempts
                             if ($fails -and $fails.Count -gt 0) {
                                 foreach ($f in $fails) {
-                                    if ($f.message) {
+                                    # Match progressTaskId at object level to ensure it belongs to same run
+                                    if ($f.progressTaskId -eq $progressId -and $f.message) {
                                         $hostMatch = $hostsObj | Where-Object { $_.object.id -eq $db.object.sourceId } | Select-Object -First 1
                                         $hostName = if ($hostMatch) { $hostMatch.object.name } else { 'N/A' }
 
@@ -102,6 +104,7 @@ foreach ($pg in $pgs) {
                                             StartTime       = [System.TimeZoneInfo]::ConvertTimeFromUtc($runStart, $estZone)
                                             EndTime         = [System.TimeZoneInfo]::ConvertTimeFromUtc($runEnd, $estZone)
                                             FailedMessage   = $f.message
+                                            ProgressTaskId  = $progressId
                                         }
                                     }
                                 }
@@ -116,12 +119,12 @@ foreach ($pg in $pgs) {
 
 # --- Output unresolved failures ---
 if ($unresolved.Count -gt 0) {
-    Write-Host "`n🔥 Unresolved DB/Host Failures ---`n"
+    Write-Host "`n🔥 Unresolved DB/Host Failures (Task-ID Verified) ---`n"
     $unresolved | Sort-Object Cluster, ProtectionGroup, Hosts, DatabaseName |
-        Format-Table Cluster, ProtectionGroup, Hosts, DatabaseName, RunType, StartTime, EndTime, FailedMessage -AutoSize
+        Format-Table Cluster, ProtectionGroup, Hosts, DatabaseName, RunType, StartTime, EndTime, FailedMessage, ProgressTaskId -AutoSize
 
     $reportDate = Get-Date -Format "yyyy-MM-dd_HHmm"
-    $csvFile = "$logDirectory\Cohesity_Unresolved_DBHost_Failures_$reportDate.csv"
+    $csvFile = "$logDirectory\Cohesity_Unresolved_DBHost_Failures_TaskID_$reportDate.csv"
     $unresolved | Export-Csv -Path $csvFile -NoTypeInformation -Encoding UTF8
     Write-Host "`n✅ Saved report to $csvFile"
 }
