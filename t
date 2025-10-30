@@ -1,12 +1,12 @@
 # -------------------------------------------------------------
-# Cohesity Oracle – Unresolved Failures (Host+DB Linked)
+# Cohesity Oracle – Unresolved Failures (Simple, Single Cluster)
 # -------------------------------------------------------------
 # ✅ One cluster only
-# ✅ Checks host-level + DB-level relationship (sourceId mapping)
-# ✅ Shows DBs that failed under failed hosts
+# ✅ Shows DB- and host-level failures
 # ✅ Skips runs with later success
 # ✅ Sorted by EndTime
-# ✅ Keeps your CSV path exactly the same
+# ✅ Exports CSV in plain UTF8 (no BOM)
+# ✅ Keeps your CSV path untouched
 # -------------------------------------------------------------
 
 $cluster_name = "YourClusterName"
@@ -15,7 +15,7 @@ $baseUrl      = "https://helios.cohesity.com"
 $apiKeyPath   = "X:\PowerShell\Cohesity_API_Scripts\DO_NOT_Delete\apikey.txt"
 $ErrorActionPreference = 'Stop'
 
-# --- API Key ---
+# --- Load API Key ---
 if (-not (Test-Path $apiKeyPath)) { throw "API key file not found: $apiKeyPath" }
 $apiKey   = (Get-Content -Path $apiKeyPath -Raw).Trim()
 $headers  = @{ apiKey = $apiKey; accessClusterId = $cluster_id }
@@ -69,7 +69,6 @@ foreach ($pg in $pgs) {
             $runType    = $info.runType
             $runStartUs = [int64]$info.startTimeUsecs
             $runEndUs   = [int64]$info.endTimeUsecs
-            $progressId = $info.progressTaskId
             $startLocal = [System.TimeZoneInfo]::ConvertTimeFromUtc((Convert-ToUtcFromEpoch $runStartUs), $tz)
             $endLocal   = [System.TimeZoneInfo]::ConvertTimeFromUtc((Convert-ToUtcFromEpoch $runEndUs),   $tz)
 
@@ -82,94 +81,41 @@ foreach ($pg in $pgs) {
             if ($laterSuccess) { continue }
 
             # =========================================================
-            # 1️⃣ RUN-LEVEL FAILURES
-            # =========================================================
-            if ($info.messages) {
-                foreach ($msg in $info.messages) {
-                    $msgClean = ($msg -replace '[\r\n]+',' ' -replace ',',' ' -replace '"','''').Trim()
-                    $globalFailures += [pscustomobject]@{
-                        Cluster         = $cluster_name
-                        ProtectionGroup = $pgName
-                        Hosts           = "Unknown (Run-Level Failure)"
-                        DatabaseName    = "No DBs Found"
-                        RunType         = $runType
-                        StartTime       = $startLocal
-                        EndTime         = $endLocal
-                        FailedMessage   = $msgClean
-                    }
-                }
-            }
-
-            # =========================================================
-            # 2️⃣ OBJECT-LEVEL FAILURES
+            # Collect object-level failures
             # =========================================================
             if ($run.objects) {
                 $dbObjs   = $run.objects | Where-Object { $_.object.objectType  -eq 'kDatabase' }
-                $phyObjs  = $run.objects | Where-Object { $_.object.objectType  -eq 'kPhysical' }
+                $hostObjs = $run.objects | Where-Object { $_.object.environment -eq 'kPhysical' }
 
-                # --- DB-level failures ---
+                # --- DB failures ---
                 foreach ($db in $dbObjs) {
                     $attempts = $db.localSnapshotInfo.failedAttempts
-                    if (-not $attempts) { continue }
-                    foreach ($fa in $attempts) {
-                        $msgClean = ($fa.message -replace '[\r\n]+',' ' -replace ',',' ' -replace '"','''').Trim()
-                        $parentHost = $phyObjs | Where-Object { $_.object.id -eq $db.object.sourceId } | Select-Object -First 1
-                        $hostName   = if ($parentHost) { $parentHost.object.name } else { "N/A" }
+                    if ($attempts) {
+                        foreach ($fa in $attempts) {
+                            $msgClean = ($fa.message -replace '[\r\n]+',' ' -replace ',',' ' -replace '"','''').Trim()
+                            $parentHost = $hostObjs | Where-Object { $_.object.id -eq $db.object.sourceId } | Select-Object -First 1
+                            $hostName = if ($parentHost) { $parentHost.object.name } else { "N/A" }
 
-                        $globalFailures += [pscustomobject]@{
-                            Cluster         = $cluster_name
-                            ProtectionGroup = $pgName
-                            Hosts           = $hostName
-                            DatabaseName    = $db.object.name
-                            RunType         = $runType
-                            StartTime       = $startLocal
-                            EndTime         = $endLocal
-                            FailedMessage   = $msgClean
+                            $globalFailures += [pscustomobject]@{
+                                Cluster         = $cluster_name
+                                ProtectionGroup = $pgName
+                                Hosts           = $hostName
+                                DatabaseName    = $db.object.name
+                                RunType         = $runType
+                                StartTime       = $startLocal
+                                EndTime         = $endLocal
+                                FailedMessage   = $msgClean
+                            }
                         }
                     }
                 }
 
-                # --- Host-level failures ---
-                foreach ($phy in $phyObjs) {
+                # --- Host failures ---
+                foreach ($phy in $hostObjs) {
                     $attempts = $phy.localSnapshotInfo.failedAttempts
-                    if (-not $attempts) { continue }
-
-                    foreach ($fa in $attempts) {
-                        $msgClean = ($fa.message -replace '[\r\n]+',' ' -replace ',',' ' -replace '"','''').Trim()
-
-                        # find DBs under this host
-                        $dbsUnderHost = $dbObjs | Where-Object { $_.object.sourceId -eq $phy.object.id }
-                        if ($dbsUnderHost.Count -gt 0) {
-                            foreach ($db in $dbsUnderHost) {
-                                $dbFails = $db.localSnapshotInfo.failedAttempts
-                                if ($dbFails) {
-                                    foreach ($dbfa in $dbFails) {
-                                        $dbMsg = ($dbfa.message -replace '[\r\n]+',' ' -replace ',',' ' -replace '"','''').Trim()
-                                        $globalFailures += [pscustomobject]@{
-                                            Cluster         = $cluster_name
-                                            ProtectionGroup = $pgName
-                                            Hosts           = $phy.object.name
-                                            DatabaseName    = $db.object.name
-                                            RunType         = $runType
-                                            StartTime       = $startLocal
-                                            EndTime         = $endLocal
-                                            FailedMessage   = $dbMsg
-                                        }
-                                    }
-                                } else {
-                                    $globalFailures += [pscustomobject]@{
-                                        Cluster         = $cluster_name
-                                        ProtectionGroup = $pgName
-                                        Hosts           = $phy.object.name
-                                        DatabaseName    = $db.object.name
-                                        RunType         = $runType
-                                        StartTime       = $startLocal
-                                        EndTime         = $endLocal
-                                        FailedMessage   = $msgClean
-                                    }
-                                }
-                            }
-                        } else {
+                    if ($attempts) {
+                        foreach ($fa in $attempts) {
+                            $msgClean = ($fa.message -replace '[\r\n]+',' ' -replace ',',' ' -replace '"','''').Trim()
                             $globalFailures += [pscustomobject]@{
                                 Cluster         = $cluster_name
                                 ProtectionGroup = $pgName
@@ -198,7 +144,7 @@ if ($globalFailures.Count -gt 0) {
 
     $timestamp = Get-Date -Format "yyyyMMdd_HHmm"
     $csvPath = "X:\PowerShell\Data\Choesity\BackupFailutes\BackupFailures_Oracle_AllClusters_$timestamp.csv"
-    $sorted | Export-Csv -Path $csvPath -NoTypeInformation -Encoding UTF8BOM
+    $sorted | Export-Csv -Path $csvPath -NoTypeInformation -Encoding UTF8
 
     Write-Host "`n📁 CSV exported to: $csvPath" -ForegroundColor Green
 } else {
