@@ -1,12 +1,12 @@
 # -------------------------------------------------------------
-# Cohesity Oracle – All Unresolved Failures (Host + DB + Run level)
+# Cohesity Oracle – Unresolved Failures (Single Cluster, CSV-Safe)
 # -------------------------------------------------------------
-# ✅ Handles:
-#   • Any run-level failure messages (not just discovery)
-#   • Host and DB backup failures from failedAttempts[]
-#   • Later-success exclusion (still applied)
-#   • All unresolved runs displayed (no grouping/trim)
-#   • Safe CSV export
+# ✅ Checks one Cohesity cluster
+# ✅ Lists all unresolved Oracle backup failures
+# ✅ Handles run-level, host-level, and DB-level messages
+# ✅ Skips runs that later succeeded
+# ✅ Sorted by EndTime (latest first)
+# ✅ Safe CSV output to X:\PowerShell\Data\Cohesity\BackupFailures\
 # -------------------------------------------------------------
 
 # --- CONFIG ---
@@ -21,7 +21,7 @@ if (-not (Test-Path $apiKeyPath)) { throw "API key file not found: $apiKeyPath" 
 $apiKey   = (Get-Content -Path $apiKeyPath -Raw).Trim()
 $headers  = @{ apiKey = $apiKey; accessClusterId = $cluster_id }
 
-# --- Time Conversion Helper ---
+# --- Helper: Epoch → UTC ---
 function Convert-ToUtcFromEpoch($v) {
     if ($null -eq $v -or $v -eq 0) { return $null }
     try { [DateTimeOffset]::FromUnixTimeMilliseconds([int64]$v).UtcDateTime }
@@ -29,12 +29,12 @@ function Convert-ToUtcFromEpoch($v) {
 }
 $tz = [System.TimeZoneInfo]::FindSystemTimeZoneById("Eastern Standard Time")
 
-Write-Host "`n🔍 Fetching Oracle protection groups from $cluster_name..." -ForegroundColor Cyan
+Write-Host "`n🔍 Fetching Oracle protection groups from cluster: $cluster_name..." -ForegroundColor Cyan
 $pgResp = Invoke-WebRequest -Uri "$baseUrl/v2/data-protect/protection-groups" -Headers $headers -Body @{
     environments = "kOracle"; isDeleted = "False"; isPaused = "False"; isActive = "True"
 } -Method Get
 $pgs = ($pgResp.Content | ConvertFrom-Json).protectionGroups
-if (-not $pgs) { throw "No Oracle protection groups found!" }
+if (-not $pgs) { throw "No Oracle protection groups found on $cluster_name!" }
 
 $globalFailures = @()
 
@@ -83,11 +83,11 @@ foreach ($pg in $pgs) {
             if ($laterSuccess) { continue }
 
             # =========================================================
-            # 1️⃣ RUN-LEVEL FAILURES (any messages[], not only discovery)
+            # 1️⃣ RUN-LEVEL FAILURES (any messages[])
             # =========================================================
             if ($info.messages) {
                 foreach ($msg in $info.messages) {
-                    $msgClean = ($msg -replace "`r|`n|,", " ") -replace '"', "'"
+                    $msgClean = ($msg -replace '[\r\n]+',' ' -replace ',',' ' -replace '"','''').Trim()
                     $hostObjs = if ($run.objects) {
                         $run.objects | Where-Object { $_.object.environment -eq 'kPhysical' }
                     } else { @() }
@@ -97,7 +97,7 @@ foreach ($pg in $pgs) {
                             Cluster         = $cluster_name
                             ProtectionGroup = $pgName
                             Hosts           = "Unknown (Run-Level Failure)"
-                            DatabaseName    = "N/A"
+                            DatabaseName    = "No DBs Found (Host-Level Failure)"
                             RunType         = $runType
                             StartTime       = $startLocal
                             EndTime         = $endLocal
@@ -109,7 +109,7 @@ foreach ($pg in $pgs) {
                                 Cluster         = $cluster_name
                                 ProtectionGroup = $pgName
                                 Hosts           = $h.object.name
-                                DatabaseName    = "N/A"
+                                DatabaseName    = "No DBs Found (Host-Level Failure)"
                                 RunType         = $runType
                                 StartTime       = $startLocal
                                 EndTime         = $endLocal
@@ -140,7 +140,7 @@ foreach ($pg in $pgs) {
                     }
 
                     foreach ($fa in $matched) {
-                        $msgClean = ($fa.message -replace "`r|`n|,", " ") -replace '"', "'"
+                        $msgClean = ($fa.message -replace '[\r\n]+',' ' -replace ',',' ' -replace '"','''').Trim()
                         $parentHost = $hostObjs | Where-Object { $_.object.id -eq $db.object.sourceId } | Select-Object -First 1
                         $hostName   = if ($parentHost) { $parentHost.object.name } else { "N/A" }
 
@@ -148,7 +148,7 @@ foreach ($pg in $pgs) {
                             Cluster         = $cluster_name
                             ProtectionGroup = $pgName
                             Hosts           = $hostName
-                            DatabaseName    = $db.object.name
+                            DatabaseName    = if ($db.object.name) { $db.object.name } else { "No DBs Found (Host-Level Failure)" }
                             RunType         = $runType
                             StartTime       = $startLocal
                             EndTime         = $endLocal
@@ -161,12 +161,12 @@ foreach ($pg in $pgs) {
                 $phyObjs = $run.objects | Where-Object { $_.object.objectType -eq 'kPhysical' -and $_.localSnapshotInfo.failedAttempts }
                 foreach ($phy in $phyObjs) {
                     foreach ($fa in $phy.localSnapshotInfo.failedAttempts) {
-                        $msgClean = ($fa.message -replace "`r|`n|,", " ") -replace '"', "'"
+                        $msgClean = ($fa.message -replace '[\r\n]+',' ' -replace ',',' ' -replace '"','''').Trim()
                         $globalFailures += [pscustomobject]@{
                             Cluster         = $cluster_name
                             ProtectionGroup = $pgName
                             Hosts           = $phy.object.name
-                            DatabaseName    = "N/A"
+                            DatabaseName    = "No DBs Found (Host-Level Failure)"
                             RunType         = $runType
                             StartTime       = $startLocal
                             EndTime         = $endLocal
@@ -180,18 +180,21 @@ foreach ($pg in $pgs) {
 }
 
 # =============================================================
-# OUTPUT SECTION (all unresolved failures)
+# OUTPUT SECTION
 # =============================================================
 if ($globalFailures.Count -gt 0) {
-    Write-Host "`n🔥 Unresolved Failures (All PGs, No Later Success):`n" -ForegroundColor Cyan
-    $globalFailures | Sort-Object ProtectionGroup, Hosts, DatabaseName, StartTime -Descending |
-        Format-Table ProtectionGroup, Hosts, DatabaseName, RunType, StartTime, EndTime, FailedMessage -AutoSize
+    Write-Host "`n🔥 Unresolved Oracle Failures (Cluster: $cluster_name):`n" -ForegroundColor Cyan
+
+    $sorted = $globalFailures | Sort-Object EndTime -Descending
+
+    $sorted | Format-Table ProtectionGroup, Hosts, DatabaseName, RunType, StartTime, EndTime, FailedMessage -AutoSize
 
     # --- Safe CSV export ---
     $timestamp = Get-Date -Format "yyyyMMdd_HHmm"
-    $csvPath = "X:\PowerShell\Cohesity_Reports\BackupFailures_Oracle_$($cluster_name)_All_$timestamp.csv"
-    $globalFailures | Export-Csv -Path $csvPath -NoTypeInformation -Encoding UTF8
+    $csvPath = "X:\PowerShell\Data\Cohesity\BackupFailures\BackupFailures_Oracle_AllClusters_$timestamp.csv"
+    $sorted | Export-Csv -Path $csvPath -NoTypeInformation -Encoding UTF8BOM
+
     Write-Host "`n📁 CSV exported to: $csvPath" -ForegroundColor Green
 } else {
-    Write-Host "`n✅ No unresolved DB/Host failures found." -ForegroundColor Green
+    Write-Host "`n✅ No unresolved DB/Host failures found on $cluster_name." -ForegroundColor Green
 }
