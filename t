@@ -1,12 +1,11 @@
 # -------------------------------------------------------------
-# Cohesity Oracle – Unresolved Failures (Simple, Single Cluster)
+# Cohesity Oracle – Latest Unresolved Failures (Single Cluster)
 # -------------------------------------------------------------
-# ✅ One cluster only
-# ✅ Shows DB- and host-level failures
-# ✅ Skips runs with later success
-# ✅ Sorted by EndTime
-# ✅ Exports CSV in plain UTF8 (no BOM)
-# ✅ Keeps your CSV path untouched
+# ✅ Shows only latest unresolved failure per Protection Group
+# ✅ Handles DB & Host failures
+# ✅ Marks missing DBs clearly
+# ✅ UTF8 CSV (no BOM)
+# ✅ Keeps your exact CSV path
 # -------------------------------------------------------------
 
 $cluster_name = "YourClusterName"
@@ -81,7 +80,7 @@ foreach ($pg in $pgs) {
             if ($laterSuccess) { continue }
 
             # =========================================================
-            # Collect object-level failures
+            # Object-level failures
             # =========================================================
             if ($run.objects) {
                 $dbObjs   = $run.objects | Where-Object { $_.object.objectType  -eq 'kDatabase' }
@@ -120,7 +119,7 @@ foreach ($pg in $pgs) {
                                 Cluster         = $cluster_name
                                 ProtectionGroup = $pgName
                                 Hosts           = $phy.object.name
-                                DatabaseName    = "No DBs Found (Host-Level Failure)"
+                                DatabaseName    = "No DBs Discovered (Host-Level Failure)"
                                 RunType         = $runType
                                 StartTime       = $startLocal
                                 EndTime         = $endLocal
@@ -138,13 +137,18 @@ foreach ($pg in $pgs) {
 # OUTPUT SECTION
 # =============================================================
 if ($globalFailures.Count -gt 0) {
-    Write-Host "`n🔥 Unresolved Oracle Failures (Cluster: $cluster_name):`n" -ForegroundColor Cyan
-    $sorted = $globalFailures | Sort-Object EndTime -Descending
-    $sorted | Format-Table ProtectionGroup, Hosts, DatabaseName, RunType, StartTime, EndTime, FailedMessage -AutoSize
+
+    # --- keep only latest failure per PG ---
+    $latestFailures = $globalFailures | Sort-Object EndTime -Descending |
+        Group-Object ProtectionGroup | ForEach-Object { $_.Group | Select-Object -First 1 }
+
+    Write-Host "`n🔥 Latest Unresolved Oracle Failures (Cluster: $cluster_name):`n" -ForegroundColor Cyan
+    $latestFailures | Sort-Object EndTime -Descending |
+        Format-Table ProtectionGroup, Hosts, DatabaseName, RunType, StartTime, EndTime, FailedMessage -AutoSize
 
     $timestamp = Get-Date -Format "yyyyMMdd_HHmm"
     $csvPath = "X:\PowerShell\Data\Choesity\BackupFailutes\BackupFailures_Oracle_AllClusters_$timestamp.csv"
-    $sorted | Export-Csv -Path $csvPath -NoTypeInformation -Encoding UTF8
+    $latestFailures | Export-Csv -Path $csvPath -NoTypeInformation -Encoding UTF8
 
     Write-Host "`n📁 CSV exported to: $csvPath" -ForegroundColor Green
 } else {
