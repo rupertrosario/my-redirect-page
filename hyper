@@ -1,172 +1,115 @@
 # -------------------------------------------------------------
 # Cohesity Hyper-V Failures – Multi-Cluster (Helios)
-# Strictly READ-ONLY (GET-only)
-# Adds Host–VM mapping from $run.objects
-# Safe timestamp conversion + guaranteed Cluster column
+# Simplified VM-only version
+# ObjectType = kVirtualMachine (no host-level mapping)
 # -------------------------------------------------------------
 
 $logDirectory = "X:\PowerShell\Data\Cohesity\BackupFailures"
-
-# Ensure folder exists and clean up if more than 50 files
 if (-not (Test-Path -Path $logDirectory -PathType Container)) {
     New-Item -Path $logDirectory -ItemType Directory | Out-Null
 }
 
-$fileCount = (Get-ChildItem -Path $logDirectory -File).Count
-if ($fileCount -gt 50) {
-    $filesToDelete = Get-ChildItem -Path $logDirectory -File |
-        Sort-Object CreationTime | Select-Object -First ($fileCount - 50)
-    $filesToDelete | Remove-Item -Force
-    Write-Host "$($filesToDelete.Count) old log files deleted."
-}
-
-# -------------------------------------------------------------
-# 0️⃣ API key from your path
-# -------------------------------------------------------------
+# --- Load API key ---
 $apikeypath = "X:\PowerShell\Cohesity_API_Scripts\DO_NOT_Delete\apikey.txt"
-if (-not (Test-Path $apikeypath)) { throw "API key file not found at $apikeypath" }
+if (-not (Test-Path $apikeypath)) { throw "API key file not found: $apikeypath" }
 $apiKey = (Get-Content -Path $apikeypath -Raw).Trim()
 $commonHeaders = @{ "apiKey" = $apiKey }
 
-# -------------------------------------------------------------
-# 1️⃣ Get Clusters (ClusterName + ClusterId)
-# -------------------------------------------------------------
+# --- Get all clusters from Helios ---
 $url = "https://helios.cohesity.com/v2/mcm/cluster-mgmt/info"
-$response = Invoke-WebRequest -Method Get -Uri $url -Headers $commonHeaders
+$response = Invoke-WebRequest -Uri $url -Headers $commonHeaders -Method Get
 $json_clu = ($response.Content | ConvertFrom-Json).cohesityClusters
 if (-not $json_clu) { throw "No clusters returned from Helios." }
 
-# -------------------------------------------------------------
-# 2️⃣ Helper + Setup
-# -------------------------------------------------------------
-function Convert-ToLocalFromEpoch($v, $tz) {
-    if (-not $v -or $v -eq 0) { return $null }
-    try {
-        $utc = [DateTimeOffset]::FromUnixTimeMilliseconds([int64]($v / 1000)).UtcDateTime
-        if ($tz) { return [System.TimeZoneInfo]::ConvertTimeFromUtc($utc, $tz) }
-        else { return $utc.ToLocalTime() }
-    } catch { return $null }
+# --- Helper for time conversion ---
+function Convert-ToLocalFromEpoch($v,$tz){
+    if(-not $v -or $v -eq 0){return $null}
+    try{
+        $utc=[DateTimeOffset]::FromUnixTimeMilliseconds([int64]($v/1000)).UtcDateTime
+        if($tz){[System.TimeZoneInfo]::ConvertTimeFromUtc($utc,$tz)}else{$utc.ToLocalTime()}
+    }catch{return $null}
 }
 
-$tz = [System.TimeZoneInfo]::FindSystemTimeZoneById("Eastern Standard Time")
-$baseUrl = "https://helios.cohesity.com"
-$globalFailures = @()
+$tz=[System.TimeZoneInfo]::FindSystemTimeZoneById("Eastern Standard Time")
+$baseUrl="https://helios.cohesity.com"
+$globalFailures=@()
 
 # -------------------------------------------------------------
-# 3️⃣ Iterate through each cluster
+# Iterate clusters
 # -------------------------------------------------------------
-foreach ($cluster in $json_clu) {
+foreach($cluster in $json_clu){
 
-    # --- Cluster name fallback logic ---
-    $cluster_name = $cluster.name
-    if ([string]::IsNullOrWhiteSpace($cluster_name)) { $cluster_name = $cluster.clusterName }
-    if ([string]::IsNullOrWhiteSpace($cluster_name)) { $cluster_name = $cluster.displayName }
-    if ([string]::IsNullOrWhiteSpace($cluster_name)) { $cluster_name = "Unknown-$($cluster.clusterId)" }
+    # --- Resolve cluster name ---
+    $cluster_name=$cluster.name
+    if([string]::IsNullOrWhiteSpace($cluster_name)){$cluster_name=$cluster.clusterName}
+    if([string]::IsNullOrWhiteSpace($cluster_name)){$cluster_name=$cluster.displayName}
+    if([string]::IsNullOrWhiteSpace($cluster_name)){$cluster_name="Unknown-$($cluster.clusterId)"}
+    $cluster_id=$cluster.clusterId
 
-    $cluster_id = $cluster.clusterId
     Write-Host "`n🔹 Processing cluster: $cluster_name" -ForegroundColor Cyan
+    $headers=@{apiKey=$apiKey;accessClusterId=$cluster_id}
 
-    $headers = @{ apiKey = $apiKey; accessClusterId = $cluster_id }
+    # --- Get Hyper-V PGs ---
+    $pgResp=Invoke-WebRequest -Uri "$baseUrl/v2/data-protect/protection-groups" -Headers $headers -Body @{
+        environments="kHyperV";isDeleted="False";isPaused="False";isActive="True"} -Method Get
+    $pgs=($pgResp.Content|ConvertFrom-Json).protectionGroups
+    if(-not $pgs){Write-Host "⚠️ No Hyper-V PGs found on $cluster_name." -ForegroundColor Yellow;continue}
 
-    # --- Fetch Hyper-V PGs ---
-    $pgResp = Invoke-WebRequest -Uri "$baseUrl/v2/data-protect/protection-groups" -Headers $headers -Body @{
-        environments = "kHyperV"; isDeleted = "False"; isPaused = "False"; isActive = "True"
-    } -Method Get
-    $pgs = ($pgResp.Content | ConvertFrom-Json).protectionGroups
-    if (-not $pgs) {
-        Write-Host "⚠️ No Hyper-V protection groups found on $cluster_name." -ForegroundColor Yellow
-        continue
-    }
-
-    foreach ($pg in $pgs) {
-        $pgId   = $pg.id
-        $pgName = $pg.name
+    foreach($pg in $pgs){
+        $pgId=$pg.id
+        $pgName=$pg.name
         Write-Host "`n📦 Checking PG: $pgName" -ForegroundColor Yellow
 
-        $runUrl = "$baseUrl/v2/data-protect/protection-groups/$pgId/runs"
-        $runBody = @{
-            environments             = "kHyperV"
-            isDeleted                = "False"
-            isPaused                 = "False"
-            isActive                 = "True"
-            numRuns                  = "10"
-            excludeNonRestorableRuns = "False"
-            includeObjectDetails     = "True"
-        }
+        $runUrl="$baseUrl/v2/data-protect/protection-groups/$pgId/runs"
+        $runBody=@{environments="kHyperV";isDeleted="False";isPaused="False";isActive="True";numRuns="10";
+                   excludeNonRestorableRuns="False";includeObjectDetails="True"}
 
-        try {
-            $runResp = Invoke-WebRequest -Uri $runUrl -Headers $headers -Body $runBody -Method Get
-            $jsonRuns = $runResp | ConvertFrom-Json
-        } catch {
-            Write-Host "⚠️ Failed to fetch runs for PG: $pgName on $cluster_name. Skipping..." -ForegroundColor Yellow
+        try{
+            $runResp=Invoke-WebRequest -Uri $runUrl -Headers $headers -Body $runBody -Method Get
+            $jsonRuns=$runResp|ConvertFrom-Json
+        }catch{
+            Write-Host "⚠️ Skipping PG $pgName on $cluster_name due to error..." -ForegroundColor Yellow
             continue
         }
 
-        if (-not $jsonRuns.runs) { continue }
+        if(-not $jsonRuns.runs){continue}
 
-        $runs = $jsonRuns.runs | Sort-Object { $_.localBackupInfo[0].startTimeUsecs }
-        $runTypes = $runs.localBackupInfo.runType | Select-Object -Unique
+        $runs=$jsonRuns.runs|Sort-Object{$_.localBackupInfo[0].startTimeUsecs}
+        $runTypes=$runs.localBackupInfo.runType|Select-Object -Unique
 
-        foreach ($rType in $runTypes) {
-            $latestRun = $runs | Where-Object { $_.localBackupInfo[0].runType -eq $rType } |
-                Sort-Object { $_.localBackupInfo[0].endTimeUsecs } -Descending | Select-Object -First 1
-            if (-not $latestRun) { continue }
+        foreach($rType in $runTypes){
+            $latestRun=$runs|Where-Object{$_.localBackupInfo[0].runType -eq $rType}|
+                        Sort-Object{$_.localBackupInfo[0].endTimeUsecs}-Descending|Select-Object -First 1
+            if(-not $latestRun){continue}
 
-            $info = $latestRun.localBackupInfo[0]
-            $status = $info.status
-            $runType = $info.runType
-            $startLocal = Convert-ToLocalFromEpoch $info.startTimeUsecs $tz
-            $endLocal   = Convert-ToLocalFromEpoch $info.endTimeUsecs   $tz
+            $info=$latestRun.localBackupInfo[0]
+            $status=$info.status
+            $runType=$info.runType
+            $startLocal=Convert-ToLocalFromEpoch $info.startTimeUsecs $tz
+            $endLocal=Convert-ToLocalFromEpoch $info.endTimeUsecs $tz
 
-            if ($status -eq "Succeeded" -or $status -eq "SucceededWithWarning") {
+            if($status -eq "Succeeded" -or $status -eq "SucceededWithWarning"){
                 Write-Host "✅ $cluster_name → $pgName [$rType] – Latest run succeeded" -ForegroundColor Green
                 continue
             }
 
-            Write-Host "❌ $cluster_name → $pgName [$rType] – Latest run failed, collecting details..." -ForegroundColor Red
+            Write-Host "❌ $cluster_name → $pgName [$rType] – Latest run failed, collecting VM details..." -ForegroundColor Red
 
-            if ($latestRun.objects) {
-                $vmObjs   = $latestRun.objects | Where-Object { $_.object.objectType  -eq 'kHyperV' }
-                $hostObjs = $latestRun.objects | Where-Object { $_.object.environment -eq 'kPhysical' }
-
-                # --- VM-level failures ---
-                foreach ($vm in $vmObjs) {
-                    $attempts = $vm.localSnapshotInfo.failedAttempts
-                    if ($attempts) {
-                        foreach ($fa in $attempts) {
-                            $msgClean = ($fa.message -replace '[\r\n]+',' ' -replace ',',' ' -replace '"','''').Trim()
-                            $parentHost = $hostObjs | Where-Object { $_.object.id -eq $vm.object.sourceId } | Select-Object -First 1
-                            $hosts = if ($parentHost) { $parentHost.object.name } else { "N/A" }
-
-                            $globalFailures += [pscustomobject]@{
-                                Cluster         = $cluster_name
-                                ProtectionGroup = $pgName
-                                RunType         = $runType
-                                Hosts           = $hosts
-                                VMName          = $vm.object.name
-                                StartTime       = $startLocal
-                                EndTime         = $endLocal
-                                FailedMessage   = $msgClean
-                            }
-                        }
-                    }
-                }
-
-                # --- Host-level failures ---
-                foreach ($phy in $hostObjs) {
-                    $attempts = $phy.localSnapshotInfo.failedAttempts
-                    if ($attempts) {
-                        foreach ($fa in $attempts) {
-                            $msgClean = ($fa.message -replace '[\r\n]+',' ' -replace ',',' ' -replace '"','''').Trim()
-                            $globalFailures += [pscustomobject]@{
-                                Cluster         = $cluster_name
-                                ProtectionGroup = $pgName
-                                RunType         = $runType
-                                Hosts           = $phy.object.name
-                                VMName          = "No VMs Discovered"
-                                StartTime       = $startLocal
-                                EndTime         = $endLocal
-                                FailedMessage   = $msgClean
+            if($latestRun.objects){
+                $vmObjs=$latestRun.objects|Where-Object{$_.object.objectType -eq 'kVirtualMachine'}
+                foreach($vm in $vmObjs){
+                    $attempts=$vm.localSnapshotInfo.failedAttempts
+                    if($attempts){
+                        foreach($fa in $attempts){
+                            $msgClean=($fa.message -replace '[\r\n]+',' ' -replace ',',' ' -replace '"','''').Trim()
+                            $globalFailures+=[pscustomobject]@{
+                                Cluster=$cluster_name
+                                ProtectionGroup=$pgName
+                                RunType=$runType
+                                VMName=$vm.object.name
+                                StartTime=$startLocal
+                                EndTime=$endLocal
+                                FailedMessage=$msgClean
                             }
                         }
                     }
@@ -177,17 +120,17 @@ foreach ($cluster in $json_clu) {
 }
 
 # -------------------------------------------------------------
-# 4️⃣ Output Section
+# Output Section
 # -------------------------------------------------------------
-if ($globalFailures.Count -gt 0) {
-    Write-Host "`n🔥 Latest Failed Hyper-V Runs (All Clusters):`n" -ForegroundColor Cyan
-    $sorted = $globalFailures | Sort-Object Cluster, ProtectionGroup, EndTime -Descending
-    $sorted | Format-Table Cluster, ProtectionGroup, RunType, Hosts, VMName, StartTime, EndTime, FailedMessage -AutoSize
-} else {
+if($globalFailures.Count -gt 0){
+    Write-Host "`n🔥 Latest Failed Hyper-V VM Runs (All Clusters):`n" -ForegroundColor Cyan
+    $sorted=$globalFailures|Sort-Object Cluster,ProtectionGroup,EndTime -Descending
+    $sorted|Format-Table Cluster,ProtectionGroup,RunType,VMName,StartTime,EndTime,FailedMessage -AutoSize
+}else{
     Write-Host "`n✅ All latest Hyper-V runs succeeded across all clusters." -ForegroundColor Green
 }
 
-# CSV reference path (no export yet)
-$timestamp = Get-Date -Format "yyyyMMdd_HHmm"
-$csvPath = "X:\PowerShell\Data\Cohesity\BackupFailures\BackupFailures_HyperV_AllClusters_$timestamp.csv"
+# --- CSV reference path (no export yet) ---
+$timestamp=Get-Date -Format "yyyyMMdd_HHmm"
+$csvPath="X:\PowerShell\Data\Cohesity\BackupFailures\BackupFailures_HyperV_AllClusters_$timestamp.csv"
 Write-Host "`n📂 (CSV path ready if needed later): $csvPath" -ForegroundColor Gray
