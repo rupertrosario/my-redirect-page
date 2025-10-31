@@ -1,7 +1,6 @@
 # =====================================================================
 # Cohesity Backup Failures – Multi-Cluster (Helios)
-# Environments: Oracle | SQL | Physical | NAS | HyperV | Acropolis | All
-# Menu-driven with Verbose / Silent options
+# Menu-Driven | Verbose / Silent | Per-Env & Combined CSV
 # =====================================================================
 
 $logDirectory = "X:\PowerShell\Data\Cohesity\BackupFailures"
@@ -16,7 +15,7 @@ $apiKey = (Get-Content -Path $apikeypath -Raw).Trim()
 $commonHeaders = @{ "apiKey" = $apiKey }
 $baseUrl = "https://helios.cohesity.com"
 
-# --- Helper for epoch time conversion ---
+# --- Helpers ---
 function Convert-ToLocalFromEpoch($v,$tz){
     if(-not $v -or $v -eq 0){return $null}
     try{
@@ -26,7 +25,7 @@ function Convert-ToLocalFromEpoch($v,$tz){
 }
 $tz=[System.TimeZoneInfo]::FindSystemTimeZoneById("Eastern Standard Time")
 
-# --- Get all clusters ---
+# --- Get clusters ---
 $url = "$baseUrl/v2/mcm/cluster-mgmt/info"
 $response = Invoke-WebRequest -Uri $url -Headers $commonHeaders -Method Get
 $json_clu = ($response.Content | ConvertFrom-Json).cohesityClusters
@@ -48,22 +47,20 @@ $choice = Read-Host "Enter your choice(s) (e.g. 2,3,4)"
 
 Write-Host "`nSelect Mode:" -ForegroundColor Yellow
 Write-Host "1. Verbose (detailed, color output – recommended)"
-Write-Host "2. Silent (background mode – CSV only)"
+Write-Host "2. Silent (background mode – CSV only, prints summary)"
 $modeChoice = Read-Host "Enter mode [1 or 2]"
 $VerboseMode = $modeChoice -eq "1"
 
-function Write-Log($msg,$color="Gray"){
-    if($VerboseMode){ Write-Host $msg -ForegroundColor $color }
-}
-
-# --- Utility to safely sort runs ---
+function Write-Log($msg,$color="Gray"){ if($VerboseMode){ Write-Host $msg -ForegroundColor $color } }
 function Get-LatestRun($runs){ $runs | Sort-Object { $_.localBackupInfo[0].endTimeUsecs } -Descending | Select-Object -First 1 }
 
-# --- Function template for each environment ---
+# ==============================================================
+# Universal Collector Function
+# ==============================================================
 function Process-Generic {
-    param($envType,$envLabel,$filter,$objectType,$nameField)
-
+    param($envType,$envLabel,$filter,$objectType,$nameField,$summaryRef,$masterRef)
     $globalFailures = @()
+    $csvPath = $null
 
     foreach($cluster in $json_clu){
         $cluster_name = ($cluster.name, $cluster.clusterName, $cluster.displayName | Where-Object { $_ -and $_.Trim() } | Select-Object -First 1)
@@ -126,6 +123,7 @@ function Process-Generic {
                                 $globalFailures += [pscustomobject]@{
                                     Cluster=$cluster_name
                                     ProtectionGroup=$pgName
+                                    Environment=$envLabel
                                     RunType=$runType
                                     Name=$o.object.$nameField
                                     StartTime=$startLocal
@@ -137,6 +135,7 @@ function Process-Generic {
                             $globalFailures += [pscustomobject]@{
                                 Cluster=$cluster_name
                                 ProtectionGroup=$pgName
+                                Environment=$envLabel
                                 RunType=$runType
                                 Name=$o.object.$nameField
                                 StartTime=$startLocal
@@ -150,7 +149,7 @@ function Process-Generic {
         }
     }
 
-    # --- De-dup ---
+    # --- De-dup + Output ---
     if($globalFailures.Count -gt 0){
         $globalFailures = $globalFailures |
             Group-Object {
@@ -166,17 +165,22 @@ function Process-Generic {
             $sorted | Format-Table Cluster,ProtectionGroup,RunType,Name,StartTime,EndTime,FailedMessage -AutoSize
         }
 
-        # Export CSV (UTF8 no BOM)
-        $timestamp = Get-Date -Format "yyyyMMdd_HHmm"
-        $csvPath = "$logDirectory\BackupFailures_${envLabel}_AllClusters_$timestamp.csv"
-        $sorted | Export-Csv -Path $csvPath -NoTypeInformation -Encoding utf8
-        Write-Log "📂 CSV saved: $csvPath" "Gray"
+        # Export CSV only if failures exist
+        if ($sorted.Count -gt 0) {
+            $timestamp = Get-Date -Format "yyyyMMdd_HHmm"
+            $csvPath = "$logDirectory\BackupFailures_${envLabel}_AllClusters_$timestamp.csv"
+            $sorted | Export-Csv -Path $csvPath -NoTypeInformation -Encoding utf8
+            Write-Host "📂 CSV saved: $csvPath" -ForegroundColor Gray
+            $summaryRef.Add("📂 $envLabel: Failures found → $csvPath") | Out-Null
+            $masterRef.AddRange($sorted) | Out-Null
+        }
     } else {
-        Write-Log "`n✅ All latest $envLabel runs succeeded across all clusters." "Green"
+        Write-Log "`n✅ All latest $envLabel runs succeeded across all clusters — no CSV created." "Green"
+        $summaryRef.Add("✅ $envLabel: No failures (no CSV created)") | Out-Null
     }
 }
 
-# --- Mapping of choices to environments ---
+# --- Map environments ---
 $envMap = @{
     2 = @{ Type="kOracle"; Label="Oracle"; Filter="kOracle"; Object="kDatabase"; NameField="name" }
     3 = @{ Type="kSQL"; Label="SQL"; Filter="kSQL"; Object="kDatabase"; NameField="name" }
@@ -186,22 +190,58 @@ $envMap = @{
     7 = @{ Type="kAcropolis"; Label="Acropolis"; Filter="kAcropolis"; Object="kVirtualMachine"; NameField="name" }
 }
 
-# --- Run environments based on choice ---
+# --- Track summary & master results ---
+$summary = New-Object System.Collections.ArrayList
+$allResults = New-Object System.Collections.ArrayList
+
+# --- Run based on menu ---
 if($choice -eq "1"){
-    Write-Log "`n▶ Running all environments..." "Cyan"
-    foreach($key in $envMap.Keys){ Process-Generic @($envMap[$key].Values) }
+    Write-Host "`n▶ Running ALL environments..." -ForegroundColor Cyan
+    foreach($key in $envMap.Keys){
+        $env = $envMap[$key]
+        Write-Host "`n==============================" -ForegroundColor DarkCyan
+        Write-Host "▶ Environment: $($env.Label)" -ForegroundColor Cyan
+        Write-Host "==============================" -ForegroundColor DarkCyan
+        Process-Generic -envType $env.Type -envLabel $env.Label -filter $env.Filter -objectType $env.Object -nameField $env.NameField -summaryRef $summary -masterRef $allResults
+        Start-Sleep -Seconds 1
+    }
+
+    # --- Combined All Environments ---
+    if($allResults.Count -gt 0){
+        Write-Host "`n🔥 Combined Failures – All Environments" -ForegroundColor Magenta
+        $sortedAll = $allResults | Sort-Object Cluster,ProtectionGroup,Environment,EndTime -Descending
+        if($VerboseMode){ $sortedAll | Format-Table Cluster,ProtectionGroup,Environment,RunType,Name,StartTime,EndTime,FailedMessage -AutoSize }
+
+        $timestamp = Get-Date -Format "yyyyMMdd_HHmm"
+        $combinedPath = "$logDirectory\BackupFailures_AllEnvironments_$timestamp.csv"
+        $sortedAll | Export-Csv -Path $combinedPath -NoTypeInformation -Encoding utf8
+        Write-Host "📂 Combined CSV saved: $combinedPath" -ForegroundColor Gray
+        $summary.Add("📂 All Environments: Combined failures → $combinedPath") | Out-Null
+    } else {
+        Write-Host "`n✅ All environments succeeded — no combined CSV created." -ForegroundColor Green
+    }
 }
 else{
     $selected = $choice.Split(',') | ForEach-Object { $_.Trim() } | Where-Object { $_ -match '^\d+$' }
     foreach($sel in $selected){
         if($envMap.ContainsKey([int]$sel)){
             $env = $envMap[[int]$sel]
-            Write-Log "`n▶ Running environment: $($env.Label)" "Cyan"
-            Process-Generic -envType $env.Type -envLabel $env.Label -filter $env.Filter -objectType $env.Object -nameField $env.NameField
+            Write-Host "`n▶ Running environment: $($env.Label)" -ForegroundColor Cyan
+            Process-Generic -envType $env.Type -envLabel $env.Label -filter $env.Filter -objectType $env.Object -nameField $env.NameField -summaryRef $summary -masterRef $allResults
         } else {
             Write-Host "⚠️ Invalid selection: $sel" -ForegroundColor Yellow
         }
     }
+}
+
+# --- Final summary block ---
+if(-not $VerboseMode -and $summary.Count -gt 0){
+    Write-Host "`n==============================" -ForegroundColor Cyan
+    Write-Host "     SILENT MODE SUMMARY" -ForegroundColor White
+    Write-Host "==============================" -ForegroundColor Cyan
+    foreach($line in $summary){ Write-Host $line }
+    Write-Host "=============================="
+    Write-Host "All environments processed."
 }
 
 Write-Host "`n✅ Processing complete!" -ForegroundColor Green
