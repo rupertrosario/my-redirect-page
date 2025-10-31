@@ -2,6 +2,7 @@
 # Cohesity NAS Backup Failures – Multi-Cluster (Helios)
 # Environment: kGenericNas | kIsilon
 # ObjectType:  kHost
+# Robust version with fallback status detection
 # -------------------------------------------------------------
 
 $logDirectory = "X:\PowerShell\Data\Cohesity\BackupFailures"
@@ -85,11 +86,20 @@ foreach($cluster in $json_clu){
         $latestRun=$runs|Select-Object -First 1
         if(-not $latestRun){continue}
 
-        $info=$latestRun.localBackupInfo[0]
-        $status=$info.status
-        $runType=$info.runType
-        $startLocal=Convert-ToLocalFromEpoch $info.startTimeUsecs $tz
-        $endLocal=Convert-ToLocalFromEpoch $info.endTimeUsecs $tz
+        # ✅ Robust status detection with fallback
+        $info = $latestRun.localBackupInfo | Where-Object { $_.status } | Select-Object -First 1
+        if (-not $info) {
+            # Fallback to top-level fields
+            $status = $latestRun.status
+            $runType = if ($latestRun.runType) { $latestRun.runType } else { "Unknown" }
+            $startLocal = Convert-ToLocalFromEpoch $latestRun.startTimeUsecs $tz
+            $endLocal   = Convert-ToLocalFromEpoch $latestRun.endTimeUsecs $tz
+        } else {
+            $status=$info.status
+            $runType=$info.runType
+            $startLocal=Convert-ToLocalFromEpoch $info.startTimeUsecs $tz
+            $endLocal=Convert-ToLocalFromEpoch $info.endTimeUsecs $tz
+        }
 
         $isFailed = ($status -ne "Succeeded" -and $status -ne "SucceededWithWarning")
 
