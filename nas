@@ -48,7 +48,7 @@ foreach($cluster in $json_clu){
     Write-Host "`n🔹 Processing cluster: $cluster_name" -ForegroundColor Cyan
     $headers=@{apiKey=$apiKey;accessClusterId=$cluster_id}
 
-    # --- Get NAS PGs (both Generic NAS and Isilon) ---
+    # --- Get NAS PGs (Generic NAS & Isilon) ---
     $pgResp=Invoke-WebRequest -Uri "$baseUrl/v2/data-protect/protection-groups" -Headers $headers -Body @{
         environments="kGenericNas,kIsilon"
         isDeleted="False"
@@ -93,8 +93,14 @@ foreach($cluster in $json_clu){
 
         $isFailed = ($status -ne "Succeeded" -and $status -ne "SucceededWithWarning")
 
+        if(-not $isFailed){
+            Write-Host "✅ $cluster_name → $pgName [$runType] – Latest run succeeded" -ForegroundColor Green
+            continue
+        }
+
+        Write-Host "❌ $cluster_name → $pgName [$runType] – Latest run failed, collecting NAS details..." -ForegroundColor Red
+
         if($latestRun.objects){
-            # objectType can vary: kHost, kNetapp, etc.
             $nasObjs=$latestRun.objects|Where-Object{
                 ($_.object.environment -in @('kGenericNas','kIsilon'))
             }
