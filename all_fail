@@ -1,0 +1,207 @@
+# =====================================================================
+# Cohesity Backup Failures – Multi-Cluster (Helios)
+# Environments: Oracle | SQL | Physical | NAS | HyperV | Acropolis | All
+# Menu-driven with Verbose / Silent options
+# =====================================================================
+
+$logDirectory = "X:\PowerShell\Data\Cohesity\BackupFailures"
+if (-not (Test-Path -Path $logDirectory -PathType Container)) {
+    New-Item -Path $logDirectory -ItemType Directory | Out-Null
+}
+
+# --- Load API key ---
+$apikeypath = "X:\PowerShell\Cohesity_API_Scripts\DO_NOT_Delete\apikey.txt"
+if (-not (Test-Path $apikeypath)) { throw "API key file not found: $apikeypath" }
+$apiKey = (Get-Content -Path $apikeypath -Raw).Trim()
+$commonHeaders = @{ "apiKey" = $apiKey }
+$baseUrl = "https://helios.cohesity.com"
+
+# --- Helper for epoch time conversion ---
+function Convert-ToLocalFromEpoch($v,$tz){
+    if(-not $v -or $v -eq 0){return $null}
+    try{
+        $utc=[DateTimeOffset]::FromUnixTimeMilliseconds([int64]($v/1000)).UtcDateTime
+        if($tz){[System.TimeZoneInfo]::ConvertTimeFromUtc($utc,$tz)}else{$utc.ToLocalTime()}
+    }catch{return $null}
+}
+$tz=[System.TimeZoneInfo]::FindSystemTimeZoneById("Eastern Standard Time")
+
+# --- Get all clusters ---
+$url = "$baseUrl/v2/mcm/cluster-mgmt/info"
+$response = Invoke-WebRequest -Uri $url -Headers $commonHeaders -Method Get
+$json_clu = ($response.Content | ConvertFrom-Json).cohesityClusters
+if (-not $json_clu) { throw "No clusters returned from Helios." }
+
+# --- Menu ---
+Write-Host "=============================================" -ForegroundColor Cyan
+Write-Host "   COHESITY BACKUP FAILURES – MAIN MENU" -ForegroundColor White
+Write-Host "=============================================" -ForegroundColor Cyan
+Write-Host "1.  All Environments"
+Write-Host "2.  Oracle"
+Write-Host "3.  SQL"
+Write-Host "4.  Physical (File System)"
+Write-Host "5.  NAS (GenericNas/Isilon)"
+Write-Host "6.  Hyper-V"
+Write-Host "7.  Acropolis (AHV)"
+Write-Host "---------------------------------------------"
+$choice = Read-Host "Enter your choice(s) (e.g. 2,3,4)"
+
+Write-Host "`nSelect Mode:" -ForegroundColor Yellow
+Write-Host "1. Verbose (detailed, color output – recommended)"
+Write-Host "2. Silent (background mode – CSV only)"
+$modeChoice = Read-Host "Enter mode [1 or 2]"
+$VerboseMode = $modeChoice -eq "1"
+
+function Write-Log($msg,$color="Gray"){
+    if($VerboseMode){ Write-Host $msg -ForegroundColor $color }
+}
+
+# --- Utility to safely sort runs ---
+function Get-LatestRun($runs){ $runs | Sort-Object { $_.localBackupInfo[0].endTimeUsecs } -Descending | Select-Object -First 1 }
+
+# --- Function template for each environment ---
+function Process-Generic {
+    param($envType,$envLabel,$filter,$objectType,$nameField)
+
+    $globalFailures = @()
+
+    foreach($cluster in $json_clu){
+        $cluster_name = ($cluster.name, $cluster.clusterName, $cluster.displayName | Where-Object { $_ -and $_.Trim() } | Select-Object -First 1)
+        if(-not $cluster_name){ $cluster_name = "Unknown-$($cluster.clusterId)" }
+        $cluster_id = $cluster.clusterId
+        $headers = @{ apiKey=$apiKey; accessClusterId=$cluster_id }
+
+        Write-Log "`n🔹 Processing cluster: $cluster_name" "Cyan"
+
+        try {
+            $pgResp = Invoke-WebRequest -Uri "$baseUrl/v2/data-protect/protection-groups" -Headers $headers -Body @{
+                environments = $filter
+                isDeleted = "False"
+                isPaused = "False"
+                isActive = "True"
+            } -Method Get
+            $pgs = ($pgResp.Content | ConvertFrom-Json).protectionGroups
+        } catch {
+            Write-Log "⚠️ Error retrieving PGs on $cluster_name" "Yellow"
+            continue
+        }
+
+        if(-not $pgs){ Write-Log "⚠️ No $envLabel PGs on $cluster_name" "Yellow"; continue }
+
+        foreach($pg in $pgs){
+            $pgId = $pg.id
+            $pgName = $pg.name
+
+            $runResp = Invoke-WebRequest -Uri "$baseUrl/v2/data-protect/protection-groups/$pgId/runs" -Headers $headers -Body @{
+                environments = $filter
+                numRuns = "10"
+                excludeNonRestorableRuns = "False"
+                includeObjectDetails = "True"
+            } -Method Get
+            $runs = ( $runResp.Content | ConvertFrom-Json ).runs
+            if(-not $runs){ continue }
+
+            $latestRun = Get-LatestRun $runs
+            if(-not $latestRun){ continue }
+
+            $info = $latestRun.localBackupInfo[0]
+            $status = $info.status
+            $runType = $info.runType
+            $startLocal = Convert-ToLocalFromEpoch $info.startTimeUsecs $tz
+            $endLocal = Convert-ToLocalFromEpoch $info.endTimeUsecs $tz
+            $isFailed = ($status -ne "Succeeded" -and $status -ne "SucceededWithWarning")
+
+            Write-Log "`n📦 Checking PG: $pgName" "Yellow"
+            if($endLocal){ Write-Log "   🕓 Latest Run Date: $($endLocal.ToString('dd-MMM-yyyy HH:mm:ss'))" "DarkGray" }
+            if($isFailed){ Write-Log "❌ $cluster_name → $pgName [$runType] – Latest run failed" "Red" } else { Write-Log "✅ $cluster_name → $pgName [$runType] – Latest run succeeded" "Green" }
+
+            if($latestRun.objects){
+                $objs = $latestRun.objects | Where-Object { $_.object.objectType -eq $objectType -and $_.object.environment -in $filter.Split(',') }
+                foreach($o in $objs){
+                    $attempts = $o.localSnapshotInfo.failedAttempts
+                    if($isFailed -or $attempts){
+                        if($attempts){
+                            foreach($fa in $attempts){
+                                $msgClean = ($fa.message -replace '[\r\n]+',' ' -replace ',',' ' -replace '"','''').Trim()
+                                $globalFailures += [pscustomobject]@{
+                                    Cluster=$cluster_name
+                                    ProtectionGroup=$pgName
+                                    RunType=$runType
+                                    Name=$o.object.$nameField
+                                    StartTime=$startLocal
+                                    EndTime=$endLocal
+                                    FailedMessage=$msgClean
+                                }
+                            }
+                        } else {
+                            $globalFailures += [pscustomobject]@{
+                                Cluster=$cluster_name
+                                ProtectionGroup=$pgName
+                                RunType=$runType
+                                Name=$o.object.$nameField
+                                StartTime=$startLocal
+                                EndTime=$endLocal
+                                FailedMessage="No failedAttempts[] details found — Run marked Failed"
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    # --- De-dup ---
+    if($globalFailures.Count -gt 0){
+        $globalFailures = $globalFailures |
+            Group-Object {
+                $end = if ($_.EndTime) { $_.EndTime.ToString('yyyy-MM-dd HH:mm') } else { 'N/A' }
+                "$($_.Cluster)|$($_.ProtectionGroup)|$($_.RunType)|$($_.Name)|$($_.FailedMessage)|$end"
+            } |
+            ForEach-Object { $_.Group | Sort-Object EndTime -Descending | Select-Object -First 1 }
+
+        Write-Log "`n🔥 Latest Failed $envLabel Runs (All Clusters):`n" "Cyan"
+        $sorted = $globalFailures | Sort-Object Cluster,ProtectionGroup,EndTime -Descending
+
+        if($VerboseMode){
+            $sorted | Format-Table Cluster,ProtectionGroup,RunType,Name,StartTime,EndTime,FailedMessage -AutoSize
+        }
+
+        # Export CSV (UTF8 no BOM)
+        $timestamp = Get-Date -Format "yyyyMMdd_HHmm"
+        $csvPath = "$logDirectory\BackupFailures_${envLabel}_AllClusters_$timestamp.csv"
+        $sorted | Export-Csv -Path $csvPath -NoTypeInformation -Encoding utf8
+        Write-Log "📂 CSV saved: $csvPath" "Gray"
+    } else {
+        Write-Log "`n✅ All latest $envLabel runs succeeded across all clusters." "Green"
+    }
+}
+
+# --- Mapping of choices to environments ---
+$envMap = @{
+    2 = @{ Type="kOracle"; Label="Oracle"; Filter="kOracle"; Object="kDatabase"; NameField="name" }
+    3 = @{ Type="kSQL"; Label="SQL"; Filter="kSQL"; Object="kDatabase"; NameField="name" }
+    4 = @{ Type="kPhysical"; Label="Physical"; Filter="kPhysical"; Object="kHost"; NameField="name" }
+    5 = @{ Type="kGenericNas"; Label="NAS"; Filter="kGenericNas,kIsilon"; Object="kHost"; NameField="name" }
+    6 = @{ Type="kHyperV"; Label="HyperV"; Filter="kHyperV"; Object="kVirtualMachine"; NameField="name" }
+    7 = @{ Type="kAcropolis"; Label="Acropolis"; Filter="kAcropolis"; Object="kVirtualMachine"; NameField="name" }
+}
+
+# --- Run environments based on choice ---
+if($choice -eq "1"){
+    Write-Log "`n▶ Running all environments..." "Cyan"
+    foreach($key in $envMap.Keys){ Process-Generic @($envMap[$key].Values) }
+}
+else{
+    $selected = $choice.Split(',') | ForEach-Object { $_.Trim() } | Where-Object { $_ -match '^\d+$' }
+    foreach($sel in $selected){
+        if($envMap.ContainsKey([int]$sel)){
+            $env = $envMap[[int]$sel]
+            Write-Log "`n▶ Running environment: $($env.Label)" "Cyan"
+            Process-Generic -envType $env.Type -envLabel $env.Label -filter $env.Filter -objectType $env.Object -nameField $env.NameField
+        } else {
+            Write-Host "⚠️ Invalid selection: $sel" -ForegroundColor Yellow
+        }
+    }
+}
+
+Write-Host "`n✅ Processing complete!" -ForegroundColor Green
