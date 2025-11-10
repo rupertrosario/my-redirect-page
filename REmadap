@@ -1,0 +1,227 @@
+# =====================================================================
+# Cohesity Remote Adapter (kRemoteAdapter) – Failures WITHOUT later success
+# Standalone report exactly per your pictured flow (no menu, no verbose modes)
+# - Helios → all clusters
+# - List PGs (kRemoteAdapter)
+# - Extract HostName & DB_name from PG.remoteAdapterParams
+# - Fetch last 10 runs with includeObjectDetails=True
+# - Flatten localBackupInfo[]
+# - For each RunType, take latest Failed WITH NO later Success
+# - Print table; save CSV only if failures exist (UTF-8, no BOM)
+# =====================================================================
+
+# -------------------------------
+# 0) Housekeeping (same as yours)
+# -------------------------------
+$logDirectory = "X:\PowerShell\Data\Cohesity\BackupFailures"
+if (-not (Test-Path -Path $logDirectory -PathType Container)) {
+    New-Item -Path $logDirectory -ItemType Directory | Out-Null
+}
+
+# keep max 50 files in folder
+$fileCount = (Get-ChildItem -Path $logDirectory -File).Count
+if ($fileCount -gt 50) {
+    Get-ChildItem -Path $logDirectory -File |
+        Sort-Object CreationTime |
+        Select-Object -First ($fileCount - 50) |
+        Remove-Item -Force
+}
+
+# -------------------------------
+# 1) Helios API setup
+# -------------------------------
+$apikeypath = "X:\PowerShell\Cohesity_API_Scripts\DO_NOT_Delete\apikey.txt"
+if (-not (Test-Path $apikeypath)) { throw "API key file not found at $apikeypath" }
+$apiKey = (Get-Content -Path $apikeypath -Raw).Trim()
+$commonHeaders = @{ "apiKey" = $apiKey }
+$baseUrl = "https://helios.cohesity.com"
+
+# -------------------------------
+# 2) Helpers (time conversion)
+# -------------------------------
+function Convert-ToUtcFromEpoch($v){
+    if ($null -eq $v -or $v -eq 0) { return $null }
+    try {
+        # value is in microseconds → convert to ms
+        return [DateTimeOffset]::FromUnixTimeMilliseconds([int64]([double]$v / 1000)).UtcDateTime
+    } catch {
+        # if it's already milliseconds
+        return [DateTimeOffset]::FromUnixTimeMilliseconds([int64]$v).UtcDateTime
+    }
+}
+function Convert-ToLocalFromUsecs($usecs, $tz){
+    $utc = Convert-ToUtcFromEpoch $usecs
+    if ($null -eq $utc) { return $null }
+    if ($tz) { [System.TimeZoneInfo]::ConvertTimeFromUtc($utc,$tz) } else { $utc.ToLocalTime() }
+}
+$tz = [System.TimeZoneInfo]::FindSystemTimeZoneById("Eastern Standard Time")
+
+# -------------------------------
+# 3) Get clusters (Helios)
+# -------------------------------
+$cluResp = Invoke-WebRequest -Method Get -Uri "$baseUrl/v2/mcm/cluster-mgmt/info" -Headers $commonHeaders
+$json_clu = ($cluResp.Content | ConvertFrom-Json).cohesityClusters
+if (-not $json_clu) { throw "No clusters returned from Helios." }
+
+# -------------------------------
+# 4) Process kRemoteAdapter
+# -------------------------------
+$globalFailures = @()
+
+foreach ($clus in $json_clu) {
+
+    $cluster_name = ($clus.name, $clus.clusterName, $clus.displayName | Where-Object { $_ -and $_.Trim() } | Select-Object -First 1)
+    if (-not $cluster_name) { $cluster_name = "Unknown-$($clus.clusterId)" }
+    $cluster_id   = $clus.clusterId
+
+    $headers = @{ apiKey=$apiKey; accessClusterId=$cluster_id }
+
+    # List PGs for RemoteAdapter
+    $pgUrl = "$baseUrl/v2/data-protect/protection-groups"
+    $pgBody = @{
+        environments = "kRemoteAdapter"
+        isDeleted    = "False"
+        isPaused     = "False"
+        isActive     = "True"
+    }
+
+    try {
+        $pgResp = Invoke-WebRequest -Method Get -Uri $pgUrl -Headers $headers -Body $pgBody
+        $pgs = ($pgResp.Content | ConvertFrom-Json).protectionGroups
+    } catch {
+        continue
+    }
+    if (-not $pgs) { continue }
+
+    foreach ($pg in $pgs) {
+        $pgId   = $pg.id
+        $pgName = $pg.name
+
+        # Pull HostName & DB_name from remoteAdapterParams (as in your screenshots)
+        $HostName = $null
+        $DB_name  = $null
+        try {
+            $HostName = $pg.remoteAdapterParams.hosts.hostname
+            if ($HostName -is [System.Array]) { $HostName = ($HostName -join ',') }
+
+            $args = $pg.remoteAdapterParams.hosts.incrementalBackupScript.params
+            if ($args -is [System.Array]) { $args = ($args -join ' ') }
+
+            # From your picture logic: extract DB after -o
+            if ($args -match "-o\s+(\S+)") { $DB_name = $matches[1] }
+        } catch { }
+
+        # Fetch latest runs
+        $runUrl = "$baseUrl/v2/data-protect/protection-groups/$pgId/runs"
+        $runBody = @{
+            environments             = "kRemoteAdapter"
+            isDeleted                = "False"
+            isPaused                 = "False"
+            isActive                 = "True"
+            numRuns                  = "10"
+            excludeNonRestorableRuns = "False"
+            includeObjectDetails     = "True"
+        }
+
+        try {
+            $runResp = Invoke-WebRequest -Method Get -Uri $runUrl -Headers $headers -Body $runBody
+            $json = $runResp | ConvertFrom-Json
+        } catch {
+            continue
+        }
+
+        $runs = if ($json -and $json.runs) { $json.runs } else { @() }
+        if (-not $runs) { continue }
+
+        # Flatten localBackupInfo[] like your flow
+        $flatRuns = @()
+        foreach ($run in $runs) {
+            if ($run.localBackupInfo) {
+                foreach ($info in $run.localBackupInfo) {
+                    $flatRuns += [pscustomobject]@{
+                        RunType         = $info.runType
+                        Status          = $info.status
+                        Message         = $info.messages
+                        StartTimeUsecs  = $info.startTimeUsecs
+                        EndTimeUsecs    = $info.endTimeUsecs
+                        Cluster         = $cluster_name
+                        ProtectionGroup = $pgName
+                        HostName        = $HostName
+                        DB_name         = $DB_name
+                    }
+                }
+            }
+        }
+        if (-not $flatRuns) { continue }
+
+        # For each RunType → pick latest Failed; ensure NO later Success
+        $grouped = $flatRuns | Group-Object RunType
+        foreach ($g in $grouped) {
+            $latestFailed = $g.Group |
+                Where-Object { $_.Status -eq 'Failed' } |
+                Sort-Object EndTimeUsecs -Descending |
+                Select-Object -First 1
+
+            if ($null -eq $latestFailed) { continue }
+
+            $hasLaterSuccess = $g.Group | Where-Object {
+                $_.Status -in @('Succeeded','SucceededWithWarning') -and
+                $_.StartTimeUsecs -gt $latestFailed.EndTimeUsecs
+            }
+
+            if (-not $hasLaterSuccess) {
+                $startLocal = Convert-ToLocalFromUsecs $latestFailed.StartTimeUsecs $tz
+                $endLocal   = Convert-ToLocalFromUsecs $latestFailed.EndTimeUsecs   $tz
+
+                $msg = $latestFailed.Message
+                if ($msg -is [System.Array]) { $msg = ($msg -join ' | ') }
+
+                $globalFailures += [pscustomobject]@{
+                    Cluster         = $latestFailed.Cluster
+                    ProtectionGroup = $latestFailed.ProtectionGroup
+                    HostName        = $latestFailed.HostName
+                    DB_name         = $latestFailed.DB_name
+                    RunType         = $latestFailed.RunType
+                    Status          = $latestFailed.Status
+                    StartTime       = $startLocal
+                    EndTime         = $endLocal
+                    Message         = $msg
+                }
+            }
+        }
+    }
+}
+
+# -------------------------------
+# 5) Output
+# -------------------------------
+if ($globalFailures.Count -gt 0) {
+
+    # De-dup by (Cluster|PG|RunType|HostName|DB|Message|EndTime)
+    $dedup = $globalFailures |
+        Group-Object {
+            $end = if ($_.EndTime) { $_.EndTime.ToString('yyyy-MM-dd HH:mm') } else { 'N/A' }
+            "$($_.Cluster)|$($_.ProtectionGroup)|$($_.RunType)|$($_.HostName)|$($_.DB_name)|$($_.Message)|$end"
+        } |
+        ForEach-Object {
+            $_.Group | Sort-Object EndTime -Descending | Select-Object -First 1
+        }
+
+    $out = $dedup |
+        Sort-Object Cluster, EndTime -Descending |
+        Select-Object Cluster, ProtectionGroup, HostName, DB_name, RunType, Status,
+            @{Name="StartTime"; Expression = { if ($_.StartTime) { $_.StartTime.ToString("dd/MM/yyyy HH:mm:ss") } }},
+            @{Name="EndTime";   Expression = { if ($_.EndTime)   { $_.EndTime.ToString("dd/MM/yyyy HH:mm:ss") } }},
+            Message
+
+    Write-Host "`n🔥 Remote Adapter – Failures WITHOUT later Success (All Clusters)`n"
+    $out | Format-Table Cluster, ProtectionGroup, HostName, DB_name, RunType, Status, StartTime, EndTime, Message -AutoSize
+
+    $timestamp = Get-Date -Format "yyyy-MM-dd_HHmm"
+    $csvPath   = Join-Path $logDirectory "BackupFailures_RemoteAdapter_AllClusters_$timestamp.csv"
+    $out | Export-Csv -Path $csvPath -NoTypeInformation -Encoding utf8
+    Write-Host "`n📂 CSV saved: $csvPath"
+}
+else {
+    Write-Host "`n✅ No Remote Adapter failures without later success (across all clusters)."
+}
