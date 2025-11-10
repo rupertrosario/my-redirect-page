@@ -2,7 +2,8 @@
 # Cohesity Backup Failures – Multi-Cluster (Helios)
 # Menu-driven | Verbose/Silent | CSV only when failures exist (UTF-8)
 # Environments: Oracle, SQL, Physical, NAS, HyperV, Acropolis, RemoteAdapter
-# Unified row schema across collectors so the table always renders.
+# Oracle/SQL: DB→Host mapping and host-level rows as "No DBs Found (Host-Level Failure)"
+# Output table columns (Oracle/SQL): Cluster, ProtectionGroup, Hosts, DatabaseName, RunType, EndTime, FailedMessage
 # =====================================================================
 
 # -------------------------------
@@ -12,7 +13,6 @@ $logDirectory = "X:\PowerShell\Data\Cohesity\BackupFailures"
 if (-not (Test-Path -Path $logDirectory -PathType Container)) {
     New-Item -Path $logDirectory -ItemType Directory | Out-Null
 }
-# Trim logs to last 50 files (optional hygiene)
 try {
     $files = Get-ChildItem -Path $logDirectory -File -ErrorAction Stop
     if ($files.Count -gt 50) {
@@ -71,12 +71,15 @@ Write-Host "5.  NAS (GenericNas/Isilon)"
 Write-Host "6.  Hyper-V"
 Write-Host "7.  Acropolis (AHV)"
 Write-Host "8.  Remote Adapter"
+Write-Host "9.  Exit"
 Write-Host "---------------------------------------------"
 $choice = Read-Host "Enter your choice(s) (e.g. 2,3,4)"
 
+if ($choice.Trim() -eq '9') { return }
+
 Write-Host "`nSelect Mode:" -ForegroundColor Yellow
 Write-Host "1. Verbose (detailed, color output)"
-Write-Host "2. Silent (compact; tables only for failures)"
+Write-Host "2. Silent (tables only for failures)"
 $modeChoice = Read-Host "Enter mode [1 or 2]"
 $script:VerboseMode = $modeChoice -eq "1"
 
@@ -95,7 +98,7 @@ $envMap = @(
 
 # -------------------------------
 # Core collector (latest run failed with object-level failedAttempts)
-# Used by Oracle, SQL, Physical, NAS, HyperV, Acropolis
+# Oracle/SQL: DB→Host mapping + host-level failure rows ("No DBs Found (Host-Level Failure)")
 # -------------------------------
 function Collect-EnvLatestFailedWithObjectAttempts {
     param(
@@ -165,17 +168,45 @@ function Collect-EnvLatestFailedWithObjectAttempts {
 
                 if(-not $latestRun.objects){ continue }
 
-                # Build id->name map for DB Host resolution (Oracle/SQL)
-                $idToName = @{}
-                if($ParentHostNeeded){
-                    foreach($ob in $latestRun.objects){
-                        if($ob.object -and $ob.object.id){
-                            $idToName[[string]$ob.object.id] = $ob.object.name
+                # --- Build maps from all objects in this run ---
+                $idToName = @{}          # any object.id -> object.name
+                $hostById = @{}          # host (kHost/kPhysical) id -> name
+                foreach($ob in $latestRun.objects){
+                    if($ob.object -and $ob.object.id){
+                        $idStr = [string]$ob.object.id
+                        $idToName[$idStr] = $ob.object.name
+                        if($ob.object.objectType -eq 'kHost' -or $ob.object.environment -eq 'kPhysical'){
+                            $hostById[$idStr] = $ob.object.name
                         }
                     }
                 }
 
-                # Filter only the target object type + env
+                # --- Oracle/SQL special: host-level failures row ---
+                if($ParentHostNeeded){
+                    $hostObjs = $latestRun.objects | Where-Object {
+                        $_.object.objectType -eq 'kHost' -or $_.object.environment -eq 'kPhysical'
+                    }
+                    foreach($h in $hostObjs){
+                        $hattempts = $h.localSnapshotInfo.failedAttempts
+                        if($hattempts){
+                            foreach($fa in $hattempts){
+                                $global += [pscustomobject]@{
+                                    Cluster         = $cluster_name
+                                    ProtectionGroup = $pgName
+                                    Environment     = $Label
+                                    RunType         = $runType
+                                    Name            = 'No DBs Found (Host-Level Failure)' # DatabaseName in table
+                                    ParentHost      = $h.object.name                      # Hosts in table
+                                    StartTime       = $startLocal
+                                    EndTime         = $endLocal
+                                    FailedMessage   = (CleanMsg $fa.message)
+                                }
+                            }
+                        }
+                    }
+                }
+
+                # --- Target object type failures (DBs, Hosts, VMs, etc.) ---
                 $objs = $latestRun.objects | Where-Object {
                     $_.object.objectType -eq $ObjectType -and $_.object.environment -in $filterSet
                 }
@@ -184,11 +215,14 @@ function Collect-EnvLatestFailedWithObjectAttempts {
                     $attempts = $o.localSnapshotInfo.failedAttempts
                     if(-not $attempts -or $attempts.Count -eq 0){ continue }  # only true object failures
 
-                    # Optional ParentHost (Oracle/SQL)
+                    # Resolve ParentHost for Oracle/SQL
                     $parent = $null
-                    if($ParentHostNeeded -and $o.object -and $o.object.sourceId){
-                        $key = [string]$o.object.sourceId
-                        if($idToName.ContainsKey($key)){ $parent = $idToName[$key] }
+                    if($ParentHostNeeded -and $o.object){
+                        if($o.object.PSObject.Properties['sourceId']){
+                            $sid = [string]$o.object.sourceId
+                            if($idToName.ContainsKey($sid)){ $parent = $idToName[$sid] }
+                            elseif($hostById.ContainsKey($sid)){ $parent = $hostById[$sid] }
+                        }
                     }
 
                     foreach($fa in $attempts){
@@ -197,8 +231,8 @@ function Collect-EnvLatestFailedWithObjectAttempts {
                             ProtectionGroup = $pgName
                             Environment     = $Label
                             RunType         = $runType
-                            Name            = $o.object.$NameField
-                            ParentHost      = $(if($ParentHostNeeded){ $parent } else { $null })
+                            Name            = $o.object.$NameField       # DatabaseName in table
+                            ParentHost      = $(if($ParentHostNeeded){ $parent } else { $null })  # Hosts in table
                             StartTime       = $startLocal
                             EndTime         = $endLocal
                             FailedMessage   = (CleanMsg $fa.message)
@@ -227,8 +261,7 @@ function Collect-EnvLatestFailedWithObjectAttempts {
 }
 
 # -------------------------------
-# RemoteAdapter collector
-# Rule: latest Failed per RunType *without* any later Success
+# RemoteAdapter collector (failed without later success)
 # -------------------------------
 function Collect-RemoteAdapter {
     $Label = "RemoteAdapter"
@@ -250,7 +283,6 @@ function Collect-RemoteAdapter {
         foreach ($pg in $pgs) {
             $pgId = $pg.id; $pgName = $pg.name
 
-            # Attempt to extract Host / DB from params (per your images)
             $raHost = $null; $raDB = $null
             try {
                 $raHost = $pg.remoteAdapterParams.hosts.hostname
@@ -273,7 +305,6 @@ function Collect-RemoteAdapter {
             $runs = if ($json -and $json.runs) { $json.runs } else { @() }
             if (-not $runs) { continue }
 
-            # Flatten
             $flat = @()
             foreach ($run in $runs) {
                 if ($run.localBackupInfo) {
@@ -311,7 +342,6 @@ function Collect-RemoteAdapter {
                 $msg        = $latestFailed.Message
                 if ($msg -is [System.Array]) { $msg = ($msg -join ' | ') }
 
-                # Normalize to unified row schema
                 $global += [pscustomobject]@{
                     Cluster         = $latestFailed.Cluster
                     ProtectionGroup = $latestFailed.ProtectionGroup
@@ -343,7 +373,8 @@ function Collect-RemoteAdapter {
 }
 
 # -------------------------------
-# Robust table render (works for all envs)
+# Table render (Oracle/SQL columns exactly as requested)
+# For non-DB envs, Hosts/DatabaseName are adapted sensibly.
 # -------------------------------
 $summary   = New-Object System.Collections.ArrayList
 $allTables = New-Object System.Collections.ArrayList
@@ -359,36 +390,50 @@ function Show-Table {
     )
     $rows = @($rows)
     if ($rows.Count -gt 0) {
-        $view = $rows | Select-Object `
-            @{n='Cluster';         e={$_.Cluster}},
-            @{n='ProtectionGroup'; e={$_.ProtectionGroup}},
-            @{n='Environment';     e={$_.Environment}},
-            @{n='RunType';         e={$_.RunType}},
-            @{n='Hosts'; e={
-                if ($_.Environment -in @('Oracle','SQL')) {
-                    if ($_.ParentHost) { $_.ParentHost } else { $null }
-                } elseif ($_.Environment -in @('Physical','NAS')) {
-                    $_.Name
-                } else {
-                    if ($_.ParentHost) { $_.ParentHost } else { $null }
-                }
-            }},
-            @{n='DatabaseName'; e={
-                if ($_.Environment -in @('Oracle','SQL')) {
-                    if ($_.Name -and $_.Name -ne 'DB Host') { $_.Name } else { $null }
-                } else { $null }
-            }},
-            @{n='StartTime';      e={$_.StartTime}},
-            @{n='EndTime';        e={$_.EndTime}},
-            @{n='FailedMessage';  e={$_.FailedMessage}}
+
+        # Map to the common view:
+        $view = $rows | ForEach-Object {
+            $env = $_.Environment
+            $hosts = $null
+            $dbname = $null
+
+            if ($env -in @('Oracle','SQL')) {
+                $hosts  = $_.ParentHost
+                $dbname = $_.Name
+            }
+            elseif ($env -in @('Physical','NAS')) {
+                $hosts  = $_.Name
+                $dbname = $null
+            }
+            else {
+                # HyperV/Acropolis/RemoteAdapter: put object name under DatabaseName column to keep width stable
+                $hosts  = $null
+                $dbname = $_.Name
+            }
+
+            [pscustomobject]@{
+                Cluster         = $_.Cluster
+                ProtectionGroup = $_.ProtectionGroup
+                Hosts           = $hosts
+                DatabaseName    = $dbname
+                RunType         = $_.RunType
+                EndTime         = $_.EndTime
+                FailedMessage   = $_.FailedMessage
+            }
+        }
 
         Write-Host ("`n🔥 Latest Failed {0} Runs (All Clusters):`n" -f $label) -ForegroundColor Cyan
-        $view | Format-Table -AutoSize
+        $view | Sort-Object Cluster,ProtectionGroup,EndTime -Descending |
+               Format-Table Cluster,ProtectionGroup,Hosts,DatabaseName,RunType,EndTime,FailedMessage -AutoSize
 
         if ($csvPath) { Write-Host ("`n📂 CSV saved: {0}" -f $csvPath) -ForegroundColor Gray }
         Add-SummaryLine $label $csvPath
     } else {
-        Write-Host ("✅ No failures found for {0} (All Clusters)" -f $label) -ForegroundColor Green
+        if ($script:VerboseMode) {
+            Write-Host ("✅ No failures found for {0} (All Clusters)" -f $label) -ForegroundColor Green
+        } else {
+            # Silent mode: no noisy "no failures" line
+        }
         $null = $summary.Add(("✅ {0}: No failures found (no CSV created)" -f $label))
     }
 }
@@ -428,11 +473,13 @@ if($choice -eq "1"){
         Write-Host ("📂 Combined CSV saved: {0}" -f $combinedPath) -ForegroundColor Gray
         $null=$summary.Add(("📂 All Environments: Combined failures → {0}" -f $combinedPath))
     } else {
-        Write-Host "`n✅ All environments succeeded — no combined CSV created." -ForegroundColor Green
+        if ($script:VerboseMode) {
+            Write-Host "`n✅ All environments succeeded — no combined CSV created." -ForegroundColor Green
+        }
     }
 }
 else {
-    $selected=$choice.Split(',')|ForEach-Object{$_.Trim()}|Where-Object{$_ -match '^\d+$'}
+    $selected=$choice.Split(',')|ForEach-Object{$_.Trim()}|Where-Object{$_ -match '^\d+$' -and $_ -ne '9'}
     foreach($sel in $selected){
         $env = $envMap | Where-Object { $_.Key -eq [int]$sel } | Select-Object -First 1
         if($null -eq $env){
