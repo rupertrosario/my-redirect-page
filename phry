@@ -1,22 +1,176 @@
-foreach ($runId in $runs.id) {
-  $response1 = Invoke-WebRequest -Method Get -Uri "https://helios.cohesity.com/v2/data-protect/runs/$runId/progress?includeEventLogs=true" -Headers $headers -Body $body
-  $rwap = $response1.Content | ConvertFrom-Json
-  $errorMessages = $rwap.localRun.objects.events.message | Select-String "kFSError"
+# -------------------------------------------------------------
+# Cohesity File System Backup Failures – Multi-Cluster (Helios)
+# Environment: kPhysical | ObjectType: kHost
+# Robust: query-string filters, correct runType selection,
+# run-level fallback, and object-level failedAttempts capture
+# -------------------------------------------------------------
 
-  $run = $runs | Where-Object { $_.id -eq $runId }
-  if ($run.localBackupInfo) {
-    foreach ($info in $run.localBackupInfo) {
-      $flatRuns += [pscustomobject]@{
-        RunId          = $runId
-        RunType        = $info.runType
-        Status         = $info.status
-        Message        = $info.message
-        EventErrors    = ($errorMessages | ForEach-Object { $_.ToString() }) -join "; "
-        StartTimeUsecs = $info.startTimeUsecs
-        EndTimeUsecs   = $info.endTimeUsecs
-        Cluster        = $cluster_name
-        ProtectionGroup= $pgName
-      }
-    }
-  }
+$logDirectory = "X:\PowerShell\Data\Cohesity\BackupFailures"
+if (-not (Test-Path -Path $logDirectory -PathType Container)) {
+    New-Item -Path $logDirectory -ItemType Directory | Out-Null
 }
+
+# --- Load API key ---
+$apikeypath = "X:\PowerShell\Cohesity_API_Scripts\DO_NOT_Delete\apikey.txt"
+if (-not (Test-Path $apikeypath)) { throw "API key file not found: $apikeypath" }
+$apiKey = (Get-Content -Path $apikeypath -Raw).Trim()
+$baseUrl = "https://helios.cohesity.com"
+$commonHeaders = @{ "apiKey" = $apiKey }
+
+# --- Helper time conversion (µs -> local) ---
+function Convert-ToLocalFromUsecs {
+    param([Nullable[Int64]]$usecs, [System.TimeZoneInfo]$tz)
+    if ($null -eq $usecs -or $usecs -eq 0) { return $null }
+    try {
+        $utc = [DateTimeOffset]::FromUnixTimeMilliseconds([int64]([double]$usecs/1000)).UtcDateTime
+        if ($tz) { return [System.TimeZoneInfo]::ConvertTimeFromUtc($utc, $tz) }
+        else     { return $utc.ToLocalTime() }
+    } catch { return $null }
+}
+
+$tz = [System.TimeZoneInfo]::FindSystemTimeZoneById("Eastern Standard Time")
+$globalFailures = @()
+
+# --- Get clusters (no body on GET) ---
+$cluUrl = "$baseUrl/v2/mcm/cluster-mgmt/info"
+$json_clu = ((Invoke-WebRequest -Method Get -Uri $cluUrl -Headers $commonHeaders).Content | ConvertFrom-Json).cohesityClusters
+if (-not $json_clu) { throw "No clusters returned from Helios." }
+
+foreach ($cluster in $json_clu) {
+    $cluster_name = ($cluster.name, $cluster.clusterName, $cluster.displayName | Where-Object { $_ -and $_.Trim() } | Select-Object -First 1)
+    if (-not $cluster_name) { $cluster_name = "Unknown-$($cluster.clusterId)" }
+    $cluster_id = $cluster.clusterId
+    $headers = @{ apiKey = $apiKey; accessClusterId = $cluster_id }
+
+    Write-Host "`n🔹 Processing cluster: $cluster_name" -ForegroundColor Cyan
+
+    # --- Protection groups for kPhysical (query string!) ---
+    $pgUrl = "$baseUrl/v2/data-protect/protection-groups?environments=kPhysical&isDeleted=false&isPaused=false&isActive=true"
+    try {
+        $pgs = ((Invoke-WebRequest -Method Get -Uri $pgUrl -Headers $headers).Content | ConvertFrom-Json).protectionGroups
+    } catch {
+        Write-Host "⚠️ Failed to list PGs on $cluster_name: $($_.Exception.Message)" -ForegroundColor Yellow
+        continue
+    }
+    if (-not $pgs) { Write-Host "⚠️ No File System PGs found on $cluster_name." -ForegroundColor Yellow; continue }
+
+    foreach ($pg in $pgs) {
+        $pgId = $pg.id
+        $pgName = $pg.name
+        Write-Host "`n📦 Checking PG: $pgName" -ForegroundColor Yellow
+
+        # --- Runs (query string; includeObjectDetails=true) ---
+        $runUrl = "$baseUrl/v2/data-protect/protection-groups/$pgId/runs?environments=kPhysical&numRuns=10&excludeNonRestorableRuns=false&includeObjectDetails=true"
+        try {
+            $jsonRuns = (Invoke-WebRequest -Method Get -Uri $runUrl -Headers $headers | ConvertFrom-Json)
+        } catch {
+            Write-Host "⚠️ Skipping $pgName due to API error: $($_.Exception.Message)" -ForegroundColor Yellow
+            continue
+        }
+        if (-not $jsonRuns.runs) { continue }
+
+        # --- For each run, collect every (runType, status, start/end) from localBackupInfo[] ---
+        $expanded = foreach ($r in $jsonRuns.runs) {
+            if ($r.localBackupInfo) {
+                foreach ($li in $r.localBackupInfo) {
+                    [pscustomobject]@{
+                        runType        = $li.runType
+                        status         = $li.status
+                        startTimeUsecs = $li.startTimeUsecs
+                        endTimeUsecs   = $li.endTimeUsecs
+                        objects        = $r.objects
+                    }
+                }
+            }
+        }
+
+        if (-not $expanded) { continue }
+
+        # --- Latest per runType by endTimeUsecs ---
+        $byType = $expanded | Group-Object runType
+        foreach ($g in $byType) {
+            $latest = $g.Group | Sort-Object endTimeUsecs -Descending | Select-Object -First 1
+            if (-not $latest) { continue }
+
+            $status     = $latest.status
+            $runType    = $latest.runType
+            $startLocal = Convert-ToLocalFromUsecs $latest.startTimeUsecs $tz
+            $endLocal   = Convert-ToLocalFromUsecs $latest.endTimeUsecs   $tz
+
+            # --- Verbose banner of latest run status ---
+            if ($status -in @("Succeeded","SucceededWithWarning")) {
+                Write-Host "✅ $cluster_name → $pgName [$runType] – Latest run succeeded" -ForegroundColor Green
+                continue
+            } else {
+                Write-Host "❌ $cluster_name → $pgName [$runType] – Latest run failed, checking objects..." -ForegroundColor Red
+            }
+
+            # --- Objects could be null if includeObjectDetails wasn't applied; guard it anyway ---
+            if ($latest.objects) {
+                # only physical host objects
+                $hosts = $latest.objects | Where-Object { $_.object.objectType -eq 'kHost' -and $_.object.environment -eq 'kPhysical' }
+
+                # Debug counters so you can see what came back
+                Write-Host ("   (objects: {0} | physical hosts: {1})" -f $latest.objects.Count, ($hosts | Measure-Object).Count) -ForegroundColor DarkGray
+
+                foreach ($h in $hosts) {
+                    $attempts = $h.localSnapshotInfo.failedAttempts
+                    if ($attempts -and $attempts.Count -gt 0) {
+                        foreach ($fa in $attempts) {
+                            $msgClean = ($fa.message -replace '[\r\n]+',' ' -replace ',',' ' -replace '"','''').Trim()
+                            $globalFailures += [pscustomobject]@{
+                                Cluster         = $cluster_name
+                                ProtectionGroup = $pgName
+                                RunType         = $runType
+                                HostName        = $h.object.name
+                                StartTime       = $startLocal
+                                EndTime         = $endLocal
+                                FailedMessage   = $msgClean
+                            }
+                        }
+                    } else {
+                        # Run failed but no per-object attempts: still surface so you don't miss it
+                        $globalFailures += [pscustomobject]@{
+                            Cluster         = $cluster_name
+                            ProtectionGroup = $pgName
+                            RunType         = $runType
+                            HostName        = $h.object.name
+                            StartTime       = $startLocal
+                            EndTime         = $endLocal
+                            FailedMessage   = "Run failed (no per-object failedAttempts details)"
+                        }
+                    }
+                }
+            } else {
+                # No objects returned at all, still log the run-level failure
+                $globalFailures += [pscustomobject]@{
+                    Cluster         = $cluster_name
+                    ProtectionGroup = $pgName
+                    RunType         = $runType
+                    HostName        = "(no object details)"
+                    StartTime       = $startLocal
+                    EndTime         = $endLocal
+                    FailedMessage   = "Run failed (objects[] unavailable – check includeObjectDetails)"
+                }
+            }
+        }
+    }
+}
+
+# --- De-dup and output ---
+if ($globalFailures.Count -gt 0) {
+    $dedup = $globalFailures |
+        Group-Object { "{0}|{1}|{2}|{3}|{4:yyyy-MM-dd HH:mm}" -f $_.Cluster,$_.ProtectionGroup,$_.RunType,$_.HostName,$_.EndTime } |
+        ForEach-Object { $_.Group | Sort-Object EndTime -Descending | Select-Object -First 1 }
+
+    $sorted = $dedup | Sort-Object Cluster,ProtectionGroup,EndTime -Descending
+    Write-Host "`n🔥 Latest Failed File System Runs (All Clusters):`n" -ForegroundColor Cyan
+    $sorted | Format-Table Cluster,ProtectionGroup,RunType,HostName,StartTime,EndTime,FailedMessage -AutoSize
+} else {
+    Write-Host "`n✅ All latest File System runs succeeded across all clusters." -ForegroundColor Green
+}
+
+# CSV reference path (for your pipeline)
+$timestamp = Get-Date -Format "yyyyMMdd_HHmm"
+$csvPath   = "X:\PowerShell\Data\Cohesity\BackupFailures\BackupFailures_FileSystem_AllClusters_$timestamp.csv"
+Write-Host "`n📂 (CSV path ready if needed later): $csvPath" -ForegroundColor Gray
