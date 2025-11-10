@@ -2,6 +2,10 @@
 # Cohesity Backup Failures – Multi-Cluster (Helios)
 # Menu-driven | Verbose / Silent | Per-Env & Combined CSV
 # Environments: Oracle, SQL, Physical, NAS, HyperV, Acropolis, RemoteAdapter
+# FIXES:
+#  - Functions now return @{ Rows=<rows>; Csv=<csvPath or $null> }
+#  - Caller prints tables (failures) and builds summary reliably
+#  - No more "System.Object[]" in summary
 # =====================================================================
 
 $logDirectory = "X:\PowerShell\Data\Cohesity\BackupFailures"
@@ -9,7 +13,7 @@ if (-not (Test-Path -Path $logDirectory -PathType Container)) {
     New-Item -Path $logDirectory -ItemType Directory | Out-Null
 }
 
-# keep logs tidy (optional; mirrors your template)
+# keep logs tidy (optional)
 $fileCount = (Get-ChildItem -Path $logDirectory -File).Count
 if ($fileCount -gt 50) {
     Get-ChildItem -Path $logDirectory -File |
@@ -80,8 +84,7 @@ $envMap = @{
 
 # ==============================================================
 # Standard environments collector (Oracle/SQL/Physical/NAS/HyperV/Acropolis)
-# → Use includeObjectDetails + failedAttempts[] messages
-# → Show latest run; if failed OR failedAttempts exist, collect rows
+# Returns @{ Rows=<PSCustomObject[]>; Csv=<string or $null> }
 # ==============================================================
 function Collect-StandardEnv {
     param($Label,$Filter,$ObjectType,$NameField)
@@ -177,7 +180,6 @@ function Collect-StandardEnv {
         }
     }
 
-    # Dedup + Output
     if ($globalFailures.Count -gt 0) {
         $globalFailures = $globalFailures |
             Group-Object {
@@ -186,31 +188,25 @@ function Collect-StandardEnv {
             } |
             ForEach-Object { $_.Group | Sort-Object EndTime -Descending | Select-Object -First 1 }
 
-        Write-Host ("`n🔥 Latest Failed {0} Runs (All Clusters):`n" -f $Label) -ForegroundColor Cyan
         $sorted = $globalFailures | Sort-Object Cluster,ProtectionGroup,EndTime -Descending
-        $sorted | Format-Table Cluster,ProtectionGroup,RunType,Name,StartTime,EndTime,FailedMessage -AutoSize
-
         $timestamp = Get-Date -Format "yyyyMMdd_HHmm"
         $csvPath = "$logDirectory\BackupFailures_${Label}_AllClusters_$timestamp.csv"
         $sorted | Export-Csv -Path $csvPath -NoTypeInformation -Encoding utf8
-        Write-Host ("📂 CSV saved: {0}" -f $csvPath) -ForegroundColor Gray
-        return ,$sorted, $csvPath
+
+        return [pscustomobject]@{ Rows = $sorted; Csv = $csvPath }
     }
     else {
-        Write-Host ("`n✅ No failures found for {0} (All Clusters)" -f $Label) -ForegroundColor Green
-        return ,@(), $null
+        return [pscustomobject]@{ Rows = @(); Csv = $null }
     }
 }
 
 # ==============================================================
 # RemoteAdapter collector (screenshot-faithful)
-# → Pull PG host/args; flatten localBackupInfo into rows
-# → Group by RunType; take latest Failed without a later Success
+# Returns @{ Rows=<PSCustomObject[]>; Csv=<string or $null> }
 # ==============================================================
 function Collect-RemoteAdapter {
     $Label = "RemoteAdapter"
     $Filter = "kRemoteAdapter"
-
     $globalFailures = @()
 
     foreach ($clus in $json_clu) {
@@ -219,9 +215,6 @@ function Collect-RemoteAdapter {
         $cluster_id = $clus.clusterId
         $headers = @{ apiKey=$apiKey; accessClusterId=$cluster_id }
 
-        Write-Log ("`n🔹 Processing cluster: {0}" -f $cluster_name) "Cyan"
-
-        # List RemoteAdapter PGs
         try {
             $pgResponse = Invoke-WebRequest -Method Get -Uri "$baseUrl/v2/data-protect/protection-groups" -Headers $headers -Body @{
                 environments = $Filter
@@ -230,27 +223,22 @@ function Collect-RemoteAdapter {
                 isActive     = "True"
             }
             $pgs = ($pgResponse.Content | ConvertFrom-Json).protectionGroups
-        } catch {
-            Write-Log ("⚠️ Failed to list RemoteAdapter PGs on {0}" -f $cluster_name) "Yellow"
-            continue
-        }
-        if (-not $pgs) { Write-Log ("⚠️ No RemoteAdapter PGs on {0}" -f $cluster_name) "Yellow"; continue }
+        } catch { continue }
+        if (-not $pgs) { continue }
 
         foreach ($pg in $pgs) {
             $pgId = $pg.id; $pgName = $pg.name
 
-            # Extract host and DB from PG params (as in your photos)
+            # Host & DB from remoteAdapterParams
             $HostName = $null; $DB_name = $null
             try {
                 $HostName = $pg.remoteAdapterParams.hosts.hostname
                 if ($HostName -is [System.Array]) { $HostName = ($HostName -join ',') }
-
                 $args = $pg.remoteAdapterParams.hosts.incrementalBackupScript.params
                 if ($args -is [System.Array]) { $args = ($args -join ' ') }
                 if ($args -match "-o\s+(\S+)") { $DB_name = $matches[1] }
             } catch { }
 
-            # Fetch recent runs (with details)
             $runResp = Invoke-WebRequest -Method Get -Uri "$baseUrl/v2/data-protect/protection-groups/$pgId/runs" -Headers $headers -Body @{
                 environments             = $Filter
                 isDeleted                = "False"
@@ -264,7 +252,7 @@ function Collect-RemoteAdapter {
             $runs = if ($json -and $json.runs) { $json.runs } else { @() }
             if (-not $runs) { continue }
 
-            # Flatten localBackupInfo (screenshot flow)
+            # Flatten localBackupInfo[]
             $flatRuns = @()
             foreach ($run in $runs) {
                 if ($run.localBackupInfo) {
@@ -285,11 +273,13 @@ function Collect-RemoteAdapter {
             }
             if (-not $flatRuns) { continue }
 
-            # Group by RunType → pick latest Failed, and ensure NO later success
+            # For each RunType: latest Failed with NO later Success
             $grouped = $flatRuns | Group-Object RunType
             foreach ($g in $grouped) {
-                $latestFailed = $g.Group | Where-Object { $_.Status -eq 'Failed' } |
-                                Sort-Object EndTimeUsecs -Descending | Select-Object -First 1
+                $latestFailed = $g.Group |
+                    Where-Object { $_.Status -eq 'Failed' } |
+                    Sort-Object EndTimeUsecs -Descending |
+                    Select-Object -First 1
                 if (-not $latestFailed) { continue }
 
                 $hasLaterSuccess = $g.Group | Where-Object {
@@ -325,18 +315,14 @@ function Collect-RemoteAdapter {
             } |
             ForEach-Object { $_.Group | Sort-Object EndTime -Descending | Select-Object -First 1 }
 
-        Write-Host ("`n🔥 Latest Failed {0} Runs (All Clusters):`n" -f $Label) -ForegroundColor Cyan
         $sorted = $globalFailures | Sort-Object Cluster,ProtectionGroup,EndTime -Descending
-        $sorted | Format-Table Cluster,ProtectionGroup,RunType,Name,StartTime,EndTime,FailedMessage -AutoSize
-
         $timestamp = Get-Date -Format "yyyyMMdd_HHmm"
-        $csvPath = "$logDirectory\BackupFailures_${Label}_AllClusters_$timestamp.csv"
+        $csvPath = "$logDirectory\BackupFailures_RemoteAdapter_AllClusters_$timestamp.csv"
         $sorted | Export-Csv -Path $csvPath -NoTypeInformation -Encoding utf8
-        Write-Host ("📂 CSV saved: {0}" -f $csvPath) -ForegroundColor Gray
-        return ,$sorted, $csvPath
+
+        return [pscustomobject]@{ Rows = $sorted; Csv = $csvPath }
     } else {
-        Write-Host ("`n✅ No failures found for {0} (All Clusters)" -f $Label) -ForegroundColor Green
-        return ,@(), $null
+        return [pscustomobject]@{ Rows = @(); Csv = $null }
     }
 }
 
@@ -353,17 +339,31 @@ if($choice -eq "1"){
         Write-Host "==============================" -ForegroundColor DarkCyan
 
         if ($env.Label -eq "RemoteAdapter") {
-            $rows,$csv = Collect-RemoteAdapter
+            $res = Collect-RemoteAdapter
         } else {
-            $rows,$csv = Collect-StandardEnv -Label $env.Label -Filter $env.Filter -ObjectType $env.Object -NameField $env.NameField
+            $res = Collect-StandardEnv -Label $env.Label -Filter $env.Filter -ObjectType $env.Object -NameField $env.NameField
         }
 
+        $rows = $res.Rows
+        $csv  = $res.Csv
+
         if($rows.Count -gt 0){
-            $summary.Add(("📂 {0}: Failures found → {1}" -f $env.Label,$csv)) | Out-Null
+            # Always show table for failures in both modes
+            if ($env.Label -eq "RemoteAdapter") {
+                Write-Host ("`n🔥 Latest Failed {0} Runs (All Clusters):`n" -f $env.Label) -ForegroundColor Cyan
+                $rows | Format-Table Cluster,ProtectionGroup,Environment,RunType,Name,StartTime,EndTime,FailedMessage -AutoSize
+            } else {
+                Write-Host ("`n🔥 Latest Failed {0} Runs (All Clusters):`n" -f $env.Label) -ForegroundColor Cyan
+                $rows | Format-Table Cluster,ProtectionGroup,RunType,Name,StartTime,EndTime,FailedMessage -AutoSize
+            }
+            if ($csv) { Write-Host ("`n📂 CSV saved: {0}" -f $csv) -ForegroundColor Gray }
+            $summary.Add(("📂 {0}: Failures found → {1}" -f $env.Label, ($csv ? $csv : "CSV path unavailable"))) | Out-Null
             $allTables.AddRange($rows) | Out-Null
         } else {
+            Write-Host ("✅ No failures found for {0} (All Clusters)" -f $env.Label) -ForegroundColor Green
             $summary.Add(("✅ {0}: No failures found (no CSV created)" -f $env.Label)) | Out-Null
         }
+
         Start-Sleep -Seconds 1
     }
 
@@ -389,14 +389,26 @@ else{
             Write-Host ("`n▶ Running environment: {0}" -f $env.Label) -ForegroundColor Cyan
 
             if ($env.Label -eq "RemoteAdapter") {
-                $rows,$csv = Collect-RemoteAdapter
+                $res = Collect-RemoteAdapter
             } else {
-                $rows,$csv = Collect-StandardEnv -Label $env.Label -Filter $env.Filter -ObjectType $env.Object -NameField $env.NameField
+                $res = Collect-StandardEnv -Label $env.Label -Filter $env.Filter -ObjectType $env.Object -NameField $env.NameField
             }
 
+            $rows = $res.Rows
+            $csv  = $res.Csv
+
             if($rows.Count -gt 0){
-                $summary.Add(("📂 {0}: Failures found → {1}" -f $env.Label,$csv)) | Out-Null
+                if ($env.Label -eq "RemoteAdapter") {
+                    Write-Host ("`n🔥 Latest Failed {0} Runs (All Clusters):`n" -f $env.Label) -ForegroundColor Cyan
+                    $rows | Format-Table Cluster,ProtectionGroup,Environment,RunType,Name,StartTime,EndTime,FailedMessage -AutoSize
+                } else {
+                    Write-Host ("`n🔥 Latest Failed {0} Runs (All Clusters):`n" -f $env.Label) -ForegroundColor Cyan
+                    $rows | Format-Table Cluster,ProtectionGroup,RunType,Name,StartTime,EndTime,FailedMessage -AutoSize
+                }
+                if ($csv) { Write-Host ("`n📂 CSV saved: {0}" -f $csv) -ForegroundColor Gray }
+                $summary.Add(("📂 {0}: Failures found → {1}" -f $env.Label, ($csv ? $csv : "CSV path unavailable"))) | Out-Null
             } else {
+                Write-Host ("✅ No failures found for {0} (All Clusters)" -f $env.Label) -ForegroundColor Green
                 $summary.Add(("✅ {0}: No failures found (no CSV created)" -f $env.Label)) | Out-Null
             }
         } else {
