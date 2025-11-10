@@ -1,401 +1,274 @@
-# =====================================================================
-# Cohesity Backup Failures – Multi-Cluster (Helios)
-# Menu-driven | Silent/Verbose | CSV only when failures exist (UTF-8)
-# Environments: Oracle, SQL, Physical, NAS, HyperV, Acropolis, RemoteAdapter
-# Unified logic (like Hyper-V) for ALL:
-#   - For each PG and each RunType: take latest run
-#   - Skip run if status is Succeeded/SucceededWithWarning
-#   - Only include objects having localSnapshotInfo.failedAttempts[]
-#   - No generic "Run marked Failed" rows
-# RemoteAdapter: retains "failed-without-later-success" rule you approved
-# Oracle/SQL: also attempt ParentHost mapping via sourceId → host object.id
-# =====================================================================
+# Cohesity Backup Failure Report (unresolved failures with no later success)
+# - Scans only a tight history window (default: last 30 runs per job/runType)
+# - Reports an object only when the newest streak is failed and has not been followed by a success
+# - Compatible with Helios/MCM or direct cluster auth via cohesity-api.ps1
+# - CSV is UTF-8 (no BOM)
 
-# ---------- Setup ----------
-$logDirectory = "X:\PowerShell\Data\Cohesity\BackupFailures"
-if (-not (Test-Path -Path $logDirectory -PathType Container)) {
-    New-Item -Path $logDirectory -ItemType Directory | Out-Null
-}
-# keep max 50 logs
-$fileCount = (Get-ChildItem -Path $logDirectory -File).Count
-if ($fileCount -gt 50) {
-    Get-ChildItem -Path $logDirectory -File |
-        Sort-Object CreationTime |
-        Select-Object -First ($fileCount - 50) |
-        Remove-Item -Force
-}
+# ============================
+# process commandline arguments
+# ============================
+[CmdletBinding()]
+param (
+    [Parameter()][string]$vip = 'helios.cohesity.com',
+    [Parameter()][string]$username = 'helios',
+    [Parameter()][string]$domain = 'local',
+    [Parameter()][string]$tenant = $null,
+    [Parameter()][switch]$useApiKey,
+    [Parameter()][string]$password = $null,
+    [Parameter()][switch]$noPrompt,
+    [Parameter()][switch]$mcm,
+    [Parameter()][string]$mfaCode = $null,
+    [Parameter()][string]$clusterName = $null,
 
-# API key
-$apikeypath = "X:\PowerShell\Cohesity_API_Scripts\DO_NOT_Delete\apikey.txt"
-if (-not (Test-Path $apikeypath)) { throw "API key file not found: $apikeypath" }
-$apiKey = (Get-Content -Path $apikeypath -Raw).Trim()
-$commonHeaders = @{ "apiKey" = $apiKey }
-$baseUrl = "https://helios.cohesity.com"
+    [Parameter()][int]$numRuns = 30,           # only scan last 30 runs per job
+    [Parameter()][int]$days = 7,               # look back 7 days
+    [Parameter()][int]$failureCount = 1,       # min consecutive failures to report
 
-# ---------- Helpers ----------
-function Convert-ToUtcFromEpoch($v){
-    if ($null -eq $v -or $v -eq 0) { return $null }
-    try { [DateTimeOffset]::FromUnixTimeMilliseconds([int64]([double]$v/1000)).UtcDateTime }
-    catch { [DateTimeOffset]::FromUnixTimeMilliseconds([int64]$v).UtcDateTime }
-}
-function Convert-ToLocalFromUsecs($usecs, $tz){
-    $utc = Convert-ToUtcFromEpoch $usecs
-    if ($null -eq $utc) { return $null }
-    if ($tz) { [System.TimeZoneInfo]::ConvertTimeFromUtc($utc,$tz) } else { $utc.ToLocalTime() }
-}
-$tz = [System.TimeZoneInfo]::FindSystemTimeZoneById("Eastern Standard Time")
-function Write-Log($msg,$color="Gray"){ if($script:VerboseMode){ Write-Host $msg -ForegroundColor $color } }
+    [Parameter()][string]$smtpServer,
+    [Parameter()][string]$smtpPort = '25',
+    [Parameter()][array]$sendTo,
+    [Parameter()][string]$sendFrom
+)
 
-# ---------- Get clusters ----------
-$response = Invoke-WebRequest -Uri "$baseUrl/v2/mcm/cluster-mgmt/info" -Headers $commonHeaders -Method Get
-$json_clu = ($response.Content | ConvertFrom-Json).cohesityClusters
-if (-not $json_clu) { throw "No clusters returned from Helios." }
+# ============================
+# load cohesity-api helper
+# ============================
+. $(Join-Path -Path $PSScriptRoot -ChildPath cohesity-api.ps1)
 
-# ---------- Menu ----------
-Write-Host "=============================================" -ForegroundColor Cyan
-Write-Host "   COHESITY BACKUP FAILURES – MAIN MENU" -ForegroundColor White
-Write-Host "=============================================" -ForegroundColor Cyan
-Write-Host "1.  All Environments"
-Write-Host "2.  Oracle"
-Write-Host "3.  SQL"
-Write-Host "4.  Physical (File System)"
-Write-Host "5.  NAS (GenericNas/Isilon)"
-Write-Host "6.  Hyper-V"
-Write-Host "7.  Acropolis (AHV)"
-Write-Host "8.  Remote Adapter"
-Write-Host "---------------------------------------------"
-$choice = Read-Host "Enter your choice(s) (e.g. 2,3,4)"
+# ============================
+# authenticate
+# ============================
+apiauth -vip $vip `
+        -username $username `
+        -domain $domain `
+        -passwd $password `
+        -apiKeyAuthentication $useApiKey `
+        -mfaCode $mfaCode `
+        -heliosAuthentication $mcm `
+        -tenant $tenant `
+        -noPromptForPassword $noPrompt
 
-Write-Host "`nSelect Mode:" -ForegroundColor Yellow
-Write-Host "1. Verbose (detailed, color output)"
-Write-Host "2. Silent (compact output; prints tables only for failures)"
-$modeChoice = Read-Host "Enter mode [1 or 2]"
-$script:VerboseMode = $modeChoice -eq "1"
-
-# ---------- Environment map ----------
-$envMap = @{
-    2 = @{ Label="Oracle";        Filter="kOracle";                 Object="kDatabase";       NameField="name"; ParentHostNeeded=$true }
-    3 = @{ Label="SQL";           Filter="kSQL";                    Object="kDatabase";       NameField="name"; ParentHostNeeded=$true }
-    4 = @{ Label="Physical";      Filter="kPhysical";               Object="kHost";           NameField="name"; ParentHostNeeded=$false }
-    5 = @{ Label="NAS";           Filter="kGenericNas,kIsilon";     Object="kHost";           NameField="name"; ParentHostNeeded=$false }
-    6 = @{ Label="HyperV";        Filter="kHyperV";                 Object="kVirtualMachine"; NameField="name"; ParentHostNeeded=$false }
-    7 = @{ Label="Acropolis";     Filter="kAcropolis";              Object="kVirtualMachine"; NameField="name"; ParentHostNeeded=$false }
-    8 = @{ Label="RemoteAdapter"; Filter="kRemoteAdapter";          Object="kRemoteAdapter";  NameField="name"; ParentHostNeeded=$false }
+# select helios/mcm managed cluster
+if ($USING_HELIOS) {
+    if ($clusterName) {
+        $thisCluster = heliosCluster $clusterName
+    } else {
+        Write-Host "Please provide -clusterName when connecting through Helios/MCM" -ForegroundColor Yellow
+        exit 1
+    }
 }
 
-# =====================================================================
-# Collectors
-# =====================================================================
+if (-not $cohesity_api.authorized) {
+    Write-Host "Not authenticated" -ForegroundColor Yellow
+    exit 1
+}
 
-# --- Unified latest-failed-with-failedAttempts collector (Oracle/SQL/Physical/NAS/HyperV/Acropolis) ---
-function Collect-EnvLatestFailedWithObjectAttempts {
+# ============================
+# helper function
+# ============================
+function Add-UnresolvedFailuresForRunTypes {
     param(
-        [string]$Label,
-        [string]$Filter,          # comma-separated envs (e.g., "kGenericNas,kIsilon")
-        [string]$ObjectType,      # object.objectType to pick
-        [string]$NameField,       # property on object to display
-        [bool]  $ParentHostNeeded # resolve ParentHost from sourceId → object.id
+        [Parameter(Mandatory)]$job,
+        [Parameter(Mandatory)][string]$runTypeLabel,
+        [Parameter(Mandatory)][string[]]$runTypes,
+        [Parameter(Mandatory)]$rootNodes,
+        [Parameter(Mandatory)][hashtable]$reportFailures, # key -> firstFailMessage (sanitized)
+        [Parameter(Mandatory)][hashtable]$failureTime,    # key -> firstFailStartTime
+        [Parameter(Mandatory)][int]$numRuns,
+        [Parameter(Mandatory)]$startUsecs,
+        [Parameter(Mandatory)][int]$failureCount
     )
 
-    $globalFailures = @()
-    $filterSet = $Filter.Split(',') | ForEach-Object { $_.Trim() }
+    # pull last N runs for only these runTypes, with object details
+    $query = "data-protect/protection-groups/$($job.id)/runs?numRuns=$numRuns&startTimeUsecs=$startUsecs&includeTenants=true&includeObjectDetails=true&runTypes=$([string]::Join(',', $runTypes))"
+    $runs = api get -v2 $query
+    if (!$runs.runs) { return }
 
-    foreach($cluster in $json_clu){
-        $cluster_name = ($cluster.name,$cluster.clusterName,$cluster.displayName | Where-Object {$_ -and $_.Trim()} | Select-Object -First 1)
-        if(-not $cluster_name){$cluster_name="Unknown-$($cluster.clusterId)"}
-        $headers=@{apiKey=$apiKey;accessClusterId=$cluster.clusterId}
-        Write-Log ("`n🔹 Processing cluster: {0}" -f $cluster_name) "Cyan"
+    # newest first (we want to find the most recent streak)
+    # localBackupInfo is an array; using .startTimeUsecs against it yields a collection – take [0] explicitly
+    $ordered = $runs.runs | Sort-Object { $_.localBackupInfo[0].startTimeUsecs } -Descending
 
-        # PG list for this environment
-        try{
-            $pgResp=Invoke-WebRequest -Uri "$baseUrl/v2/data-protect/protection-groups" -Headers $headers -Body @{
-                environments=$Filter;isDeleted="False";isPaused="False";isActive="True"} -Method Get
-            $pgs=($pgResp.Content|ConvertFrom-Json).protectionGroups
-        }catch{ continue }
-        if(-not $pgs){ continue }
+    foreach ($run in $ordered) {
 
-        foreach($pg in $pgs){
-            $pgId=$pg.id;$pgName=$pg.name
+        # Best-effort guard
+        if (-not $run.objects -or -not $run.localBackupInfo) { continue }
 
-            # Get last 10 runs with object details
-            try{
-                $runResp=Invoke-WebRequest -Uri "$baseUrl/v2/data-protect/protection-groups/$pgId/runs" -Headers $headers -Body @{
-                    environments=$Filter;numRuns="10";excludeNonRestorableRuns="False";includeObjectDetails="True"} -Method Get
-                $jsonRuns=$runResp|ConvertFrom-Json
-            }catch{ continue }
-            if(-not $jsonRuns.runs){ continue }
+        # filter only objects that match the job environment (keeps signal tight)
+        $theseObjects = $run.objects | Where-Object { $_.object.environment -eq $job.environment }
+        if (-not $theseObjects) { continue }
 
-            # group by runType, pick the latest by endTimeUsecs
-            $runs = $jsonRuns.runs
-            $runTypes = $runs.localBackupInfo.runType | Select-Object -Unique
+        foreach ($obj in $theseObjects) {
 
-            foreach($rType in $runTypes){
-                $latestRun = $runs |
-                    Where-Object { $_.localBackupInfo[0].runType -eq $rType } |
-                    Sort-Object { $_.localBackupInfo[0].endTimeUsecs } -Descending |
-                    Select-Object -First 1
-                if(-not $latestRun){ continue }
+            # object & (optional) parent source mapping (e.g., DB → host)
+            $objectName = $obj.object.name
+            $sourceName = $objectName
+            if ($obj.object.PSObject.Properties['sourceId']) {
+                $src = $rootNodes.rootNodes | Where-Object { $_.rootNode.id -eq $obj.object.sourceId }
+                if ($src -and $src.rootNode -and $src.rootNode.name) {
+                    $sourceName = $src.rootNode.name
+                }
+            }
 
-                $info       = $latestRun.localBackupInfo[0]
-                $status     = $info.status
-                $runType    = $info.runType
-                $startLocal = Convert-ToLocalFromUsecs $info.startTimeUsecs $tz
-                $endLocal   = Convert-ToLocalFromUsecs $info.endTimeUsecs   $tz
+            # build a per-object/runType key; use a stable hash to scope "decision" and "streak" vars
+            $key = "$($job.name);;$objectName;;$sourceName;;$runTypeLabel"
+            $hash = $key.GetHashCode()
+            $decidedVar = "__decided_$hash"
+            if (Get-Variable -Name $decidedVar -Scope Local -ErrorAction SilentlyContinue) {
+                continue
+            }
 
-                # Skip if latest run succeeded (matches Hyper-V behavior you wanted everywhere)
-                if ($status -eq "Succeeded" -or $status -eq "SucceededWithWarning") { continue }
+            # object-level status (snapshotInfo.status) – we only care when object actually failed
+            $objSnap = $obj.localSnapshotInfo.snapshotInfo
+            $status  = $objSnap.status
 
-                if(-not $latestRun.objects){ continue }
+            # normalize start time
+            $runStartTime = usecsToDate $run.localBackupInfo[0].startTimeUsecs
 
-                # Build a quick id->name map for ParentHost resolving (Oracle/SQL)
-                $idToName = @{}
-                if($ParentHostNeeded){
-                    foreach($ob in $latestRun.objects){
-                        if($ob.object -and $ob.object.id){
-                            $idToName[[string]$ob.object.id] = $ob.object.name
-                        }
+            # per-key streak tracking
+            $streakVar    = "__streak_$hash"
+            $firstMsgVar  = "__firstFailMsg_$hash"
+            $firstTimeVar = "__firstFailTime_$hash"
+
+            if (-not (Get-Variable -Name $streakVar -Scope Local -ErrorAction SilentlyContinue)) {
+                Set-Variable -Name $streakVar -Value 0     -Scope Local
+                Set-Variable -Name $firstMsgVar -Value $null -Scope Local
+                Set-Variable -Name $firstTimeVar -Value $null -Scope Local
+            }
+
+            $streak    = (Get-Variable -Name $streakVar -Scope Local).Value
+            $firstMsg  = (Get-Variable -Name $firstMsgVar -Scope Local).Value
+            $firstTime = (Get-Variable -Name $firstTimeVar -Scope Local).Value
+
+            if ($status -eq 'kFailed') {
+                # increment the newest-failure streak
+                $streak++
+
+                # capture the first failure message & time for this current streak
+                if (-not $firstMsg) {
+                    $msg = $null
+                    if ($obj.localSnapshotInfo.failedAttempts -and $obj.localSnapshotInfo.failedAttempts.Count -gt 0) {
+                        $msg = [string]$obj.localSnapshotInfo.failedAttempts[0].message
                     }
+                    # sanitize for CSV safety
+                    if ($msg) {
+                        $msg = $msg.Replace("`r"," ").Replace("`n"," ").Replace(",",";")
+                        if ($msg.Length -gt 300) { $msg = $msg.Substring(0,300) }
+                    }
+                    $firstMsg  = $msg
+                    $firstTime = $runStartTime
                 }
 
-                # Filter only the object type we care about and env in filterSet
-                $objs = $latestRun.objects | Where-Object {
-                    $_.object.objectType -eq $ObjectType -and $_.object.environment -in $filterSet
+                # if we’ve reached the report threshold, store in hashtables
+                if ($streak -ge $failureCount) {
+                    $reportFailures[$key] = $firstMsg
+                    $failureTime[$key]    = $firstTime
                 }
 
-                foreach($o in $objs){
-                    $attempts = $o.localSnapshotInfo.failedAttempts
-                    if(-not $attempts -or $attempts.Count -eq 0){ continue }  # only real object-level failures
-
-                    # Optional ParentHost (DBs)
-                    $parent = $null
-                    if($ParentHostNeeded -and $o.object -and $o.object.sourceId){
-                        $key = [string]$o.object.sourceId
-                        if($idToName.ContainsKey($key)){ $parent = $idToName[$key] }
-                    }
-
-                    foreach($fa in $attempts){
-                        $msgClean = ($fa.message -replace '[\r\n]+',' ' -replace ',',' ' -replace '"','''').Trim()
-                        $globalFailures += [pscustomobject]@{
-                            Cluster         = $cluster_name
-                            ProtectionGroup = $pgName
-                            Environment     = $Label
-                            RunType         = $runType
-                            Name            = $o.object.$NameField
-                            ParentHost      = $parent
-                            StartTime       = $startLocal
-                            EndTime         = $endLocal
-                            FailedMessage   = $msgClean
-                        }
-                    }
-                }
+                # update locals
+                Set-Variable -Name $streakVar -Value $streak    -Scope Local
+                Set-Variable -Name $firstMsgVar -Value $firstMsg -Scope Local
+                Set-Variable -Name $firstTimeVar -Value $firstTime -Scope Local
+            }
+            else {
+                # any success (or not-failed) after a streak resolves it – do not report
+                if ($reportFailures.ContainsKey($key)) { $reportFailures.Remove($key) }
+                if ($failureTime.ContainsKey($key))    { $failureTime.Remove($key)    }
+                Set-Variable -Name $decidedVar -Value $true -Scope Local
             }
         }
     }
-
-    # De-dup and return
-    if($globalFailures.Count -gt 0){
-        $globalFailures = $globalFailures |
-            Group-Object { "$($_.Cluster)|$($_.ProtectionGroup)|$($_.RunType)|$($_.Name)|$($_.ParentHost)|$($_.FailedMessage)|$($_.EndTime)" } |
-            ForEach-Object { $_.Group | Sort-Object EndTime -Descending | Select-Object -First 1 }
-
-        $sorted    = $globalFailures | Sort-Object Cluster,ProtectionGroup,EndTime -Descending
-        $timestamp = Get-Date -Format "yyyyMMdd_HHmm"
-        $csvPath   = "$logDirectory\BackupFailures_${Label}_AllClusters_$timestamp.csv"
-        $sorted    | Export-Csv -Path $csvPath -NoTypeInformation -Encoding utf8
-        return [pscustomobject]@{ Rows = $sorted; Csv = $csvPath }
-    } else {
-        return [pscustomobject]@{ Rows = @(); Csv = $null }
-    }
 }
 
-# --- RemoteAdapter: keep your "failed WITHOUT later success" logic exactly ---
-function Collect-RemoteAdapter {
-    $Label = "RemoteAdapter"
-    $globalFailures = @()
+# ============================
+# collect job and failure data
+# ============================
+$cluster      = api get cluster
+$dateString   = (Get-Date).ToString('yyyy-MM-dd')
+$outfileName  = "backupFailureReport-$($cluster.name)-$dateString.csv"
 
-    foreach ($clus in $json_clu) {
-        $cluster_name = ($clus.name, $clus.clusterName, $clus.displayName | Where-Object { $_ -and $_.Trim() } | Select-Object -First 1)
-        if (-not $cluster_name) { $cluster_name = "Unknown-$($clus.clusterId)" }
-        $headers = @{ apiKey=$apiKey; accessClusterId=$clus.clusterId }
+# CSV header (UTF-8, no BOM)
+"Job Name,Latest Backup,Backup Type,Source Name,Object Name,Message" | Out-File -FilePath $outfileName -Encoding utf8
 
-        try {
-            $pgResp = Invoke-WebRequest -Method Get -Uri "$baseUrl/v2/data-protect/protection-groups" -Headers $headers -Body @{
-                environments = "kRemoteAdapter"; isDeleted = "False"; isPaused = "False"; isActive = "True"
-            }
-            $pgs = ($pgResp.Content | ConvertFrom-Json).protectionGroups
-        } catch { continue }
-        if (-not $pgs) { continue }
+$jobs       = api get -v2 "data-protect/protection-groups?isDeleted=false&isActive=true&includeTenants=true"
+$rootNodes  = api get "protectionSources/registrationInfo"
+$startUsecs = timeAgo $days 'days'
 
-        foreach ($pg in $pgs) {
-            $pgId = $pg.id; $pgName = $pg.name
+$totalFailures = 0
 
-            $HostName = $null; $DB_name = $null
-            try {
-                $HostName = $pg.remoteAdapterParams.hosts.hostname
-                if ($HostName -is [System.Array]) { $HostName = ($HostName -join ',') }
-                $args = $pg.remoteAdapterParams.hosts.incrementalBackupScript.params
-                if ($args -is [System.Array]) { $args = ($args -join ' ') }
-                if ($args -match "-o\s+(\S+)") { $DB_name = $matches[1] }
-            } catch { }
+foreach ($job in $jobs.protectionGroups | Sort-Object -Property name) {
+    $reportFailures = @{}
+    $failureTime    = @{}
 
-            try {
-                $runResp = Invoke-WebRequest -Method Get -Uri "$baseUrl/v2/data-protect/protection-groups/$pgId/runs" -Headers $headers -Body @{
-                    environments             = "kRemoteAdapter"
-                    isDeleted                = "False"
-                    isPaused                 = "False"
-                    isActive                 = "True"
-                    numRuns                  = "10"
-                    excludeNonRestorableRuns = "False"
-                    includeObjectDetails     = "True"
-                }
-                $json = $runResp | ConvertFrom-Json
-            } catch { continue }
+    # Backup-type runs (Full/Incremental/System)
+    Add-UnresolvedFailuresForRunTypes -job $job -runTypeLabel 'Backup' `
+        -runTypes @('kSystem','kFull','kIncremental') `
+        -rootNodes $rootNodes `
+        -reportFailures $reportFailures `
+        -failureTime $failureTime `
+        -numRuns $numRuns `
+        -startUsecs $startUsecs `
+        -failureCount $failureCount
 
-            $runs = if ($json -and $json.runs) { $json.runs } else { @() }
-            if (-not $runs) { continue }
+    # Log-type runs
+    Add-UnresolvedFailuresForRunTypes -job $job -runTypeLabel 'Log Backup' `
+        -runTypes @('kLog') `
+        -rootNodes $rootNodes `
+        -reportFailures $reportFailures `
+        -failureTime $failureTime `
+        -numRuns $numRuns `
+        -startUsecs $startUsecs `
+        -failureCount $failureCount
 
-            $flatRuns = @()
-            foreach ($run in $runs) {
-                if ($run.localBackupInfo) {
-                    foreach ($info in $run.localBackupInfo) {
-                        $flatRuns += [pscustomobject]@{
-                            RunType         = $info.runType
-                            Status          = $info.status
-                            Message         = $info.messages
-                            StartTimeUsecs  = $info.startTimeUsecs
-                            EndTimeUsecs    = $info.endTimeUsecs
-                            Cluster         = $cluster_name
-                            ProtectionGroup = $pgName
-                            HostName        = $HostName
-                            DB_name         = $DB_name
-                        }
-                    }
-                }
-            }
-            if (-not $flatRuns) { continue }
+    # Emit for this job
+    foreach ($failureKey in $reportFailures.Keys | Sort-Object) {
+        $totalFailures += 1
 
-            $grouped = $flatRuns | Group-Object RunType
-            foreach ($g in $grouped) {
-                $latestFailed = $g.Group |
-                    Where-Object { $_.Status -eq 'Failed' } |
-                    Sort-Object EndTimeUsecs -Descending |
-                    Select-Object -First 1
-                if ($null -eq $latestFailed) { continue }
+        # Key form: "$jobName;;$objectName;;$sourceName;;$runTypeLabel"
+        $parts = $failureKey -split ';;'
+        $jobName    = $parts[0]
+        $objectName = $parts[1]
+        $sourceName = $parts[2]
+        $runType    = $parts[3]
 
-                $hasLaterSuccess = $g.Group | Where-Object {
-                    $_.Status -in @('Succeeded','SucceededWithWarning') -and
-                    $_.StartTimeUsecs -gt $latestFailed.EndTimeUsecs
-                }
-                if ($hasLaterSuccess) { continue }
-
-                $startLocal = Convert-ToLocalFromUsecs $latestFailed.StartTimeUsecs $tz
-                $endLocal   = Convert-ToLocalFromUsecs $latestFailed.EndTimeUsecs   $tz
-                $msg = $latestFailed.Message
-                if ($msg -is [System.Array]) { $msg = ($msg -join ' | ') }
-
-                $globalFailures += [pscustomobject]@{
-                    Cluster         = $latestFailed.Cluster
-                    ProtectionGroup = $latestFailed.ProtectionGroup
-                    Environment     = $Label
-                    Name            = if ($latestFailed.DB_name) { $latestFailed.DB_name } else { $latestFailed.HostName }
-                    ParentHost      = $null
-                    RunType         = $latestFailed.RunType
-                    StartTime       = $startLocal
-                    EndTime         = $endLocal
-                    FailedMessage   = $msg
-                }
-            }
+        $message = [string]$reportFailures[$failureKey]
+        if ($message) {
+            $message = $message.Replace("`n",' ').Replace("`r",' ')
+            if ($message.Length -gt 300) { $message = $message.Substring(0,300) }
         }
-    }
 
-    if ($globalFailures.Count -gt 0) {
-        $dedup = $globalFailures |
-            Group-Object { "$($_.Cluster)|$($_.ProtectionGroup)|$($_.RunType)|$($_.Name)|$($_.FailedMessage)|$($_.EndTime)" } |
-            ForEach-Object { $_.Group | Sort-Object EndTime -Descending | Select-Object -First 1 }
+        $runStartTime = $failureTime[$failureKey]
 
-        $rows = $dedup | Sort-Object Cluster,ProtectionGroup,EndTime -Descending
-        $timestamp = Get-Date -Format "yyyyMMdd_HHmm"
-        $csvPath   = Join-Path $logDirectory "BackupFailures_RemoteAdapter_AllClusters_$timestamp.csv"
-        $rows | Export-Csv -Path $csvPath -NoTypeInformation -Encoding utf8
-
-        return [pscustomobject]@{ Rows = $rows; Csv = $csvPath }
-    } else {
-        return [pscustomobject]@{ Rows = @(); Csv = $null }
-    }
-}
-
-# =====================================================================
-# Run menu selection
-# =====================================================================
-$summary   = New-Object System.Collections.ArrayList
-$allTables = New-Object System.Collections.ArrayList
-function Add-SummaryLine($label,$csv){
-    $csvText = if ($csv -and -not ([string]::IsNullOrWhiteSpace($csv))) { [string]$csv } else { "CSV path unavailable" }
-    $null = $summary.Add(("📂 {0}: Failures found → {1}" -f $label, $csvText))
-}
-
-function Show-Table {
-    param($label,$rows,$csvPath)
-    if($rows.Count -gt 0){
-        Write-Host ("`n🔥 Latest Failed {0} Runs (All Clusters):`n" -f $label) -ForegroundColor Cyan
-        $rows | Select-Object Cluster,ProtectionGroup,Environment,RunType,
-                               Name,ParentHost,StartTime,EndTime,FailedMessage |
-                Format-Table -AutoSize
-        if($csvPath){ Write-Host ("`n📂 CSV saved: {0}" -f $csvPath) -ForegroundColor Gray }
-        Add-SummaryLine $label $csvPath
-    } else {
-        Write-Host ("✅ No failures found for {0} (All Clusters)" -f $label) -ForegroundColor Green
-        $null = $summary.Add(("✅ {0}: No failures found (no CSV created)" -f $label))
-    }
-}
-
-if($choice -eq "1"){
-    Write-Host "`n▶ Running ALL environments..." -ForegroundColor Cyan
-    foreach($key in ($envMap.Keys|Sort-Object)){
-        $env=$envMap[$key]
-        Write-Host "`n==============================" -ForegroundColor DarkCyan
-        Write-Host ("▶ Environment: {0}" -f $env.Label) -ForegroundColor Cyan
-        Write-Host "==============================" -ForegroundColor DarkCyan
-
-        $res = if     ($env.Label -eq "RemoteAdapter") { Collect-RemoteAdapter }
-               else { Collect-EnvLatestFailedWithObjectAttempts -Label $env.Label -Filter $env.Filter -ObjectType $env.Object -NameField $env.NameField -ParentHostNeeded:$env.ParentHostNeeded }
-
-        Show-Table -label $env.Label -rows $res.Rows -csvPath $res.Csv
-        if($res.Rows.Count -gt 0){ $allTables.AddRange($res.Rows) | Out-Null }
-    }
-
-    if($allTables.Count -gt 0){
-        Write-Host "`n🔥 Combined Failures – All Environments" -ForegroundColor Magenta
-        $sortedAll=$allTables|Sort-Object Cluster,ProtectionGroup,Environment,EndTime -Descending
-        $timestamp=Get-Date -Format "yyyyMMdd_HHmm"
-        $combinedPath="$logDirectory\BackupFailures_AllEnvironments_$timestamp.csv"
-        $sortedAll|Export-Csv -Path $combinedPath -NoTypeInformation -Encoding utf8
-        Write-Host ("📂 Combined CSV saved: {0}" -f $combinedPath) -ForegroundColor Gray
-        $null=$summary.Add(("📂 All Environments: Combined failures → {0}" -f $combinedPath))
-    } else {
-        Write-Host "`n✅ All environments succeeded — no combined CSV created." -ForegroundColor Green
-    }
-}
-else{
-    $selected=$choice.Split(',')|ForEach-Object{$_.Trim()}|Where-Object{$_ -match '^\d+$'}
-    foreach($sel in $selected){
-        if($envMap.ContainsKey([int]$sel)){
-            $env=$envMap[[int]$sel]
-            Write-Host ("`n▶ Running environment: {0}" -f $env.Label) -ForegroundColor Cyan
-            $res = if     ($env.Label -eq "RemoteAdapter") { Collect-RemoteAdapter }
-                   else { Collect-EnvLatestFailedWithObjectAttempts -Label $env.Label -Filter $env.Filter -ObjectType $env.Object -NameField $env.NameField -ParentHostNeeded:$env.ParentHostNeeded }
-
-            Show-Table -label $env.Label -rows $res.Rows -csvPath $res.Csv
+        if ($sourceName -eq $objectName) {
+            Write-Host ("    {0} ({1}) [{2}] {3}" -f $jobName, $runStartTime, $runType, $objectName)
         } else {
-            Write-Host ("⚠️ Invalid selection: {0}" -f $sel) -ForegroundColor Yellow
+            Write-Host ("    {0} ({1}) [{2}] {3}/{4}" -f $jobName, $runStartTime, $runType, $sourceName, $objectName)
         }
+
+        "{0},{1},{2},{3},{4},{5}" -f $jobName, $runStartTime, $runType, $sourceName, $objectName, $message |
+            Out-File -FilePath $outfileName -Append -Encoding utf8
     }
 }
 
-# ---------- Final summary ----------
-Write-Host "`n==============================" -ForegroundColor Cyan
-Write-Host "          SUMMARY" -ForegroundColor White
-Write-Host "==============================" -ForegroundColor Cyan
-foreach($line in $summary){ Write-Host $line }
-Write-Host "=============================="
-Write-Host "✅ Processing complete!" -ForegroundColor Green
+if ($totalFailures -gt 0) {
+    Write-Host "`nTotal Unresolved Failures: $totalFailures" -ForegroundColor Cyan
+    Write-Host "Output saved to $outfileName`n" -ForegroundColor Cyan
+} else {
+    Write-Host "`n✅ No unresolved failures (within the lookback window). Output file still created with header: $outfileName`n" -ForegroundColor Green
+}
+
+# ============================
+# optional email
+# ============================
+if ($smtpServer -and $sendFrom -and $sendTo) {
+    Write-Host "Sending report to $([string]::Join(', ', $sendTo))" -ForegroundColor Cyan
+    foreach ($toaddr in $sendTo) {
+        try {
+            Send-MailMessage -From $sendFrom -To $toaddr -SmtpServer $smtpServer -Port $smtpPort `
+                -Subject "${clusterName} Backup Failure Report ($totalFailures)" `
+                -Body "Total Unresolved Failures: $totalFailures`nReport: $outfileName`n" `
+                -Attachments $outfileName -WarningAction SilentlyContinue
+        } catch {
+            Write-Warning "Failed to send mail to $toaddr: $($_.Exception.Message)"
+        }
+    }
+}
