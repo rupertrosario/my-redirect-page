@@ -3,21 +3,19 @@
 # Menu-driven | Verbose/Silent | CSV only when failures exist (UTF-8)
 #
 # Environments handled:
-#   2 Oracle (kOracle, kDatabase)     → Columns: Hosts, DatabaseName
-#   3 SQL    (kSQL, kDatabase)        → Columns: Hosts, DatabaseName
-#   4 Physical (kPhysical, kHost)     → Columns: Name (=Host), ParentHost=null
-#   5 NAS (kGenericNas,kIsilon,kHost) → Columns: Name (=NAS source), ParentHost=null
+#   2 Oracle (kOracle, kDatabase)     → Columns: Hosts, DatabaseName ("DB Host" for host-only)
+#   3 SQL    (kSQL, kDatabase)        → Columns: Hosts, DatabaseName ("DB Host" for host-only)
+#   4 Physical (kPhysical, kHost)     → Fallback to run-level messages when no failedAttempts
+#   5 NAS (kGenericNas,kIsilon,kHost) → Fallback to run-level messages when no failedAttempts
 #   6 HyperV (kHyperV, kVirtualMachine)
 #   7 Acropolis (kAcropolis, kVirtualMachine)
-#   8 RemoteAdapter (kRemoteAdapter)  → Special rule: latest Failed WITHOUT later Success
+#   8 RemoteAdapter (kRemoteAdapter)  → latest Failed WITHOUT later Success
 #
 # Unified rule (all but RemoteAdapter):
-#   - For each PG and each RunType → take the latest run
+#   - For each PG and RunType → take latest run
 #   - Skip if latest run status ∈ {Succeeded, SucceededWithWarning}
-#   - Include ONLY objects where localSnapshotInfo.failedAttempts[] exists
-# Oracle/SQL specifics:
-#   - Emit columns: Hosts (parent host via sourceId), DatabaseName (DB name)
-#   - Host-only failures (no DBs) are reported with DatabaseName = "DB Host"
+#   - Prefer object.localSnapshotInfo.failedAttempts[]; for Physical/NAS
+#     fall back to run-level messages if none found.
 # =====================================================================
 
 # ---------- Setup ----------
@@ -84,27 +82,28 @@ $script:VerboseMode = $modeChoice -eq "1"
 
 # ---------- Environment map ----------
 $envMap = @{
-    2 = @{ Label="Oracle";        Filter="kOracle";                 Object="kDatabase";       NameField="name"; ParentHostNeeded=$true }
-    3 = @{ Label="SQL";           Filter="kSQL";                    Object="kDatabase";       NameField="name"; ParentHostNeeded=$true }
-    4 = @{ Label="Physical";      Filter="kPhysical";               Object="kHost";           NameField="name"; ParentHostNeeded=$false }
-    5 = @{ Label="NAS";           Filter="kGenericNas,kIsilon";     Object="kHost";           NameField="name"; ParentHostNeeded=$false }
-    6 = @{ Label="HyperV";        Filter="kHyperV";                 Object="kVirtualMachine"; NameField="name"; ParentHostNeeded=$false }
-    7 = @{ Label="Acropolis";     Filter="kAcropolis";              Object="kVirtualMachine"; NameField="name"; ParentHostNeeded=$false }
-    8 = @{ Label="RemoteAdapter"; Filter="kRemoteAdapter";          Object="kRemoteAdapter";  NameField="name"; ParentHostNeeded=$false }
+    2 = @{ Label="Oracle";        Filter="kOracle";                 Object="kDatabase";       NameField="name"; ParentHostNeeded=$true;  AllowRunFallback=$false }
+    3 = @{ Label="SQL";           Filter="kSQL";                    Object="kDatabase";       NameField="name"; ParentHostNeeded=$true;  AllowRunFallback=$false }
+    4 = @{ Label="Physical";      Filter="kPhysical";               Object="kHost";           NameField="name"; ParentHostNeeded=$false; AllowRunFallback=$true  }  # Fallback ON
+    5 = @{ Label="NAS";           Filter="kGenericNas,kIsilon";     Object="kHost";           NameField="name"; ParentHostNeeded=$false; AllowRunFallback=$true  }  # Fallback ON
+    6 = @{ Label="HyperV";        Filter="kHyperV";                 Object="kVirtualMachine"; NameField="name"; ParentHostNeeded=$false; AllowRunFallback=$false }
+    7 = @{ Label="Acropolis";     Filter="kAcropolis";              Object="kVirtualMachine"; NameField="name"; ParentHostNeeded=$false; AllowRunFallback=$false }
+    8 = @{ Label="RemoteAdapter"; Filter="kRemoteAdapter";          Object="kRemoteAdapter";  NameField="name"; ParentHostNeeded=$false; AllowRunFallback=$false }
 }
 
 # =====================================================================
 # Collectors
 # =====================================================================
 
-# --- Unified latest-failed-with-failedAttempts collector (ALL except RA) ---
+# --- Unified collector (ALL except RemoteAdapter) ---
 function Collect-EnvLatestFailedWithObjectAttempts {
     param(
         [string]$Label,
         [string]$Filter,          # comma-separated envs
         [string]$ObjectType,      # object.objectType to pick
         [string]$NameField,       # property on object to display
-        [bool]  $ParentHostNeeded # Oracle/SQL parent host mapping via sourceId
+        [bool]  $ParentHostNeeded,# Oracle/SQL parent host mapping via sourceId
+        [bool]  $AllowRunFallback # Physical/NAS: allow run-level message fallback
     )
 
     $globalFailures = @()
@@ -177,13 +176,14 @@ function Collect-EnvLatestFailedWithObjectAttempts {
                     $_.object.objectType -eq $ObjectType -and $_.object.environment -in $filterSet
                 }
 
+                $addedAnyObject = $false
+
                 if($ParentHostNeeded){
-                    # ----- Oracle/SQL: emit Hosts + DatabaseName -----
+                    # ----- Oracle/SQL: Hosts + DatabaseName -----
                     foreach($o in $objs){
                         $attempts = $o.localSnapshotInfo.failedAttempts
-                        if(-not $attempts -or $attempts.Count -eq 0){ continue }  # only real object-level failures
+                        if(-not $attempts -or $attempts.Count -eq 0){ continue }
 
-                        # Parent host by sourceId → object.id
                         $parent = $null
                         if($o.object -and $o.object.sourceId){
                             $key = [string]$o.object.sourceId
@@ -203,10 +203,11 @@ function Collect-EnvLatestFailedWithObjectAttempts {
                                 EndTime         = $endLocal
                                 FailedMessage   = $msgClean
                             }
+                            $addedAnyObject = $true
                         }
                     }
 
-                    # Host-only failures (no DBs discovered): DatabaseName = "DB Host"
+                    # Host-only failures (no DBs discovered)
                     $hostObjs = $latestRun.objects | Where-Object { $_.object.objectType -eq 'kHost' }
                     foreach($h in $hostObjs){
                         $hattempts = $h.localSnapshotInfo.failedAttempts
@@ -224,11 +225,12 @@ function Collect-EnvLatestFailedWithObjectAttempts {
                                 EndTime         = $endLocal
                                 FailedMessage   = $msgClean
                             }
+                            $addedAnyObject = $true
                         }
                     }
                 }
                 else{
-                    # ----- Other envs: emit Name + ParentHost (optional) -----
+                    # ----- Physical/NAS/HyperV/AHV: Name (+ optional ParentHost=null) -----
                     foreach($o in $objs){
                         $attempts = $o.localSnapshotInfo.failedAttempts
                         if(-not $attempts -or $attempts.Count -eq 0){ continue }
@@ -245,6 +247,33 @@ function Collect-EnvLatestFailedWithObjectAttempts {
                                 EndTime         = $endLocal
                                 FailedMessage   = $msgClean
                             }
+                            $addedAnyObject = $true
+                        }
+                    }
+                }
+
+                # ---- Run-level fallback (ONLY for Physical/NAS) ----
+                if(-not $addedAnyObject -and $AllowRunFallback){
+                    $runMsg = $null
+                    if($info.messages){
+                        if($info.messages -is [System.Array]){ $runMsg = ($info.messages -join ' | ') } else { $runMsg = [string]$info.messages }
+                    } else { $runMsg = "Run failed (no per-object failedAttempts[] present)" }
+
+                    # Emit one line per host object (visible in the run) to show where it failed
+                    $hostLike = $latestRun.objects | Where-Object { $_.object.objectType -eq 'kHost' -and $_.object.environment -in $filterSet }
+                    if(-not $hostLike){ $hostLike = @(@{ object = @{ name = "(run-level)" } }) }
+
+                    foreach($h in $hostLike){
+                        $globalFailures += [pscustomobject]@{
+                            Cluster         = $cluster_name
+                            ProtectionGroup = $pgName
+                            Environment     = $Label
+                            RunType         = $runType
+                            Name            = $h.object.name
+                            ParentHost      = $null
+                            StartTime       = $startLocal
+                            EndTime         = $endLocal
+                            FailedMessage   = ($runMsg -replace '[\r\n]+',' ' -replace ',',' ' -replace '"','''').Trim()
                         }
                     }
                 }
@@ -254,7 +283,6 @@ function Collect-EnvLatestFailedWithObjectAttempts {
 
     # De-dup and return
     if($globalFailures.Count -gt 0){
-        # Key matches emitted fields (Hosts/DatabaseName OR Name/ParentHost)
         $globalFailures = $globalFailures |
             Group-Object {
                 if($_.PSObject.Properties.Name -contains 'Hosts'){
@@ -275,7 +303,7 @@ function Collect-EnvLatestFailedWithObjectAttempts {
     }
 }
 
-# --- RemoteAdapter: “latest Failed WITHOUT later Success” per RunType ---
+# --- RemoteAdapter: latest Failed WITHOUT later Success ---
 function Collect-RemoteAdapter {
     $Label = "RemoteAdapter"
     $globalFailures = @()
@@ -296,7 +324,6 @@ function Collect-RemoteAdapter {
         foreach ($pg in $pgs) {
             $pgId = $pg.id; $pgName = $pg.name
 
-            # Pull HostName / DB_name from PG params where present (for display only)
             $HostName = $null; $DB_name = $null
             try {
                 $HostName = $pg.remoteAdapterParams.hosts.hostname
@@ -435,7 +462,7 @@ if($choice -eq "1"){
         Print-Line "==============================" "DarkCyan"
 
         $res = if     ($env.Label -eq "RemoteAdapter") { Collect-RemoteAdapter }
-               else { Collect-EnvLatestFailedWithObjectAttempts -Label $env.Label -Filter $env.Filter -ObjectType $env.Object -NameField $env.NameField -ParentHostNeeded:$env.ParentHostNeeded }
+               else { Collect-EnvLatestFailedWithObjectAttempts -Label $env.Label -Filter $env.Filter -ObjectType $env.Object -NameField $env.NameField -ParentHostNeeded:$env.ParentHostNeeded -AllowRunFallback:$env.AllowRunFallback }
 
         Show-Table -label $env.Label -rows $res.Rows -csvPath $res.Csv
         if($res.Rows.Count -gt 0){ $allTables.AddRange($res.Rows) | Out-Null }
@@ -463,7 +490,7 @@ else{
             $env=$envMap[[int]$sel]
             Print-Line ("`n▶ Running environment: {0}" -f $env.Label) "Cyan"
             $res = if     ($env.Label -eq "RemoteAdapter") { Collect-RemoteAdapter }
-                   else { Collect-EnvLatestFailedWithObjectAttempts -Label $env.Label -Filter $env.Filter -ObjectType $env.Object -NameField $env.NameField -ParentHostNeeded:$env.ParentHostNeeded }
+                   else { Collect-EnvLatestFailedWithObjectAttempts -Label $env.Label -Filter $env.Filter -ObjectType $env.Object -NameField $env.NameField -ParentHostNeeded:$env.ParentHostNeeded -AllowRunFallback:$env.AllowRunFallback }
             Show-Table -label $env.Label -rows $res.Rows -csvPath $res.Csv
         } else {
             Print-Line ("⚠️ Invalid selection: {0}" -f $sel) "Yellow"
