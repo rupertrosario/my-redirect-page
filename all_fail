@@ -1,14 +1,17 @@
 # =====================================================================
 # Cohesity Backup Failures – Multi-Cluster (Helios)
-# Menu-driven | Silent/Verbose | CSV only when failures exist (UTF-8)
+# Menu-driven | Verbose/Silent | CSV only when failures exist (UTF-8)
 # Environments: Oracle, SQL, Physical, NAS, HyperV, Acropolis, RemoteAdapter
-# Unified logic (like Hyper-V) for ALL:
-#   - For each PG and each RunType: take latest run
-#   - Skip run if status is Succeeded/SucceededWithWarning
-#   - Only include objects having localSnapshotInfo.failedAttempts[]
-#   - No generic "Run marked Failed" rows
-# RemoteAdapter: retains "failed-without-later-success" rule you approved
-# Oracle/SQL: also attempt ParentHost mapping via sourceId → host object.id
+#
+# Unified rule (all but RemoteAdapter):
+#   - For each PG and each RunType → take latest run
+#   - Skip if latest run status ∈ {Succeeded, SucceededWithWarning}
+#   - Include ONLY objects where localSnapshotInfo.failedAttempts[] exists
+# Oracle/SQL extras:
+#   - DB object rows: Name = database, ParentHost = host (via sourceId → object.id)
+#   - Host-only rows (no DBs, host has failedAttempts): Name = "DB Host", ParentHost = host name
+# RemoteAdapter:
+#   - Report latest Failed per RunType ONLY when no later Success exists
 # =====================================================================
 
 # ---------- Setup ----------
@@ -116,6 +119,7 @@ function Collect-EnvLatestFailedWithObjectAttempts {
 
         foreach($pg in $pgs){
             $pgId=$pg.id;$pgName=$pg.name
+            Write-Log ("📦 Checking PG: {0}" -f $pgName) "Yellow"
 
             # Get last 10 runs with object details
             try{
@@ -142,12 +146,14 @@ function Collect-EnvLatestFailedWithObjectAttempts {
                 $startLocal = Convert-ToLocalFromUsecs $info.startTimeUsecs $tz
                 $endLocal   = Convert-ToLocalFromUsecs $info.endTimeUsecs   $tz
 
-                # Skip if latest run succeeded (matches Hyper-V behavior you wanted everywhere)
-                if ($status -eq "Succeeded" -or $status -eq "SucceededWithWarning") { continue }
-
+                # Skip if latest run succeeded
+                if ($status -eq "Succeeded" -or $status -eq "SucceededWithWarning") {
+                    Write-Log ("✅ {0} → {1} [{2}] – Latest run succeeded" -f $cluster_name,$pgName,$rType) "Green"
+                    continue
+                }
                 if(-not $latestRun.objects){ continue }
 
-                # Build a quick id->name map for ParentHost resolving (Oracle/SQL)
+                # Build id->name map for ParentHost resolving (Oracle/SQL)
                 $idToName = @{}
                 if($ParentHostNeeded){
                     foreach($ob in $latestRun.objects){
@@ -162,6 +168,7 @@ function Collect-EnvLatestFailedWithObjectAttempts {
                     $_.object.objectType -eq $ObjectType -and $_.object.environment -in $filterSet
                 }
 
+                # DB/VM/Host-level rows (have failedAttempts[])
                 foreach($o in $objs){
                     $attempts = $o.localSnapshotInfo.failedAttempts
                     if(-not $attempts -or $attempts.Count -eq 0){ continue }  # only real object-level failures
@@ -188,6 +195,29 @@ function Collect-EnvLatestFailedWithObjectAttempts {
                         }
                     }
                 }
+
+                # Host-only rows for Oracle/SQL (DB Host) when the host itself failed and no DB object to hang the error on
+                if($ParentHostNeeded){
+                    $hostObjs = $latestRun.objects | Where-Object { $_.object.objectType -eq 'kHost' }
+                    foreach($h in $hostObjs){
+                        $hattempts = $h.localSnapshotInfo.failedAttempts
+                        if(-not $hattempts -or $hattempts.Count -eq 0){ continue }
+                        foreach($fa in $hattempts){
+                            $msgClean = ($fa.message -replace '[\r\n]+',' ' -replace ',',' ' -replace '"','''').Trim()
+                            $globalFailures += [pscustomobject]@{
+                                Cluster         = $cluster_name
+                                ProtectionGroup = $pgName
+                                Environment     = $Label
+                                RunType         = $runType
+                                Name            = "DB Host"            # per request
+                                ParentHost      = $h.object.name       # host name
+                                StartTime       = $startLocal
+                                EndTime         = $endLocal
+                                FailedMessage   = $msgClean
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -208,7 +238,7 @@ function Collect-EnvLatestFailedWithObjectAttempts {
     }
 }
 
-# --- RemoteAdapter: keep your "failed WITHOUT later success" logic exactly ---
+# --- RemoteAdapter: “failed WITHOUT later success” per RunType ---
 function Collect-RemoteAdapter {
     $Label = "RemoteAdapter"
     $globalFailures = @()
@@ -229,6 +259,7 @@ function Collect-RemoteAdapter {
         foreach ($pg in $pgs) {
             $pgId = $pg.id; $pgName = $pg.name
 
+            # Pull HostName / DB_name from PG params where present
             $HostName = $null; $DB_name = $null
             try {
                 $HostName = $pg.remoteAdapterParams.hosts.hostname
@@ -297,9 +328,9 @@ function Collect-RemoteAdapter {
                     Cluster         = $latestFailed.Cluster
                     ProtectionGroup = $latestFailed.ProtectionGroup
                     Environment     = $Label
+                    RunType         = $latestFailed.RunType
                     Name            = if ($latestFailed.DB_name) { $latestFailed.DB_name } else { $latestFailed.HostName }
                     ParentHost      = $null
-                    RunType         = $latestFailed.RunType
                     StartTime       = $startLocal
                     EndTime         = $endLocal
                     FailedMessage   = $msg
