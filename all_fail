@@ -7,9 +7,9 @@
 #   - For each PG and each RunType → take latest run
 #   - Skip if latest run status ∈ {Succeeded, SucceededWithWarning}
 #   - Include ONLY objects where localSnapshotInfo.failedAttempts[] exists
-# Oracle/SQL extras:
-#   - DB object rows: Name = database, ParentHost = host (via sourceId → object.id)
-#   - Host-only rows (no DBs, host has failedAttempts): Name = "DB Host", ParentHost = host name
+# Oracle/SQL:
+#   - Emit columns: Hosts (parent host), DatabaseName (DB name)
+#   - Host-only failures (no DBs): Hosts = host name, DatabaseName = "No DBs Discovered"
 # RemoteAdapter:
 #   - Report latest Failed per RunType ONLY when no later Success exists
 # =====================================================================
@@ -90,7 +90,7 @@ $envMap = @{
 # Collectors
 # =====================================================================
 
-# --- Unified latest-failed-with-failedAttempts collector (Oracle/SQL/Physical/NAS/HyperV/Acropolis) ---
+# --- Unified latest-failed-with-failedAttempts collector ---
 function Collect-EnvLatestFailedWithObjectAttempts {
     param(
         [string]$Label,
@@ -168,36 +168,36 @@ function Collect-EnvLatestFailedWithObjectAttempts {
                     $_.object.objectType -eq $ObjectType -and $_.object.environment -in $filterSet
                 }
 
-                # DB/VM/Host-level rows (have failedAttempts[])
-                foreach($o in $objs){
-                    $attempts = $o.localSnapshotInfo.failedAttempts
-                    if(-not $attempts -or $attempts.Count -eq 0){ continue }  # only real object-level failures
+                if($ParentHostNeeded){
+                    # ----- Oracle/SQL: emit Hosts + DatabaseName -----
+                    foreach($o in $objs){
+                        $attempts = $o.localSnapshotInfo.failedAttempts
+                        if(-not $attempts -or $attempts.Count -eq 0){ continue }  # only real object-level failures
 
-                    # Optional ParentHost (DBs)
-                    $parent = $null
-                    if($ParentHostNeeded -and $o.object -and $o.object.sourceId){
-                        $key = [string]$o.object.sourceId
-                        if($idToName.ContainsKey($key)){ $parent = $idToName[$key] }
-                    }
+                        # Parent host by sourceId → object.id
+                        $parent = $null
+                        if($o.object -and $o.object.sourceId){
+                            $key = [string]$o.object.sourceId
+                            if($idToName.ContainsKey($key)){ $parent = $idToName[$key] }
+                        }
 
-                    foreach($fa in $attempts){
-                        $msgClean = ($fa.message -replace '[\r\n]+',' ' -replace ',',' ' -replace '"','''').Trim()
-                        $globalFailures += [pscustomobject]@{
-                            Cluster         = $cluster_name
-                            ProtectionGroup = $pgName
-                            Environment     = $Label
-                            RunType         = $runType
-                            Name            = $o.object.$NameField
-                            ParentHost      = $parent
-                            StartTime       = $startLocal
-                            EndTime         = $endLocal
-                            FailedMessage   = $msgClean
+                        foreach($fa in $attempts){
+                            $msgClean = ($fa.message -replace '[\r\n]+',' ' -replace ',',' ' -replace '"','''').Trim()
+                            $globalFailures += [pscustomobject]@{
+                                Cluster         = $cluster_name
+                                ProtectionGroup = $pgName
+                                Environment     = $Label
+                                RunType         = $runType
+                                Hosts           = $parent
+                                DatabaseName    = $o.object.$NameField
+                                StartTime       = $startLocal
+                                EndTime         = $endLocal
+                                FailedMessage   = $msgClean
+                            }
                         }
                     }
-                }
 
-                # Host-only rows for Oracle/SQL (DB Host) when the host itself failed and no DB object to hang the error on
-                if($ParentHostNeeded){
+                    # Host-only failures (no DBs discovered)
                     $hostObjs = $latestRun.objects | Where-Object { $_.object.objectType -eq 'kHost' }
                     foreach($h in $hostObjs){
                         $hattempts = $h.localSnapshotInfo.failedAttempts
@@ -209,8 +209,29 @@ function Collect-EnvLatestFailedWithObjectAttempts {
                                 ProtectionGroup = $pgName
                                 Environment     = $Label
                                 RunType         = $runType
-                                Name            = "DB Host"            # per request
-                                ParentHost      = $h.object.name       # host name
+                                Hosts           = $h.object.name
+                                DatabaseName    = "No DBs Discovered"
+                                StartTime       = $startLocal
+                                EndTime         = $endLocal
+                                FailedMessage   = $msgClean
+                            }
+                        }
+                    }
+                }
+                else{
+                    # ----- Other envs: emit Name + ParentHost (optional) -----
+                    foreach($o in $objs){
+                        $attempts = $o.localSnapshotInfo.failedAttempts
+                        if(-not $attempts -or $attempts.Count -eq 0){ continue }
+                        foreach($fa in $attempts){
+                            $msgClean = ($fa.message -replace '[\r\n]+',' ' -replace ',',' ' -replace '"','''').Trim()
+                            $globalFailures += [pscustomobject]@{
+                                Cluster         = $cluster_name
+                                ProtectionGroup = $pgName
+                                Environment     = $Label
+                                RunType         = $runType
+                                Name            = $o.object.$NameField
+                                ParentHost      = $null
                                 StartTime       = $startLocal
                                 EndTime         = $endLocal
                                 FailedMessage   = $msgClean
@@ -224,8 +245,15 @@ function Collect-EnvLatestFailedWithObjectAttempts {
 
     # De-dup and return
     if($globalFailures.Count -gt 0){
+        # Key must match emitted fields (Hosts/DatabaseName OR Name/ParentHost)
         $globalFailures = $globalFailures |
-            Group-Object { "$($_.Cluster)|$($_.ProtectionGroup)|$($_.RunType)|$($_.Name)|$($_.ParentHost)|$($_.FailedMessage)|$($_.EndTime)" } |
+            Group-Object {
+                if($_.PSObject.Properties.Name -contains 'Hosts'){
+                    "$($_.Cluster)|$($_.ProtectionGroup)|$($_.RunType)|$($_.Hosts)|$($_.DatabaseName)|$($_.FailedMessage)|$($_.EndTime)"
+                } else {
+                    "$($_.Cluster)|$($_.ProtectionGroup)|$($_.RunType)|$($_.Name)|$($_.ParentHost)|$($_.FailedMessage)|$($_.EndTime)"
+                }
+            } |
             ForEach-Object { $_.Group | Sort-Object EndTime -Descending | Select-Object -First 1 }
 
         $sorted    = $globalFailures | Sort-Object Cluster,ProtectionGroup,EndTime -Descending
@@ -369,9 +397,16 @@ function Show-Table {
     param($label,$rows,$csvPath)
     if($rows.Count -gt 0){
         Write-Host ("`n🔥 Latest Failed {0} Runs (All Clusters):`n" -f $label) -ForegroundColor Cyan
-        $rows | Select-Object Cluster,ProtectionGroup,Environment,RunType,
-                               Name,ParentHost,StartTime,EndTime,FailedMessage |
-                Format-Table -AutoSize
+
+        # Auto-pick Oracle/SQL column set if present
+        $hasOracleShape = ($rows[0].PSObject.Properties.Name -contains 'Hosts' -and $rows[0].PSObject.Properties.Name -contains 'DatabaseName')
+        if($hasOracleShape){
+            $rows | Select-Object Cluster,ProtectionGroup,RunType,Hosts,DatabaseName,StartTime,EndTime,FailedMessage |
+                    Format-Table -AutoSize
+        } else {
+            $rows | Select-Object Cluster,ProtectionGroup,Environment,RunType,Name,ParentHost,StartTime,EndTime,FailedMessage |
+                    Format-Table -AutoSize
+        }
         if($csvPath){ Write-Host ("`n📂 CSV saved: {0}" -f $csvPath) -ForegroundColor Gray }
         Add-SummaryLine $label $csvPath
     } else {
