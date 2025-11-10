@@ -1,106 +1,136 @@
+// Dynatrace Workflow: Run JavaScript
+// Requires: @dynatrace-sdk/client-classic-environment-v2 (available in Workflows)
+// Scopes: environment-api:credentials:read, environment-api:metrics.ingest
+import {
+  credentialVaultClient,
+  metricsClient,
+  // Types for intellisense (optional)
+  CredentialsDetailsTokenResponseElement,
+} from '@dynatrace-sdk/client-classic-environment-v2';
+
 export default async function () {
-  console.log("🚀 Cohesity Helios – Strict READ-ONLY (GET-only, no write/delete/post)");
+  console.log("🚀 Cohesity Helios → Dynatrace metrics (READ-ONLY)");
 
-  // 🔐 OPTION 1: Secure – from Dynatrace Credential Vault
-  // Make sure your vault entry name is "Cohesity_API_Key"
-  let apiKey;
+  // --- 🔐 1) Resolve token from Credential Vault (TOKEN type)
+  //    Option A: use the Credential ID (recommended for reliability)
+  //    Option B: if you don’t know the ID, map a “credentials.<name>” input in the step and fallback.
+  let heliosApiKey = null;
+
+  // 👉 Replace with your credential ID from the vault UI ("Copy ID")
+  const CREDENTIAL_ID = 'CREDENTIALS_VAULT-xxxxxxxxxxxxxxxx'; // <-- put your real ID
+
   try {
-    apiKey = credentials?.Cohesity_API_Key?.token;
-  } catch {
-    apiKey = null;
+    const tokenCred = /** @type {CredentialsDetailsTokenResponseElement} */ (
+      await credentialVaultClient.getCredentialsDetails({ id: CREDENTIAL_ID })
+    );
+    if (tokenCred?.token) {
+      heliosApiKey = tokenCred.token;
+      console.log("✅ Token retrieved from Credential Vault (by ID).");
+    }
+  } catch (e) {
+    console.warn("⚠️ Vault lookup by ID failed or not configured. Will try step credential mapping…", e?.message || e);
   }
 
-  // 🧩 OPTION 2: Manual fallback – paste directly if vault not configured
-  if (!apiKey || apiKey === "PASTE_YOUR_API_KEY_HERE") {
-    apiKey = "PASTE_YOUR_API_KEY_HERE"; // <-- Replace only for testing
-    console.warn("⚠️ Using hard-coded API key (not from vault) – for testing only!");
-  } else {
-    console.log("✅ Using secure API key from Dynatrace Credential Vault");
+  // Fallback: if you mapped a token as a step credential input named “Cohesity_API_Key”
+  if (!heliosApiKey && typeof credentials?.Cohesity_API_Key?.token === 'string') {
+    heliosApiKey = credentials.Cohesity_API_Key.token;
+    console.log("✅ Token retrieved from step credentials (Cohesity_API_Key).");
   }
 
+  if (!heliosApiKey) {
+    throw new Error("❌ No Helios API token available. Configure Credential Vault (Token) or step credential mapping.");
+  }
+
+  // --- 2) Call Cohesity Helios (READ-ONLY)
   const baseUrl = "https://helios.cohesity.com";
   const oneTiB  = 1099511627776;
-  const headers = { accept: "application/json", apiKey };
+  const headers = { accept: "application/json", apiKey: heliosApiKey };
 
-  // 1️⃣ Get cluster inventory
-  const listUrl = `${baseUrl}/v2/mcm/cluster-mgmt/info`;
+  // Inventory
+  const listUrl  = `${baseUrl}/v2/mcm/cluster-mgmt/info`;
   const listResp = await fetch(listUrl, { method: "GET", headers });
-  if (listResp.status !== 200) throw new Error(`❌ Cluster list failed (HTTP ${listResp.status})`);
-
-  const data = await listResp.json();
+  if (listResp.status !== 200) throw new Error(`Cluster list failed (HTTP ${listResp.status})`);
+  const data     = await listResp.json();
   const clusters = data?.cohesityClusters || [];
-
   if (clusters.length === 0) {
-    console.log("⚠️ No clusters returned.");
+    console.log("⚠️ No clusters returned from Helios.");
     return { clusters: [] };
   }
 
   const results = [];
+  const lines   = []; // metrics ingestion lines
 
-  // 2️⃣ For each cluster, read-only GETs for garbage + capacity
   for (const { clusterName, clusterId } of clusters) {
     const h = { ...headers, accessClusterId: String(clusterId) };
-    console.log(`📊 Reading ${clusterName} (ID ${clusterId})`);
 
+    // Build entityId for timeSeriesStats
     const safeName = clusterName.replace(/\s+/g, '');
     const entityId = `${safeName}+(ID+${clusterId})`;
 
+    // Garbage bytes (latest point)
     const tsUrl =
       `${baseUrl}/irisservices/api/v1/public/statistics/timeSeriesStats` +
       `?schemaName=ApolloV2ClusterStats` +
       `&metricName=EstimatedGarbageBytes` +
       `&startTimeMsecs=2` +
-      `&entityId=${entityId}` +
+      `&entityId=${encodeURIComponent(entityId)}` +
       `&rollupFunction=latest` +
       `&rollupIntervalSecs=30` +
       `&metricUnitType=0` +
       `&range=day`;
-
-    console.log(`🔗 GET → ${tsUrl}`);
 
     const tsResp = await fetch(tsUrl, { method: "GET", headers: h });
     if (tsResp.status !== 200) {
       console.log(`⚠️ Garbage stats GET failed for ${clusterName} (HTTP ${tsResp.status})`);
       continue;
     }
-
     const tsJson = await tsResp.json();
     const latest = Array.isArray(tsJson?.dataPointVec)
       ? tsJson.dataPointVec[tsJson.dataPointVec.length - 1]
       : undefined;
     const garbageBytes = latest?.data?.int64Value ?? 0;
-    const garbageGB = +(garbageBytes / (1024 ** 3)).toFixed(2);
-    const garbageTB = +(garbageBytes / (1024 ** 4)).toFixed(3);
+    const garbageGB    = +(garbageBytes / (1024 ** 3)).toFixed(2);
+    const garbageTB    = +(garbageBytes / (1024 ** 4)).toFixed(3);
 
-    const capUrl = `${baseUrl}/irisservices/api/v1/public/stats/storage`;
+    // Capacity
+    const capUrl  = `${baseUrl}/irisservices/api/v1/public/stats/storage`;
     const capResp = await fetch(capUrl, { method: "GET", headers: h });
     if (capResp.status !== 200) {
       console.log(`⚠️ Capacity stats GET failed for ${clusterName} (HTTP ${capResp.status})`);
       continue;
     }
-
     const s = await capResp.json();
-    const totalTiB = +(s.totalCapacityBytes / oneTiB).toFixed(2);
-    const usedTiB  = +(s.localUsageBytes / oneTiB).toFixed(2);
-    const availTiB = +(s.localAvailableBytes / oneTiB).toFixed(2);
+    const totalTiB = +(s.totalCapacityBytes   / oneTiB).toFixed(2);
+    const usedTiB  = +(s.localUsageBytes      / oneTiB).toFixed(2);
+    const availTiB = +(s.localAvailableBytes  / oneTiB).toFixed(2);
     const consumed = +((s.localUsageBytes / s.totalCapacityBytes) * 100).toFixed(2);
 
     results.push({
-      clusterName,
-      clusterId,
-      totalTiB,
-      usedTiB,
-      availTiB,
-      consumedPercent: consumed,
-      garbageGB,
-      garbageTB
+      clusterName, clusterId, totalTiB, usedTiB, availTiB, consumedPercent: consumed, garbageGB, garbageTB
     });
 
-    console.log(`✅ ${clusterName}: ${consumed}% used (${usedTiB}/${totalTiB} TiB) | Garbage ${garbageGB} GB (${garbageTB} TB)`);
+    // --- 3) Build Metrics v2 ingestion lines (one line per metric)
+    // NOTE: Dimensions are labels you can split on in Data explorer (dashboard table).
+    const dims = `clusterName="${clusterName.replace(/"/g, '\\"')}",clusterId="${clusterId}"`;
+    lines.push(
+      `cohesity.capacity.total.tib,${dims} ${totalTiB}`,
+      `cohesity.capacity.used.tib,${dims} ${usedTiB}`,
+      `cohesity.capacity.avail.tib,${dims} ${availTiB}`,
+      `cohesity.capacity.consumed.percent,${dims} ${consumed}`,
+      `cohesity.garbage.gb,${dims} ${garbageGB}`,
+      `cohesity.garbage.tb,${dims} ${garbageTB}`,
+    );
+
+    console.log(`✅ ${clusterName}: ${consumed}% used (${usedTiB}/${totalTiB} TiB) | Garbage ${garbageGB} GB`);
   }
 
-  console.log("📄 Final summary (read-only):");
-  console.log(JSON.stringify(results, null, 2));
+  // --- 4) Ingest metrics into Dynatrace
+  if (lines.length > 0) {
+    const body = lines.join('\n');
+    await metricsClient.ingest({ body }); // Metrics API v2 ingestion
+    console.log(`📥 Ingested ${lines.length} metric lines to Dynatrace.`);
+  }
 
+  // Return useful payload (also visible in workflow run result)
   return { clusters: results };
 }
