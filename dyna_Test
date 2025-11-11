@@ -1,0 +1,150 @@
+// Dynatrace Workflow JavaScript – Cohesity Helios READ-ONLY + Dynatrace ingest (with variant debug + smart error msg)
+// GETs to Cohesity only; POST is to Dynatrace for storing data (metrics). Requires environment-api:metrics:ingest for ingest.
+import { metricsClient } from '@dynatrace-sdk/client-classic-environment-v2';
+
+export default async function () {
+  console.log("🚀 Cohesity Helios – Read-Only (GET) + Dynatrace metrics ingest");
+
+  // 🔑 Inline key for now (move to credential vault when ready)
+  const apiKey  = "PASTE_YOUR_API_KEY_HERE";
+  const baseUrl = "https://helios.cohesity.com";
+  const oneTiB  = 1099511627776;
+  const headers = { accept: "application/json", apiKey };
+
+  // Helper: GET with friendly result
+  async function tryGet(url, h) {
+    const resp = await fetch(url, { method: "GET", headers: h });
+    if (resp.status === 200) return { ok: true, status: 200, json: await resp.json() };
+    const text = await resp.text().catch(() => "");
+    return { ok: false, status: resp.status, text };
+  }
+
+  // Helper: garbage bytes using your WORKING query + entityId variants
+  async function getGarbageLatest(clusterName, clusterId, h) {
+    const safeName = clusterName.replace(/\s+/g, '');
+    const entityId = `${safeName}+(ID+${clusterId})`; // ✅ your known-working variant
+
+    const variants = [
+      entityId,                          // #1 works in your environment
+      `${safeName}(ID ${clusterId})`,    // no plus, no space
+      `${safeName} (ID ${clusterId})`,   // space before (ID ...)
+      `${clusterName}(ID ${clusterId})`, // full spaced name
+    ];
+
+    for (const v of variants) {
+      // Intentionally not URL-encoding to mirror your working call
+      const tsUrl =
+        `${baseUrl}/irisservices/api/v1/public/statistics/timeSeriesStats` +
+        `?schemaName=ApolloV2ClusterStats` +
+        `&metricName=EstimatedGarbageBytes` +
+        `&startTimeMsecs=2` +
+        `&entityId=${v}` +
+        `&rollupFunction=latest` +
+        `&rollupIntervalSecs=30` +
+        `&metricUnitType=0` +
+        `&range=day`;
+
+      console.log(`🔗 Trying entityId variant: '${v}'`);
+      const r = await tryGet(tsUrl, h);
+      if (r.ok && Array.isArray(r.json?.dataPointVec)) {
+        const vec = r.json.dataPointVec;
+        const latest = vec.length ? vec[vec.length - 1] : undefined;
+        const bytes = latest?.data?.int64Value ?? 0;
+        return { bytes, variant: v };
+      } else {
+        console.log(`⚠️ Garbage GET failed (HTTP ${r.status}) for variant='${v}' → ${r.text || 'no body'}`);
+      }
+    }
+    return { bytes: 0, variant: null, failed: true };
+  }
+
+  // 1) Inventory
+  const listUrl  = `${baseUrl}/v2/mcm/cluster-mgmt/info`;
+  const listResp = await fetch(listUrl, { method: "GET", headers });
+  if (listResp.status !== 200) throw new Error(`❌ Cluster list failed (HTTP ${listResp.status})`);
+  const data     = await listResp.json();
+  const clusters = data?.cohesityClusters || [];
+  if (clusters.length === 0) {
+    console.log("⚠️ No clusters returned.");
+    return { clusters: [] };
+  }
+
+  const results = [];
+  const lines   = []; // Dynatrace Metrics v2 payload lines
+
+  // 2) Per-cluster GETs (garbage + capacity)
+  for (const { clusterName, clusterId } of clusters) {
+    const h = { ...headers, accessClusterId: String(clusterId) };
+    console.log(`📊 Reading ${clusterName} (ID ${clusterId})`);
+
+    // Garbage
+    const g = await getGarbageLatest(clusterName, clusterId, h);
+    const garbageBytes = g.bytes;
+    const garbageGB    = +(garbageBytes / (1024 ** 3)).toFixed(2);
+    const garbageTB    = +(garbageBytes / (1024 ** 4)).toFixed(3);
+    if (g.failed) {
+      console.log(`❌ Garbage not available for ${clusterName}; continuing with capacity only.`);
+    } else {
+      console.log(`🧹 Garbage OK via '${g.variant}' → ${garbageGB} GB`);
+    }
+
+    // Capacity
+    const capUrl = `${baseUrl}/irisservices/api/v1/public/stats/storage`;
+    const capTry = await tryGet(capUrl, h);
+    if (!capTry.ok) {
+      console.log(`⚠️ Capacity GET failed for ${clusterName} (HTTP ${capTry.status}) → ${capTry.text || 'no body'}`);
+      continue;
+    }
+    const s = capTry.json;
+    const totalTiB = +(s.totalCapacityBytes  / oneTiB).toFixed(2);
+    const usedTiB  = +(s.localUsageBytes     / oneTiB).toFixed(2);
+    const availTiB = +(s.localAvailableBytes / oneTiB).toFixed(2);
+    const consumed = +((s.localUsageBytes / s.totalCapacityBytes) * 100).toFixed(2);
+
+    results.push({
+      clusterName, clusterId,
+      totalTiB, usedTiB, availTiB,
+      consumedPercent: consumed,
+      garbageGB, garbageTB
+    });
+
+    console.log(`✅ ${clusterName}: ${consumed}% used (${usedTiB}/${totalTiB} TiB) | Garbage ${garbageGB} GB (${garbageTB} TB)`);
+
+    // Build metrics lines
+    const dims = `clusterName="${clusterName.replace(/"/g, '\\"')}",clusterId="${clusterId}"`;
+    lines.push(
+      `cohesity.capacity.total.tib,${dims} ${totalTiB}`,
+      `cohesity.capacity.used.tib,${dims} ${usedTiB}`,
+      `cohesity.capacity.avail.tib,${dims} ${availTiB}`,
+      `cohesity.capacity.consumed.percent,${dims} ${consumed}`,
+      `cohesity.garbage.gb,${dims} ${garbageGB}`,
+      `cohesity.garbage.tb,${dims} ${garbageTB}`
+    );
+  }
+
+  // 3) Ingest metrics to Dynatrace (safe guard with clear, *exact* error message)
+  if (lines.length > 0) {
+    console.log(`📡 Ingesting ${lines.length} lines to Dynatrace...`);
+    try {
+      await metricsClient.ingest({ body: lines.join('\n') });
+      console.log("✅ Metrics successfully ingested to Dynatrace");
+    } catch (e) {
+      console.log("🚫 Dynatrace rejected metrics ingest.");
+      // Try to surface the exact permission/message from the API
+      let msg = e?.message || String(e);
+      try {
+        const parsed = JSON.parse(msg);
+        if (parsed?.error?.message) msg = parsed.error.message;
+        else if (parsed?.message)   msg = parsed.message;
+      } catch { /* keep msg as-is */ }
+      console.log(`❌ Dynatrace API response: ${msg}`);
+      console.log("👉 If this mentions 'Missing required permission', grant that to the workflow Actor or use Events/Logs instead.");
+    }
+  } else {
+    console.log("ℹ️ No metric lines to ingest.");
+  }
+
+  console.log("📄 Final summary (read-only):");
+  console.log(JSON.stringify(results, null, 2));
+  return { clusters: results };
+}
