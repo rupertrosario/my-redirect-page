@@ -1,26 +1,31 @@
-// Fast minimal: Cohesity Helios READ-ONLY → Dynatrace metrics ingest (parallelized)
+// 🚀 Cohesity Helios – Fast Read-Only Cluster Stats + Garbage + Capacity
+// GET only (read-only). POST is only to Dynatrace metrics API (safe).
 import { metricsClient } from '@dynatrace-sdk/client-classic-environment-v2';
 
 export default async function () {
-  const apiKey  = "PASTE_YOUR_API_KEY_HERE";
+  const apiKey  = "PASTE_YOUR_API_KEY_HERE";  // Helios API key
   const baseUrl = "https://helios.cohesity.com";
   const oneTiB  = 1099511627776;
   const headers = { accept: "application/json", apiKey };
 
-  // 1) Get clusters
+  // 1️⃣ Get cluster list
   const listResp = await fetch(`${baseUrl}/v2/mcm/cluster-mgmt/info`, { method: "GET", headers });
-  if (listResp.status !== 200) throw new Error(`Cluster list failed (${listResp.status})`);
+  if (listResp.status !== 200) throw new Error(`❌ Cluster list failed (${listResp.status})`);
   const clusters = (await listResp.json())?.cohesityClusters || [];
-  if (!clusters.length) return { clusters: [] };
+  if (!clusters.length) {
+    console.log("⚠️ No clusters found.");
+    return { clusters: [] };
+  }
 
-  // 2) Per-cluster work in parallel (and per-cluster GETs in parallel)
-  const perClusterPromises = clusters.map(async ({ clusterName, clusterId }) => {
+  console.log(`🔍 Found ${clusters.length} clusters. Fetching capacity and garbage...`);
+
+  // 2️⃣ Process clusters in parallel
+  const clusterStats = await Promise.all(clusters.map(async ({ clusterName, clusterId }) => {
     const h = { ...headers, accessClusterId: String(clusterId) };
-
-    // entityId in your proven-working format
     const safeName = clusterName.replace(/\s+/g, '');
-    const entityId = `${safeName}+(ID+${clusterId})`;
+    const entityId = `${safeName}+(ID+${clusterId})`;  // ✅ your working format
 
+    // --- Parallel GETs for capacity & garbage
     const tsUrl =
       `${baseUrl}/irisservices/api/v1/public/statistics/timeSeriesStats` +
       `?schemaName=ApolloV2ClusterStats` +
@@ -31,16 +36,13 @@ export default async function () {
       `&rollupIntervalSecs=30` +
       `&metricUnitType=0` +
       `&range=day`;
-
     const capUrl = `${baseUrl}/irisservices/api/v1/public/stats/storage`;
 
-    // Run both GETs together
     const [tsResp, capResp] = await Promise.all([
       fetch(tsUrl, { method: "GET", headers: h }),
       fetch(capUrl, { method: "GET", headers: h })
     ]);
 
-    // Garbage
     let garbageGB = 0, garbageTB = 0;
     if (tsResp.status === 200) {
       const tsJson = await tsResp.json();
@@ -49,53 +51,59 @@ export default async function () {
       const bytes = latest?.data?.int64Value ?? 0;
       garbageGB = +(bytes / (1024 ** 3)).toFixed(2);
       garbageTB = +(bytes / (1024 ** 4)).toFixed(3);
+    } else {
+      console.log(`⚠️ Garbage fetch failed for ${clusterName} (HTTP ${tsResp.status})`);
     }
 
-    // Capacity
-    if (capResp.status !== 200) return null;
+    if (capResp.status !== 200) {
+      console.log(`⚠️ Capacity fetch failed for ${clusterName} (HTTP ${capResp.status})`);
+      return null;
+    }
+
     const s = await capResp.json();
-    const totalTiB = +(s.totalCapacityBytes  / oneTiB).toFixed(2);
-    const usedTiB  = +(s.localUsageBytes     / oneTiB).toFixed(2);
+    const totalTiB = +(s.totalCapacityBytes / oneTiB).toFixed(2);
+    const usedTiB  = +(s.localUsageBytes / oneTiB).toFixed(2);
     const availTiB = +(s.localAvailableBytes / oneTiB).toFixed(2);
     const consumed = +((s.localUsageBytes / s.totalCapacityBytes) * 100).toFixed(2);
 
-    // Build result + metric lines for this cluster
-    const dims = `clusterName="${clusterName.replace(/"/g, '\\"')}",clusterId="${clusterId}"`;
-    const lines = [
-      `cohesity.capacity.total.tib,${dims} ${totalTiB}`,
-      `cohesity.capacity.used.tib,${dims} ${usedTiB}`,
-      `cohesity.capacity.avail.tib,${dims} ${availTiB}`,
-      `cohesity.capacity.consumed.percent,${dims} ${consumed}`,
-      `cohesity.garbage.gb,${dims} ${garbageGB}`,
-      `cohesity.garbage.tb,${dims} ${garbageTB}`
-    ];
+    console.log(`✅ ${clusterName}: ${usedTiB}/${totalTiB} TiB used (${consumed}%) | Garbage ${garbageGB} GB`);
 
     return {
-      result: { clusterName, clusterId, totalTiB, usedTiB, availTiB, consumedPercent: consumed, garbageGB, garbageTB },
-      lines
+      clusterName, clusterId,
+      totalTiB, usedTiB, availTiB,
+      consumedPercent: consumed,
+      garbageGB, garbageTB
     };
-  });
+  }));
 
-  const perCluster = await Promise.all(perClusterPromises);
-  const valid = perCluster.filter(Boolean);
+  const valid = clusterStats.filter(Boolean);
 
-  const results = valid.map(v => v.result);
-  const lines = valid.flatMap(v => v.lines);
+  // 3️⃣ (Optional) Ingest to Dynatrace Metrics
+  try {
+    const lines = valid.map(c => {
+      const dims = `clusterName="${c.clusterName.replace(/"/g, '\\"')}",clusterId="${c.clusterId}"`;
+      return [
+        `cohesity.capacity.total.tib,${dims} ${c.totalTiB}`,
+        `cohesity.capacity.used.tib,${dims} ${c.usedTiB}`,
+        `cohesity.capacity.avail.tib,${dims} ${c.availTiB}`,
+        `cohesity.capacity.consumed.percent,${dims} ${c.consumedPercent}`,
+        `cohesity.garbage.gb,${dims} ${c.garbageGB}`,
+        `cohesity.garbage.tb,${dims} ${c.garbageTB}`
+      ].join("\n");
+    }).join("\n");
 
-  // 3) Ingest to Dynatrace (if permitted)
-  if (lines.length) {
+    if (lines.length) await metricsClient.ingest({ body: lines });
+  } catch (e) {
+    let msg = e?.message || String(e);
     try {
-      await metricsClient.ingest({ body: lines.join('\n') });
-    } catch (e) {
-      // print exact API message if present
-      let msg = e?.message || String(e);
-      try {
-        const parsed = JSON.parse(msg);
-        msg = parsed?.error?.message || parsed?.message || msg;
-      } catch {}
-      console.log(`Metrics ingest error: ${msg}`);
-    }
+      const parsed = JSON.parse(msg);
+      msg = parsed?.error?.message || parsed?.message || msg;
+    } catch {}
+    console.log(`🚫 Dynatrace ingest error: ${msg}`);
   }
 
-  return { clusters: results };
+  // 4️⃣ Return clean cluster data for output pane
+  console.log("📄 Final summary:");
+  console.log(JSON.stringify(valid, null, 2));
+  return { clusters: valid };
 }
