@@ -1,33 +1,14 @@
-// 🚀 Cohesity Helios → Dynatrace Metrics (dashboard-ready)
-// - GET-only from Cohesity (capacity + garbage)
-// - POST-only to Dynatrace Metrics API
-// - Vault by Name → by ID → Manual fallback for Helios API key
-//
-// View later in Dashboards → Data explorer (Metrics):
-//   cohesity.capacity.total.tib
-//   cohesity.capacity.used.tib
-//   cohesity.capacity.avail.tib
-//   cohesity.capacity.consumed.percent
-//   cohesity.garbage.gb
-//   cohesity.garbage.tb
-//
-// Permissions to ask your team for (workflow actor):
-//   environment-api:metrics:ingest   (Dynatrace Metrics v2 write)
-//   (some tenants label it "storage:metrics:write" — ask for both if unsure)
-
-import {
-  metricsClient,
-  credentialVaultClient,
-} from "@dynatrace-sdk/client-classic-environment-v2";
+// 🚀 Cohesity Helios – Read-only capacity + garbage (Vault by Name→ID→Manual)
+// ❌ No metrics ingest – just collects and returns data.
+import { credentialVaultClient } from "@dynatrace-sdk/client-classic-environment-v2";
 
 export default async function () {
-  // --- Config ---
   const baseUrl   = "https://helios.cohesity.com";
   const oneTiB    = 1099511627776;
-  const vaultName = "Cohesity_API_Key";       // ✅ your working Vault name
-  const vaultId   = "credentials_vault-312312"; // optional fallback ID
+  const vaultName = "Cohesity_API_Key";          // ✅ working vault name
+  const vaultId   = "credentials_vault-312312";  // optional fallback ID
 
-  // --- Resolve Helios API key: Vault by Name → by ID → Manual ---
+  // ---------- Resolve Helios API key ----------
   async function getKeyFromVaultByName(name) {
     const list = await credentialVaultClient.getCredentials();
     const found = list.credentials.find(c => c.name === name);
@@ -38,6 +19,7 @@ export default async function () {
 
   let apiKey = null;
   let authMode = "vault-name";
+
   try {
     apiKey = await getKeyFromVaultByName(vaultName);
     if (!apiKey) throw new Error("not-found-by-name");
@@ -50,32 +32,33 @@ export default async function () {
       console.log(`🔐 Loaded Helios key from vault (by id): ${vaultId}`);
     } catch (e2) {
       authMode = "manual";
-      apiKey = "PASTE_YOUR_API_KEY_HERE"; // manual fallback for testing only
+      apiKey = "PASTE_YOUR_API_KEY_HERE";  // temporary manual key
       console.log("⚠️ Using manual Helios API key fallback.");
     }
   }
 
   const headers = { accept: "application/json", apiKey };
 
-  // --- 1) Cluster inventory (GET)
+  // ---------- 1️⃣ Get cluster inventory ----------
   const listUrl  = `${baseUrl}/v2/mcm/cluster-mgmt/info`;
   const listResp = await fetch(listUrl, { method: "GET", headers });
   if (listResp.status !== 200) {
     const body = await listResp.text().catch(() => "");
     throw new Error(`❌ Cluster list failed (HTTP ${listResp.status}) ${body}`);
   }
+
   const clusters = (await listResp.json())?.cohesityClusters || [];
   if (!clusters.length) {
     console.log("⚠️ No clusters returned from Helios.");
-    return { clusters: [], ingested: 0, authMode };
+    return { clusters: [], authMode };
   }
 
   console.log(`🔍 Found ${clusters.length} clusters. Collecting metrics...`);
 
-  // --- Helper: fetch garbage latest for this cluster (GET)
+  // ---------- Helper to read garbage metric ----------
   async function getGarbageLatest(clusterName, clusterId, h) {
     const safeName = clusterName.replace(/\s+/g, "");
-    const entityId = `${safeName}+(ID+${clusterId})`; // your proven-working format
+    const entityId = `${safeName}+(ID+${clusterId})`; // proven format
 
     const tsUrl =
       `${baseUrl}/irisservices/api/v1/public/statistics/timeSeriesStats` +
@@ -89,7 +72,9 @@ export default async function () {
       `&range=day`;
 
     const r = await fetch(tsUrl, { method: "GET", headers: h });
-    if (r.status !== 200) return { bytes: 0, ok: false, status: r.status };
+    if (r.status !== 200) {
+      return { bytes: 0, ok: false, status: r.status, body: await r.text().catch(() => "") };
+    }
 
     const j = await r.json();
     const vec = Array.isArray(j?.dataPointVec) ? j.dataPointVec : [];
@@ -98,83 +83,58 @@ export default async function () {
     return { bytes, ok: true, status: 200 };
   }
 
-  // --- 2) Per-cluster: GET capacity + garbage, build metric lines
-  const metricLines = [];
-  const results     = [];
+  // ---------- 2️⃣ Collect per-cluster capacity + garbage ----------
+  const results = [];
 
-  await Promise.all(clusters.map(async ({ clusterName, clusterId }) => {
-    const h = { ...headers, accessClusterId: String(clusterId) };
+  await Promise.all(
+    clusters.map(async ({ clusterName, clusterId }) => {
+      const h = { ...headers, accessClusterId: String(clusterId) };
 
-    // Capacity (GET)
-    const capUrl  = `${baseUrl}/irisservices/api/v1/public/stats/storage`;
-    const capResp = await fetch(capUrl, { method: "GET", headers: h });
-    if (capResp.status !== 200) {
-      const t = await capResp.text().catch(() => "");
-      console.log(`⚠️ Capacity GET failed for ${clusterName} (HTTP ${capResp.status}) ${t}`);
-      return;
-    }
-    const s = await capResp.json();
+      // Capacity
+      const capUrl  = `${baseUrl}/irisservices/api/v1/public/stats/storage`;
+      const capResp = await fetch(capUrl, { method: "GET", headers: h });
+      if (capResp.status !== 200) {
+        const t = await capResp.text().catch(() => "");
+        console.log(`⚠️ Capacity GET failed for ${clusterName} (HTTP ${capResp.status}) ${t}`);
+        return;
+      }
 
-    const totalTiB = +(s.totalCapacityBytes  / oneTiB).toFixed(2);
-    const usedTiB  = +(s.localUsageBytes     / oneTiB).toFixed(2);
-    const availTiB = +(s.localAvailableBytes / oneTiB).toFixed(2);
-    const consumed = +((s.localUsageBytes / s.totalCapacityBytes) * 100).toFixed(2);
+      const s = await capResp.json();
+      const totalTiB = +(s.totalCapacityBytes  / oneTiB).toFixed(2);
+      const usedTiB  = +(s.localUsageBytes     / oneTiB).toFixed(2);
+      const availTiB = +(s.localAvailableBytes / oneTiB).toFixed(2);
+      const consumedPercent = +((s.localUsageBytes / s.totalCapacityBytes) * 100).toFixed(2);
 
-    // Garbage (GET)
-    const g = await getGarbageLatest(clusterName, clusterId, h);
-    const garbageBytes = g.bytes || 0;
-    const garbageGB    = +(garbageBytes / (1024 ** 3)).toFixed(2);
-    const garbageTB    = +(garbageBytes / (1024 ** 4)).toFixed(3);
+      // Garbage
+      const g = await getGarbageLatest(clusterName, clusterId, h);
+      if (!g.ok) {
+        console.log(`⚠️ Garbage GET failed for ${clusterName} (HTTP ${g.status}) ${g.body || ""}`);
+      }
+      const garbageBytes = g.bytes || 0;
+      const garbageGB = +(garbageBytes / (1024 ** 3)).toFixed(2);
+      const garbageTB = +(garbageBytes / (1024 ** 4)).toFixed(3);
 
-    results.push({
-      clusterName, clusterId, totalTiB, usedTiB, availTiB, consumedPercent: consumed, garbageGB, garbageTB
-    });
+      results.push({
+        clusterName,
+        clusterId,
+        totalTiB,
+        usedTiB,
+        availTiB,
+        consumedPercent,
+        garbageGB,
+        garbageTB,
+      });
 
-    // Build Dynatrace metric lines (dimensions: clusterName, clusterId)
-    const dims = `clusterName="${clusterName.replace(/"/g, '\\"')}",clusterId="${clusterId}"`;
-    metricLines.push(
-      `cohesity.capacity.total.tib,${dims} ${totalTiB}`,
-      `cohesity.capacity.used.tib,${dims} ${usedTiB}`,
-      `cohesity.capacity.avail.tib,${dims} ${availTiB}`,
-      `cohesity.capacity.consumed.percent,${dims} ${consumed}`,
-      `cohesity.garbage.gb,${dims} ${garbageGB}`,
-      `cohesity.garbage.tb,${dims} ${garbageTB}`
-    );
+      console.log(
+        `✅ ${clusterName}: ${usedTiB}/${totalTiB} TiB (${consumedPercent}%) | Garbage ${garbageGB} GB (${garbageTB} TB)`
+      );
+    })
+  );
 
-    console.log(`✅ ${clusterName}: ${usedTiB}/${totalTiB} TiB (${consumed}%) | Garbage ${garbageGB} GB (${garbageTB} TB)`);
-  }));
-
-  // --- 3) Ingest to Dynatrace Metrics (POST to Dynatrace only)
-  let ingested = 0;
-  if (metricLines.length) {
-    console.log(`📡 Ingesting ${metricLines.length} lines to Dynatrace Metrics...`);
-    try {
-      await metricsClient.ingest({ body: metricLines.join("\n") });
-      ingested = metricLines.length;
-      console.log("✅ Metrics ingest OK.");
-    } catch (e) {
-      // These logs help your team diagnose missing scopes
-      const maybeStatus = e?.status || e?.response?.status;
-      let errText = "";
-      try { errText = await e?.response?.text(); } catch { /* ignore */ }
-
-      console.log("🚫 Dynatrace Metrics ingest failed.");
-      console.log(`   HTTP status: ${maybeStatus || "unknown"}`);
-      if (errText) console.log(`   Body: ${errText}`);
-
-      console.log("   Likely missing permission/scope on the workflow actor:");
-      console.log("   • environment-api:metrics:ingest   (primary)");
-      console.log("   • (some tenants call it storage:metrics:write)");
-      console.log("   Ask the platform team to grant the correct scope to this workflow.");
-    }
-  } else {
-    console.log("ℹ️ No metric lines to ingest.");
-  }
-
-  // --- 4) Return summary
+  // ---------- 3️⃣ Return summary (for email, table, or future metrics step) ----------
   return {
-    authMode,                      // "vault-name" | "vault-id" | "manual"
-    clusters: results,             // raw results
-    ingestedMetricLines: ingested, // how many datapoints we tried to push
+    authMode,       // vault-name | vault-id | manual
+    clusters: results,
+    clusterCount: results.length,
   };
 }
