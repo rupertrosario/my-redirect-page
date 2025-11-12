@@ -1,14 +1,15 @@
-// 🚀 Cohesity Helios Connectivity Test (Vault by ID → by Name → Manual Fallback)
+// 🚀 Cohesity Helios – Read-only Capacity + Garbage (Vault by Name → ID → Manual Fallback)
 import { credentialVaultClient } from "@dynatrace-sdk/client-classic-environment-v2";
 
 export default async function () {
   const baseUrl = "https://helios.cohesity.com";
-  const vaultId = "credentials_vault-312312";   // your stored credential ID
-  const vaultName = "Cohesity_API_Key";         // your stored credential name
+  const oneTiB  = 1099511627776;
+  const vaultId = "credentials_vault-312312";   // optional backup ID
+  const vaultName = "Cohesity_API_Key";         // ✅ your working Vault credential name
   let apiKey = null;
-  let authMode = "vault";
+  let authMode = "vault-name";
 
-  // Helper to fetch credential by name (list & match)
+  // Helper to fetch credential by name
   async function tryGetByName(name) {
     try {
       const list = await credentialVaultClient.getCredentials();
@@ -26,56 +27,114 @@ export default async function () {
     }
   }
 
-  // 1️⃣ Try vault by ID
-  try {
-    const vaultData = await credentialVaultClient.getCredentialsDetails({ id: vaultId });
-    apiKey = vaultData?.token;
-    console.log(`✅ Loaded API key from vault (by ID): ${vaultData?.name || vaultId}`);
-  } catch (err) {
-    console.log(`⚠️ Vault ID fetch failed (${err.message || "unknown error"})`);
+  // 1️⃣ Try Vault by Name
+  apiKey = await tryGetByName(vaultName);
+
+  // 2️⃣ If name fails, try Vault by ID
+  if (!apiKey) {
+    try {
+      const vaultData = await credentialVaultClient.getCredentialsDetails({ id: vaultId });
+      apiKey = vaultData?.token;
+      authMode = "vault-id";
+      console.log(`✅ Loaded API key from vault (by ID): ${vaultData?.name || vaultId}`);
+    } catch (err) {
+      console.log(`⚠️ Vault ID fetch failed (${err.message || "unknown error"})`);
+    }
   }
 
-  // 2️⃣ Try vault by name (if ID not found or failed)
+  // 3️⃣ Manual fallback for testing
   if (!apiKey) {
-    apiKey = await tryGetByName(vaultName);
-    if (apiKey) authMode = "vault-name";
-  }
-
-  // 3️⃣ Manual fallback
-  if (!apiKey) {
-    apiKey = "PASTE_YOUR_API_KEY_HERE"; // fallback key for testing
+    apiKey = "PASTE_YOUR_API_KEY_HERE"; // 🧪 manual fallback
     authMode = "manual";
     console.log("⚠️ Using manual API key fallback");
   }
 
-  // 4️⃣ Make Helios API call
   const headers = { accept: "application/json", apiKey };
-  const url = `${baseUrl}/v2/mcm/cluster-mgmt/info`;
-  console.log(`🌐 Calling: ${url}`);
 
-  const resp = await fetch(url, { method: "GET", headers });
-  if (resp.status !== 200) {
-    const text = await resp.text();
-    console.log(`❌ API request failed (HTTP ${resp.status}) → ${text}`);
-    throw new Error(`Cluster list fetch failed (${resp.status})`);
+  // 4️⃣ Get cluster list
+  const listResp = await fetch(`${baseUrl}/v2/mcm/cluster-mgmt/info`, { method: "GET", headers });
+  if (listResp.status !== 200)
+    throw new Error(`❌ Cluster list failed (${listResp.status})`);
+  const clusters = (await listResp.json())?.cohesityClusters || [];
+  if (!clusters.length) {
+    const emptyReport = "📊 **Cohesity Cluster Capacity Report**\n\n_No clusters returned._";
+    return { clusters: [], report: emptyReport, authMode };
   }
 
-  const data = await resp.json();
-  const clusters = data?.cohesityClusters || [];
-  const clusterCount = clusters.length;
+  // 5️⃣ Get capacity + garbage for each cluster
+  const stats = await Promise.all(clusters.map(async ({ clusterName, clusterId }) => {
+    const h = { ...headers, accessClusterId: String(clusterId) };
+    const safeName = clusterName.replace(/\s+/g, '');
+    const entityId = `${safeName}+(ID+${clusterId})`; // ✅ working format
 
-  // 5️⃣ Log results
-  console.log(`✅ Successfully connected to Cohesity Helios`);
-  console.log(`📊 Total clusters found: ${clusterCount}`);
-  if (clusterCount) {
-    console.log("🧩 Cluster names:");
-    clusters.forEach(c => console.log(`  • ${c.clusterName}`));
-  }
+    const tsUrl =
+      `${baseUrl}/irisservices/api/v1/public/statistics/timeSeriesStats` +
+      `?schemaName=ApolloV2ClusterStats` +
+      `&metricName=EstimatedGarbageBytes` +
+      `&startTimeMsecs=2` +
+      `&entityId=${entityId}` +
+      `&rollupFunction=latest` +
+      `&rollupIntervalSecs=30` +
+      `&metricUnitType=0` +
+      `&range=day`;
 
-  // 6️⃣ Return structured output
-  return {
-    authMode,                      // vault, vault-name, or manual
-    clusterCount,
-    clusterNames: clusters.map(c => c.clusterName) || []
-  };
+    const capUrl = `${baseUrl}/irisservices/api/v1/public/stats/storage`;
+
+    const [tsResp, capResp] = await Promise.all([
+      fetch(tsUrl,  { method: "GET", headers: h }),
+      fetch(capUrl, { method: "GET", headers: h })
+    ]);
+
+    // Garbage
+    let garbageGB = 0, garbageTB = 0;
+    if (tsResp.status === 200) {
+      const tsJson = await tsResp.json();
+      const vec = tsJson?.dataPointVec || [];
+      const latest = vec.length ? vec[vec.length - 1] : undefined;
+      const bytes = latest?.data?.int64Value ?? 0;
+      garbageGB = +(bytes / (1024 ** 3)).toFixed(2);
+      garbageTB = +(bytes / (1024 ** 4)).toFixed(3);
+    }
+
+    // Capacity
+    if (capResp.status !== 200) return null;
+    const s = await capResp.json();
+    const totalTiB = +(s.totalCapacityBytes  / oneTiB).toFixed(2);
+    const usedTiB  = +(s.localUsageBytes     / oneTiB).toFixed(2);
+    const availTiB = +(s.localAvailableBytes / oneTiB).toFixed(2);
+    const consumedPercent = +((s.localUsageBytes / s.totalCapacityBytes) * 100).toFixed(2);
+
+    return { clusterName, clusterId, totalTiB, usedTiB, availTiB, consumedPercent, garbageGB, garbageTB };
+  }));
+
+  // 6️⃣ Sort alphabetically and build color-coded table
+  const rows = stats.filter(Boolean).sort((a, b) => a.clusterName.localeCompare(b.clusterName));
+  const badge = (p) => (p >= 80 ? "🔴" : (p > 70 ? "🟡" : "🟢"));
+
+  const header = [
+    "📊 **Cohesity Cluster Capacity Report**",
+    "",
+    "| Cluster | Used TiB | Avail TiB | % Used | Status | Garbage GB | Garbage TB |",
+    "|----------|----------:|----------:|--------:|:------:|-----------:|-----------:|"
+  ].join("\n");
+
+  const body = rows.map(c =>
+    `| ${c.clusterName} | ${c.usedTiB} | ${c.availTiB} | ${c.consumedPercent}% | ${badge(c.consumedPercent)} | ${c.garbageGB} | ${c.garbageTB} |`
+  ).join("\n");
+
+  const footer = [
+    "",
+    `**_Total clusters in report: ${rows.length}_**`,
+    "",
+    "🟢 = Healthy (≤ 70%)",
+    "🟡 = Warning (70–79%)",
+    "🔴 = Critical (≥ 80%)",
+    "",
+    `🔑 Auth mode used: **${authMode}**`
+  ].join("\n");
+
+  const report = [header, body, "", footer].join("\n");
+
+  // 7️⃣ Return clean data for email or table output
+  return { clusters: rows, report, authMode };
 }
