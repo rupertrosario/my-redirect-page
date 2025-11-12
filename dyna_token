@@ -1,0 +1,107 @@
+// 🚀 Cohesity Helios – Read-only capacity + garbage (sorted, thresholds, emoji legend)
+// 🔐 Credential Vault support: prefers credentials.Cohesity_API_Key.token; falls back to inline.
+export default async function () {
+  // --- 🔐 API key resolution (Vault → Inline fallback) ---
+  const vaultKey =
+    (typeof credentials !== "undefined" &&
+     credentials?.Cohesity_API_Key?.token) || null;
+
+  const inlineKey = "PASTE_YOUR_API_KEY_HERE"; // fallback if no vault key
+  const apiKey = vaultKey || inlineKey;
+
+  const baseUrl = "https://helios.cohesity.com";
+  const oneTiB  = 1099511627776;
+  const headers = { accept: "application/json", apiKey };
+
+  // 1️⃣ Get cluster inventory
+  const listResp = await fetch(`${baseUrl}/v2/mcm/cluster-mgmt/info`, { method: "GET", headers });
+  if (listResp.status !== 200) throw new Error(`❌ Cluster list failed (${listResp.status})`);
+  const clusters = (await listResp.json())?.cohesityClusters || [];
+  if (!clusters.length) {
+    const emptyReport =
+      "📊 **Cohesity Cluster Capacity Report**\n\n_No clusters returned._";
+    return { clusters: [], report: emptyReport, authMode: vaultKey ? "vault" : "inline" };
+  }
+
+  // 2️⃣ Per-cluster GETs (capacity + garbage)
+  const stats = await Promise.all(clusters.map(async ({ clusterName, clusterId }) => {
+    const h = { ...headers, accessClusterId: String(clusterId) };
+    const safeName = clusterName.replace(/\s+/g, '');
+    const entityId = `${safeName}+(ID+${clusterId})`; // ✅ working format
+
+    const tsUrl =
+      `${baseUrl}/irisservices/api/v1/public/statistics/timeSeriesStats` +
+      `?schemaName=ApolloV2ClusterStats` +
+      `&metricName=EstimatedGarbageBytes` +
+      `&startTimeMsecs=2` +
+      `&entityId=${entityId}` +
+      `&rollupFunction=latest` +
+      `&rollupIntervalSecs=30` +
+      `&metricUnitType=0` +
+      `&range=day`;
+    const capUrl = `${baseUrl}/irisservices/api/v1/public/stats/storage`;
+
+    const [tsResp, capResp] = await Promise.all([
+      fetch(tsUrl,  { method: "GET", headers: h }),
+      fetch(capUrl, { method: "GET", headers: h })
+    ]);
+
+    // Garbage stats
+    let garbageGB = 0, garbageTB = 0;
+    if (tsResp.status === 200) {
+      const tsJson = await tsResp.json();
+      const vec = tsJson?.dataPointVec || [];
+      const latest = vec.length ? vec[vec.length - 1] : undefined;
+      const bytes = latest?.data?.int64Value ?? 0;
+      garbageGB = +(bytes / (1024 ** 3)).toFixed(2);
+      garbageTB = +(bytes / (1024 ** 4)).toFixed(3);
+    }
+
+    // Capacity stats
+    if (capResp.status !== 200) return null;
+    const s = await capResp.json();
+    const totalTiB = +(s.totalCapacityBytes  / oneTiB).toFixed(2);
+    const usedTiB  = +(s.localUsageBytes     / oneTiB).toFixed(2);
+    const availTiB = +(s.localAvailableBytes / oneTiB).toFixed(2);
+    const consumedPercent = +((s.localUsageBytes / s.totalCapacityBytes) * 100).toFixed(2);
+
+    return {
+      clusterName, clusterId,
+      totalTiB, usedTiB, availTiB,
+      consumedPercent,
+      garbageGB, garbageTB
+    };
+  }));
+
+  // 3️⃣ Filter valid + sort by cluster name
+  const rows = stats.filter(Boolean).sort((a, b) => a.clusterName.localeCompare(b.clusterName));
+
+  // Status badge
+  const badge = (p) => (p >= 80 ? "🔴" : (p > 70 ? "🟡" : "🟢"));
+
+  // 4️⃣ Build Markdown report
+  const header = [
+    "📊 **Cohesity Cluster Capacity Report**",
+    "",
+    "| Cluster | Used TiB | Avail TiB | % Used | Status | Garbage GB | Garbage TB |",
+    "|----------|----------:|----------:|--------:|:------:|-----------:|-----------:|"
+  ].join("\n");
+
+  const body = rows.map(c =>
+    `| ${c.clusterName} | ${c.usedTiB} | ${c.availTiB} | ${c.consumedPercent}% | ${badge(c.consumedPercent)} | ${c.garbageGB} | ${c.garbageTB} |`
+  ).join("\n");
+
+  const footer = [
+    "",
+    `**_Total clusters in report: ${rows.length}_**`,
+    "",
+    "🟢 = Healthy (≤ 70%)  ",
+    "🟡 = Warning (70–79%)  ",
+    "🔴 = Critical (≥ 80%)"
+  ].join("\n");
+
+  const report = [header, body, "", footer].join("\n");
+
+  // 5️⃣ Return raw + formatted + which auth path was used
+  return { clusters: rows, report, authMode: vaultKey ? "vault" : "inline" };
+}
