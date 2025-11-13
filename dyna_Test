@@ -1,61 +1,68 @@
+// 🚀 Cohesity Helios – Read-only Capacity + Garbage + Version + Location + Node Count
+// Vault priority: Name → ID → Manual fallback
 import { credentialVaultClient } from "@dynatrace-sdk/client-classic-environment-v2";
 
 export default async function () {
-
   const baseUrl = "https://helios.cohesity.com";
   const oneTiB = 1099511627776;
-  const vaultName = "Cohesity_API_Key";
-  const vaultId = "credentials_vault-312312";
+
+  const vaultName = "Cohesity_API_Key";         // working vault name
+  const vaultId   = "credentials_vault-312312"; // optional fallback
 
   let apiKey = null;
   let authMode = "vault-name";
 
-  async function getKeyByName(name) {
-    const creds = await credentialVaultClient.getCredentials();
-    const found = creds.credentials.find(x => x.name === name);
-    if (!found) return null;
-    const details = await credentialVaultClient.getCredentialsDetails({ id: found.id });
-    return details?.token || null;
+  // helper → vault by name
+  async function tryGetByName(name) {
+    try {
+      const list = await credentialVaultClient.getCredentials();
+      const found = list.credentials.find(c => c.name === name);
+      if (!found) return null;
+      const details = await credentialVaultClient.getCredentialsDetails({ id: found.id });
+      console.log(`✓ loaded API key (vault name): ${found.name}`);
+      return details.token;
+    } catch {
+      return null;
+    }
   }
 
-  try {
-    apiKey = await getKeyByName(vaultName);
-    if (!apiKey) throw "not-found";
-    console.log(`✅ loaded key from vault (name): ${vaultName}`);
-  } catch (e1) {
+  // 1️⃣ vault → by name
+  apiKey = await tryGetByName(vaultName);
+
+  // 2️⃣ vault → by ID
+  if (!apiKey) {
     try {
-      const d = await credentialVaultClient.getCredentialsDetails({ id: vaultId });
-      apiKey = d?.token;
+      const details = await credentialVaultClient.getCredentialsDetails({ id: vaultId });
+      apiKey = details?.token;
       authMode = "vault-id";
-      console.log(`✅ loaded key from vault (id): ${vaultId}`);
-    } catch (e2) {
-      authMode = "manual";
-      apiKey = "PASTE_YOUR_API_KEY_HERE"; // temp for testing
-      console.log("⚠️ using manual api key");
-    }
+      console.log(`✓ loaded API key (vault ID): ${details?.name || vaultId}`);
+    } catch {}
+  }
+
+  // 3️⃣ manual fallback
+  if (!apiKey) {
+    apiKey = "PASTE_YOUR_API_KEY_HERE";
+    authMode = "manual";
+    console.log("⚠️ manual key fallback");
   }
 
   const headers = { accept: "application/json", apiKey };
 
-  // get cluster list
-  const listUrl = `${baseUrl}/v2/mcm/cluster-mgmt/info`;
-  const listResp = await fetch(listUrl, { method: "GET", headers });
-  if (listResp.status !== 200) {
-    const text = await listResp.text().catch(() => "");
-    throw new Error(`cluster list failed (${listResp.status}) ${text}`);
-  }
+  // 4️⃣ cluster list
+  const listResp = await fetch(`${baseUrl}/v2/mcm/cluster-mgmt/info`, { method: "GET", headers });
+  if (listResp.status !== 200) throw new Error(`cluster list failed (${listResp.status})`);
 
-  const clusters = (await listResp.json())?.cohesityClusters || [];
+  const raw = await listResp.json();
+  const clusters = raw?.cohesityClusters || [];
   if (!clusters.length) {
-    console.log("no clusters found.");
-    return { clusters: [], authMode };
+    return { clusters: [], report: "No clusters", authMode };
   }
 
-  console.log(`found ${clusters.length} clusters...`);
-
+  // helper → garbage
   async function getGarbage(clusterName, clusterId, h) {
     const safe = clusterName.replace(/\s+/g, "");
     const entityId = `${safe}+(ID+${clusterId})`;
+
     const url =
       `${baseUrl}/irisservices/api/v1/public/statistics/timeSeriesStats` +
       `?schemaName=ApolloV2ClusterStats` +
@@ -67,53 +74,93 @@ export default async function () {
       `&metricUnitType=0` +
       `&range=day`;
 
-    const resp = await fetch(url, { method: "GET", headers: h });
-    if (resp.status !== 200) {
-      return { ok: false, status: resp.status, bytes: 0 };
-    }
-    const js = await resp.json();
+    const r = await fetch(url, { method: "GET", headers: h });
+    if (r.status !== 200) return 0;
+
+    const js = await r.json();
     const vec = js?.dataPointVec || [];
     const last = vec[vec.length - 1];
-    const bytes = last?.data?.int64Value ?? 0;
-    return { ok: true, bytes };
+    return last?.data?.int64Value ?? 0;
   }
 
   const results = [];
 
-  await Promise.all(clusters.map(async ({ clusterName, clusterId }) => {
-    const h = { ...headers, accessClusterId: String(clusterId) };
-
-    const capUrl = `${baseUrl}/irisservices/api/v1/public/stats/storage`;
-    const capResp = await fetch(capUrl, { method: "GET", headers: h });
-    if (capResp.status !== 200) {
-      console.log(`capacity failed for ${clusterName} (${capResp.status})`);
-      return;
-    }
-    const s = await capResp.json();
-    const totalTiB = +(s.totalCapacityBytes / oneTiB).toFixed(2);
-    const usedTiB = +(s.localUsageBytes / oneTiB).toFixed(2);
-    const availTiB = +(s.localAvailableBytes / oneTiB).toFixed(2);
-    const percent = +((s.localUsageBytes / s.totalCapacityBytes) * 100).toFixed(2);
-
-    const g = await getGarbage(clusterName, clusterId, h);
-    const garbageGB = +(g.bytes / (1024 ** 3)).toFixed(2);
-    const garbageTB = +(g.bytes / (1024 ** 4)).toFixed(3);
-
-    results.push({
+  // 5️⃣ per cluster stats
+  await Promise.all(
+    clusters.map(async ({
       clusterName,
       clusterId,
-      totalTiB,
-      usedTiB,
-      availTiB,
-      consumedPercent: percent,
-      garbageGB,
-      garbageTB
-    });
+      currentVersion,
+      location,
+      numberOfNodes   // 👈 NEW field extracted from Helios metadata
+    }) => {
 
-    console.log(`✅ ${clusterName}: ${usedTiB}/${totalTiB} TiB (${percent}%) | Garbage ${garbageGB} GB (${garbageTB} TB)`);
-  }));
+      const h = { ...headers, accessClusterId: String(clusterId) };
 
-  console.log(`finished, got ${results.length} valid clusters`);
+      // capacity
+      const capUrl = `${baseUrl}/irisservices/api/v1/public/stats/storage`;
+      const cap = await fetch(capUrl, { method: "GET", headers: h });
+      if (cap.status !== 200) return;
 
-  return { authMode, clusters: results, count: results.length };
+      const s = await cap.json();
+      const totalTiB = +(s.totalCapacityBytes / oneTiB).toFixed(2);
+      const usedTiB  = +(s.localUsageBytes / oneTiB).toFixed(2);
+      const availTiB = +(s.localAvailableBytes / oneTiB).toFixed(2);
+      const percent  = +((s.localUsageBytes / s.totalCapacityBytes) * 100).toFixed(2);
+
+      // garbage
+      const bytes = await getGarbage(clusterName, clusterId, h);
+      const garbageGB = +(bytes / (1024 ** 3)).toFixed(2);
+      const garbageTB = +(bytes / (1024 ** 4)).toFixed(3);
+
+      results.push({
+        clusterName,
+        location: location || "Unknown",
+        version: currentVersion || "Unknown",
+        numberOfNodes: numberOfNodes || 0,  // 👈 included here
+        totalTiB,
+        usedTiB,
+        availTiB,
+        consumedPercent: percent,
+        garbageGB,
+        garbageTB
+      });
+
+      console.log(`✓ ${clusterName} | Nodes: ${numberOfNodes} | ${usedTiB}/${totalTiB} TiB`);
+    })
+  );
+
+  // sort by name
+  const rows = results.sort((a, b) => a.clusterName.localeCompare(b.clusterName));
+
+  const badge = (p) => (p >= 80 ? "🔴" : p > 70 ? "🟡" : "🟢");
+
+  // 6️⃣ markdown output
+  const header = [
+    "📊 **Cohesity Cluster Capacity Report**",
+    "",
+    "| Cluster | Location | Version | Nodes | Used TiB | Avail TiB | % Used | Status | Garbage GB | Garbage TB |",
+    "|---------|-----------|----------|-------:|----------:|-----------:|--------:|:-------:|------------:|-------------:|"
+  ].join("\n");
+
+  const body = rows
+    .map(c =>
+      `| ${c.clusterName} | ${c.location} | ${c.version} | ${c.numberOfNodes} | ${c.usedTiB} | ${c.availTiB} | ${c.consumedPercent}% | ${badge(c.consumedPercent)} | ${c.garbageGB} | ${c.garbageTB} |`
+    )
+    .join("\n");
+
+  const footer = [
+    "",
+    `**_Total clusters in report: ${rows.length}_**`,
+    "",
+    "🟢 = Healthy (≤ 70%)",
+    "🟡 = Warning (70–79%)",
+    "🔴 = Critical (≥ 80%)",
+    "",
+    `🔑 Auth mode used: **${authMode}**`
+  ].join("\n");
+
+  const report = [header, body, "", footer].join("\n");
+
+  return { clusters: rows, report, authMode };
 }
