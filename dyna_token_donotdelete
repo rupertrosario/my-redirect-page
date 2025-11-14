@@ -1,140 +1,110 @@
-// 🚀 Cohesity Helios – Read-only Capacity + Garbage (Vault by Name → ID → Manual Fallback)
-import { credentialVaultClient } from "@dynatrace-sdk/client-classic-environment-v2";
+import { execution } from "@dynatrace-sdk/automation-utils";
 
-export default async function () {
-  const baseUrl = "https://helios.cohesity.com";
-  const oneTiB  = 1099511627776;
-  const vaultId = "credentials_vault-312312";   // optional backup ID
-  const vaultName = "Cohesity_API_Key";         // ✅ your working Vault credential name
-  let apiKey = null;
-  let authMode = "vault-name";
+export default async function ({ execution_id }) {
+  const ex     = await execution(execution_id);
+  const result = await ex.result(execute_dql_query_1);   // your DQL step ID
+  const rows   = result.records ?? [];
 
-  // Helper to fetch credential by name
-  async function tryGetByName(name) {
-    try {
-      const list = await credentialVaultClient.getCredentials();
-      const found = list.credentials.find(c => c.name === name);
-      if (!found) {
-        console.log(`❌ No credential found with name: ${name}`);
-        return null;
-      }
-      const detail = await credentialVaultClient.getCredentialsDetails({ id: found.id });
-      console.log(`✅ Loaded API key from vault (by name): ${found.name}`);
-      return detail.token;
-    } catch (err) {
-      console.log(`⚠️ Vault name lookup failed (${err.message || "unknown error"})`);
-      return null;
-    }
+  const BYTES_PER_TB = 1_000_000_000_000;
+
+  function safeNum(x) {
+    const n = Number(x);
+    return Number.isFinite(n) ? n : 0;
   }
 
-  // 1️⃣ Try Vault by Name
-  apiKey = await tryGetByName(vaultName);
-
-  // 2️⃣ If name fails, try Vault by ID
-  if (!apiKey) {
-    try {
-      const vaultData = await credentialVaultClient.getCredentialsDetails({ id: vaultId });
-      apiKey = vaultData?.token;
-      authMode = "vault-id";
-      console.log(`✅ Loaded API key from vault (by ID): ${vaultData?.name || vaultId}`);
-    } catch (err) {
-      console.log(`⚠️ Vault ID fetch failed (${err.message || "unknown error"})`);
-    }
+  function badge(p) {
+    const n = Number(p);
+    if (!Number.isFinite(n)) return "⚪";
+    if (n < 70) return "🟢";
+    if (n < 85) return "🟡";
+    return "🔴";
   }
 
-  // 3️⃣ Manual fallback for testing
-  if (!apiKey) {
-    apiKey = "PASTE_YOUR_API_KEY_HERE"; // 🧪 manual fallback
-    authMode = "manual";
-    console.log("⚠️ Using manual API key fallback");
-  }
+  // Normalize DQL rows
+  const clusters = rows
+    .map((r) => {
+      const clusterName = r.clusterName ?? "Unknown";
 
-  const headers = { accept: "application/json", apiKey };
+      const usedTB  = safeNum(r.used_TB);
+      const totalTB = safeNum(r.total_TB);
 
-  // 4️⃣ Get cluster list
-  const listResp = await fetch(`${baseUrl}/v2/mcm/cluster-mgmt/info`, { method: "GET", headers });
-  if (listResp.status !== 200)
-    throw new Error(`❌ Cluster list failed (${listResp.status})`);
-  const clusters = (await listResp.json())?.cohesityClusters || [];
-  if (!clusters.length) {
-    const emptyReport = "📊 **Cohesity Cluster Capacity Report**\n\n_No clusters returned._";
-    return { clusters: [], report: emptyReport, authMode };
-  }
+      const usedPctRaw =
+        r.used_pct_rounded != null
+          ? safeNum(r.used_pct_rounded)
+          : (totalTB > 0 ? (usedTB / totalTB) * 100 : 0);
 
-  // 5️⃣ Get capacity + garbage for each cluster
-  const stats = await Promise.all(clusters.map(async ({ clusterName, clusterId }) => {
-    const h = { ...headers, accessClusterId: String(clusterId) };
-    const safeName = clusterName.replace(/\s+/g, '');
-    const entityId = `${safeName}+(ID+${clusterId})`; // ✅ working format
+      const usedPctLabel =
+        typeof r.used_pct_label === "string"
+          ? r.used_pct_label
+          : `${usedPctRaw.toFixed(1)} %`;
 
-    const tsUrl =
-      `${baseUrl}/irisservices/api/v1/public/statistics/timeSeriesStats` +
-      `?schemaName=ApolloV2ClusterStats` +
-      `&metricName=EstimatedGarbageBytes` +
-      `&startTimeMsecs=2` +
-      `&entityId=${entityId}` +
-      `&rollupFunction=latest` +
-      `&rollupIntervalSecs=30` +
-      `&metricUnitType=0` +
-      `&range=day`;
+      const usedHddTB  = safeNum(r.used_hdd_bytes)  / BYTES_PER_TB;
+      const totalHddTB = safeNum(r.total_hdd_bytes) / BYTES_PER_TB;
+      const usedSddTB  = safeNum(r.used_sdd_bytes)  / BYTES_PER_TB;
+      const totalSddTB = safeNum(r.total_sdd_bytes) / BYTES_PER_TB;
 
-    const capUrl = `${baseUrl}/irisservices/api/v1/public/stats/storage`;
+      const usedHddPct =
+        totalHddTB > 0 ? (usedHddTB / totalHddTB) * 100 : 0;
+      const usedSddPct =
+        totalSddTB > 0 ? (usedSddTB / totalSddTB) * 100 : 0;
 
-    const [tsResp, capResp] = await Promise.all([
-      fetch(tsUrl,  { method: "GET", headers: h }),
-      fetch(capUrl, { method: "GET", headers: h })
-    ]);
+      return {
+        clusterName,
 
-    // Garbage
-    let garbageGB = 0, garbageTB = 0;
-    if (tsResp.status === 200) {
-      const tsJson = await tsResp.json();
-      const vec = tsJson?.dataPointVec || [];
-      const latest = vec.length ? vec[vec.length - 1] : undefined;
-      const bytes = latest?.data?.int64Value ?? 0;
-      garbageGB = +(bytes / (1024 ** 3)).toFixed(2);
-      garbageTB = +(bytes / (1024 ** 4)).toFixed(3);
-    }
+        usedPct:      usedPctRaw.toFixed(1),
+        usedPctLabel,
 
-    // Capacity
-    if (capResp.status !== 200) return null;
-    const s = await capResp.json();
-    const totalTiB = +(s.totalCapacityBytes  / oneTiB).toFixed(2);
-    const usedTiB  = +(s.localUsageBytes     / oneTiB).toFixed(2);
-    const availTiB = +(s.localAvailableBytes / oneTiB).toFixed(2);
-    const consumedPercent = +((s.localUsageBytes / s.totalCapacityBytes) * 100).toFixed(2);
+        usedHddTB:    usedHddTB.toFixed(1),
+        totalHddTB:   totalHddTB.toFixed(1),
+        usedHddPct:   usedHddPct.toFixed(1),
 
-    return { clusterName, clusterId, totalTiB, usedTiB, availTiB, consumedPercent, garbageGB, garbageTB };
-  }));
+        usedSddTB:    usedSddTB.toFixed(1),
+        totalSddTB:   totalSddTB.toFixed(1),
+        usedSddPct:   usedSddPct.toFixed(1),
 
-  // 6️⃣ Sort alphabetically and build color-coded table
-  const rows = stats.filter(Boolean).sort((a, b) => a.clusterName.localeCompare(b.clusterName));
-  const badge = (p) => (p >= 80 ? "🔴" : (p > 70 ? "🟡" : "🟢"));
+        usedTB:       usedTB.toFixed(1),
+        totalTB:      totalTB.toFixed(1),
 
+        status:       badge(usedPctRaw)
+      };
+    })
+    .sort((a, b) => a.clusterName.localeCompare(b.clusterName));
+
+  // 📊 Table – same style as your Cohesity script, with Used/Total TB at the end
   const header = [
-    "📊 **Cohesity Cluster Capacity Report**",
+    "📊 **Isilon Cluster Capacity Report**",
     "",
-    "| Cluster | Used TiB | Avail TiB | % Used | Status | Garbage GB | Garbage TB |",
-    "|----------|----------:|----------:|--------:|:------:|-----------:|-----------:|"
+    "| Cluster | Used % | Status | HDD Used TB | HDD Total TB | HDD % | SSD Used TB | SSD Total TB | SSD % | Used TB | Total TB |",
+    "|---------|-------:|:------:|------------:|-------------:|------:|------------:|-------------:|------:|--------:|---------:|"
   ].join("\n");
 
-  const body = rows.map(c =>
-    `| ${c.clusterName} | ${c.usedTiB} | ${c.availTiB} | ${c.consumedPercent}% | ${badge(c.consumedPercent)} | ${c.garbageGB} | ${c.garbageTB} |`
-  ).join("\n");
+  const body = clusters
+    .map((c) =>
+      `| ${c.clusterName}` +
+      ` | ${c.usedPct} %` +
+      ` | ${c.status}` +
+      ` | ${c.usedHddTB}` +
+      ` | ${c.totalHddTB}` +
+      ` | ${c.usedHddPct} %` +
+      ` | ${c.usedSddTB}` +
+      ` | ${c.totalSddTB}` +
+      ` | ${c.usedSddPct} %` +
+      ` | ${c.usedTB}` +
+      ` | ${c.totalTB} |`
+    )
+    .join("\n");
 
   const footer = [
     "",
-    `**_Total clusters in report: ${rows.length}_**`,
+    `**_Total clusters in report: ${clusters.length}_**`,
     "",
     "🟢 = Healthy (≤ 70%)",
-    "🟡 = Warning (70–79%)",
-    "🔴 = Critical (≥ 80%)",
-    "",
-    `🔑 Auth mode used: **${authMode}**`
+    "🟡 = Warning (70–84.9%)",
+    "🔴 = Critical (≥ 85%)"
   ].join("\n");
 
   const report = [header, body, "", footer].join("\n");
 
-  // 7️⃣ Return clean data for email or table output
-  return { clusters: rows, report, authMode };
+  // For email: use `report` as body; `clusters` is there if you need JSON
+  return { clusters, report };
 }
