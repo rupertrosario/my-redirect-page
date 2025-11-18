@@ -1,6 +1,8 @@
-// Cohesity Helios – Combined Backup Failures (All Environments)
+// Cohesity Helios – Combined Backup Failures (All Environments, per Protection Group)
 // - Dynatrace classic credential vault (name -> id -> manual)
 // - READ-ONLY: Helios is accessed with HTTP GET only
+// - Performance-optimized: per-PG latest run only, parallelized per cluster & PG
+//
 // Output:
 // {
 //   authMode: "vault-name" | "vault-id" | "manual",
@@ -10,11 +12,10 @@
 //       Environment,
 //       Cluster,
 //       ProtectionGroup,
-//       Host,
-//       ObjectName,
 //       RunType,
 //       StartTime,
 //       EndTime,
+//       Status,
 //       FailedMessage
 //     }
 //   ],
@@ -27,7 +28,7 @@ export default async function () {
   const baseUrl = "https://helios.cohesity.com";
 
   // ------------------------------
-  // Credential vault: name -> id -> manual
+  // 1) Credential vault: name -> id -> manual (same pattern as your capacity script)
   // ------------------------------
   const vaultName = "Cohesity_API_Key";
   const vaultId   = "credentials_vault-312312";
@@ -37,26 +38,23 @@ export default async function () {
 
   async function getKeyByName(name) {
     const all = await credentialVaultClient.getCredentials();
-    const found = all.credentials.find(function (c) { return c.name === name; });
+    const found = all.credentials.find(c => c.name === name);
     if (!found) return null;
     const detail = await credentialVaultClient.getCredentialsDetails({ id: found.id });
-    console.log("✓ Helios key from vault (name): " + found.name);
-    return (detail && (detail.token || detail.password)) || null;
+    console.log(`✓ Helios key from vault (name): ${found.name}`);
+    return detail?.token || detail?.password || null;
   }
 
-  // 1) vault by name
   try {
     apiKey = await getKeyByName(vaultName);
     if (!apiKey) throw new Error("not-found");
-  } catch (e) {
-    // 2) vault by id
+  } catch {
     try {
       const detail = await credentialVaultClient.getCredentialsDetails({ id: vaultId });
-      apiKey       = (detail && (detail.token || detail.password)) || null;
+      apiKey       = detail?.token || detail?.password || null;
       authMode     = "vault-id";
-      console.log("✓ Helios key from vault (id): " + (detail && detail.name ? detail.name : vaultId));
-    } catch (e2) {
-      // 3) manual fallback
+      console.log(`✓ Helios key from vault (id): ${detail?.name || vaultId}`);
+    } catch {
       authMode = "manual";
       apiKey   = "PASTE_YOUR_API_KEY_HERE";  // last resort, still GET-only
       console.log("⚠️ Using manual Helios API key (fallback)");
@@ -67,24 +65,24 @@ export default async function () {
     throw new Error("No Helios API key available (vault + manual failed).");
   }
 
-  const commonHeaders = { accept: "application/json", apiKey: apiKey };
+  const commonHeaders = { accept: "application/json", apiKey };
 
   // ------------------------------
-  // Helpers (all GET)
+  // 2) Helpers (all GET, no writes)
   // ------------------------------
-  async function getJson(url, headers) {
-    const resp = await fetch(url, { method: "GET", headers: headers });
+  async function getJson(url, headers = {}) {
+    const resp = await fetch(url, { method: "GET", headers });
     if (!resp.ok) {
       let txt = "";
-      try { txt = await resp.text(); } catch (e) {}
-      throw new Error("GET " + url + " -> HTTP " + resp.status + " " + txt);
+      try { txt = await resp.text(); } catch {}
+      throw new Error(`GET ${url} -> HTTP ${resp.status} ${txt}`);
     }
     return resp.json();
   }
 
   function usecsToDateString(usecs) {
-    if (usecs == null || usecs === 0) return null;
-    const ms = Number(usecs) / 1000; // microseconds -> ms
+    if (!usecs) return null;
+    const ms = Number(usecs) / 1000;  // microseconds -> ms
     if (!Number.isFinite(ms)) return null;
     return new Date(ms).toISOString();
   }
@@ -98,12 +96,10 @@ export default async function () {
 
   function buildQuery(params) {
     const usp = new URLSearchParams();
-    for (const k in params) {
-      if (!Object.prototype.hasOwnProperty.call(params, k)) continue;
-      const v = params[k];
+    for (const [k, v] of Object.entries(params)) {
       if (v === undefined || v === null) continue;
       if (Array.isArray(v)) {
-        v.forEach(function (val) { usp.append(k, String(val)); });
+        v.forEach(val => usp.append(k, String(val)));
       } else {
         usp.append(k, String(v));
       }
@@ -111,469 +107,167 @@ export default async function () {
     return usp.toString();
   }
 
-  // If localBackupInfo is object, treat as array
   function toInfoArray(localBackupInfo) {
     if (!localBackupInfo) return [];
-    if (Array.isArray(localBackupInfo)) return localBackupInfo;
-    return [localBackupInfo];
+    return Array.isArray(localBackupInfo) ? localBackupInfo : [localBackupInfo];
   }
 
-  // Env map – same idea as PowerShell envMap
-  const ENV_CONFIGS = [
-    { label: "Oracle",        filter: ["kOracle"],                objectType: "kDatabase",       parentHostNeeded: true  },
-    { label: "SQL",           filter: ["kSQL"],                   objectType: "kDatabase",       parentHostNeeded: true  },
-    { label: "Physical",      filter: ["kPhysical"],              objectType: "kHost",           parentHostNeeded: false },
-    { label: "NAS",           filter: ["kGenericNas", "kIsilon"], objectType: "kHost",           parentHostNeeded: false },
-    { label: "HyperV",        filter: ["kHyperV"],                objectType: "kVirtualMachine", parentHostNeeded: false },
-    { label: "Acropolis",     filter: ["kAcropolis"],             objectType: "kVirtualMachine", parentHostNeeded: false },
-    { label: "RemoteAdapter", filter: ["kRemoteAdapter"],         objectType: "kRemoteAdapter",  parentHostNeeded: false }
-  ];
+  const ENV_LABELS = {
+    kOracle:        "Oracle",
+    kSQL:           "SQL",
+    kPhysical:      "Physical",
+    kGenericNas:    "NAS",
+    kIsilon:        "NAS",
+    kHyperV:        "HyperV",
+    kAcropolis:     "Acropolis",
+    kRemoteAdapter: "RemoteAdapter"
+  };
+
+  function mapEnvironment(pg) {
+    let envRaw = pg.environment;
+    if (!envRaw && Array.isArray(pg.environmentTypes) && pg.environmentTypes.length > 0) {
+      envRaw = pg.environmentTypes[0];
+    }
+    if (!envRaw) return "Unknown";
+    return ENV_LABELS[envRaw] || envRaw;
+  }
 
   // ------------------------------
-  // Non-RemoteAdapter collector
+  // 3) Per-PG failure collector (fast, latest run only)
   // ------------------------------
-  async function collectEnvFailuresForCluster(cluster, envCfg) {
-    const label            = envCfg.label;
-    const filter           = envCfg.filter;
-    const objectType       = envCfg.objectType;
-    const parentHostNeeded = envCfg.parentHostNeeded;
+  async function collectPgFailure(clusterName, headers, pg) {
+    const pgId   = pg.id;
+    const pgName = pg.name || "Unknown PG";
+    const envLbl = mapEnvironment(pg);
 
+    // Only latest run; no object details = smaller payload
+    const runQuery = buildQuery({
+      numRuns: 1,
+      excludeNonRestorableRuns: false,
+      includeObjectDetails: false
+    });
+
+    let runData;
+    try {
+      runData = await getJson(
+        `${baseUrl}/v2/data-protect/protection-groups/${encodeURIComponent(pgId)}/runs?${runQuery}`,
+        headers
+      );
+    } catch {
+      // Fail quietly per PG; we don't want one bad PG to kill the whole report
+      return [];
+    }
+
+    const runs = runData.runs || [];
+    if (!runs.length) return [];
+
+    const run = runs[0]; // numRuns=1 → latest
+    const infoArr = toInfoArray(run.localBackupInfo);
+    if (!infoArr.length) return [];
+
+    const info   = infoArr[0];
+    const status = info.status || "Unknown";
+    const runType = info.runType || "";
+
+    // Only report failures (anything not Succeeded / SucceededWithWarning)
+    if (status === "Succeeded" || status === "SucceededWithWarning") return [];
+
+    const startTimeStr = usecsToDateString(info.startTimeUsecs || 0);
+    const endTimeStr   = usecsToDateString(info.endTimeUsecs || 0);
+    const msg          = cleanMessage(info.messages);
+
+    return [{
+      Environment:     envLbl,
+      Cluster:         clusterName,
+      ProtectionGroup: pgName,
+      RunType:         runType,
+      StartTime:       startTimeStr,
+      EndTime:         endTimeStr,
+      Status:          status,
+      FailedMessage:   msg
+    }];
+  }
+
+  // ------------------------------
+  // 4) Per-cluster collector (parallel over PGs)
+  // ------------------------------
+  async function collectClusterFailures(cluster) {
     const clusterName =
       cluster.name ||
       cluster.clusterName ||
       cluster.displayName ||
-      ("Unknown-" + cluster.clusterId);
+      `Unknown-${cluster.clusterId}`;
 
-    const headers = {
-      accept: "application/json",
-      apiKey: apiKey,
-      accessClusterId: String(cluster.clusterId)
-    };
-
-    const allRows = [];
+    const headers = { ...commonHeaders, accessClusterId: String(cluster.clusterId) };
 
     const pgQuery = buildQuery({
       isDeleted: false,
       isPaused: false,
-      isActive: true,
-      environments: filter
+      isActive: true
     });
 
     let pgData;
     try {
-      pgData = await getJson(baseUrl + "/v2/data-protect/protection-groups?" + pgQuery, headers);
-    } catch (e) {
-      return allRows;
+      pgData = await getJson(
+        `${baseUrl}/v2/data-protect/protection-groups?${pgQuery}`,
+        headers
+      );
+    } catch {
+      return [];
     }
 
     const pgs = pgData.protectionGroups || [];
-    if (!pgs.length) return allRows;
+    if (!pgs.length) return [];
 
-    for (let i = 0; i < pgs.length; i++) {
-      const pg     = pgs[i];
-      const pgId   = pg.id;
-      const pgName = pg.name || "Unknown PG";
-
-      const runQuery = buildQuery({
-        environments: filter,
-        numRuns: 10,
-        excludeNonRestorableRuns: false,
-        includeObjectDetails: true
-      });
-
-      let runData;
-      try {
-        runData = await getJson(
-          baseUrl + "/v2/data-protect/protection-groups/" + encodeURIComponent(pgId) + "/runs?" + runQuery,
-          headers
-        );
-      } catch (e2) {
-        continue;
-      }
-
-      const runs = runData.runs || [];
-      if (!runs.length) continue;
-
-      // Collect runTypes present
-      const runTypesSet = {};
-      for (let r = 0; r < runs.length; r++) {
-        const lbArray = toInfoArray(runs[r].localBackupInfo);
-        for (let j = 0; j < lbArray.length; j++) {
-          const info = lbArray[j];
-          if (info && info.runType) {
-            runTypesSet[info.runType] = true;
-          }
-        }
-      }
-
-      // For each RunType, pick latest failed run
-      const runTypes = Object.keys(runTypesSet);
-      for (let rtIndex = 0; rtIndex < runTypes.length; rtIndex++) {
-        const rType = runTypes[rtIndex];
-
-        let latestRun  = null;
-        let latestInfo = null;
-
-        for (let r = 0; r < runs.length; r++) {
-          const run   = runs[r];
-          const lbArr = toInfoArray(run.localBackupInfo);
-          if (!lbArr.length) continue;
-
-          // mimic PS: use index 0
-          const info0 = lbArr[0];
-          if (!info0 || info0.runType !== rType) continue;
-
-          if (!latestRun) {
-            latestRun  = run;
-            latestInfo = info0;
-          } else {
-            const existingEnd = latestInfo && latestInfo.endTimeUsecs ? latestInfo.endTimeUsecs : 0;
-            const newEnd      = info0.endTimeUsecs || 0;
-            if (newEnd > existingEnd) {
-              latestRun  = run;
-              latestInfo = info0;
-            }
-          }
-        }
-
-        if (!latestRun || !latestInfo) continue;
-
-        const status       = latestInfo.status;
-        const runType      = latestInfo.runType;
-        const startTimeStr = usecsToDateString(latestInfo.startTimeUsecs || 0);
-        const endTimeStr   = usecsToDateString(latestInfo.endTimeUsecs || 0);
-
-        // If latest is success, skip (matches your PS logic)
-        if (status === "Succeeded" || status === "SucceededWithWarning") continue;
-
-        const objects = latestRun.objects || [];
-        if (!objects.length) continue;
-
-        const idToName = {};
-        for (let o = 0; o < objects.length; o++) {
-          const ob  = objects[o];
-          const obj = ob.object;
-          if (obj && obj.id != null && obj.name) {
-            idToName[String(obj.id)] = obj.name;
-          }
-        }
-
-        // Host-level rows for Oracle/SQL
-        if (parentHostNeeded) {
-          for (let o = 0; o < objects.length; o++) {
-            const ob  = objects[o];
-            const obj = ob.object || {};
-            const isHost = (obj.objectType === "kHost") || (obj.environment === "kPhysical");
-            if (!isHost) continue;
-
-            const lsi            = ob.localSnapshotInfo || {};
-            const failedAttempts = lsi.failedAttempts || [];
-            if (!failedAttempts.length) continue;
-
-            for (let faIdx = 0; faIdx < failedAttempts.length; faIdx++) {
-              const fa = failedAttempts[faIdx];
-              allRows.push({
-                environment:     label,
-                cluster:         clusterName,
-                protectionGroup: pgName,
-                host:            obj.name || null,
-                objectName:      "No DBs Found (Host-Level Failure)",
-                runType:         runType,
-                startTime:       startTimeStr,
-                endTime:         endTimeStr,
-                failedMessage:   cleanMessage(fa.message)
-              });
-            }
-          }
-        }
-
-        // Object-level rows
-        for (let o = 0; o < objects.length; o++) {
-          const ob  = objects[o];
-          const obj = ob.object || {};
-          if (obj.objectType !== objectType) continue;
-          if (filter.indexOf(obj.environment) === -1) continue;
-
-          const lsi            = ob.localSnapshotInfo || {};
-          const failedAttempts = lsi.failedAttempts || [];
-          if (!failedAttempts.length) continue;
-
-          let parentHost = null;
-          if (parentHostNeeded && obj.sourceId != null && idToName[String(obj.sourceId)]) {
-            parentHost = idToName[String(obj.sourceId)];
-          }
-
-          for (let faIdx = 0; faIdx < failedAttempts.length; faIdx++) {
-            const fa = failedAttempts[faIdx];
-            if (label === "Oracle" || label === "SQL") {
-              allRows.push({
-                environment:     label,
-                cluster:         clusterName,
-                protectionGroup: pgName,
-                host:            parentHost,
-                objectName:      obj.name || null,   // DB name
-                runType:         runType,
-                startTime:       startTimeStr,
-                endTime:         endTimeStr,
-                failedMessage:   cleanMessage(fa.message)
-              });
-            } else {
-              allRows.push({
-                environment:     label,
-                cluster:         clusterName,
-                protectionGroup: pgName,
-                host:            null,
-                objectName:      obj.name || null,
-                runType:         runType,
-                startTime:       startTimeStr,
-                endTime:         endTimeStr,
-                failedMessage:   cleanMessage(fa.message)
-              });
-            }
-          }
-        }
-      }
-    }
-
-    return allRows;
-  }
-
-  // ------------------------------
-  // RemoteAdapter collector – "failed without later success"
-  // ------------------------------
-  async function collectRemoteAdapterFailuresForCluster(cluster) {
-    const label = "RemoteAdapter";
-
-    const clusterName =
-      cluster.name ||
-      cluster.clusterName ||
-      cluster.displayName ||
-      ("Unknown-" + cluster.clusterId);
-
-    const headers = {
-      accept: "application/json",
-      apiKey: apiKey,
-      accessClusterId: String(cluster.clusterId)
-    };
+    // Parallelize PG-level /runs calls for speed
+    const pgPromises = pgs.map(pg => collectPgFailure(clusterName, headers, pg));
+    const results = await Promise.all(pgPromises);
 
     const allRows = [];
-
-    const pgQuery = buildQuery({
-      isDeleted: false,
-      isPaused: false,
-      isActive: true,
-      environments: ["kRemoteAdapter"]
-    });
-
-    let pgData;
-    try {
-      pgData = await getJson(baseUrl + "/v2/data-protect/protection-groups?" + pgQuery, headers);
-    } catch (e) {
-      return allRows;
+    for (const arr of results) {
+      if (arr && arr.length) allRows.push(...arr);
     }
-
-    const pgs = pgData.protectionGroups || [];
-    if (!pgs.length) return allRows;
-
-    for (let i = 0; i < pgs.length; i++) {
-      const pg     = pgs[i];
-      const pgId   = pg.id;
-      const pgName = pg.name || "Unknown PG";
-
-      let raHost = null;
-      let raDB   = null;
-
-      try {
-        const hosts  = (pg.remoteAdapterParams && pg.remoteAdapterParams.hosts) || {};
-        let hostname = hosts.hostname;
-        if (Array.isArray(hostname)) hostname = hostname.join(",");
-        raHost = hostname || null;
-
-        let args = hosts.incrementalBackupScript && hosts.incrementalBackupScript.params;
-        if (Array.isArray(args)) args = args.join(" ");
-        if (typeof args === "string") {
-          const m = args.match(/-o\s+(\S+)/);
-          if (m) raDB = m[1];
-        }
-      } catch (eRA) {
-        // ignore RA parsing issues
-      }
-
-      const runQuery = buildQuery({
-        environments: ["kRemoteAdapter"],
-        numRuns: 10,
-        excludeNonRestorableRuns: false,
-        includeObjectDetails: true
-      });
-
-      let runData;
-      try {
-        runData = await getJson(
-          baseUrl + "/v2/data-protect/protection-groups/" + encodeURIComponent(pgId) + "/runs?" + runQuery,
-          headers
-        );
-      } catch (eRun) {
-        continue;
-      }
-
-      const runs = runData.runs || [];
-      if (!runs.length) continue;
-
-      const flat = [];
-      for (let r = 0; r < runs.length; r++) {
-        const run   = runs[r];
-        const lbArr = toInfoArray(run.localBackupInfo);
-        for (let j = 0; j < lbArr.length; j++) {
-          const info = lbArr[j];
-          flat.push({
-            runType:        info.runType,
-            status:         info.status,
-            message:        info.messages,
-            startTimeUsecs: info.startTimeUsecs,
-            endTimeUsecs:   info.endTimeUsecs,
-            cluster:        clusterName,
-            protectionGroup:pgName,
-            raHost:         raHost,
-            raDB:           raDB
-          });
-        }
-      }
-      if (!flat.length) continue;
-
-      // group by runType
-      const byRunType = {};
-      for (let f = 0; f < flat.length; f++) {
-        const row = flat[f];
-        const key = row.runType || "UNKNOWN";
-        if (!byRunType[key]) byRunType[key] = [];
-        byRunType[key].push(row);
-      }
-
-      const runTypeKeys = Object.keys(byRunType);
-      for (let k = 0; k < runTypeKeys.length; k++) {
-        const rType = runTypeKeys[k];
-        const rows  = byRunType[rType];
-
-        const failedRows = rows.filter(function (r) { return r.status === "Failed"; });
-        if (!failedRows.length) continue;
-
-        // Latest failed
-        let latestFailed = failedRows[0];
-        for (let x = 1; x < failedRows.length; x++) {
-          const r = failedRows[x];
-          if ((r.endTimeUsecs || 0) > (latestFailed.endTimeUsecs || 0)) {
-            latestFailed = r;
-          }
-        }
-
-        // Any later success?
-        let hasLaterSuccess = false;
-        for (let x = 0; x < rows.length; x++) {
-          const r = rows[x];
-          if (r.status !== "Succeeded" && r.status !== "SucceededWithWarning") continue;
-          if ((r.startTimeUsecs || 0) > (latestFailed.endTimeUsecs || 0)) {
-            hasLaterSuccess = true;
-            break;
-          }
-        }
-        if (hasLaterSuccess) continue;
-
-        const startTimeStr = usecsToDateString(latestFailed.startTimeUsecs || 0);
-        const endTimeStr   = usecsToDateString(latestFailed.endTimeUsecs || 0);
-        const msg          = cleanMessage(latestFailed.message);
-        const objName      =
-          latestFailed.raDB ||
-          latestFailed.raHost ||
-          raDB ||
-          raHost ||
-          null;
-
-        allRows.push({
-          environment:     label,
-          cluster:         latestFailed.cluster,
-          protectionGroup: latestFailed.protectionGroup,
-          host:            null,
-          objectName:      objName,
-          runType:         rType,
-          startTime:       startTimeStr,
-          endTime:         endTimeStr,
-          failedMessage:   msg
-        });
-      }
-    }
-
     return allRows;
   }
 
   // ------------------------------
-  // Collect all clusters + envs, dedup + sort
+  // 5) Collect all clusters, flatten, sort
   // ------------------------------
-  async function collectAllCombinedFailures() {
-    const clusterData = await getJson(baseUrl + "/v2/mcm/cluster-mgmt/info", commonHeaders);
-    const clusters    = clusterData.cohesityClusters || [];
+  async function collectAllFailures() {
+    const clusterData = await getJson(
+      `${baseUrl}/v2/mcm/cluster-mgmt/info`,
+      commonHeaders
+    );
+    const clusters = clusterData.cohesityClusters || [];
     if (!clusters.length) return [];
 
-    const combined = [];
+    // Parallelize per-cluster collection as well
+    const clusterPromises = clusters.map(cluster => collectClusterFailures(cluster));
+    const clusterResults  = await Promise.all(clusterPromises);
 
-    for (let c = 0; c < clusters.length; c++) {
-      const cluster = clusters[c];
-      for (let e = 0; e < ENV_CONFIGS.length; e++) {
-        const cfg = ENV_CONFIGS[e];
-        if (cfg.label === "RemoteAdapter") {
-          const raRows = await collectRemoteAdapterFailuresForCluster(cluster);
-          combined.push.apply(combined, raRows);
-        } else {
-          const envRows = await collectEnvFailuresForCluster(cluster, cfg);
-          combined.push.apply(combined, envRows);
-        }
-      }
+    const allRows = [];
+    for (const arr of clusterResults) {
+      if (arr && arr.length) allRows.push(...arr);
     }
 
-    // Dedup by env|cluster|PG|host|objectName|runType|failedMessage|endTime
-    const map = {};
-    for (let i = 0; i < combined.length; i++) {
-      const row = combined[i];
-      const key =
-        (row.environment || "") + "|" +
-        (row.cluster || "") + "|" +
-        (row.protectionGroup || "") + "|" +
-        (row.host || "") + "|" +
-        (row.objectName || "") + "|" +
-        (row.runType || "") + "|" +
-        (row.failedMessage || "") + "|" +
-        (row.endTime || "");
-
-      const existing = map[key];
-      if (!existing) {
-        map[key] = row;
-      } else {
-        const existingEnd = existing.endTime ? new Date(existing.endTime).getTime() : 0;
-        const newEnd      = row.endTime ? new Date(row.endTime).getTime() : 0;
-        if (newEnd > existingEnd) {
-          map[key] = row;
-        }
-      }
-    }
-
-    const finalRows = Object.keys(map).map(function (k) { return map[k]; });
-
-    finalRows.sort(function (a, b) {
-      const c1 = (a.cluster || "").localeCompare(b.cluster || "");
+    // Sort: Cluster, Environment, ProtectionGroup, EndTime (latest first)
+    allRows.sort((a, b) => {
+      const c1 = (a.Cluster || "").localeCompare(b.Cluster || "");
       if (c1 !== 0) return c1;
-      const c2 = (a.protectionGroup || "").localeCompare(b.protectionGroup || "");
+      const c2 = (a.Environment || "").localeCompare(b.Environment || "");
       if (c2 !== 0) return c2;
-      const c3 = (a.environment || "").localeCompare(b.environment || "");
+      const c3 = (a.ProtectionGroup || "").localeCompare(b.ProtectionGroup || "");
       if (c3 !== 0) return c3;
-      const tA = a.endTime ? new Date(a.endTime).getTime() : 0;
-      const tB = b.endTime ? new Date(b.endTime).getTime() : 0;
-      return tB - tA; // latest first
+      const tA = a.EndTime ? new Date(a.EndTime).getTime() : 0;
+      const tB = b.EndTime ? new Date(b.EndTime).getTime() : 0;
+      return tB - tA;
     });
 
-    return finalRows;
+    return allRows;
   }
 
   // ------------------------------
-  // Markdown table for email
+  // 6) Markdown table for email
   // ------------------------------
   function toMarkdownTable(rows) {
     if (!rows || rows.length === 0) {
@@ -584,54 +278,38 @@ export default async function () {
       "Environment",
       "Cluster",
       "ProtectionGroup",
-      "Host",
-      "ObjectName",
       "RunType",
       "StartTime",
       "EndTime",
+      "Status",
       "FailedMessage"
     ];
 
-    const headerRow = "| " + headers.join(" | ") + " |";
-    const separator = "| " + headers.map(function () { return "---"; }).join(" | ") + " |";
+    const headerRow = `| ${headers.join(" | ")} |`;
+    const separator = `| ${headers.map(() => "---").join(" | ")} |`;
 
-    const bodyRows = rows.map(function (r) {
-      const vals = headers.map(function (h) {
-        const v = r[h] != null ? r[h] : "";
+    const bodyRows = rows.map(r => {
+      const vals = headers.map(h => {
+        const v = r[h] ?? "";
         const s = String(v);
         return s.length > 300 ? s.slice(0, 297) + "..." : s;
       });
-      return "| " + vals.join(" | ") + " |";
+      return `| ${vals.join(" | ")} |`;
     });
 
-    return [headerRow, separator].concat(bodyRows).join("\n");
+    return [headerRow, separator, ...bodyRows].join("\n");
   }
 
   // ------------------------------
-  // Run + return
+  // 7) Run + return consolidated output
   // ------------------------------
-  const failuresRaw = await collectAllCombinedFailures();
-
-  const failures = failuresRaw.map(function (r) {
-    return {
-      Environment:     r.environment,
-      Cluster:         r.cluster,
-      ProtectionGroup: r.protectionGroup,
-      Host:            r.host,
-      ObjectName:      r.objectName,
-      RunType:         r.runType,
-      StartTime:       r.startTime,
-      EndTime:         r.endTime,
-      FailedMessage:   r.failedMessage
-    };
-  });
-
+  const failures      = await collectAllFailures();
   const markdownTable = toMarkdownTable(failures);
 
   return {
-    authMode: authMode,
+    authMode,
     count: failures.length,
-    failures: failures,
-    markdownTable: markdownTable
+    failures,
+    markdownTable
   };
 }
