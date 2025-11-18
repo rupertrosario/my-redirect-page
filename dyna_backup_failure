@@ -1,7 +1,10 @@
 // Cohesity Helios – Backup Failures (All Environments, per Protection Group)
-// Only failures with NO later successful backup
-// - Dynatrace classic credential vault (name -> id -> manual)
-// - READ-ONLY: all Helios calls are HTTP GET
+// Only FAILED runs with NO later successful backup (per RunType),
+// and includes Host + ObjectName (object-level) similar to your PowerShell script.
+//
+// - Uses Dynatrace classic credential vault (name -> id -> manual)
+// - All Helios calls are HTTP GET
+// - Per Protection Group + RunType, expanded to objects
 //
 // Output:
 // {
@@ -16,6 +19,8 @@
 //       StartTime,
 //       EndTime,
 //       Status,
+//       Host,
+//       ObjectName,
 //       FailedMessage
 //     }
 //   ],
@@ -38,23 +43,23 @@ export default async function () {
 
   async function getKeyByName(name) {
     const all = await credentialVaultClient.getCredentials();
-    const found = all.credentials.find(c => c.name === name);
+    const found = all.credentials.find(function (c) { return c.name === name; });
     if (!found) return null;
     const detail = await credentialVaultClient.getCredentialsDetails({ id: found.id });
-    console.log(`✓ Helios key from vault (name): ${found.name}`);
-    return detail?.token || detail?.password || null;
+    console.log("✓ Helios key from vault (name): " + found.name);
+    return (detail && (detail.token || detail.password)) || null;
   }
 
   try {
     apiKey = await getKeyByName(vaultName);
     if (!apiKey) throw new Error("not-found");
-  } catch {
+  } catch (e) {
     try {
       const detail = await credentialVaultClient.getCredentialsDetails({ id: vaultId });
-      apiKey       = detail?.token || detail?.password || null;
+      apiKey       = (detail && (detail.token || detail.password)) || null;
       authMode     = "vault-id";
-      console.log(`✓ Helios key from vault (id): ${detail?.name || vaultId}`);
-    } catch {
+      console.log("✓ Helios key from vault (id): " + (detail && detail.name ? detail.name : vaultId));
+    } catch (e2) {
       authMode = "manual";
       apiKey   = "PASTE_YOUR_API_KEY_HERE";  // last resort, still GET-only
       console.log("⚠️ Using manual Helios API key (fallback)");
@@ -65,17 +70,17 @@ export default async function () {
     throw new Error("No Helios API key available (vault + manual failed).");
   }
 
-  const commonHeaders = { accept: "application/json", apiKey };
+  const commonHeaders = { accept: "application/json", apiKey: apiKey };
 
   // ------------------------------
-  // 2) Helpers
+  // 2) Helpers (GET-only)
   // ------------------------------
-  async function getJson(url, headers = {}) {
-    const resp = await fetch(url, { method: "GET", headers });
+  async function getJson(url, headers) {
+    const resp = await fetch(url, { method: "GET", headers: headers });
     if (!resp.ok) {
       let txt = "";
-      try { txt = await resp.text(); } catch {}
-      throw new Error(`GET ${url} -> HTTP ${resp.status} ${txt}`);
+      try { txt = await resp.text(); } catch (e) {}
+      throw new Error("GET " + url + " -> HTTP " + resp.status + " " + txt);
     }
     return resp.json();
   }
@@ -96,10 +101,12 @@ export default async function () {
 
   function buildQuery(params) {
     const usp = new URLSearchParams();
-    for (const [k, v] of Object.entries(params)) {
+    for (const k in params) {
+      if (!Object.prototype.hasOwnProperty.call(params, k)) continue;
+      const v = params[k];
       if (v === undefined || v === null) continue;
       if (Array.isArray(v)) {
-        v.forEach(val => usp.append(k, String(val)));
+        v.forEach(function (val) { usp.append(k, String(val)); });
       } else {
         usp.append(k, String(v));
       }
@@ -109,10 +116,11 @@ export default async function () {
 
   function toInfoArray(localBackupInfo) {
     if (!localBackupInfo) return [];
-    return Array.isArray(localBackupInfo) ? localBackupInfo : [localBackupInfo];
+    if (Array.isArray(localBackupInfo)) return localBackupInfo;
+    return [localBackupInfo];
   }
 
-  // environment mapping – same idea as your PS envMap
+  // Environment maps
   const ENV_LABELS = {
     kOracle:        "Oracle",
     kSQL:           "SQL",
@@ -124,18 +132,43 @@ export default async function () {
     kRemoteAdapter: "RemoteAdapter"
   };
 
-  function mapEnvironment(pg) {
+  const ENV_OBJECT_TYPES = {
+    kOracle:        "kDatabase",
+    kSQL:           "kDatabase",
+    kPhysical:      "kHost",
+    kGenericNas:    "kHost",
+    kIsilon:        "kHost",
+    kHyperV:        "kVirtualMachine",
+    kAcropolis:     "kVirtualMachine",
+    kRemoteAdapter: "kRemoteAdapter"
+  };
+
+  const ENV_FILTERS = {
+    kOracle:        ["kOracle"],
+    kSQL:           ["kSQL"],
+    kPhysical:      ["kPhysical"],
+    kGenericNas:    ["kGenericNas", "kIsilon"],
+    kIsilon:        ["kIsilon", "kGenericNas"],
+    kHyperV:        ["kHyperV"],
+    kAcropolis:     ["kAcropolis"],
+    kRemoteAdapter: ["kRemoteAdapter"]
+  };
+
+  function getEnvCode(pg) {
     let envRaw = pg.environment;
     if (!envRaw && Array.isArray(pg.environmentTypes) && pg.environmentTypes.length > 0) {
       envRaw = pg.environmentTypes[0];
     }
-    if (!envRaw) return "Unknown";
-    return ENV_LABELS[envRaw] || envRaw;
+    return envRaw || null;
   }
 
-  // Only treat this as a "failure" if it’s an actual failure, not Running/Accepted/etc.
+  function mapEnvironmentLabel(envCode) {
+    if (!envCode) return "Unknown";
+    return ENV_LABELS[envCode] || envCode;
+  }
+
   function isFailedStatus(status) {
-    return status === "Failed";  // you can extend if Cohesity uses more failure strings
+    return status === "Failed";  // align with your RA logic
   }
 
   function isSuccessStatus(status) {
@@ -143,106 +176,288 @@ export default async function () {
   }
 
   // ------------------------------
-  // 3) Per-PG collector:
-  //    - Look at last 30 runs (fast enough)
-  //    - Find latest FAILED run
-  //    - If there is any SUCCESS after that → ignore
-  //    - Else → include that failed run
+  // 3) Per-PG collector (RunType-based, RA semantics applied to all envs)
   // ------------------------------
   async function collectPgFailure(clusterName, headers, pg) {
-    const pgId   = pg.id;
-    const pgName = pg.name || "Unknown PG";
-    const envLbl = mapEnvironment(pg);
+    const pgId     = pg.id;
+    const pgName   = pg.name || "Unknown PG";
+    const envCode  = getEnvCode(pg);
+    const envLbl   = mapEnvironmentLabel(envCode);
+    const targetType = ENV_OBJECT_TYPES[envCode] || null;
+    const envFilter = ENV_FILTERS[envCode] || null;
+    const parentHostNeeded = (envCode === "kOracle" || envCode === "kSQL");
+
+    // RemoteAdapter params (for Host/ObjectName)
+    let raHost = null;
+    let raDB   = null;
+    if (envCode === "kRemoteAdapter") {
+      try {
+        const hosts  = (pg.remoteAdapterParams && pg.remoteAdapterParams.hosts) || {};
+        let hostname = hosts.hostname;
+        if (Array.isArray(hostname)) hostname = hostname.join(",");
+        raHost = hostname || null;
+
+        let args = hosts.incrementalBackupScript && hosts.incrementalBackupScript.params;
+        if (Array.isArray(args)) args = args.join(" ");
+        if (typeof args === "string") {
+          const m = args.match(/-o\s+(\S+)/);
+          if (m) raDB = m[1];
+        }
+      } catch (eRA) {
+        // ignore parsing issues
+      }
+    }
 
     const runQuery = buildQuery({
-      numRuns: 30,                      // matches your "numRuns=30" ask
+      numRuns: 30,                       // last 30 runs
       excludeNonRestorableRuns: false,
-      includeObjectDetails: false       // keep payload small
+      includeObjectDetails: true         // we need objects + failedAttempts
     });
 
     let runData;
     try {
       runData = await getJson(
-        `${baseUrl}/v2/data-protect/protection-groups/${encodeURIComponent(pgId)}/runs?${runQuery}`,
+        baseUrl + "/v2/data-protect/protection-groups/" + encodeURIComponent(pgId) + "/runs?" + runQuery,
         headers
       );
-    } catch {
-      // One bad PG shouldn’t kill the report
+    } catch (e) {
       return [];
     }
 
     const runs = runData.runs || [];
     if (!runs.length) return [];
 
-    // Flatten runs into simple records (PG-level, using first localBackupInfo)
+    // Flatten to records (per run) with first localBackupInfo
     const records = [];
-    for (const run of runs) {
+    for (let i = 0; i < runs.length; i++) {
+      const run = runs[i];
       const infos = toInfoArray(run.localBackupInfo);
       if (!infos.length) continue;
-      const info = infos[0];  // match your PS pattern
+      const info = infos[0];
 
-      const status = info.status || "Unknown";
+      const status  = info.status || "Unknown";
       const runType = info.runType || "";
       const startUsecs = info.startTimeUsecs || 0;
       const endUsecs   = info.endTimeUsecs || 0;
 
       records.push({
-        status,
-        runType,
-        startUsecs,
-        endUsecs,
+        status:       status,
+        runType:      runType,
+        startUsecs:   startUsecs,
+        endUsecs:     endUsecs,
         startTimeStr: usecsToDateString(startUsecs),
         endTimeStr:   usecsToDateString(endUsecs),
-        message:      cleanMessage(info.messages)
+        message:      cleanMessage(info.messages),
+        run:          run
       });
     }
 
     if (!records.length) return [];
 
-    // Sort by endTime ascending so we can reason about "later"
-    records.sort((a, b) => (a.endUsecs || 0) - (b.endUsecs || 0));
-
-    // Find latest FAILED run
-    let latestFailed = null;
-    for (let i = records.length - 1; i >= 0; i--) {
-      if (isFailedStatus(records[i].status)) {
-        latestFailed = records[i];
-        break;
-      }
-    }
-    if (!latestFailed) return [];  // no failed runs at all
-
-    // Check if there is any SUCCESS after that failed run
-    const failEnd = latestFailed.endUsecs || 0;
-    let hasLaterSuccess = false;
+    // Group by RunType (like $flat | Group-Object RunType)
+    const byType = {};
     for (let i = 0; i < records.length; i++) {
-      const r = records[i];
-      if (!isSuccessStatus(r.status)) continue;
-      if ((r.startUsecs || 0) > failEnd) {
-        hasLaterSuccess = true;
-        break;
+      const rec = records[i];
+      const key = rec.runType || "UNKNOWN";
+      if (!byType[key]) byType[key] = [];
+      byType[key].push(rec);
+    }
+
+    const typeKeys = Object.keys(byType);
+    const out = [];
+
+    for (let t = 0; t < typeKeys.length; t++) {
+      const rType = typeKeys[t];
+      const rows  = byType[rType];
+      if (!rows.length) continue;
+
+      // Sort by endUsecs ascending so "later" is at the end
+      rows.sort(function (a, b) {
+        return (a.endUsecs || 0) - (b.endUsecs || 0);
+      });
+
+      // Latest Failed run
+      let latestFailed = null;
+      for (let i = rows.length - 1; i >= 0; i--) {
+        if (isFailedStatus(rows[i].status)) {
+          latestFailed = rows[i];
+          break;
+        }
+      }
+      if (!latestFailed) continue;  // no failed runs at all for this RunType
+
+      const failEnd = latestFailed.endUsecs || 0;
+
+      // Any later success? (StartTimeUsecs > latestFailed.EndTimeUsecs)
+      let hasLaterSuccess = false;
+      for (let i = 0; i < rows.length; i++) {
+        const r = rows[i];
+        if (!isSuccessStatus(r.status)) continue;
+        if ((r.startUsecs || 0) > failEnd) {
+          hasLaterSuccess = true;
+          break;
+        }
+      }
+
+      if (hasLaterSuccess) {
+        // "resolved" by a later success → skip this runType
+        continue;
+      }
+
+      // Now we know: latestFailed is a FAILED run with no later success for this RunType.
+
+      // RemoteAdapter: PG-level row with RA DB/Host (like your RA collector)
+      if (envCode === "kRemoteAdapter") {
+        out.push({
+          Environment:     envLbl,
+          Cluster:         clusterName,
+          ProtectionGroup: pgName,
+          RunType:         rType,
+          StartTime:       latestFailed.startTimeStr,
+          EndTime:         latestFailed.endTimeStr,
+          Status:          latestFailed.status,
+          Host:            null,
+          ObjectName:      raDB || raHost || null,
+          FailedMessage:   latestFailed.message
+        });
+        continue;
+      }
+
+      // Non-RA: expand objects/failedAttempts from latest failed run
+      const runObj = latestFailed.run;
+      const objects = (runObj && runObj.objects) ? runObj.objects : [];
+      if (!objects.length) {
+        // Fallback PG-level row if no objects present
+        out.push({
+          Environment:     envLbl,
+          Cluster:         clusterName,
+          ProtectionGroup: pgName,
+          RunType:         rType,
+          StartTime:       latestFailed.startTimeStr,
+          EndTime:         latestFailed.endTimeStr,
+          Status:          latestFailed.status,
+          Host:            null,
+          ObjectName:      null,
+          FailedMessage:   latestFailed.message
+        });
+        continue;
+      }
+
+      // Build id -> name map for parent-host resolution
+      const idToName = {};
+      for (let oi = 0; oi < objects.length; oi++) {
+        const ob  = objects[oi];
+        const obj = ob && ob.object ? ob.object : null;
+        if (obj && obj.id != null && obj.name) {
+          idToName[String(obj.id)] = obj.name;
+        }
+      }
+
+      const envSet = envFilter;
+      const hasTargetType = !!targetType;
+      const rowsForRunType = [];
+
+      // Host-level rows for Oracle/SQL (host discovery failures)
+      if (parentHostNeeded) {
+        for (let oi = 0; oi < objects.length; oi++) {
+          const ob  = objects[oi];
+          const obj = ob && ob.object ? ob.object : {};
+          const isHostObj =
+            (obj.objectType === "kHost") || (obj.environment === "kPhysical");
+          if (!isHostObj) continue;
+
+          const lsi            = ob.localSnapshotInfo || {};
+          const failedAttempts = lsi.failedAttempts || [];
+          if (!failedAttempts.length) continue;
+
+          // Combine messages for this host
+          let msgCombined = "";
+          for (let fi = 0; fi < failedAttempts.length; fi++) {
+            const fa   = failedAttempts[fi];
+            const part = cleanMessage(fa && fa.message);
+            if (!part) continue;
+            msgCombined = msgCombined ? (msgCombined + " | " + part) : part;
+          }
+          if (!msgCombined) continue;
+
+          rowsForRunType.push({
+            Environment:     envLbl,
+            Cluster:         clusterName,
+            ProtectionGroup: pgName,
+            RunType:         rType,
+            StartTime:       latestFailed.startTimeStr,
+            EndTime:         latestFailed.endTimeStr,
+            Status:          latestFailed.status,
+            Host:            obj.name || null,
+            ObjectName:      "No DBs Found (Host-Level Failure)",
+            FailedMessage:   msgCombined
+          });
+        }
+      }
+
+      // Object-level rows (DB/VM/host, etc.)
+      for (let oi = 0; oi < objects.length; oi++) {
+        const ob  = objects[oi];
+        const obj = ob && ob.object ? ob.object : {};
+        if (hasTargetType && obj.objectType !== targetType) continue;
+        if (envSet && obj.environment && envSet.indexOf(obj.environment) === -1) continue;
+
+        const lsi            = ob.localSnapshotInfo || {};
+        const failedAttempts = lsi.failedAttempts || [];
+        if (!failedAttempts.length) continue;
+
+        // Combine messages for this object
+        let msgCombined = "";
+        for (let fi = 0; fi < failedAttempts.length; fi++) {
+          const fa   = failedAttempts[fi];
+          const part = cleanMessage(fa && fa.message);
+          if (!part) continue;
+          msgCombined = msgCombined ? (msgCombined + " | " + part) : part;
+        }
+        if (!msgCombined) continue;
+
+        let hostName = null;
+        if (parentHostNeeded && obj.sourceId != null) {
+          const sid = String(obj.sourceId);
+          if (idToName[sid]) hostName = idToName[sid];
+        }
+
+        rowsForRunType.push({
+          Environment:     envLbl,
+          Cluster:         clusterName,
+          ProtectionGroup: pgName,
+          RunType:         rType,
+          StartTime:       latestFailed.startTimeStr,
+          EndTime:         latestFailed.endTimeStr,
+          Status:          latestFailed.status,
+          Host:            hostName,
+          ObjectName:      obj.name || null,
+          FailedMessage:   msgCombined
+        });
+      }
+
+      if (rowsForRunType.length === 0) {
+        // As a last fallback, emit one PG-level row
+        out.push({
+          Environment:     envLbl,
+          Cluster:         clusterName,
+          ProtectionGroup: pgName,
+          RunType:         rType,
+          StartTime:       latestFailed.startTimeStr,
+          EndTime:         latestFailed.endTimeStr,
+          Status:          latestFailed.status,
+          Host:            null,
+          ObjectName:      null,
+          FailedMessage:   latestFailed.message
+        });
+      } else {
+        for (let i = 0; i < rowsForRunType.length; i++) {
+          out.push(rowsForRunType[i]);
+        }
       }
     }
 
-    if (hasLaterSuccess) {
-      // "failure resolved by later success" → exclude, as you requested
-      return [];
-    }
-
-    // If we reach here:
-    // - There is at least one Failed run
-    // - No later Succeeded / SucceededWithWarning run
-    // - We DO NOT include Running / Accepted at all
-    return [{
-      Environment:     envLbl,
-      Cluster:         clusterName,
-      ProtectionGroup: pgName,
-      RunType:         latestFailed.runType,
-      StartTime:       latestFailed.startTimeStr,
-      EndTime:         latestFailed.endTimeStr,
-      Status:          latestFailed.status,
-      FailedMessage:   latestFailed.message
-    }];
+    return out;
   }
 
   // ------------------------------
@@ -253,9 +468,13 @@ export default async function () {
       cluster.name ||
       cluster.clusterName ||
       cluster.displayName ||
-      `Unknown-${cluster.clusterId}`;
+      ("Unknown-" + cluster.clusterId);
 
-    const headers = { ...commonHeaders, accessClusterId: String(cluster.clusterId) };
+    const headers = {
+      accept: "application/json",
+      apiKey: apiKey,
+      accessClusterId: String(cluster.clusterId)
+    };
 
     const pgQuery = buildQuery({
       isDeleted: false,
@@ -266,23 +485,29 @@ export default async function () {
     let pgData;
     try {
       pgData = await getJson(
-        `${baseUrl}/v2/data-protect/protection-groups?${pgQuery}`,
+        baseUrl + "/v2/data-protect/protection-groups?" + pgQuery,
         headers
       );
-    } catch {
+    } catch (e) {
       return [];
     }
 
     const pgs = pgData.protectionGroups || [];
     if (!pgs.length) return [];
 
-    // Parallelize PG-level /runs calls for speed
-    const pgPromises = pgs.map(pg => collectPgFailure(clusterName, headers, pg));
+    const pgPromises = pgs.map(function (pg) {
+      return collectPgFailure(clusterName, headers, pg);
+    });
     const results = await Promise.all(pgPromises);
 
     const allRows = [];
-    for (const arr of results) {
-      if (arr && arr.length) allRows.push(...arr);
+    for (let i = 0; i < results.length; i++) {
+      const arr = results[i];
+      if (arr && arr.length) {
+        for (let j = 0; j < arr.length; j++) {
+          allRows.push(arr[j]);
+        }
+      }
     }
     return allRows;
   }
@@ -292,28 +517,39 @@ export default async function () {
   // ------------------------------
   async function collectAllFailures() {
     const clusterData = await getJson(
-      `${baseUrl}/v2/mcm/cluster-mgmt/info`,
+      baseUrl + "/v2/mcm/cluster-mgmt/info",
       commonHeaders
     );
     const clusters = clusterData.cohesityClusters || [];
     if (!clusters.length) return [];
 
-    const clusterPromises = clusters.map(cluster => collectClusterFailures(cluster));
-    const clusterResults  = await Promise.all(clusterPromises);
+    const clusterPromises = clusters.map(function (cluster) {
+      return collectClusterFailures(cluster);
+    });
+    const clusterResults = await Promise.all(clusterPromises);
 
     const allRows = [];
-    for (const arr of clusterResults) {
-      if (arr && arr.length) allRows.push(...arr);
+    for (let i = 0; i < clusterResults.length; i++) {
+      const arr = clusterResults[i];
+      if (arr && arr.length) {
+        for (let j = 0; j < arr.length; j++) {
+          allRows.push(arr[j]);
+        }
+      }
     }
 
-    // Sort: Cluster, Environment, ProtectionGroup, EndTime (latest first)
-    allRows.sort((a, b) => {
+    // Sort: Cluster, Environment, PG, Host, ObjectName, EndTime desc
+    allRows.sort(function (a, b) {
       const c1 = (a.Cluster || "").localeCompare(b.Cluster || "");
       if (c1 !== 0) return c1;
       const c2 = (a.Environment || "").localeCompare(b.Environment || "");
       if (c2 !== 0) return c2;
       const c3 = (a.ProtectionGroup || "").localeCompare(b.ProtectionGroup || "");
       if (c3 !== 0) return c3;
+      const c4 = (a.Host || "").localeCompare(b.Host || "");
+      if (c4 !== 0) return c4;
+      const c5 = (a.ObjectName || "").localeCompare(b.ObjectName || "");
+      if (c5 !== 0) return c5;
       const tA = a.EndTime ? new Date(a.EndTime).getTime() : 0;
       const tB = b.EndTime ? new Date(b.EndTime).getTime() : 0;
       return tB - tA;
@@ -323,17 +559,19 @@ export default async function () {
   }
 
   // ------------------------------
-  // 6) Markdown table for email
+  // 6) Markdown table for email (with Host + ObjectName)
   // ------------------------------
   function toMarkdownTable(rows) {
     if (!rows || rows.length === 0) {
-      return "✅ No backup failures found without a later successful run.";
+      return "✅ No FAILED backup runs without a later successful run.";
     }
 
     const headers = [
       "Environment",
       "Cluster",
       "ProtectionGroup",
+      "Host",
+      "ObjectName",
       "RunType",
       "StartTime",
       "EndTime",
@@ -341,31 +579,31 @@ export default async function () {
       "FailedMessage"
     ];
 
-    const headerRow = `| ${headers.join(" | ")} |`;
-    const separator = `| ${headers.map(() => "---").join(" | ")} |`;
+    const headerRow = "| " + headers.join(" | ") + " |";
+    const separator = "| " + headers.map(function () { return "---"; }).join(" | ") + " |";
 
-    const bodyRows = rows.map(r => {
-      const vals = headers.map(h => {
-        const v = r[h] ?? "";
+    const bodyRows = rows.map(function (r) {
+      const vals = headers.map(function (h) {
+        const v = r[h] != null ? r[h] : "";
         const s = String(v);
         return s.length > 300 ? s.slice(0, 297) + "..." : s;
       });
-      return `| ${vals.join(" | ")} |`;
+      return "| " + vals.join(" | ") + " |";
     });
 
-    return [headerRow, separator, ...bodyRows].join("\n");
+    return [headerRow, separator].concat(bodyRows).join("\n");
   }
 
   // ------------------------------
   // 7) Run + return
   // ------------------------------
-  const failures      = await collectAllFailures();
+  const failures = await collectAllFailures();
   const markdownTable = toMarkdownTable(failures);
 
   return {
-    authMode,
+    authMode: authMode,
     count: failures.length,
-    failures,
-    markdownTable
+    failures: failures,
+    markdownTable: markdownTable
   };
 }
