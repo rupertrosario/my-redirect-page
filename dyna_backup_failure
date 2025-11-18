@@ -1,0 +1,625 @@
+// Cohesity Helios – Combined Backup Failures (All Environments)
+// - Uses Dynatrace credential vault (classic-environment-v2)
+// - GET-only, read-only
+// - Output:
+//     {
+//       authMode: "vault-name" | "vault-id" | "manual",
+//       count: <number of rows>,
+//       failures: [ { Environment, Cluster, ProtectionGroup, Host, ObjectName, RunType, EndTime, FailedMessage } ],
+//       markdownTable: "<markdown table string>"
+//     }
+
+import { credentialVaultClient } from "@dynatrace-sdk/client-classic-environment-v2";
+
+export default async function () {
+  const baseUrl = "https://helios.cohesity.com";
+
+  // ------------------------------
+  // 1) API key from vault (name → id → manual)
+  // ------------------------------
+  const vaultName = "Cohesity_API_Key";       // your preferred name in vault
+  const vaultId   = "credentials_vault-312312"; // optional fixed ID fallback
+
+  let apiKey   = null;
+  let authMode = "vault-name";
+
+  const vault = credentialVaultClient();
+
+  async function getKeyByName(name) {
+    const all = await vault.getCredentials();
+    const found = all.credentials.find((c) => c.name === name);
+    if (!found) return null;
+    const detail = await vault.getCredentialsDetails({ id: found.id });
+    console.log(`✓ loaded Helios key from vault (name): ${found.name}`);
+    return detail?.token || detail?.password || null;
+  }
+
+  // 1) try by name
+  try {
+    apiKey = await getKeyByName(vaultName);
+    if (!apiKey) throw new Error("not-found");
+  } catch {
+    // 2) try by fixed ID
+    try {
+      const detail = await vault.getCredentialsDetails({ id: vaultId });
+      apiKey       = detail?.token || detail?.password || null;
+      authMode     = "vault-id";
+      console.log(`✓ loaded Helios key from vault (id): ${detail?.name || vaultId}`);
+    } catch {
+      // 3) manual last resort
+      authMode = "manual";
+      apiKey   = "PASTE_YOUR_API_KEY_HERE";
+      console.log("⚠️ using manual Helios API key (fallback)");
+    }
+  }
+
+  if (!apiKey) {
+    throw new Error("No Helios API key available (vault + manual fallback all failed).");
+  }
+
+  const commonHeaders = {
+    accept: "application/json",
+    apiKey
+  };
+
+  // ------------------------------
+  // Helpers
+  // ------------------------------
+  async function getJson(url, headers = {}) {
+    const resp = await fetch(url, { method: "GET", headers });
+    if (!resp.ok) {
+      throw new Error(`GET ${url} -> HTTP ${resp.status}`);
+    }
+    return resp.json();
+  }
+
+  function usecsToDateString(usecs) {
+    if (usecs == null || usecs === 0) return null;
+    // Helios uses microseconds; convert to ms
+    const ms = Number(usecs) / 1000;
+    if (!Number.isFinite(ms)) return null;
+    const d = new Date(ms);
+    return d.toISOString(); // UTC ISO string
+  }
+
+  function cleanMessage(msg) {
+    if (msg == null) return "";
+    if (Array.isArray(msg)) msg = msg.join(" | ");
+    msg = String(msg);
+    return msg.replace(/[\r\n]+/g, " ").replace(/,/g, " ").replace(/"/g, "'").trim();
+  }
+
+  function buildQuery(params) {
+    const usp = new URLSearchParams();
+    for (const [k, v] of Object.entries(params)) {
+      if (v === undefined || v === null) continue;
+      if (Array.isArray(v)) {
+        v.forEach((val) => usp.append(k, String(val)));
+      } else {
+        usp.append(k, String(v));
+      }
+    }
+    return usp.toString();
+  }
+
+  // Mirrors your PowerShell envMap
+  const ENV_CONFIGS = [
+    {
+      key: 2,
+      label: "Oracle",
+      filter: ["kOracle"],
+      objectType: "kDatabase",
+      parentHostNeeded: true
+    },
+    {
+      key: 3,
+      label: "SQL",
+      filter: ["kSQL"],
+      objectType: "kDatabase",
+      parentHostNeeded: true
+    },
+    {
+      key: 4,
+      label: "Physical",
+      filter: ["kPhysical"],
+      objectType: "kHost",
+      parentHostNeeded: false
+    },
+    {
+      key: 5,
+      label: "NAS",
+      filter: ["kGenericNas", "kIsilon"],
+      objectType: "kHost",
+      parentHostNeeded: false
+    },
+    {
+      key: 6,
+      label: "HyperV",
+      filter: ["kHyperV"],
+      objectType: "kVirtualMachine",
+      parentHostNeeded: false
+    },
+    {
+      key: 7,
+      label: "Acropolis",
+      filter: ["kAcropolis"],
+      objectType: "kVirtualMachine",
+      parentHostNeeded: false
+    },
+    {
+      key: 8,
+      label: "RemoteAdapter",
+      filter: ["kRemoteAdapter"],
+      objectType: "kRemoteAdapter",
+      parentHostNeeded: false
+    }
+  ];
+
+  // ------------------------------
+  // Non-RemoteAdapter collector
+  // ------------------------------
+  async function collectEnvFailuresForCluster(cluster, envCfg) {
+    const { label, filter, objectType, parentHostNeeded } = envCfg;
+
+    const clusterName =
+      cluster.name ||
+      cluster.clusterName ||
+      cluster.displayName ||
+      `Unknown-${cluster.clusterId}`;
+
+    const headers = {
+      ...commonHeaders,
+      accessClusterId: String(cluster.clusterId)
+    };
+
+    const allRows = [];
+
+    // 1) List PGs
+    const pgQuery = buildQuery({
+      isDeleted: false,
+      isPaused: false,
+      isActive: true,
+      environments: filter
+    });
+
+    let pgData;
+    try {
+      pgData = await getJson(
+        `${baseUrl}/v2/data-protect/protection-groups?${pgQuery}`,
+        headers
+      );
+    } catch {
+      return allRows;
+    }
+
+    const pgs = pgData.protectionGroups || [];
+    if (!pgs.length) return allRows;
+
+    // 2) For each PG, read last 10 runs
+    for (const pg of pgs) {
+      const pgId   = pg.id;
+      const pgName = pg.name || "Unknown PG";
+
+      const runQuery = buildQuery({
+        environments: filter,
+        numRuns: 10,
+        excludeNonRestorableRuns: false,
+        includeObjectDetails: true
+      });
+
+      let runData;
+      try {
+        runData = await getJson(
+          `${baseUrl}/v2/data-protect/protection-groups/${encodeURIComponent(pgId)}/runs?${runQuery}`,
+          headers
+        );
+      } catch {
+        continue;
+      }
+
+      const runs = runData.runs || [];
+      if (!runs.length) continue;
+
+      // RunTypes present
+      const runTypesSet = new Set();
+      for (const run of runs) {
+        const lb = run.localBackupInfo || [];
+        for (const info of lb) {
+          if (info.runType) runTypesSet.add(info.runType);
+        }
+      }
+
+      // For each runType, pick latest run
+      for (const rType of runTypesSet) {
+        let latestRun = null;
+        for (const run of runs) {
+          const info0 = run.localBackupInfo?.[0];
+          if (!info0 || info0.runType !== rType) continue;
+          if (!latestRun) {
+            latestRun = run;
+          } else {
+            const existingEnd = latestRun.localBackupInfo?.[0]?.endTimeUsecs ?? 0;
+            const newEnd      = info0.endTimeUsecs ?? 0;
+            if (newEnd > existingEnd) latestRun = run;
+          }
+        }
+        if (!latestRun) continue;
+
+        const info0 = latestRun.localBackupInfo?.[0];
+        if (!info0) continue;
+
+        const status       = info0.status;
+        const runType      = info0.runType;
+        const endTimeUsecs = info0.endTimeUsecs ?? 0;
+        const endTimeStr   = usecsToDateString(endTimeUsecs);
+
+        // Skip if latest run succeeded
+        if (status === "Succeeded" || status === "SucceededWithWarning") {
+          continue;
+        }
+
+        const objects = latestRun.objects || [];
+        if (!objects.length) continue;
+
+        // Map id -> name (for Oracle/SQL host resolution via sourceId)
+        const idToName = new Map();
+        for (const ob of objects) {
+          const obj = ob.object;
+          if (obj && obj.id != null && obj.name) {
+            idToName.set(String(obj.id), obj.name);
+          }
+        }
+
+        // Oracle/SQL host-level failures ("No DBs Found (Host-Level Failure)")
+        if (parentHostNeeded) {
+          const hostObjs = objects.filter((ob) => {
+            const obj = ob.object || {};
+            return obj.objectType === "kHost" || obj.environment === "kPhysical";
+          });
+
+          for (const h of hostObjs) {
+            const lsi            = h.localSnapshotInfo || {};
+            const failedAttempts = lsi.failedAttempts || [];
+            if (!failedAttempts.length) continue;
+
+            for (const fa of failedAttempts) {
+              allRows.push({
+                environment: label,
+                cluster: clusterName,
+                protectionGroup: pgName,
+                host: h.object?.name || null,
+                objectName: "No DBs Found (Host-Level Failure)",
+                runType,
+                endTime: endTimeStr,
+                failedMessage: cleanMessage(fa.message)
+              });
+            }
+          }
+        }
+
+        // Object-level failures for target objectType
+        for (const ob of objects) {
+          const obj = ob.object || {};
+          if (obj.objectType !== objectType) continue;
+          if (!filter.includes(obj.environment)) continue;
+
+          const lsi            = ob.localSnapshotInfo || {};
+          const failedAttempts = lsi.failedAttempts || [];
+          if (!failedAttempts.length) continue;
+
+          // Resolve parent host for Oracle/SQL
+          let parentHost = null;
+          if (parentHostNeeded && obj.sourceId != null) {
+            const sid = String(obj.sourceId);
+            if (idToName.has(sid)) parentHost = idToName.get(sid);
+          }
+
+          for (const fa of failedAttempts) {
+            if (label === "Oracle" || label === "SQL") {
+              allRows.push({
+                environment: label,
+                cluster: clusterName,
+                protectionGroup: pgName,
+                host: parentHost,
+                objectName: obj.name || null, // DB name
+                runType,
+                endTime: endTimeStr,
+                failedMessage: cleanMessage(fa.message)
+              });
+            } else {
+              allRows.push({
+                environment: label,
+                cluster: clusterName,
+                protectionGroup: pgName,
+                host: null,
+                objectName: obj.name || null,
+                runType,
+                endTime: endTimeStr,
+                failedMessage: cleanMessage(fa.message)
+              });
+            }
+          }
+        }
+      }
+    }
+
+    return allRows;
+  }
+
+  // ------------------------------
+  // RemoteAdapter collector: "failed without later success"
+  // ------------------------------
+  async function collectRemoteAdapterFailuresForCluster(cluster) {
+    const label = "RemoteAdapter";
+    const clusterName =
+      cluster.name ||
+      cluster.clusterName ||
+      cluster.displayName ||
+      `Unknown-${cluster.clusterId}`;
+
+    const headers = {
+      ...commonHeaders,
+      accessClusterId: String(cluster.clusterId)
+    };
+
+    const allRows = [];
+
+    const pgQuery = buildQuery({
+      isDeleted: false,
+      isPaused: false,
+      isActive: true,
+      environments: ["kRemoteAdapter"]
+    });
+
+    let pgData;
+    try {
+      pgData = await getJson(
+        `${baseUrl}/v2/data-protect/protection-groups?${pgQuery}`,
+        headers
+      );
+    } catch {
+      return allRows;
+    }
+
+    const pgs = pgData.protectionGroups || [];
+    if (!pgs.length) return allRows;
+
+    for (const pg of pgs) {
+      const pgId   = pg.id;
+      const pgName = pg.name || "Unknown PG";
+
+      let raHost = null;
+      let raDB   = null;
+
+      try {
+        const hosts  = pg.remoteAdapterParams?.hosts || {};
+        let hostname = hosts.hostname;
+        if (Array.isArray(hostname)) hostname = hostname.join(",");
+        raHost       = hostname || null;
+
+        let args = hosts.incrementalBackupScript?.params;
+        if (Array.isArray(args)) args = args.join(" ");
+        if (typeof args === "string") {
+          const m = args.match(/-o\s+(\S+)/);
+          if (m) raDB = m[1];
+        }
+      } catch {
+        // ignore RA param parsing errors
+      }
+
+      const runQuery = buildQuery({
+        environments: ["kRemoteAdapter"],
+        numRuns: 10,
+        excludeNonRestorableRuns: false,
+        includeObjectDetails: true
+      });
+
+      let runData;
+      try {
+        runData = await getJson(
+          `${baseUrl}/v2/data-protect/protection-groups/${encodeURIComponent(pgId)}/runs?${runQuery}`,
+          headers
+        );
+      } catch {
+        continue;
+      }
+
+      const runs = runData.runs || [];
+      if (!runs.length) continue;
+
+      const flat = [];
+      for (const run of runs) {
+        const lb = run.localBackupInfo || [];
+        for (const info of lb) {
+          flat.push({
+            runType: info.runType,
+            status: info.status,
+            message: info.messages,
+            startTimeUsecs: info.startTimeUsecs,
+            endTimeUsecs: info.endTimeUsecs,
+            cluster: clusterName,
+            protectionGroup: pgName,
+            raHost,
+            raDB
+          });
+        }
+      }
+      if (!flat.length) continue;
+
+      const byRunType = new Map();
+      for (const row of flat) {
+        const key = row.runType || "UNKNOWN";
+        if (!byRunType.has(key)) byRunType.set(key, []);
+        byRunType.get(key).push(row);
+      }
+
+      for (const [rType, groupRows] of byRunType.entries()) {
+        const failedRows = groupRows.filter((r) => r.status === "Failed");
+        if (!failedRows.length) continue;
+
+        let latestFailed = failedRows[0];
+        for (const r of failedRows) {
+          if ((r.endTimeUsecs ?? 0) > (latestFailed.endTimeUsecs ?? 0)) {
+            latestFailed = r;
+          }
+        }
+
+        const hasLaterSuccess = groupRows.some((r) => {
+          if (!["Succeeded", "SucceededWithWarning"].includes(r.status)) return false;
+          return (r.startTimeUsecs ?? 0) > (latestFailed.endTimeUsecs ?? 0);
+        });
+
+        if (hasLaterSuccess) continue;
+
+        const endTimeStr = usecsToDateString(latestFailed.endTimeUsecs);
+        const msg        = cleanMessage(latestFailed.message);
+        const objName    =
+          latestFailed.raDB ||
+          latestFailed.raHost ||
+          raDB ||
+          raHost ||
+          null;
+
+        allRows.push({
+          environment: label,
+          cluster: latestFailed.cluster,
+          protectionGroup: latestFailed.protectionGroup,
+          host: null,
+          objectName: objName,
+          runType: rType,
+          endTime: endTimeStr,
+          failedMessage: msg
+        });
+      }
+    }
+
+    return allRows;
+  }
+
+  // ------------------------------
+  // Combined collector
+  // ------------------------------
+  async function collectAllCombinedFailures() {
+    const clusterData = await getJson(
+      `${baseUrl}/v2/mcm/cluster-mgmt/info`,
+      commonHeaders
+    );
+    const clusters = clusterData.cohesityClusters || [];
+    if (!clusters.length) return [];
+
+    const combinedRows = [];
+
+    for (const cluster of clusters) {
+      for (const envCfg of ENV_CONFIGS) {
+        if (envCfg.label === "RemoteAdapter") {
+          const raRows = await collectRemoteAdapterFailuresForCluster(cluster);
+          combinedRows.push(...raRows);
+        } else {
+          const envRows = await collectEnvFailuresForCluster(cluster, envCfg);
+          combinedRows.push(...envRows);
+        }
+      }
+    }
+
+    // Dedup by env|cluster|PG|host|objectName|runType|failedMessage|endTime
+    const dedupMap = new Map();
+    for (const row of combinedRows) {
+      const key = [
+        row.environment || "",
+        row.cluster || "",
+        row.protectionGroup || "",
+        row.host || "",
+        row.objectName || "",
+        row.runType || "",
+        row.failedMessage || "",
+        row.endTime || ""
+      ].join("|");
+
+      const existing = dedupMap.get(key);
+      if (!existing) {
+        dedupMap.set(key, row);
+      } else {
+        const existingEnd = new Date(existing.endTime || 0).getTime();
+        const newEnd      = new Date(row.endTime || 0).getTime();
+        if (newEnd > existingEnd) dedupMap.set(key, row);
+      }
+    }
+
+    const finalRows = Array.from(dedupMap.values());
+
+    // Sort like your PS combined: Cluster, PG, Env, EndTime DESC
+    finalRows.sort((a, b) => {
+      const c1 = (a.cluster || "").localeCompare(b.cluster || "");
+      if (c1 !== 0) return c1;
+      const c2 = (a.protectionGroup || "").localeCompare(b.protectionGroup || "");
+      if (c2 !== 0) return c2;
+      const c3 = (a.environment || "").localeCompare(b.environment || "");
+      if (c3 !== 0) return c3;
+      const tA = new Date(a.endTime || 0).getTime();
+      const tB = new Date(b.endTime || 0).getTime();
+      return tB - tA; // DESC
+    });
+
+    return finalRows;
+  }
+
+  // ------------------------------
+  // Markdown table formatter
+  // ------------------------------
+  function toMarkdownTable(rows) {
+    if (!rows || rows.length === 0) {
+      return "✅ No backup failures found in the selected scope.";
+    }
+
+    const headers = [
+      "Environment",
+      "Cluster",
+      "ProtectionGroup",
+      "Host",
+      "ObjectName",
+      "RunType",
+      "EndTime",
+      "FailedMessage"
+    ];
+
+    const headerRow = `| ${headers.join(" | ")} |`;
+    const separator = `| ${headers.map(() => "---").join(" | ")} |`;
+
+    const bodyRows = rows.map((r) => {
+      const vals = headers.map((h) => {
+        const v = r[h] ?? "";
+        const s = String(v);
+        // keep email readable: trim huge messages
+        return s.length > 300 ? s.slice(0, 297) + "..." : s;
+      });
+      return `| ${vals.join(" | ")} |`;
+    });
+
+    return [headerRow, separator, ...bodyRows].join("\n");
+  }
+
+  // ------------------------------
+  // Run + normalize output
+  // ------------------------------
+  const failuresRaw = await collectAllCombinedFailures();
+
+  const failures = failuresRaw.map((r) => ({
+    Environment:     r.environment,
+    Cluster:         r.cluster,
+    ProtectionGroup: r.protectionGroup,
+    Host:            r.host,
+    ObjectName:      r.objectName,
+    RunType:         r.runType,
+    EndTime:         r.endTime,
+    FailedMessage:   r.failedMessage
+  }));
+
+  const markdownTable = toMarkdownTable(failures);
+
+  return {
+    authMode,
+    count: failures.length,
+    failures,
+    markdownTable
+  };
+}
