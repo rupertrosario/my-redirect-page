@@ -144,4 +144,195 @@ foreach ($cluster in $json_clu) {
 
         $pgs = ($pgResp.Content | ConvertFrom-Json).protectionGroups
     } catch {
-        Write-Host "  ⚠️ Failed to list PGs on $cluster_name:_
+        Write-Host "  ⚠️ Failed to list PGs on $cluster_name: $($_.Exception.Message)" -ForegroundColor Yellow
+        continue
+    }
+
+    if (-not $pgs) {
+        Write-Host "  ℹ️ No active protection groups on $cluster_name." -ForegroundColor DarkGray
+        continue
+    }
+
+    foreach ($pg in $pgs) {
+        $pgId   = $pg.id
+        $pgName = $pg.name
+
+        Write-Host "  📦 PG: $pgName" -ForegroundColor DarkCyan
+
+        # Get recent runs for this PG
+        try {
+            $runResp = Invoke-WebRequest -Uri "$baseUrl/v2/data-protect/protection-groups/$pgId/runs" -Headers $headers -Body @{
+                numRuns                  = "50"
+                excludeNonRestorableRuns = "False"
+                includeObjectDetails     = "False"
+            } -Method Get
+
+            $jsonRuns = $runResp.Content | ConvertFrom-Json
+        } catch {
+            Write-Host "    ⚠️ Failed to get runs: $($_.Exception.Message)" -ForegroundColor Yellow
+            continue
+        }
+
+        if (-not $jsonRuns.runs) { continue }
+
+        foreach ($run in $jsonRuns.runs) {
+
+            $env = if ($run.environment) { $run.environment } elseif ($pg.environment) { $pg.environment } else { "Unknown" }
+
+            # ---------------------------
+            # 1) Local BACKUP copy
+            # ---------------------------
+            if ($run.localBackupInfo) {
+                $bInfo = $run.localBackupInfo
+                if ($bInfo -is [System.Array]) { $bInfo = $bInfo[0] }
+
+                $bStatus = $bInfo.status
+                if ($bStatus -eq "Running" -or $bStatus -eq "kRunning") {
+
+                    $startUsecs = $bInfo.startTimeUsecs
+                    $startUtc   = Convert-ToUtcFromEpoch $startUsecs
+                    if ($startUtc) {
+                        $hoursRunning = ([DateTime]::UtcNow - $startUtc).TotalHours
+
+                        if ($hoursRunning -ge $thresholdHours) {
+                            $startLocal = Convert-ToLocalFromUsecs $startUsecs $tz
+                            $durStr     = Format-Duration -Hours $hoursRunning
+
+                            $runTypeRaw = $bInfo.runType
+                            $runType    = if ($runTypeRaw -and $runTypeRaw.StartsWith('k')) { $runTypeRaw.Substring(1) } else { $runTypeRaw }
+
+                            $backupRows += [pscustomobject]@{
+                                Cluster         = $cluster_name
+                                ProtectionGroup = $pgName
+                                Environment     = $env
+                                RunType         = $runType
+                                CopyType        = "Backup"
+                                StartTime       = $startLocal
+                                Duration        = $durStr
+                                Status          = "Running"
+                            }
+                        }
+                    }
+                }
+            }
+
+            # ---------------------------
+            # 2) REMOTE copies – REPLICATION
+            # ---------------------------
+            if ($run.replicationInfo -and $run.replicationInfo.replicationTargetResults) {
+                foreach ($rep in $run.replicationInfo.replicationTargetResults) {
+
+                    $rStatus = $rep.status
+                    if ($rStatus -ne "Running" -and $rStatus -ne "kRunning") { continue }
+
+                    $startUsecs = $rep.startTimeUsecs
+                    $startUtc   = Convert-ToUtcFromEpoch $startUsecs
+                    if (-not $startUtc) { continue }
+
+                    $hoursRunning = ([DateTime]::UtcNow - $startUtc).TotalHours
+                    if ($hoursRunning -lt $thresholdHours) { continue }
+
+                    $startLocal = Convert-ToLocalFromUsecs $startUsecs $tz
+                    $durStr     = Format-Duration -Hours $hoursRunning
+
+                    $targetCluster = $rep.clusterName
+                    $copyType      = "Replication"
+                    $targetType    = "RemoteCluster"
+
+                    $remoteRows += [pscustomobject]@{
+                        Cluster         = $cluster_name
+                        ProtectionGroup = $pgName
+                        Environment     = $env
+                        RunType         = $copyType
+                        CopyType        = $copyType
+                        TargetType      = $targetType
+                        TargetName      = $targetCluster
+                        StartTime       = $startLocal
+                        Duration        = $durStr
+                        Status          = "Running"
+                    }
+                }
+            }
+
+            # ---------------------------
+            # 3) REMOTE copies – ARCHIVAL
+            # ---------------------------
+            if ($run.archivalInfo -and $run.archivalInfo.archivalTargetResults) {
+                foreach ($arch in $run.archivalInfo.archivalTargetResults) {
+
+                    $aStatus = $arch.status
+                    if ($aStatus -ne "Running" -and $aStatus -ne "kRunning") { continue }
+
+                    $startUsecs = $arch.startTimeUsecs
+                    $startUtc   = Convert-ToUtcFromEpoch $startUsecs
+                    if (-not $startUtc) { continue }
+
+                    $hoursRunning = ([DateTime]::UtcNow - $startUtc).TotalHours
+                    if ($hoursRunning -lt $thresholdHours) { continue }
+
+                    $startLocal = Convert-ToLocalFromUsecs $startUsecs $tz
+                    $durStr     = Format-Duration -Hours $hoursRunning
+
+                    $copyType   = "Archival"
+                    $targetType = $arch.targetType
+                    $targetName = $arch.targetName
+
+                    $remoteRows += [pscustomobject]@{
+                        Cluster         = $cluster_name
+                        ProtectionGroup = $pgName
+                        Environment     = $env
+                        RunType         = $copyType
+                        CopyType        = $copyType
+                        TargetType      = $targetType
+                        TargetName      = $targetName
+                        StartTime       = $startLocal
+                        Duration        = $durStr
+                        Status          = "Running"
+                    }
+                }
+            }
+        } # foreach run
+    } # foreach PG
+} # foreach cluster
+
+# -------------------------------
+# Output – Backup vs Remote tables
+# -------------------------------
+$timestamp = Get-Date -Format "yyyyMMdd_HHmm"
+
+if ($backupRows.Count -eq 0 -and $remoteRows.Count -eq 0) {
+    Write-Host "`n✅ No jobs running longer than $thresholdHours hours (All Clusters)." -ForegroundColor Green
+    return
+}
+
+# BACKUP TABLE
+if ($backupRows.Count -gt 0) {
+    $backupSorted = $backupRows | Sort-Object Cluster, ProtectionGroup, StartTime
+
+    Write-Host "`nJobs running longer than $thresholdHours hours – BACKUP (Local):`n" -ForegroundColor Cyan
+    $backupSorted | Format-Table Cluster,ProtectionGroup,Environment,RunType,StartTime,Duration,Status -AutoSize
+
+    $backupCsv = Join-Path $logDirectory ("LongRunningJobs_Backup_AllClusters_Over{0}h_{1}.csv" -f $thresholdHours, $timestamp)
+    $backupSorted | Select-Object Cluster,ProtectionGroup,Environment,RunType,CopyType,StartTime,Duration,Status |
+        Export-Csv -Path $backupCsv -NoTypeInformation -Encoding utf8
+    Write-Host "`n📂 Backup CSV saved: $backupCsv" -ForegroundColor Gray
+} else {
+    Write-Host "`n✅ No BACKUP copies running longer than $thresholdHours hours." -ForegroundColor Green
+}
+
+# REMOTE TABLE (Replication + Archival)
+if ($remoteRows.Count -gt 0) {
+    $remoteSorted = $remoteRows | Sort-Object Cluster, ProtectionGroup, StartTime
+
+    Write-Host "`nJobs running longer than $thresholdHours hours – REMOTE (Replication/Archival):`n" -ForegroundColor Magenta
+    $remoteSorted | Format-Table Cluster,ProtectionGroup,Environment,RunType,CopyType,TargetType,TargetName,StartTime,Duration,Status -AutoSize
+
+    $remoteCsv = Join-Path $logDirectory ("LongRunningJobs_Remote_AllClusters_Over{0}h_{1}.csv" -f $thresholdHours, $timestamp)
+    $remoteSorted | Select-Object Cluster,ProtectionGroup,Environment,RunType,CopyType,TargetType,TargetName,StartTime,Duration,Status |
+        Export-Csv -Path $remoteCsv -NoTypeInformation -Encoding utf8
+    Write-Host "`n📂 Remote CSV saved: $remoteCsv" -ForegroundColor Gray
+} else {
+    Write-Host "`n✅ No REMOTE (Replication/Archival) copies running longer than $thresholdHours hours." -ForegroundColor Green
+}
+
+Write-Host "`n✅ Long-running job scan complete!" -ForegroundColor White
