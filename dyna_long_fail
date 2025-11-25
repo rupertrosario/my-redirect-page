@@ -1,377 +1,519 @@
- // Cohesity Running Jobs – Multi-Cluster (Helios, apiKey, GET-only)
-// For Dynatrace Workflows JavaScript step
+// Cohesity Helios – Long-Running Jobs (> 24h, status=Running, all clusters)
+//
+// - GET-only
+// - Uses Dynatrace classic credential vault (name -> id -> manual fallback)
+// - For every cluster + active PG:
+//     - Fetches recent runs (numRuns=5, includeObjectDetails=false)
+//     - Finds:
+//         * localBackupInfo with status = "Running" (backup)
+//         * replicationTargetResults with status = "Running" (replication)
+//         * archivalTargetResults with status = "Running" (archival)
+//     - If running for > 24 hours -> add to report
 //
 // Output:
-//  - backupTable: plain-text table (local backups)
-//  - remoteTable: plain-text table (replication + archival)
-//  - backupJobs: JSON array (if you ever want it)
-//  - remoteJobs: JSON array
+// {
+//   authMode: "vault-name" | "vault-id" | "manual",
+//   backupCount: <number>,
+//   remoteCount: <number>,
+//   backupJobs: [ { ...backup row... } ],
+//   remoteJobs: [ { ...remote row... } ],
+//   backupMarkdown: "<markdown table for backup>",
+//   remoteMarkdown: "<markdown table for replication/archival>"
+// }
 
-const HELIOS_BASE_URL = "https://helios.cohesity.com";
-
-// TODO: replace this with a credential-vault lookup in Dynatrace.
-// For now, keep as placeholder:
-const API_KEY = "PASTE_HELIOS_API_KEY_HERE";
-
-// Threshold (in hours) to flag IsLongRunning
-const THRESHOLD_HOURS = 24;
-
-// Use the same "display" timezone idea as your PS script (EST)
-const DISPLAY_TIMEZONE = "America/New_York";
-
-// ---------- Helper functions ----------
-
-function usecsToDate(usecs) {
-  if (usecs == null || usecs === 0) return null;
-  // Cohesity timestamps in microseconds → ms
-  const ms = Number(usecs) / 1000;
-  if (!Number.isFinite(ms)) return null;
-  return new Date(ms);
-}
-
-function formatLocalDate(usecs) {
-  const d = usecsToDate(usecs);
-  if (!d) return "<unknown>";
-
-  // dd-MM-yyyy HH:mm:ss roughly like your PS script
-  const fmt = new Intl.DateTimeFormat("en-GB", {
-    timeZone: DISPLAY_TIMEZONE,
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
-    hour12: false
-  });
-
-  return fmt.format(d).replace(/\//g, "-"); // 24/11/2025 → 24-11-2025
-}
-
-function hoursRunningFrom(usecs) {
-  const d = usecsToDate(usecs);
-  if (!d) return 0;
-  const nowMs = Date.now();           // ms, current time in local timezone
-  const startMs = d.getTime();        // both in epoch ms → diff is timezone-independent
-  const diffMs = nowMs - startMs;
-  return diffMs / 3600000;           // hours
-}
-
-function formatDuration(hours) {
-  if (!Number.isFinite(hours) || hours < 0) hours = 0;
-  const totalMinutes = Math.floor(hours * 60);
-  const days = Math.floor(totalMinutes / (24 * 60));
-  const remMinutes = totalMinutes - days * 24 * 60;
-  const hrs = Math.floor(remMinutes / 60);
-  const mins = remMinutes - hrs * 60;
-  // "1d 0h 05m"
-  return `${days}d ${hrs}h ${mins.toString().padStart(2, "0")}m`;
-}
-
-// Render generic text table (similar feel to PS Format-Table)
-function renderTable(rows, columns) {
-  if (!rows || rows.length === 0) return "No rows.\n";
-
-  // Compute width per column
-  const colWidths = {};
-  for (const col of columns) {
-    colWidths[col] = col.length; // header length
-  }
-  for (const row of rows) {
-    for (const col of columns) {
-      const val = row[col] != null ? String(row[col]) : "";
-      if (val.length > colWidths[col]) {
-        colWidths[col] = val.length;
-      }
-    }
-  }
-
-  const pad = (value, width) => {
-    const s = value != null ? String(value) : "";
-    return s.padEnd(width, " ");
-  };
-
-  // Header line
-  const header = columns.map(col => pad(col, colWidths[col])).join("  ");
-  const sep = columns
-    .map(col => "-".repeat(colWidths[col]))
-    .join("  ");
-
-  // Data lines
-  const lines = rows.map(row =>
-    columns
-      .map(col => pad(row[col] != null ? row[col] : "", colWidths[col]))
-      .join("  ")
-  );
-
-  return header + "\n" + sep + "\n" + lines.join("\n") + "\n";
-}
-
-// Simple GET with fetch + apiKey + optional accessClusterId
-async function heliosGet(path, { accessClusterId, query } = {}) {
-  const url = new URL(`${HELIOS_BASE_URL}${path}`);
-
-  if (query) {
-    for (const [k, v] of Object.entries(query)) {
-      if (v !== undefined && v !== null) {
-        url.searchParams.append(k, String(v));
-      }
-    }
-  }
-
-  const headers = {
-    accept: "application/json",
-    apiKey: API_KEY
-  };
-  if (accessClusterId) {
-    headers["accessClusterId"] = String(accessClusterId);
-  }
-
-  const resp = await fetch(url.toString(), { method: "GET", headers });
-  if (!resp.ok) {
-    const text = await resp.text().catch(() => "");
-    throw new Error(
-      `Helios GET ${path} failed (${resp.status} ${resp.statusText}): ${text}`
-    );
-  }
-  return resp.json();
-}
-
-// ---------- Main logic ----------
+import { credentialVaultClient } from "@dynatrace-sdk/client-classic-environment-v2";
 
 export default async function () {
-  const backupJobs = []; // local backups
-  const remoteJobs = []; // replication + archival
+  const baseUrl = "https://helios.cohesity.com";
 
-  // 1) Get Helios-managed clusters
-  const clustersResp = await heliosGet("/v2/mcm/cluster-mgmt/info");
-  const clusters = clustersResp?.cohesityClusters || [];
+  // ------------------------------
+  // 1) Credential vault: name -> id -> manual
+  // ------------------------------
+  const vaultName = "Cohesity_API_Key";
+  const vaultId   = "credentials_vault-312312";
 
-  if (!clusters.length) {
-    return {
-      backupTable: "No clusters returned from Helios.\n",
-      remoteTable: "No clusters returned from Helios.\n",
-      backupJobs,
-      remoteJobs
-    };
+  let apiKey   = null;
+  let authMode = "vault-name";
+
+  async function getKeyByName(name) {
+    const all = await credentialVaultClient.getCredentials();
+    const found = all.credentials.find(function (c) { return c.name === name; });
+    if (!found) return null;
+    const detail = await credentialVaultClient.getCredentialsDetails({ id: found.id });
+    console.log("✓ Helios key from vault (name): " + found.name);
+    return (detail && (detail.token || detail.password)) || null;
   }
 
-  for (const cluster of clusters) {
-    const clusterId = cluster.clusterId;
+  try {
+    apiKey = await getKeyByName(vaultName);
+    if (!apiKey) throw new Error("not-found");
+  } catch (e) {
+    try {
+      const detail = await credentialVaultClient.getCredentialsDetails({ id: vaultId });
+      apiKey       = (detail && (detail.token || detail.password)) || null;
+      authMode     = "vault-id";
+      console.log("✓ Helios key from vault (id): " + (detail && detail.name ? detail.name : vaultId));
+    } catch (e2) {
+      authMode = "manual";
+      apiKey   = "PASTE_YOUR_API_KEY_HERE";  // last resort, still GET-only
+      console.log("⚠️ Using manual Helios API key (fallback)");
+    }
+  }
+
+  if (!apiKey) {
+    throw new Error("No Helios API key available (vault + manual failed).");
+  }
+
+  const commonHeaders = { accept: "application/json", apiKey: apiKey };
+
+  // Jobs must run this many hours or more to be included
+  const THRESHOLD_HOURS = 24;
+  const THRESHOLD_MS    = THRESHOLD_HOURS * 60 * 60 * 1000;
+
+  // ------------------------------
+  // 2) Helpers
+  // ------------------------------
+  async function getJson(url, headers) {
+    const resp = await fetch(url, { method: "GET", headers: headers });
+    if (!resp.ok) {
+      let txt = "";
+      try { txt = await resp.text(); } catch (e) {}
+      throw new Error("GET " + url + " -> HTTP " + resp.status + " " + txt);
+    }
+    return resp.json();
+  }
+
+  // EST/EDT with suffix, e.g. "11/18/2025, 03:09:00 EST"
+  function usecsToDateString(usecs) {
+    if (!usecs) return null;
+    const ms = Number(usecs) / 1000;  // microseconds -> ms
+    if (!Number.isFinite(ms)) return null;
+
+    return new Date(ms).toLocaleString("en-US", {
+      timeZone: "America/New_York",
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+      hour12: false,
+      timeZoneName: "short"
+    });
+  }
+
+  // Duration in ms -> "Xd 0h 05m" style
+  function formatDuration(ms) {
+    if (!Number.isFinite(ms) || ms < 0) return "";
+
+    const totalMinutes = Math.floor(ms / (1000 * 60));
+    const days   = Math.floor(totalMinutes / (24 * 60));
+    const remMin = totalMinutes - days * 24 * 60;
+    const hours  = Math.floor(remMin / 60);
+    const mins   = remMin - hours * 60;
+
+    function pad(n) { return n.toString().padStart(2, "0"); }
+
+    // "1d 03h 05m", "0d 01h 09m", etc.
+    return days + "d " + hours + "h " + pad(mins) + "m";
+  }
+
+  function buildQuery(params) {
+    const usp = new URLSearchParams();
+    for (const k in params) {
+      if (!Object.prototype.hasOwnProperty.call(params, k)) continue;
+      const v = params[k];
+      if (v === undefined || v === null) continue;
+      if (Array.isArray(v)) {
+        v.forEach(function (val) { usp.append(k, String(val)); });
+      } else {
+        usp.append(k, String(v));
+      }
+    }
+    return usp.toString();
+  }
+
+  function toInfoArray(localBackupInfo) {
+    if (!localBackupInfo) return [];
+    if (Array.isArray(localBackupInfo)) return localBackupInfo;
+    return [localBackupInfo];
+  }
+
+  const ENV_LABELS = {
+    kOracle:        "Oracle",
+    kSQL:           "SQL",
+    kPhysical:      "Physical",
+    kGenericNas:    "NAS",
+    kIsilon:        "NAS",
+    kHyperV:        "HyperV",
+    kAcropolis:     "Acropolis",
+    kRemoteAdapter: "RemoteAdapter"
+  };
+
+  function getEnvCode(pg) {
+    let envRaw = pg.environment;
+    if (!envRaw && Array.isArray(pg.environmentTypes) && pg.environmentTypes.length > 0) {
+      envRaw = pg.environmentTypes[0];
+    }
+    return envRaw || null;
+  }
+
+  function mapEnvironmentLabel(envCode) {
+    if (!envCode) return "Unknown";
+    return ENV_LABELS[envCode] || envCode;
+  }
+
+  // ------------------------------
+  // 3) Per-PG: collect long-running backup + replication/archival
+  // ------------------------------
+  async function collectLongRunningForPg(clusterName, headers, pg, nowMs) {
+    const pgId   = pg.id;
+    const pgName = pg.name || "Unknown PG";
+    const envLbl = mapEnvironmentLabel(getEnvCode(pg));
+
+    const runQuery = buildQuery({
+      numRuns: 5,
+      excludeNonRestorableRuns: false,
+      includeObjectDetails: false
+    });
+
+    let runData;
+    try {
+      runData = await getJson(
+        baseUrl + "/v2/data-protect/protection-groups/" +
+        encodeURIComponent(pgId) + "/runs?" + runQuery,
+        headers
+      );
+    } catch (e) {
+      return { backupRows: [], remoteRows: [] };
+    }
+
+    const runs = runData.runs || [];
+    if (!runs.length) return { backupRows: [], remoteRows: [] };
+
+    const backupRows = [];
+    const remoteRows = [];
+
+    for (let i = 0; i < runs.length; i++) {
+      const run   = runs[i];
+
+      // ---------- BACKUP (localBackupInfo) ----------
+      const infos = toInfoArray(run.localBackupInfo);
+      for (let j = 0; j < infos.length; j++) {
+        const info   = infos[j];
+        const status = info.status || "Unknown";
+        if (status !== "Running" && status !== "kRunning") continue;
+
+        const startUsecs   = info.startTimeUsecs || 0;
+        const startMs      = Number(startUsecs) / 1000;
+        if (!Number.isFinite(startMs) || startMs <= 0) continue;
+
+        const diffMs       = nowMs - startMs;
+        const elapsedHours = diffMs / (1000 * 60 * 60);
+
+        if (diffMs >= THRESHOLD_MS) {
+          let runType = info.runType || "";
+          if (runType && runType.startsWith("k")) {
+            runType = runType.substring(1);
+          }
+
+          backupRows.push({
+            Cluster:         clusterName,
+            Environment:     envLbl,
+            ProtectionGroup: pgName,
+            RunType:         runType,
+            Status:          status,
+            StartTime:       usecsToDateString(startUsecs),
+            ElapsedHours:    elapsedHours,
+            Elapsed:         formatDuration(diffMs)
+          });
+        }
+      }
+
+      // ---------- REPLICATION (replicationTargetResults) ----------
+      if (run.replicationInfo &&
+          Array.isArray(run.replicationInfo.replicationTargetResults)) {
+
+        for (const rTarget of run.replicationInfo.replicationTargetResults) {
+          const rStatus = rTarget.status || "Unknown";
+          if (rStatus !== "Running" && rStatus !== "kRunning") continue;
+
+          const startUsecs = rTarget.startTimeUsecs || 0;
+          const startMs    = Number(startUsecs) / 1000;
+          if (!Number.isFinite(startMs) || startMs <= 0) continue;
+
+          const diffMs       = nowMs - startMs;
+          const elapsedHours = diffMs / (1000 * 60 * 60);
+          if (diffMs < THRESHOLD_MS) continue;
+
+          let runType = (run.localBackupInfo && run.localBackupInfo.runType) || "Replication";
+          if (runType && runType.startsWith("k")) {
+            runType = runType.substring(1);
+          }
+
+          const dest = rTarget.clusterName || "RemoteCluster";
+
+          remoteRows.push({
+            Cluster:         clusterName,
+            Environment:     envLbl,
+            ProtectionGroup: pgName,
+            RunType:         runType,
+            CopyType:        "Replication",
+            Destination:     dest,
+            Status:          rStatus,
+            StartTime:       usecsToDateString(startUsecs),
+            ElapsedHours:    elapsedHours,
+            Elapsed:         formatDuration(diffMs)
+          });
+        }
+      }
+
+      // ---------- ARCHIVAL (archivalTargetResults) ----------
+      if (run.archivalInfo &&
+          Array.isArray(run.archivalInfo.archivalTargetResults)) {
+
+        for (const aTarget of run.archivalInfo.archivalTargetResults) {
+          const aStatus = aTarget.status || "Unknown";
+          if (aStatus !== "Running" && aStatus !== "kRunning") continue;
+
+          const startUsecs = aTarget.startTimeUsecs || 0;
+          const startMs    = Number(startUsecs) / 1000;
+          if (!Number.isFinite(startMs) || startMs <= 0) continue;
+
+          const diffMs       = nowMs - startMs;
+          const elapsedHours = diffMs / (1000 * 60 * 60);
+          if (diffMs < THRESHOLD_MS) continue;
+
+          let runType = aTarget.runType || "Archival";
+          if (runType && runType.startsWith("k")) {
+            runType = runType.substring(1);
+          }
+
+          const dest = aTarget.targetName || aTarget.targetType || "ArchivalTarget";
+
+          remoteRows.push({
+            Cluster:         clusterName,
+            Environment:     envLbl,
+            ProtectionGroup: pgName,
+            RunType:         runType,
+            CopyType:        "Archival",
+            Destination:     dest,
+            Status:          aStatus,
+            StartTime:       usecsToDateString(startUsecs),
+            ElapsedHours:    elapsedHours,
+            Elapsed:         formatDuration(diffMs)
+          });
+        }
+      }
+    }
+
+    return { backupRows, remoteRows };
+  }
+
+  // ------------------------------
+  // 4) Per-cluster: iterate PGs
+  // ------------------------------
+  async function collectClusterLongRunning(cluster) {
     const clusterName =
       cluster.name ||
       cluster.clusterName ||
       cluster.displayName ||
-      `Unknown-${clusterId}`;
+      ("Unknown-" + cluster.clusterId);
 
-    // 2) List active protection groups on this cluster
-    let pgs = [];
+    const headers = {
+      accept: "application/json",
+      apiKey: apiKey,
+      accessClusterId: String(cluster.clusterId)
+    };
+
+    const pgQuery = buildQuery({
+      isDeleted: false,
+      isPaused:  false,
+      isActive:  true
+    });
+
+    let pgData;
     try {
-      const pgResp = await heliosGet("/v2/data-protect/protection-groups", {
-        accessClusterId: clusterId,
-        query: {
-          isDeleted: "False",
-          isPaused: "False",
-          isActive: "True"
-        }
-      });
-      pgs = pgResp?.protectionGroups || [];
+      pgData = await getJson(
+        baseUrl + "/v2/data-protect/protection-groups?" + pgQuery,
+        headers
+      );
     } catch (e) {
-      // Keep going even if one cluster errors
-      // console.log(`Failed to list PGs on ${clusterName}: ${e.message}`);
-      continue;
+      return { backupRows: [], remoteRows: [] };
     }
 
-    if (!pgs.length) continue;
+    const pgs = pgData.protectionGroups || [];
+    if (!pgs.length) return { backupRows: [], remoteRows: [] };
 
-    // 3) For each PG, get runs
-    for (const pg of pgs) {
-      const pgId = pg.id;
-      const pgName = pg.name || "<no name>";
-      const env = pg.environment || "Unknown";
+    const nowMs = Date.now();
+    const clusterBackup = [];
+    const clusterRemote = [];
 
-      let runsResp;
-      try {
-        runsResp = await heliosGet(
-          `/v2/data-protect/protection-groups/${encodeURIComponent(pgId)}/runs`,
-          {
-            accessClusterId: clusterId,
-            query: {
-              numRuns: "50",
-              excludeNonRestorableRuns: "False",
-              includeObjectDetails: "False"
-            }
-          }
-        );
-      } catch (e) {
-        // console.log(`Failed runs for PG ${pgName} on ${clusterName}: ${e.message}`);
-        continue;
+    // Sequential over PGs
+    for (let i = 0; i < pgs.length; i++) {
+      const pg = pgs[i];
+      const { backupRows, remoteRows } = await collectLongRunningForPg(clusterName, headers, pg, nowMs);
+
+      if (backupRows && backupRows.length) {
+        clusterBackup.push(...backupRows);
       }
-
-      const runs = runsResp?.runs || [];
-      if (!runs.length) continue;
-
-      for (const run of runs) {
-        // ---------------- BACKUP (local) ----------------
-        if (run.localBackupInfo) {
-          const bInfo = run.localBackupInfo;
-          const bStatus = bInfo.status;
-
-          if (bStatus === "Running" || bStatus === "kRunning") {
-            const startUsecs = bInfo.startTimeUsecs;
-            const hours = hoursRunningFrom(startUsecs);
-            const duration = formatDuration(hours);
-            const startText = formatLocalDate(startUsecs);
-            const isLong = hours >= THRESHOLD_HOURS ? "Yes" : "No";
-
-            let runTypeRaw = bInfo.runType;
-            if (runTypeRaw && typeof runTypeRaw === "string" && runTypeRaw.startsWith("k")) {
-              runTypeRaw = runTypeRaw.substring(1);
-            }
-
-            backupJobs.push({
-              Cluster: clusterName,
-              ProtectionGroup: pgName,
-              Environment: env,
-              RunType: runTypeRaw || "",
-              StartTime: startText,
-              Duration: duration,
-              HoursRunning: hours.toFixed(2),
-              Status: "Running",
-              IsLongRunning: isLong,
-              CopyType: "LocalBackup"
-            });
-          }
-        }
-
-        // ---------------- REPLICATION ----------------
-        if (
-          run.replicationInfo &&
-          Array.isArray(run.replicationInfo.replicationTargetResults)
-        ) {
-          for (const rt of run.replicationInfo.replicationTargetResults) {
-            const rStatus = rt.status;
-            if (rStatus !== "Running" && rStatus !== "kRunning") continue;
-
-            const startUsecs = rt.startTimeUsecs;
-            const hours = hoursRunningFrom(startUsecs);
-            const duration = formatDuration(hours);
-            const startText = formatLocalDate(startUsecs);
-            const isLong = hours >= THRESHOLD_HOURS ? "Yes" : "No";
-
-            const destName = rt.clusterName || "RemoteCluster";
-
-            let runTypeRaw = run?.localBackupInfo?.runType || "Replication";
-            if (runTypeRaw && typeof runTypeRaw === "string" && runTypeRaw.startsWith("k")) {
-              runTypeRaw = runTypeRaw.substring(1);
-            }
-
-            remoteJobs.push({
-              Cluster: clusterName,
-              ProtectionGroup: pgName,
-              Environment: env,
-              RunType: runTypeRaw,
-              CopyType: "RemoteReplication",
-              Destination: destName,
-              StartTime: startText,
-              Duration: duration,
-              HoursRunning: hours.toFixed(2),
-              Status: "Running",
-              IsLongRunning: isLong
-            });
-          }
-        }
-
-        // ---------------- ARCHIVAL ----------------
-        if (
-          run.archivalInfo &&
-          Array.isArray(run.archivalInfo.archivalTargetResults)
-        ) {
-          for (const at of run.archivalInfo.archivalTargetResults) {
-            const aStatus = at.status;
-            if (aStatus !== "Running" && aStatus !== "kRunning") continue;
-
-            const startUsecs = at.startTimeUsecs;
-            const hours = hoursRunningFrom(startUsecs);
-            const duration = formatDuration(hours);
-            const startText = formatLocalDate(startUsecs);
-            const isLong = hours >= THRESHOLD_HOURS ? "Yes" : "No";
-
-            const destName = at.targetName || at.targetType || "ArchivalTarget";
-
-            let runTypeRaw = at.runType || "Archival";
-            if (runTypeRaw && typeof runTypeRaw === "string" && runTypeRaw.startsWith("k")) {
-              runTypeRaw = runTypeRaw.substring(1);
-            }
-
-            remoteJobs.push({
-              Cluster: clusterName,
-              ProtectionGroup: pgName,
-              Environment: env,
-              RunType: runTypeRaw,
-              CopyType: "CloudArchival",
-              Destination: destName,
-              StartTime: startText,
-              Duration: duration,
-              HoursRunning: hours.toFixed(2),
-              Status: "Running",
-              IsLongRunning: isLong
-            });
-          }
-        }
+      if (remoteRows && remoteRows.length) {
+        clusterRemote.push(...remoteRows);
       }
     }
+
+    return { backupRows: clusterBackup, remoteRows: clusterRemote };
   }
 
-  // ---------- Build text tables (no CSV) ----------
+  // ------------------------------
+  // 5) All clusters – aggregate
+  // ------------------------------
+  async function collectAllLongRunning() {
+    const clusterData = await getJson(
+      baseUrl + "/v2/mcm/cluster-mgmt/info",
+      commonHeaders
+    );
+    const clusters = clusterData.cohesityClusters || [];
+    if (!clusters.length) return { backupRows: [], remoteRows: [] };
 
-  let backupTable;
-  if (backupJobs.length === 0) {
-    backupTable = "✅ No BACKUP jobs currently running on any cluster.\n";
-  } else {
-    const colsBackup = [
+    const clusterPromises = clusters.map(function (cluster) {
+      return collectClusterLongRunning(cluster);
+    });
+    const clusterResults = await Promise.all(clusterPromises);
+
+    const backupRows = [];
+    const remoteRows = [];
+
+    for (let i = 0; i < clusterResults.length; i++) {
+      const res = clusterResults[i];
+      if (res.backupRows && res.backupRows.length) {
+        backupRows.push(...res.backupRows);
+      }
+      if (res.remoteRows && res.remoteRows.length) {
+        remoteRows.push(...res.remoteRows);
+      }
+    }
+
+    // Sort backup: Cluster, Environment, PG, RunType, ElapsedHours desc
+    backupRows.sort(function (a, b) {
+      const c1 = (a.Cluster || "").localeCompare(b.Cluster || "");
+      if (c1 !== 0) return c1;
+      const c2 = (a.Environment || "").localeCompare(b.Environment || "");
+      if (c2 !== 0) return c2;
+      const c3 = (a.ProtectionGroup || "").localeCompare(b.ProtectionGroup || "");
+      if (c3 !== 0) return c3;
+      const c4 = (a.RunType || "").localeCompare(b.RunType || "");
+      if (c4 !== 0) return c4;
+      return (b.ElapsedHours || 0) - (a.ElapsedHours || 0);
+    });
+
+    // Sort remote: Cluster, Environment, PG, CopyType, ElapsedHours desc
+    remoteRows.sort(function (a, b) {
+      const c1 = (a.Cluster || "").localeCompare(b.Cluster || "");
+      if (c1 !== 0) return c1;
+      const c2 = (a.Environment || "").localeCompare(b.Environment || "");
+      if (c2 !== 0) return c2;
+      const c3 = (a.ProtectionGroup || "").localeCompare(b.ProtectionGroup || "");
+      if (c3 !== 0) return c3;
+      const c4 = (a.CopyType || "").localeCompare(b.CopyType || "");
+      if (c4 !== 0) return c4;
+      return (b.ElapsedHours || 0) - (a.ElapsedHours || 0);
+    });
+
+    return { backupRows, remoteRows };
+  }
+
+  // ------------------------------
+  // 6) Markdown for email
+  // ------------------------------
+  function toBackupMarkdown(rows) {
+    if (!rows || rows.length === 0) {
+      return `✅ No BACKUP jobs are currently Running for more than ${THRESHOLD_HOURS} hours.`;
+    }
+
+    const headers = [
       "Cluster",
-      "ProtectionGroup",
       "Environment",
+      "ProtectionGroup",
       "RunType",
-      "StartTime",
-      "Duration",
-      "HoursRunning",
       "Status",
-      "IsLongRunning"
+      "StartTime",
+      "Elapsed"
     ];
-    backupTable =
-      "Running BACKUP Jobs (Local) – All Clusters\n\n" +
-      renderTable(backupJobs, colsBackup);
+
+    const headerRow = "| " + headers.join(" | ") + " |";
+    const separator = "| " + headers.map(() => "---").join(" | ") + " |";
+
+    const bodyRows = rows.map(function (r) {
+      const vals = headers.map(function (h) {
+        const v = r[h] != null ? r[h] : "";
+        return String(v);
+      });
+      return "| " + vals.join(" | ") + " |";
+    });
+
+    const introLines = [
+      `### Long-running Cohesity BACKUP jobs (> ${THRESHOLD_HOURS} hours, status = Running)`,
+      "",
+      "_Scope: All active protection groups on all Helios-managed clusters. Only runs whose status is **Running** and whose duration exceeds the threshold are shown._",
+      ""
+    ];
+
+    return introLines.join("\n") + "\n" +
+           [headerRow, separator].concat(bodyRows).join("\n");
   }
 
-  let remoteTable;
-  if (remoteJobs.length === 0) {
-    remoteTable = "✅ No REPLICATION/ARCHIVAL jobs currently running on any cluster.\n";
-  } else {
-    const colsRemote = [
+  function toRemoteMarkdown(rows) {
+    if (!rows || rows.length === 0) {
+      return `✅ No REPLICATION/ARCHIVAL jobs are currently Running for more than ${THRESHOLD_HOURS} hours.`;
+    }
+
+    const headers = [
       "Cluster",
-      "ProtectionGroup",
       "Environment",
-      "RunType",
+      "ProtectionGroup",
       "CopyType",
+      "RunType",
       "Destination",
-      "StartTime",
-      "Duration",
-      "HoursRunning",
       "Status",
-      "IsLongRunning"
+      "StartTime",
+      "Elapsed"
     ];
-    remoteTable =
-      "Running REPLICATION / ARCHIVAL Jobs (Remote) – All Clusters\n\n" +
-      renderTable(remoteJobs, colsRemote);
+
+    const headerRow = "| " + headers.join(" | ") + " |";
+    const separator = "| " + headers.map(() => "---").join(" | ") + " |";
+
+    const bodyRows = rows.map(function (r) {
+      const vals = headers.map(function (h) {
+        const v = r[h] != null ? r[h] : "";
+        return String(v);
+      });
+      return "| " + vals.join(" | ") + " |";
+    });
+
+    const introLines = [
+      `### Long-running Cohesity REPLICATION / ARCHIVAL jobs (> ${THRESHOLD_HOURS} hours, status = Running)`,
+      "",
+      "_Scope: All active protection groups on all Helios-managed clusters. Only replication/archival copies whose status is **Running** and whose duration exceeds the threshold are shown._",
+      ""
+    ];
+
+    return introLines.join("\n") + "\n" +
+           [headerRow, separator].concat(bodyRows).join("\n");
   }
 
-  // This is what Dynatrace will see as step output
+  // ------------------------------
+  // 7) Run + return
+  // ------------------------------
+  const { backupRows, remoteRows } = await collectAllLongRunning();
+
   return {
-    backupTable,
-    remoteTable,
-    backupJobs,
-    remoteJobs
+    authMode:       authMode,
+    backupCount:    backupRows.length,
+    remoteCount:    remoteRows.length,
+    backupJobs:     backupRows,
+    remoteJobs:     remoteRows,
+    backupMarkdown: toBackupMarkdown(backupRows),
+    remoteMarkdown: toRemoteMarkdown(remoteRows)
   };
 }
