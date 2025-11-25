@@ -1,254 +1,325 @@
 # =====================================================================
-# Cohesity – Long Running Jobs (All Clusters via Helios)
-# - Uses API key (same style as your BackupFailures script)
-# - GET operations only (read-only)
-# - Finds any protection job runs where:
-#     * backupRun.status = kRunning
-#     * AND any copyRun.status is not in (kCanceled, kSuccess, kFailure)
-#     * AND job has been running > thresholdHours (default 24)
-# - Classifies copyRun.target.type:
-#     kLocal   -> backup (Local)
-#     kRemote  -> replication
-#     kArchival-> archival (shown in replication table)
-# - Output:
-#     1) Backup table (Local)
-#     2) Replication/Archival table (Remote/Archival)
-# - CSVs:
-#   X:\PowerShell\Data\Cohesity\LongRunningJobs\LongRunningJobs_Backup_Over24h_yyyyMMdd_HHmm.csv
-#   X:\PowerShell\Data\Cohesity\LongRunningJobs\LongRunningJobs_Replication_Over24h_yyyyMMdd_HHmm.csv
+# Cohesity Long-Running Jobs – Multi-Cluster (Helios, API key)
+# GET-only | Read-only
+# - Scans ALL Helios-managed clusters via accessClusterId
+# - Finds backup + replication/archival runs that are "Running"
+#   for more than $thresholdHours (default 24)
+# - Separate tables + CSVs:
+#     1) Long-running BACKUP (Local) jobs
+#     2) Long-running REPLICATION/ARCHIVAL (Remote/Cloud) jobs
+# - Duration shown as "Xd Yh ZZm" (e.g. 1d 0h 05m)
 # =====================================================================
 
-# -------------------------------
-# Settings
-# -------------------------------
-$thresholdHours = 24.0
+# Threshold in hours for "long-running"
+$thresholdHours = 24
 
+# -------------------------------
+# Folder + API key
+# -------------------------------
 $logDirectory = "X:\PowerShell\Data\Cohesity\LongRunningJobs"
 if (-not (Test-Path -Path $logDirectory -PathType Container)) {
     New-Item -Path $logDirectory -ItemType Directory | Out-Null
 }
 
+# Hygiene 1: keep at most 50 newest files
+try {
+    $files = Get-ChildItem -Path $logDirectory -File -ErrorAction Stop
+    if ($files.Count -gt 50) {
+        $toDelete = $files | Sort-Object CreationTime | Select-Object -First ($files.Count - 50)
+        $count = ($toDelete | Measure-Object).Count
+        if ($count -gt 0) { $toDelete | Remove-Item -Force -ErrorAction SilentlyContinue }
+        Write-Host "🧹 Removed $count old files to keep last 50." -ForegroundColor DarkGray
+    }
+} catch {}
+
+# Hygiene 2: delete anything older than 30 days
+try {
+    $thresholdDate = (Get-Date).AddDays(-30)
+    $older = Get-ChildItem -Path $logDirectory -File -ErrorAction SilentlyContinue |
+             Where-Object { $_.LastWriteTime -lt $thresholdDate }
+    $oldCount = ($older | Measure-Object).Count
+    if ($oldCount -gt 0) {
+        $older | Remove-Item -Force -ErrorAction SilentlyContinue
+        Write-Host "🧽 Deleted $oldCount files older than 30 days." -ForegroundColor DarkGray
+    }
+} catch {}
+
 $apikeypath = "X:\PowerShell\Cohesity_API_Scripts\DO_NOT_Delete\apikey.txt"
-if (-not (Test-Path $apikeypath)) {
-    throw "API key file not found at $apikeypath"
-}
-$apiKey  = (Get-Content -Path $apikeypath -Raw).Trim()
+if (-not (Test-Path $apikeypath)) { throw "API key file not found at $apikeypath" }
+$apiKey = (Get-Content -Path $apikeypath -Raw).Trim()
+
 $baseUrl = "https://helios.cohesity.com"
 $commonHeaders = @{ "apiKey" = $apiKey }
 
-# Time zone (same pattern as your failures script – EST fallback to local)
-try {
-    $tz = [System.TimeZoneInfo]::FindSystemTimeZoneById("Eastern Standard Time")
-} catch {
-    $tz = [System.TimeZoneInfo]::Local
+# -------------------------------
+# Helpers (same style as failures script)
+# -------------------------------
+function Convert-ToUtcFromEpoch($v){
+    if ($null -eq $v -or $v -eq 0) { return $null }
+    try {
+        # handles microseconds by dividing by 1000
+        [DateTimeOffset]::FromUnixTimeMilliseconds([int64]([double]$v/1000)).UtcDateTime
+    }
+    catch {
+        [DateTimeOffset]::FromUnixTimeMilliseconds([int64]$v).UtcDateTime
+    }
 }
 
-# -------------------------------
-# Helpers
-# -------------------------------
-function Convert-UsecsToUtc {
-    param([Nullable[int64]]$Usecs)
-
-    if ($null -eq $Usecs -or $Usecs -le 0) { return $null }
-    $epoch = [datetime]'1970-01-01T00:00:00Z'
-    $ticks = [int64]$Usecs * 10      # 1 microsecond = 10 ticks (100ns)
-    return $epoch.AddTicks($ticks)
+function Convert-ToLocalFromUsecs($usecs, $tz){
+    $utc = Convert-ToUtcFromEpoch $usecs
+    if ($null -eq $utc) { return $null }
+    if ($tz) { [System.TimeZoneInfo]::ConvertTimeFromUtc($utc,$tz) } else { $utc.ToLocalTime() }
 }
 
 function Format-Duration {
-    param([double]$Hours)
-
-    $span  = [TimeSpan]::FromHours($Hours)
-    $days  = [int][math]::Floor($span.TotalDays)
-    $hrs   = $span.Hours
-    $mins  = $span.Minutes
-    # Example: "1d 0h 05m"
+    param(
+        [double]$Hours
+    )
+    if ($Hours -lt 0) {
+        $Hours = 0
+    }
+    $ts    = [TimeSpan]::FromHours($Hours)
+    $days  = [int][Math]::Floor($ts.TotalDays)
+    $hrs   = $ts.Hours
+    $mins  = $ts.Minutes
+    # 1d 0h 05m
     return ("{0}d {1}h {2:00}m" -f $days, $hrs, $mins)
 }
 
+function Write-Log($msg,$color="Gray"){
+    # flip to $true if you want verbose debug here
+    if($script:VerboseMode){
+        Write-Host $msg -ForegroundColor $color
+    }
+}
+
+# EST (to match your failures script style)
+$tz = [System.TimeZoneInfo]::FindSystemTimeZoneById("Eastern Standard Time")
+
 # -------------------------------
-# Get Helios clusters (GET only)
+# Get Helios-managed clusters
 # -------------------------------
 try {
-    $cluResp  = Invoke-WebRequest -Uri "$baseUrl/v2/mcm/cluster-mgmt/info" -Headers $commonHeaders -Method Get
-    $json_clu = ($cluResp.Content | ConvertFrom-Json).cohesityClusters
+    $resp = Invoke-WebRequest -Uri "$baseUrl/v2/mcm/cluster-mgmt/info" -Headers $commonHeaders -Method Get
+    $json_clu = ($resp.Content | ConvertFrom-Json).cohesityClusters
 } catch {
     throw "Failed to query Helios clusters: $($_.Exception.Message)"
 }
+
 if (-not $json_clu) { throw "No clusters returned from Helios." }
 
 # -------------------------------
-# Main collection
+# Collectors: Backup vs Replication/Archival
 # -------------------------------
-$finishedStates = @('kCanceled', 'kSuccess', 'kFailure')
-$results        = New-Object System.Collections.Generic.List[object]
+$backupRows    = New-Object System.Collections.ArrayList
+$replicaRows   = New-Object System.Collections.ArrayList
+
+Write-Host "=============================================" -ForegroundColor Cyan
+Write-Host "   COHESITY LONG-RUNNING JOBS – ALL CLUSTERS" -ForegroundColor White
+Write-Host "=============================================" -ForegroundColor Cyan
+Write-Host ("Threshold: {0} hours`n" -f $thresholdHours) -ForegroundColor Yellow
 
 foreach ($cluster in $json_clu) {
 
-    $clusterName = ($cluster.name, $cluster.clusterName, $cluster.displayName |
+    $cluster_name = ($cluster.name, $cluster.clusterName, $cluster.displayName |
                     Where-Object { $_ -and $_.Trim() } | Select-Object -First 1)
-    if (-not $clusterName) { $clusterName = "Unknown-$($cluster.clusterId)" }
+    if (-not $cluster_name) { $cluster_name = "Unknown-$($cluster.clusterId)" }
 
     $headers = @{
-        apiKey          = $apiKey
-        accessClusterId = $cluster.clusterId
+        apiKey        = $apiKey
+        accessClusterId = $cluster.clusterId  # NOTE: no 'clusters:' param; Helios prefers this header
     }
 
-    # --- Get v1 protection jobs (for jobId + environment) ---
+    Write-Log ("`n🔹 Processing cluster: {0}" -f $cluster_name) "Cyan"
+
+    # Active protection groups
     try {
-        $jobsResp = Invoke-WebRequest -Uri "$baseUrl/irisservices/api/v1/public/protectionJobs?isDeleted=false" `
-                                      -Headers $headers -Method Get
-        $jobs = $jobsResp.Content | ConvertFrom-Json
-    } catch {
-        Write-Host "⚠️ Failed to fetch protectionJobs for cluster $clusterName: $($_.Exception.Message)" -ForegroundColor Yellow
-        continue
-    }
-    if (-not $jobs) { continue }
-
-    # Map job name -> job object for quick lookup
-    $jobByName = @{}
-    foreach ($j in $jobs) {
-        if ($j.name) { $jobByName[$j.name] = $j }
-    }
-
-    # --- Get v2 protection groups whose last run is Running (reduce scope) ---
-    try {
-        $pgResp = Invoke-WebRequest -Uri "$baseUrl/v2/data-protect/protection-groups?useCachedData=false&lastRunAnyStatus=Running&isDeleted=false&includeTenants=true&includeLastRunInfo=true" `
-                                    -Headers $headers -Method Get
+        $pgResp = Invoke-WebRequest -Uri "$baseUrl/v2/data-protect/protection-groups" -Headers $headers -Method Get -Body @{
+            isDeleted = "False"
+            isPaused  = "False"
+            isActive  = "True"
+        }
         $pgs = ($pgResp.Content | ConvertFrom-Json).protectionGroups
     } catch {
-        Write-Host "⚠️ Failed to fetch protection-groups for cluster $clusterName: $($_.Exception.Message)" -ForegroundColor Yellow
+        Write-Log ("⚠️ Failed to list PGs on {0}: {1}" -f $cluster_name, $_.Exception.Message) "Yellow"
         continue
     }
     if (-not $pgs) { continue }
 
     foreach ($pg in $pgs) {
+
+        $pgId   = $pg.id
         $pgName = $pg.name
-        if (-not $pgName) { continue }
+        $env    = $pg.environment
 
-        if (-not $jobByName.ContainsKey($pgName)) {
-            # ProtectionGroup name didn't map cleanly to v1 job name – skip
-            continue
-        }
+        Write-Log ("📦 Checking PG: {0} ({1})" -f $pgName, $env) "Yellow"
 
-        $job   = $jobByName[$pgName]
-        $jobId = $job.id
-        if (-not $jobId) { continue }
-
-        # --- Get recent runs for this job (GET only) ---
+        # Get recent runs for this PG (GET-only)
         try {
-            $runResp = Invoke-WebRequest -Uri "$baseUrl/irisservices/api/v1/public/protectionRuns?jobId=$jobId&excludeTasks=true" `
-                                         -Headers $headers -Method Get
-            $runs = $runResp.Content | ConvertFrom-Json
+            $runResp = Invoke-WebRequest -Uri "$baseUrl/v2/data-protect/protection-groups/$pgId/runs" `
+                                         -Headers $headers -Method Get -Body @{
+                numRuns                  = "50"
+                excludeNonRestorableRuns = "False"
+                includeObjectDetails     = "False"
+            }
+            $jsonRuns = $runResp.Content | ConvertFrom-Json
         } catch {
-            Write-Host "⚠️ Failed to fetch protectionRuns for job $pgName on $clusterName: $($_.Exception.Message)" -ForegroundColor Yellow
+            Write-Log ("⚠️ Failed to list runs for PG {0} on {1}: {2}" -f $pgName, $cluster_name, $_.Exception.Message) "Yellow"
             continue
         }
 
-        if (-not $runs) { continue }
+        if (-not $jsonRuns -or -not $jsonRuns.runs) { continue }
+        $runs = $jsonRuns.runs
 
         foreach ($run in $runs) {
-            if (-not $run.backupRun) { continue }
 
-            $backupRun = $run.backupRun
+            # -----------------------
+            # BACKUP (Local) long-running
+            # -----------------------
+            if ($run.PSObject.Properties['localBackupInfo'] -and $run.localBackupInfo) {
+                $backupInfo = $run.localBackupInfo
 
-            # Only runs whose job-level status is actually Running
-            if ($backupRun.status -ne 'kRunning') { continue }
+                $bStatus = $backupInfo.status
+                # Cohesity uses values like "Running", "Succeeded", etc
+                if ($bStatus -eq 'Running' -or $bStatus -eq 'kRunning') {
 
-            $startUsecs = $backupRun.stats.startTimeUsecs
-            $startUtc   = Convert-UsecsToUtc $startUsecs
-            if (-not $startUtc) { continue }
+                    $startLocal = Convert-ToLocalFromUsecs $backupInfo.startTimeUsecs $tz
+                    if ($null -ne $startLocal) {
+                        $hoursRunning = ((Get-Date) - $startLocal).TotalHours
+                        if ($hoursRunning -ge $thresholdHours) {
 
-            $hoursRunning = ([DateTime]::UtcNow - $startUtc).TotalHours
-            if ($hoursRunning -lt $thresholdHours) { continue }
+                            $durationStr = Format-Duration -Hours $hoursRunning
 
-            $startLocal = [System.TimeZoneInfo]::ConvertTimeFromUtc($startUtc, $tz)
-            $startText  = $startLocal.ToString("dd-MM-yyyy HH:mm:ss")
+                            $null = $backupRows.Add([pscustomobject]@{
+                                Cluster         = $cluster_name
+                                ProtectionGroup = $pgName
+                                Environment     = $run.environment
+                                RunType         = $backupInfo.runType
+                                StartTime       = $startLocal
+                                Duration        = $durationStr
+                                Status          = "Running"
+                                CopyType        = "LocalBackup"
+                            })
+                        }
+                    }
+                }
+            }
 
-            $runTypeRaw = $backupRun.runType
-            $runType    = if ($runTypeRaw -and $runTypeRaw.StartsWith('k')) { $runTypeRaw.Substring(1) } else { $runTypeRaw }
+            # -----------------------
+            # REPLICATION long-running (RemoteCluster)
+            # -----------------------
+            if ($run.PSObject.Properties['replicationInfo'] -and
+                $run.replicationInfo -and
+                $run.replicationInfo.replicationTargetResults) {
 
-            $envRaw = if ($job.environment) { $job.environment } elseif ($pg.environment) { $pg.environment } else { $null }
-            $env    = if ($envRaw) { $envRaw } else { 'Unknown' }
+                foreach ($rTarget in $run.replicationInfo.replicationTargetResults) {
 
-            if (-not $run.copyRun) { continue }
+                    $rStatus = $rTarget.status
+                    if ($rStatus -ne 'Running' -and $rStatus -ne 'kRunning') { continue }
 
-            foreach ($copyRun in $run.copyRun) {
-                if (-not $copyRun) { continue }
-                if ($copyRun.status -in $finishedStates) { continue }
+                    $startLocalRep = Convert-ToLocalFromUsecs $rTarget.startTimeUsecs $tz
+                    if ($null -eq $startLocalRep) { continue }
 
-                $targetTypeRaw = $copyRun.target.type
-                if (-not $targetTypeRaw) { $targetTypeRaw = 'kLocal' }
+                    $hrsRep = ((Get-Date) - $startLocalRep).TotalHours
+                    if ($hrsRep -lt $thresholdHours) { continue }
 
-                $targetType = if ($targetTypeRaw.StartsWith('k')) { $targetTypeRaw.Substring(1) } else { $targetTypeRaw }
+                    $durationRep = Format-Duration -Hours $hrsRep
+                    $destName    = if ($rTarget.clusterName) { $rTarget.clusterName } else { "RemoteCluster" }
 
-                $statusRaw = $copyRun.status
-                $status    = if ($statusRaw -and $statusRaw.StartsWith('k')) { $statusRaw.Substring(1) } else { $statusRaw }
+                    $null = $replicaRows.Add([pscustomobject]@{
+                        Cluster         = $cluster_name
+                        ProtectionGroup = $pgName
+                        Environment     = $run.environment
+                        RunType         = $run.localBackupInfo.runType
+                        StartTime       = $startLocalRep
+                        Duration        = $durationRep
+                        Status          = "Running"
+                        CopyType        = "RemoteReplication"
+                        Destination     = $destName
+                    })
+                }
+            }
 
-                $durationStr = Format-Duration -Hours $hoursRunning
+            # -----------------------
+            # ARCHIVAL long-running (Cloud targets)
+            # -----------------------
+            if ($run.PSObject.Properties['archivalInfo'] -and
+                $run.archivalInfo -and
+                $run.archivalInfo.archivalTargetResults) {
 
-                $results.Add([pscustomobject]@{
-                    Cluster         = $clusterName
-                    ProtectionGroup = $pgName
-                    Environment     = $env          # e.g. kSQL, kOracle, kGenericNas, etc.
-                    TargetType      = $targetType   # Local / Remote / Archival / etc.
-                    RunType         = $runType      # e.g. RegularBackup
-                    StartTime       = $startText
-                    HoursRunning    = [math]::Round($hoursRunning, 2)
-                    Duration        = $durationStr
-                    Status          = $status       # e.g. Running
-                }) | Out-Null
+                foreach ($aTarget in $run.archivalInfo.archivalTargetResults) {
+
+                    $aStatus = $aTarget.status
+                    if ($aStatus -ne 'Running' -and $aStatus -ne 'kRunning') { continue }
+
+                    $startLocalArch = Convert-ToLocalFromUsecs $aTarget.startTimeUsecs $tz
+                    if ($null -eq $startLocalArch) { continue }
+
+                    $hrsArch = ((Get-Date) - $startLocalArch).TotalHours
+                    if ($hrsArch -lt $thresholdHours) { continue }
+
+                    $durationArch = Format-Duration -Hours $hrsArch
+                    $destName     = if ($aTarget.targetName) { $aTarget.targetName } else { $aTarget.targetType }
+
+                    $null = $replicaRows.Add([pscustomobject]@{
+                        Cluster         = $cluster_name
+                        ProtectionGroup = $pgName
+                        Environment     = $run.environment
+                        RunType         = $aTarget.runType
+                        StartTime       = $startLocalArch
+                        Duration        = $durationArch
+                        Status          = "Running"
+                        CopyType        = "CloudArchival"
+                        Destination     = $destName
+                    })
+                }
             }
         }
     }
 }
 
+$nowStamp  = Get-Date -Format "yyyyMMdd_HHmm"
+
 # -------------------------------
-# Split into Backup vs Replication/Archival
+# BACKUP TABLE + CSV
 # -------------------------------
-if ($results.Count -eq 0) {
-    Write-Host "`n✅ No jobs running longer than $thresholdHours hours (All Clusters)." -ForegroundColor Green
-    return
-}
+$backupRows = @($backupRows) | Sort-Object Cluster,ProtectionGroup,StartTime
 
-$sorted = $results |
-    Sort-Object Cluster, ProtectionGroup, StartTime -Descending
+Write-Host "`n==================================================" -ForegroundColor Cyan
+Write-Host (" Jobs running longer than {0} hours (Backup – Local)" -f $thresholdHours) -ForegroundColor White
+Write-Host "==================================================" -ForegroundColor Cyan
 
-$backupRows = $sorted | Where-Object { $_.TargetType -eq 'Local' }
-$replRows   = $sorted | Where-Object { $_.TargetType -ne 'Local' }
-
-$timestamp       = Get-Date -Format "yyyyMMdd_HHmm"
-$backupCsvPath   = Join-Path $logDirectory ("LongRunningJobs_Backup_Over{0}h_{1}.csv" -f [int]$thresholdHours, $timestamp)
-$replCsvPath     = Join-Path $logDirectory ("LongRunningJobs_Replication_Over{0}h_{1}.csv" -f [int]$thresholdHours, $timestamp)
-
-# --- Backup (Local) ---
 if ($backupRows.Count -gt 0) {
-    $backupRows |
-        Select-Object Cluster, ProtectionGroup, Environment, RunType, StartTime, Duration, HoursRunning, Status |
-        Export-Csv -Path $backupCsvPath -NoTypeInformation -Encoding utf8
+    $backupRows | Format-Table Cluster,ProtectionGroup,Environment,RunType,StartTime,Duration,Status -AutoSize
 
-    Write-Host "`nJobs running longer than $thresholdHours hours – BACKUP (Local):`n" -ForegroundColor Cyan
-    $backupRows |
-        Select-Object Cluster, ProtectionGroup, Environment, RunType, StartTime, Duration |
-        Format-Table -AutoSize
+    $backupCsv = Join-Path $logDirectory ("LongRunningJobs_Backup_AllClusters_Over{0}h_{1}.csv" -f $thresholdHours,$nowStamp)
+    $backupRows | Select-Object Cluster,ProtectionGroup,Environment,RunType,StartTime,Duration,Status,CopyType |
+        Export-Csv -Path $backupCsv -NoTypeInformation -Encoding utf8
 
-    Write-Host "`n📂 Backup CSV saved: $backupCsvPath" -ForegroundColor Gray
+    Write-Host ("`n📂 Backup CSV saved: {0}" -f $backupCsv) -ForegroundColor Gray
 } else {
-    Write-Host "`nNo backup jobs running longer than $thresholdHours hours." -ForegroundColor Green
+    Write-Host ("✅ No BACKUP (local) jobs running longer than {0} hours across all clusters." -f $thresholdHours) -ForegroundColor Green
 }
 
-# --- Replication / Archival (Remote/Archival) ---
-if ($replRows.Count -gt 0) {
-    $replRows |
-        Select-Object Cluster, ProtectionGroup, Environment, TargetType, RunType, StartTime, Duration, HoursRunning, Status |
-        Export-Csv -Path $replCsvPath -NoTypeInformation -Encoding utf8
+# -------------------------------
+# REPLICATION / ARCHIVAL TABLE + CSV
+# -------------------------------
+$replicaRows = @($replicaRows) | Sort-Object Cluster,ProtectionGroup,StartTime
 
-    Write-Host "`nJobs running longer than $thresholdHours hours – REPLICATION / ARCHIVAL (Remote/Archival):`n" -ForegroundColor Cyan
-    $replRows |
-        Select-Object Cluster, ProtectionGroup, Environment, TargetType, RunType, StartTime, Duration |
-        Format-Table -AutoSize
+Write-Host "`n============================================================" -ForegroundColor Cyan
+Write-Host (" Jobs running longer than {0} hours (Replication/Archival)" -f $thresholdHours) -ForegroundColor White
+Write-Host "============================================================" -ForegroundColor Cyan
 
-    Write-Host "`n📂 Replication CSV saved: $replCsvPath" -ForegroundColor Gray
+if ($replicaRows.Count -gt 0) {
+    $replicaRows | Format-Table Cluster,ProtectionGroup,Environment,RunType,CopyType,Destination,StartTime,Duration,Status -AutoSize
+
+    $replicaCsv = Join-Path $logDirectory ("LongRunningJobs_Replication_AllClusters_Over{0}h_{1}.csv" -f $thresholdHours,$nowStamp)
+    $replicaRows | Select-Object Cluster,ProtectionGroup,Environment,RunType,CopyType,Destination,StartTime,Duration,Status |
+        Export-Csv -Path $replicaCsv -NoTypeInformation -Encoding utf8
+
+    Write-Host ("`n📂 Replication/Archival CSV saved: {0}" -f $replicaCsv) -ForegroundColor Gray
 } else {
-    Write-Host "`nNo replication/archival jobs running longer than $thresholdHours hours." -ForegroundColor Green
+    Write-Host ("✅ No REPLICATION/ARCHIVAL jobs running longer than {0} hours across all clusters." -f $thresholdHours) -ForegroundColor Green
 }
+
+Write-Host "`n✅ Long-running jobs scan complete.`n" -ForegroundColor Cyan
