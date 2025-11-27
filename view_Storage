@@ -1,0 +1,328 @@
+$ErrorActionPreference = 'Stop'
+
+[CmdletBinding()]
+param(
+    [Parameter()][int]$Days = 31   # lookback window in days
+)
+
+# -------------------------------------------------------------
+# 📁 Log directory + hygiene
+# -------------------------------------------------------------
+$logDirectory = "X:\PowerShell\Data\Cohesity\"
+if (-not (Test-Path -Path $logDirectory -PathType Container)) {
+    New-Item -Path $logDirectory -ItemType Directory | Out-Null
+}
+
+# Hygiene 1: keep at most 50 newest files
+try {
+    $files = Get-ChildItem -Path $logDirectory -File -ErrorAction Stop
+    if ($files.Count -gt 50) {
+        $toDelete = $files | Sort-Object CreationTime | Select-Object -First ($files.Count - 50)
+        $count    = ($toDelete | Measure-Object).Count
+        if ($count -gt 0) {
+            $toDelete | Remove-Item -Force -ErrorAction SilentlyContinue
+            Write-Host "🧹 Removed $count old files to keep last 50."
+        }
+    }
+} catch {}
+
+# Hygiene 2: delete anything older than 30 days
+try {
+    $threshold = (Get-Date).AddDays(-30)
+    $older = Get-ChildItem -Path $logDirectory -File -ErrorAction SilentlyContinue |
+             Where-Object { $_.LastWriteTime -lt $threshold }
+    $oldCount = ($older | Measure-Object).Count
+    if ($oldCount -gt 0) {
+        $older | Remove-Item -Force -ErrorAction SilentlyContinue
+        Write-Host "🧽 Deleted $oldCount files older than 30 days."
+    }
+} catch {}
+
+# -------------------------------------------------------------
+# 0️⃣ API key from your path
+# -------------------------------------------------------------
+$apikeypath = "X:\PowerShell\Cohesity_API_Scripts\DO_NOT_Delete\apikey.txt"
+if (-not (Test-Path $apikeypath)) {
+    throw "API key file not found at $apikeypath"
+}
+
+$apiKey        = (Get-Content -Path $apikeypath -Raw).Trim()
+$commonHeaders = @{ "apiKey" = $apiKey }
+
+# Base URLs
+$baseMcm  = "https://helios.cohesity.com/v2/mcm"
+$baseIris = "https://helios.cohesity.com/irisservices/api/v1/public"
+
+# -------------------------------------------------------------
+# 1️⃣ Get Clusters (ClusterName + ClusterId)
+# -------------------------------------------------------------
+$url      = "$baseMcm/cluster-mgmt/info"
+$response = Invoke-WebRequest -Method Get -Uri $url -Headers $commonHeaders
+$json     = $response.Content | ConvertFrom-Json
+$json_clu = $json.cohesityClusters
+
+if (-not $json_clu -or $json_clu.Count -eq 0) {
+    throw "No clusters returned from Helios."
+}
+
+# -------------------------------------------------------------
+# 2️⃣ Sort alphabetically and build index
+# -------------------------------------------------------------
+$sorted = $json_clu | Sort-Object -Property clusterName
+
+$clusters = for ($i = 0; $i -lt $sorted.Count; $i++) {
+    [pscustomobject]@{
+        Index       = $i + 1
+        ClusterName = $sorted[$i].clusterName
+        ClusterId   = $sorted[$i].clusterId
+    }
+}
+
+Write-Host ""
+Write-Host "Available Helios Clusters (sorted by name):" -ForegroundColor Cyan
+$clusters | Format-Table -AutoSize
+
+Write-Host ""
+Write-Host "[0] All clusters" -ForegroundColor Yellow
+Write-Host "[X] Exit without selecting" -ForegroundColor Yellow
+Write-Host ""
+
+# -------------------------------------------------------------
+# 3️⃣ Let user select ALL, ONE, or EXIT
+# -------------------------------------------------------------
+while ($true) {
+
+    $inputVal = Read-Host "Enter 0 for ALL, 1-$($clusters.Count) for single, or X to exit"
+
+    if ($inputVal -match '^(x|X|q|Q)$') {
+        Write-Host "Exit selected. No clusters chosen." -ForegroundColor Cyan
+        return
+    }
+
+    [int]$num = 0
+    if (-not [int]::TryParse($inputVal, [ref]$num)) {
+        Write-Host "Please enter a valid number or X to exit." -ForegroundColor Red
+        continue
+    }
+
+    if ($num -lt 0 -or $num -gt $clusters.Count) {
+        Write-Host "Please enter 0, 1-$($clusters.Count), or X to exit." -ForegroundColor Red
+        continue
+    }
+
+    $selection = $num
+    break
+}
+
+if ($selection -eq 0) {
+    $SelectedClusters   = $clusters
+    $SelectedClusterIds = $clusters.ClusterId
+
+    Write-Host ""
+    Write-Host "You selected: ALL clusters" -ForegroundColor Green
+    $SelectedClusters | Format-Table -AutoSize
+}
+else {
+    $selectedCluster    = $clusters | Where-Object { $_.Index -eq $selection }
+    $SelectedClusters   = @($selectedCluster)
+    $SelectedClusterIds = @($selectedCluster.ClusterId)
+
+    Write-Host ""
+    Write-Host "You selected cluster:" -ForegroundColor Green
+    Write-Host "  Name: $($selectedCluster.ClusterName)"
+    Write-Host "  Id:   $($selectedCluster.ClusterId)"
+    Write-Host ""
+}
+
+# -------------------------------------------------------------
+# 4️⃣ Helpers: time + size formatting
+# -------------------------------------------------------------
+function Get-TimeMsecs {
+    param(
+        [Parameter(Mandatory = $true)][datetime]$Date
+    )
+    $epoch = [datetime]::SpecifyKind([datetime]'1970-01-01T00:00:00Z', [System.DateTimeKind]::Utc)
+    return [int64]($Date.ToUniversalTime() - $epoch).TotalMilliseconds
+}
+
+function Format-Size {
+    param(
+        [Parameter(Mandatory = $true)]
+        [long]$Size
+    )
+
+    $sizeUnits = 'B'
+    $abs       = [math]::Abs($Size)
+
+    if ($abs -ge 1TB) {
+        $Size      = [math]::Round($Size / 1TB, 1)
+        $sizeUnits = 'TiB'
+    }
+    elseif ($abs -ge 1GB) {
+        $Size      = [math]::Round($Size / 1GB, 1)
+        $sizeUnits = 'GiB'
+    }
+    elseif ($abs -ge 1MB) {
+        $Size      = [math]::Round($Size / 1MB, 1)
+        $sizeUnits = 'MiB'
+    }
+    elseif ($abs -ge 1KB) {
+        $Size      = [math]::Round($Size / 1KB, 1)
+        $sizeUnits = 'KiB'
+    }
+
+    return "$Size $sizeUnits"
+}
+
+# -------------------------------------------------------------
+# 5️⃣ Time window for growth
+# -------------------------------------------------------------
+$endDate   = Get-Date
+$startDate = $endDate.AddDays(-$Days)
+
+$startDateString = $startDate.ToString("yyyy-MM-dd")
+$endDateString   = $endDate.ToString("yyyy-MM-dd")
+
+Write-Host ""
+Write-Host "📅 Reporting window: $startDateString -> $endDateString" -ForegroundColor Yellow
+
+$startDateMsecs = Get-TimeMsecs -Date $startDate
+$endDateMsecs   = Get-TimeMsecs -Date $endDate
+
+# -------------------------------------------------------------
+# 6️⃣ For each selected cluster: fetch Views + growth (GET only)
+# -------------------------------------------------------------
+foreach ($cid in $SelectedClusterIds) {
+
+    $cluster_name = ($SelectedClusters | Where-Object { $_.ClusterId -eq $cid }).ClusterName
+
+    Write-Host ""
+    Write-Host "=======================" -ForegroundColor Cyan
+    Write-Host "Cluster: $cluster_name" -ForegroundColor Cyan
+    Write-Host "=======================" -ForegroundColor Cyan
+
+    $headers = @{
+        "apiKey"          = $apiKey
+        "accessClusterId" = "$cid"
+    }
+
+    # 6.1 Get views (GET)
+    try {
+        $viewsUrl  = "$baseIris/views"
+        $viewsResp = Invoke-WebRequest -Method Get -Uri $viewsUrl -Headers $headers
+        $viewsJson = $viewsResp.Content | ConvertFrom-Json
+        $views     = $viewsJson.views
+    }
+    catch {
+        Write-Host "Failed to get views for cluster '$cluster_name' (Id: $cid): $_" -ForegroundColor Red
+        continue
+    }
+
+    if (-not $views) {
+        Write-Host "No views returned for cluster '$cluster_name'." -ForegroundColor Yellow
+        continue
+    }
+
+    $views = $views | Sort-Object -Property name
+
+    $clusterResults = @()
+
+    # 6.2 For each view, get timeSeriesStats (GET)
+    foreach ($view in $views) {
+
+        $viewName = $view.name
+        $viewId   = $view.viewId
+
+        Write-Host "📊 Processing view: $viewName" -ForegroundColor DarkCyan
+
+        $statsUrl =
+            "$baseIris/statistics/timeSeriesStats" +
+            "?endTimeMsecs=$endDateMsecs" +
+            "&startTimeMsecs=$startDateMsecs" +
+            "&entityId=$viewId" +
+            "&metricName=kSystemUsageBytes" +
+            "&metricUnitType=0" +
+            "&range=week" +
+            "&rollupFunction=latest" +
+            "&rollupIntervalSecs=14400" +
+            "&schemaName=kBridgeViewLogicalStats"
+
+        try {
+            $statsResp = Invoke-WebRequest -Method Get -Uri $statsUrl -Headers $headers
+            $stats     = $statsResp.Content | ConvertFrom-Json
+        }
+        catch {
+            Write-Host "  ⚠ Failed to get stats for view '$viewName': $_" -ForegroundColor Red
+            continue
+        }
+
+        if (-not $stats -or -not $stats.dataPointVec -or $stats.dataPointVec.Count -eq 0) {
+            Write-Host "  ⚠ No stats in window for '$viewName'." -ForegroundColor DarkYellow
+
+            $clusterResults += [pscustomobject]@{
+                ClusterName     = $cluster_name
+                ViewName        = $viewName
+                StartSize       = $null
+                EndSize         = $null
+                Growth          = $null
+            }
+            continue
+        }
+
+        $startSize = [int64]$stats.dataPointVec[0].data.int64Value
+        $endSize   = [int64]$stats.dataPointVec[-1].data.int64Value
+        $growth    = $endSize - $startSize
+
+        $startFmt  = Format-Size -Size $startSize
+        $endFmt    = Format-Size -Size $endSize
+        $growthFmt = Format-Size -Size $growth
+
+        $clusterResults += [pscustomobject]@{
+            ClusterName     = $cluster_name
+            ViewName        = $viewName
+            StartSize       = $startFmt
+            EndSize         = $endFmt
+            Growth          = $growthFmt
+        }
+    }
+
+    if (-not $clusterResults) {
+        Write-Host "No view growth data collected for cluster '$cluster_name'." -ForegroundColor Yellow
+        continue
+    }
+
+    # ---------------------------------------------------------
+    # 7️⃣ Console table: View growth (no bytes)
+    # ---------------------------------------------------------
+    Write-Host ""
+    Write-Host "=== View Growth (Last $Days days) for '$cluster_name' ===" -ForegroundColor Cyan
+    Write-Host ""
+
+    # Best-effort sort: Growth then ViewName (string sort is fine for formatted sizes)
+    $clusterResultsSorted = $clusterResults |
+        Sort-Object -Property Growth, ViewName
+
+    $clusterResultsSorted |
+        Format-Table ViewName,
+                     @{Label = 'StartSize'; Expression = { $_.StartSize }},
+                     @{Label = 'EndSize';   Expression = { $_.EndSize }},
+                     @{Label = 'Growth';    Expression = { $_.Growth }} -AutoSize
+
+    # ---------------------------------------------------------
+    # 8️⃣ CSV export (cluster-specific, formatted sizes only)
+    # ---------------------------------------------------------
+    $safeClusterName = ($cluster_name -replace ':', '_')
+    $outFileName     = "ViewGrowth_${safeClusterName}_$($startDateString)_$($endDateString).csv"
+    $outFilePath     = Join-Path -Path $logDirectory -ChildPath $outFileName
+
+    $clusterResultsSorted |
+        Select-Object ClusterName,
+                      ViewName,
+                      StartSize,
+                      EndSize,
+                      Growth |
+        Export-Csv -Path $outFilePath -NoTypeInformation
+
+    Write-Host ""
+    Write-Host "📄 View growth CSV for '$cluster_name' written to: $outFilePath" -ForegroundColor Green
+}
