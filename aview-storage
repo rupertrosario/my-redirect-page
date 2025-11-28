@@ -1,1 +1,273 @@
 
+$ErrorActionPreference = 'Stop'
+
+# -------------------------------------------------------------
+# 0️⃣ API key from your path (local file, not cluster)
+# -------------------------------------------------------------
+$apikeypath = "X:\PowerShell\Cohesity_API_Scripts\DO_NOT_Delete\apikey.txt"
+if (-not (Test-Path $apikeypath)) {
+    throw "API key file not found at $apikeypath"
+}
+
+$apiKey        = (Get-Content -Path $apikeypath -Raw).Trim()
+$commonHeaders = @{ "apiKey" = $apiKey }
+
+# Base URLs (read-only Helios APIs)
+$baseMcm  = "https://helios.cohesity.com/v2/mcm"
+$baseIris = "https://helios.cohesity.com/irisservices/api/v1/public"
+
+# -------------------------------------------------------------
+# 1️⃣ Get clusters from Helios (GET ONLY)
+# -------------------------------------------------------------
+$clusterUrl  = "$baseMcm/cluster-mgmt/info"
+$clusterResp = Invoke-WebRequest -Method Get -Uri $clusterUrl -Headers $commonHeaders
+$clusterJson = $clusterResp.Content | ConvertFrom-Json
+$json_clus   = $clusterJson.cohesityClusters
+
+if (-not $json_clus -or $json_clus.Count -eq 0) {
+    throw "No clusters returned from Helios."
+}
+
+# Sort clusters alphabetically
+$json_clus = $json_clus | Sort-Object -Property clusterName
+
+$clusters = for ($i = 0; $i -lt $json_clus.Count; $i++) {
+    [pscustomobject]@{
+        Index       = $i + 1
+        ClusterName = $json_clus[$i].clusterName
+        ClusterId   = $json_clus[$i].clusterId
+    }
+}
+
+Write-Host ""
+Write-Host "Available Helios Clusters (sorted by name):" -ForegroundColor Cyan
+$clusters | Format-Table -AutoSize
+
+Write-Host ""
+Write-Host "[0] All clusters" -ForegroundColor Yellow
+Write-Host "[X] Exit without selecting" -ForegroundColor Yellow
+Write-Host ""
+
+# -------------------------------------------------------------
+# 2️⃣ Let user select ALL, ONE, or EXIT (local only)
+# -------------------------------------------------------------
+while ($true) {
+
+    $inputVal = Read-Host "Enter 0 for ALL, 1-$($clusters.Count) for single, or X to exit"
+
+    if ($inputVal -match '^(x|X|q|Q)$') {
+        Write-Host "Exit selected. No clusters chosen." -ForegroundColor Cyan
+        return
+    }
+
+    [int]$num = 0
+    if (-not [int]::TryParse($inputVal, [ref]$num)) {
+        Write-Host "Please enter a valid number or X to exit." -ForegroundColor Red
+        continue
+    }
+
+    if ($num -lt 0 -or $num -gt $clusters.Count) {
+        Write-Host "Please enter 0, 1-$($clusters.Count), or X to exit." -ForegroundColor Red
+        continue
+    }
+
+    $selection = $num
+    break
+}
+
+if ($selection -eq 0) {
+    $SelectedClusters   = $clusters
+    $SelectedClusterIds = $clusters.ClusterId
+
+    Write-Host ""
+    Write-Host "You selected: ALL clusters" -ForegroundColor Green
+    $SelectedClusters | Format-Table -AutoSize
+}
+else {
+    $selectedCluster    = $clusters | Where-Object { $_.Index -eq $selection }
+    $SelectedClusters   = @($selectedCluster)
+    $SelectedClusterIds = @($selectedCluster.ClusterId)
+
+    Write-Host ""
+    Write-Host "You selected cluster:" -ForegroundColor Green
+    Write-Host "  Name: $($selectedCluster.ClusterName)"
+    Write-Host "  Id:   $($selectedCluster.ClusterId)"
+    Write-Host ""
+}
+
+# -------------------------------------------------------------
+# 3️⃣ Helpers: size + K-formatting (local only)
+# -------------------------------------------------------------
+function Format-Size {
+    param(
+        [Parameter(Mandatory = $true)]
+        [long]$Bytes
+    )
+
+    $abs = [math]::Abs([double]$Bytes)
+
+    if ($abs -ge 1TB) {
+        return ("{0:N1} TB" -f ($Bytes / 1TB))
+    }
+    elseif ($abs -ge 1GB) {
+        return ("{0:N1} GB" -f ($Bytes / 1GB))
+    }
+    elseif ($abs -ge 1MB) {
+        return ("{0:N1} MB" -f ($Bytes / 1MB))
+    }
+    elseif ($abs -ge 1KB) {
+        return ("{0:N1} KB" -f ($Bytes / 1KB))
+    }
+    else {
+        return ("{0} B" -f $Bytes)
+    }
+}
+
+function Format-K {
+    param(
+        [Parameter(Mandatory = $true)]
+        [long]$Value
+    )
+
+    if ($null -eq $Value) { return $null }
+    if ($Value -eq 0)     { return "0" }
+
+    $abs = [math]::Abs([double]$Value)
+
+    if ($abs -lt 1000) {
+        return ("{0:N0}" -f $Value)
+    }
+
+    return ("{0:N1}K" -f ($Value / 1e3))
+}
+
+# -------------------------------------------------------------
+# 4️⃣ stats/consumers (kViews) – GET ONLY, per selected cluster
+# -------------------------------------------------------------
+# NOTE: consumerType is passed as query param; still a pure GET.
+$URL_EP = "$baseIris/stats/consumers?consumerType=kViews"
+
+foreach ($cid in $SelectedClusterIds) {
+
+    $cluster_name = ($SelectedClusters | Where-Object { $_.ClusterId -eq $cid }).ClusterName
+
+    Write-Host ""
+    Write-Host "Cluster: $cluster_name  (consumerType: kViews)" -ForegroundColor Cyan
+    Write-Host ""
+
+    $headers = @{
+        "apiKey"          = $apiKey
+        "accessClusterId" = "$cid"
+    }
+
+    try {
+        # ✅ READ-ONLY GET – no body, no side effects on cluster
+        $response = Invoke-WebRequest -Method Get -Uri $URL_EP -Headers $headers
+        $json     = $response.Content | ConvertFrom-Json
+    }
+    catch {
+        Write-Host "  ⚠ Failed to get kViews stats for cluster '$cluster_name': $_" -ForegroundColor Red
+        continue
+    }
+
+    if (-not $json -or -not $json.statsList) {
+        Write-Host "  ⚠ No statsList returned for cluster '$cluster_name'." -ForegroundColor Yellow
+        continue
+    }
+
+    $rows = @()
+
+    foreach ($entry in $json.statsList) {
+
+        # Try common name fields for view
+        $viewName = $entry.entityName
+        if (-not $viewName) { $viewName = $entry.consumerName }
+        if (-not $viewName) { $viewName = $entry.name }
+        if (-not $viewName) { $viewName = "<UnknownView>" }
+
+        $s = $entry.stats
+        if (-not $s) { continue }
+
+        $totalLogicalBytes   = [int64]($s.totalLogicalUsageBytes)
+        $dataInBytes         = [int64]($s.dataInBytes)
+        $afterDedupBytes     = [int64]($s.dataInBytesAfterDedup)
+        $storageUsedBytes    = [int64]($s.storageConsumedBytes)
+        $uniquePhysicalBytes = [int64]($s.uniquePhysicalDataBytes)
+
+        $numFilesRaw = [int64]($s.numFiles)
+        $numDirsRaw  = [int64]($s.numDirectories)
+
+        $rows += [pscustomobject]@{
+            ClusterName         = $cluster_name
+            ViewName            = $viewName
+
+            TotalLogical        = Format-Size $totalLogicalBytes
+            DataIn              = Format-Size $dataInBytes
+            AfterDedup          = Format-Size $afterDedupBytes
+            StorageUsed         = Format-Size $storageUsedBytes
+            UniquePhysical      = Format-Size $uniquePhysicalBytes
+
+            NumFilesK           = Format-K $numFilesRaw
+            NumDirsK            = Format-K $numDirsRaw
+
+            # raw fields (for totals – still local only)
+            TotalLogicalBytes   = $totalLogicalBytes
+            DataInBytes         = $dataInBytes
+            AfterDedupBytes     = $afterDedupBytes
+            StorageUsedBytes    = $storageUsedBytes
+            UniquePhysicalBytes = $uniquePhysicalBytes
+            NumFilesRaw         = $numFilesRaw
+            NumDirsRaw          = $numDirsRaw
+        }
+    }
+
+    if (-not $rows) {
+        Write-Host "  ⚠ No per-view stats in kViews for cluster '$cluster_name'." -ForegroundColor Yellow
+        continue
+    }
+
+    # ---------------------------------------------------------
+    # 5️⃣ Build TOTAL row across all views (local math only)
+    # ---------------------------------------------------------
+    $totLogicalBytes    = ($rows.TotalLogicalBytes   | Measure-Object -Sum).Sum
+    $totDataInBytes     = ($rows.DataInBytes         | Measure-Object -Sum).Sum
+    $totAfterDedupBytes = ($rows.AfterDedupBytes     | Measure-Object -Sum).Sum
+    $totStorageBytes    = ($rows.StorageUsedBytes    | Measure-Object -Sum).Sum
+    $totUniqueBytes     = ($rows.UniquePhysicalBytes | Measure-Object -Sum).Sum
+    $totNumFiles        = ($rows.NumFilesRaw         | Measure-Object -Sum).Sum
+    $totNumDirs         = ($rows.NumDirsRaw          | Measure-Object -Sum).Sum
+
+    $totalRow = [pscustomobject]@{
+        ClusterName    = $cluster_name
+        ViewName       = 'TOTAL'
+
+        TotalLogical   = Format-Size $totLogicalBytes
+        DataIn         = Format-Size $totDataInBytes
+        AfterDedup     = Format-Size $totAfterDedupBytes
+        StorageUsed    = Format-Size $totStorageBytes
+        UniquePhysical = Format-Size $totUniqueBytes
+
+        NumFilesK      = Format-K $totNumFiles
+        NumDirsK       = Format-K $totNumDirs
+    }
+
+    # ---------------------------------------------------------
+    # 6️⃣ Output: per-view rows + TOTAL, all in one table
+    # ---------------------------------------------------------
+    $sortedViews = $rows | Sort-Object -Property ViewName
+    $outputRows  = @()
+    $outputRows += $sortedViews
+    $outputRows += $totalRow
+
+    $outputRows |
+        Format-Table ViewName,
+                     TotalLogical,
+                     DataIn,
+                     AfterDedup,
+                     StorageUsed,
+                     UniquePhysical,
+                     @{Label='NumFiles'; Expression={ $_.NumFilesK }},
+                     @{Label='NumDirs';  Expression={ $_.NumDirsK }} -AutoSize
+
+    Write-Host ""
+}
