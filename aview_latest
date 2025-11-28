@@ -140,7 +140,7 @@ else {
 }
 
 # -------------------------------------------------------------
-# 4️⃣ Helpers: time + size + reduction + K-format
+# 4️⃣ Helpers: time, decimal size, K-format, data reduction
 # -------------------------------------------------------------
 function Get-TimeMsecs {
     param(
@@ -150,54 +150,29 @@ function Get-TimeMsecs {
     return [int64]($Date.ToUniversalTime() - $epoch).TotalMilliseconds
 }
 
-# Decimal PB/TB/GB/MB/KB/B with 1 decimal
-function Format-Size {
-    param(
-        [Parameter(Mandatory = $true)]
-        [long]$Size
-    )
+function Format-SizeDecimal {
+    param([long]$bytes)
 
-    $abs = [math]::Abs($Size)
+    $abs = [math]::Abs([double]$bytes)
 
-    if ($abs -ge 1e15) {          # 1 PB
-        $value = $Size / 1e15
-        $unit  = 'PB'
-    }
-    elseif ($abs -ge 1e12) {      # 1 TB
-        $value = $Size / 1e12
-        $unit  = 'TB'
-    }
-    elseif ($abs -ge 1e9) {       # 1 GB
-        $value = $Size / 1e9
-        $unit  = 'GB'
-    }
-    elseif ($abs -ge 1e6) {       # 1 MB
-        $value = $Size / 1e6
-        $unit  = 'MB'
-    }
-    elseif ($abs -ge 1e3) {       # 1 KB
-        $value = $Size / 1e3
-        $unit  = 'KB'
-    }
-    else {
-        $value = $Size
-        $unit  = 'B'
-    }
-
-    "{0:N1} {1}" -f $value, $unit
+    if     ($abs -ge 1e15) { return "{0:N1} PB" -f ($bytes / 1e15) }
+    elseif ($abs -ge 1e12) { return "{0:N1} TB" -f ($bytes / 1e12) }
+    elseif ($abs -ge 1e9)  { return "{0:N1} GB" -f ($bytes / 1e9)  }
+    elseif ($abs -ge 1e6)  { return "{0:N1} MB" -f ($bytes / 1e6)  }
+    elseif ($abs -ge 1e3)  { return "{0:N1} KB" -f ($bytes / 1e3)  }
+    else                   { return "{0} B"     -f $bytes          }
 }
 
-# K-format without commas inside the number (e.g., 1189.5K)
 function Format-K {
-    param([long]$Value)
+    param([long]$value)
 
-    if ($null -eq $Value) { return $null }
-    if ($Value -eq 0)     { return "0" }
+    if ($null -eq $value) { return "" }
+    if ($value -eq 0)     { return "0" }
 
-    $abs = [math]::Abs([double]$Value)
-    if ($abs -lt 1000) { return ("{0:0}" -f $Value) }
+    $abs = [math]::Abs([double]$value)
+    if ($abs -lt 1000) { return ("{0:0}" -f $value) }
 
-    return ("{0:0.0}K" -f ($Value / 1e3))
+    return ("{0:0.0}K" -f ($value / 1e3))
 }
 
 function Compute-Reduction {
@@ -206,10 +181,10 @@ function Compute-Reduction {
         [long]$PhysicalBytes
     )
 
-    if ($PhysicalBytes -le 0 -or $LogicalBytes -le 0) { return "-" }
+    if ($PhysicalBytes -le 0 -or $LogicalBytes -le 0) { return "N/A" }
 
     $ratio = [double]$LogicalBytes / [double]$PhysicalBytes
-    "{0:N1}x" -f $ratio
+    return ("{0:N1}x" -f $ratio)
 }
 
 # -------------------------------------------------------------
@@ -225,38 +200,10 @@ $startDateMsecs = Get-TimeMsecs -Date $startDate
 $endDateMsecs   = Get-TimeMsecs -Date $endDate
 
 # -------------------------------------------------------------
-# 6️⃣ Accumulators & CSV paths
+# 6️⃣ Collect combined rows (all selected clusters)
 # -------------------------------------------------------------
-$combinedAll            = @()
+$combinedAll = @()
 
-$globalStartBytes       = 0L
-$globalEndBytes         = 0L
-$globalLogicalNowBytes  = 0L
-$globalPhysicalNowBytes = 0L
-$globalResiliencyBytes  = 0L
-$globalConsumedBytes    = 0L
-$globalFilesRaw         = 0L
-$globalDirsRaw          = 0L
-
-$clusterCsvPath     = $null  # single-cluster CSV
-$allClustersCsvPath = $null  # all-clusters CSV
-
-# vars to hold global TOTAL formatted values for CSV
-$totStartFmt       = $null
-$totEndFmt         = $null
-$totGrowthFmt      = $null
-$totPctFmt         = $null
-$totLogicalNowFmt  = $null
-$totPhysicalNowFmt = $null
-$totResiliencyFmt  = $null
-$totConsumedFmt    = $null
-$totFilesFmt       = $null
-$totDirsFmt        = $null
-$globalTotalRow    = $null
-
-# -------------------------------------------------------------
-# 7️⃣ For each selected cluster: growth + current stats (GET only)
-# -------------------------------------------------------------
 foreach ($cid in $SelectedClusterIds) {
 
     $cluster_name = ($SelectedClusters | Where-Object { $_.ClusterId -eq $cid }).ClusterName
@@ -266,7 +213,7 @@ foreach ($cid in $SelectedClusterIds) {
         "accessClusterId" = $cid
     }
 
-    # 7.1 Get basic views (for viewId + name)
+    # 6.1 Basic views for this cluster – GET
     try {
         $viewsUrl  = "$baseIris/views"
         $viewsResp = Invoke-WebRequest -Method Get -Uri $viewsUrl -Headers $headers
@@ -286,9 +233,9 @@ foreach ($cid in $SelectedClusterIds) {
     $views = $views | Sort-Object -Property name
 
     # -------------------------------------------
-    # 7.A Build growth data from timeSeriesStats
+    # 6.A 30-day growth from timeSeriesStats
     # -------------------------------------------
-    $growthResults = @()
+    $growthByName = @{}
 
     foreach ($view in $views) {
 
@@ -317,9 +264,7 @@ foreach ($cid in $SelectedClusterIds) {
         }
 
         if (-not $stats -or -not $stats.dataPointVec -or $stats.dataPointVec.Count -eq 0) {
-            $growthResults += [pscustomobject]@{
-                ClusterName   = $cluster_name
-                ViewName      = $viewName
+            $growthByName[$viewName] = [pscustomobject]@{
                 StartBytes    = 0L
                 EndBytes      = 0L
                 LogicalStart  = "0 B"
@@ -334,9 +279,9 @@ foreach ($cid in $SelectedClusterIds) {
         $endBytes    = [int64]$stats.dataPointVec[-1].data.int64Value
         $growthBytes = $endBytes - $startBytes
 
-        $startFmt    = Format-Size -Size $startBytes
-        $endFmt      = Format-Size -Size $endBytes
-        $growthFmt   = Format-Size -Size $growthBytes
+        $startFmt  = Format-SizeDecimal $startBytes
+        $endFmt    = Format-SizeDecimal $endBytes
+        $growthFmt = Format-SizeDecimal $growthBytes
 
         if ($startBytes -gt 0) {
             $pct    = [math]::Round(($growthBytes * 100.0) / $startBytes, 1)
@@ -346,9 +291,7 @@ foreach ($cid in $SelectedClusterIds) {
             $pctFmt = "N/A"
         }
 
-        $growthResults += [pscustomobject]@{
-            ClusterName   = $cluster_name
-            ViewName      = $viewName
+        $growthByName[$viewName] = [pscustomobject]@{
             StartBytes    = $startBytes
             EndBytes      = $endBytes
             LogicalStart  = $startFmt
@@ -359,9 +302,9 @@ foreach ($cid in $SelectedClusterIds) {
     }
 
     # -------------------------------------------
-    # 7.B Get current capacity stats (includeStats=true)
+    # 6.B Current stats via views?includeStats=true – GET
     # -------------------------------------------
-    $viewsStatsUrl  = "$baseIris/views?includeStats=true"
+    $viewsStatsUrl = "$baseIris/views?includeStats=true"
     $snapshotByName = @{}
 
     try {
@@ -379,205 +322,108 @@ foreach ($cid in $SelectedClusterIds) {
         $viewsWithStats = @()
     }
 
-    foreach ($view in $viewsWithStats) {
+    foreach ($v in $viewsWithStats) {
 
-        $name = $view.name
+        $name = $v.name
         if (-not $name) { continue }
 
-        $stats = $view.stats.dataUsageStats
-        if (-not $stats) { continue }
+        $du = $v.stats.dataUsageStats
+        if (-not $du) { continue }
 
-        if ($stats -is [System.Collections.IEnumerable] -and -not ($stats -is [string])) {
-            $stats = $stats[0]
+        if ($du -is [System.Collections.IEnumerable] -and -not ($du -is [string])) {
+            $du = $du[0]
         }
 
-        $logicalNowBytes   = [int64]$stats.totalLogicalUsageBytes
-        $physicalNowBytes  = [int64]$stats.localTotalPhysicalUsageBytes
-        $overheadBytes     = [int64]$stats.localTierResiliencyImpactBytes
-        $consumedBytes     = [int64]$stats.storageConsumedBytes
-        $numFilesRaw       = [int64]$stats.numFiles
-        $numDirsRaw        = [int64]$stats.numDirectories
+        $logicalBytes       = [int64]$du.totalLogicalUsageBytes
+        $localPhysicalBytes = [int64]$du.localTotalPhysicalUsageBytes
+        $storageConsumed    = [int64]$du.storageConsumedBytes
+        $resiliencyImpact   = [int64]$du.localTierResiliencyImpactBytes
+        $numFilesRaw        = [int64]$du.numFiles
+        $numDirsRaw         = [int64]$du.numDirectories
 
-        $reductionNow      = Compute-Reduction -LogicalBytes $logicalNowBytes -PhysicalBytes $physicalNowBytes
+        $reductionNow       = Compute-Reduction -LogicalBytes $logicalBytes -PhysicalBytes $localPhysicalBytes
 
         $snapshotByName[$name] = [pscustomobject]@{
-            LogicalNowBytes   = $logicalNowBytes
-            PhysicalNowBytes  = $physicalNowBytes
-            ResiliencyBytes   = $overheadBytes
-            ConsumedBytes     = $consumedBytes
+            LogicalBytes      = $logicalBytes
+            LocalPhysical     = $localPhysicalBytes
+            StorageConsumed   = $storageConsumed
+            ResiliencyBytes   = $resiliencyImpact
             NumFilesRaw       = $numFilesRaw
             NumDirsRaw        = $numDirsRaw
 
-            LogicalNow        = Format-Size $logicalNowBytes
-            PhysicalNow       = Format-Size $physicalNowBytes
-            ReductionNow      = $reductionNow
-            ResiliencyImpact  = Format-Size $overheadBytes
-            ConsumedNow       = Format-Size $consumedBytes
-            NumFiles          = Format-K  $numFilesRaw
-            NumDirs           = Format-K  $numDirsRaw
+            Logical           = Format-SizeDecimal $logicalBytes
+            Physical          = Format-SizeDecimal $localPhysicalBytes
+            StorageConsumedFm = Format-SizeDecimal $storageConsumed
+            ResiliencyFm      = Format-SizeDecimal $resiliencyImpact
+            DataReduction     = $reductionNow
+            NumFiles          = Format-K $numFilesRaw
+            NumDirs           = Format-K $numDirsRaw
         }
     }
 
-    if (-not $growthResults) {
-        Write-Host "No view growth data collected for cluster '$cluster_name'." -ForegroundColor Yellow
-        continue
-    }
+    # -------------------------------------------
+    # 6.C Combine growth + current for this cluster
+    # -------------------------------------------
+    foreach ($view in $views) {
 
-    # ---------------------------------------------------------
-    # 7.C Combine: growth (30d) + current snapshot (Now)
-    # ---------------------------------------------------------
-    $clusterCombined = @()
+        $name = $view.name
 
-    foreach ($g in ($growthResults | Sort-Object -Property ViewName)) {
-
-        $snap = $null
-        if ($snapshotByName.ContainsKey($g.ViewName)) {
-            $snap = $snapshotByName[$g.ViewName]
-        }
-
-        if ($snap) {
-            $logicalNowDisplay = $snap.LogicalNow
-            $physicalNow       = $snap.PhysicalNow
-            $reductionNow      = $snap.ReductionNow
-            $impactNow         = $snap.ResiliencyImpact
-            $consumedNow       = $snap.ConsumedNow
-            $numFiles          = $snap.NumFiles
-            $numDirs           = $snap.NumDirs
-
-            $logicalNowBytesForTotal  = $snap.LogicalNowBytes
-            $physicalNowBytesForTotal = $snap.PhysicalNowBytes
-            $overheadBytesForTotal    = $snap.ResiliencyBytes
-            $consumedBytesForTotal    = $snap.ConsumedBytes
-            $numFilesRawForTotal      = $snap.NumFilesRaw
-            $numDirsRawForTotal       = $snap.NumDirsRaw
+        # growth
+        if ($growthByName.ContainsKey($name)) {
+            $g = $growthByName[$name]
         }
         else {
-            $logicalNowDisplay        = $g.LogicalEnd
-            $physicalNow              = "0 B"
-            $reductionNow             = "-"
-            $impactNow                = "0 B"
-            $consumedNow              = "0 B"
-            $numFiles                 = ""
-            $numDirs                  = ""
-
-            $logicalNowBytesForTotal  = $g.EndBytes
-            $physicalNowBytesForTotal = 0L
-            $overheadBytesForTotal    = 0L
-            $consumedBytesForTotal    = 0L
-            $numFilesRawForTotal      = 0L
-            $numDirsRawForTotal       = 0L
+            $g = [pscustomobject]@{
+                StartBytes    = 0L
+                EndBytes      = 0L
+                LogicalStart  = "0 B"
+                LogicalEnd    = "0 B"
+                GrowthSize    = "0 B"
+                PercentGrowth = "N/A"
+            }
         }
 
-        $row = [pscustomobject]@{
-            ClusterName        = $g.ClusterName
-            ViewName           = $g.ViewName
-
-            StartBytes         = $g.StartBytes
-            EndBytes           = $g.EndBytes
-            LogicalNowBytes    = $logicalNowBytesForTotal
-            PhysicalNowBytes   = $physicalNowBytesForTotal
-            ResiliencyBytes    = $overheadBytesForTotal
-            ConsumedBytes      = $consumedBytesForTotal
-            NumFilesRaw        = $numFilesRawForTotal
-            NumDirsRaw         = $numDirsRawForTotal
-
-            LogicalStart       = $g.LogicalStart
-            LogicalEnd         = $g.LogicalEnd
-            GrowthSize         = $g.GrowthSize
-            PercentGrowth      = $g.PercentGrowth
-
-            LogicalNow         = $logicalNowDisplay
-            PhysicalNow        = $physicalNow
-            ReductionNow       = $reductionNow
-            ResiliencyImpact   = $impactNow
-            ConsumedNow        = $consumedNow
-            NumFiles           = $numFiles
-            NumDirs            = $numDirs
-        }
-
-        $clusterCombined += $row
-        $combinedAll     += $row
-
-        # Global totals across all selected clusters
-        $globalStartBytes       += $row.StartBytes
-        $globalEndBytes         += $row.EndBytes
-        $globalLogicalNowBytes  += $row.LogicalNowBytes
-        $globalPhysicalNowBytes += $row.PhysicalNowBytes
-        $globalResiliencyBytes  += $row.ResiliencyBytes
-        $globalConsumedBytes    += $row.ConsumedBytes
-        $globalFilesRaw         += $row.NumFilesRaw
-        $globalDirsRaw          += $row.NumDirsRaw
-    }
-
-    # ---------------------------------------------------------
-    # 7.D Single-cluster TOTAL row (only if ONE selected)
-    #     (no CSV export here; that comes at the very end)
-    # ---------------------------------------------------------
-    if (-not $AllClustersSelected) {
-
-        $totStartBytes       = [int64](($clusterCombined.StartBytes       | Measure-Object -Sum).Sum)
-        $totEndBytes         = [int64](($clusterCombined.EndBytes         | Measure-Object -Sum).Sum)
-        $totLogicalNowBytes  = [int64](($clusterCombined.LogicalNowBytes  | Measure-Object -Sum).Sum)
-        $totPhysicalNowBytes = [int64](($clusterCombined.PhysicalNowBytes | Measure-Object -Sum).Sum)
-        $totResiliencyBytes  = [int64](($clusterCombined.ResiliencyBytes  | Measure-Object -Sum).Sum)
-        $totConsumedBytes    = [int64](($clusterCombined.ConsumedBytes    | Measure-Object -Sum).Sum)
-        $totFilesRaw         = [int64](($clusterCombined.NumFilesRaw      | Measure-Object -Sum).Sum)
-        $totDirsRaw          = [int64](($clusterCombined.NumDirsRaw       | Measure-Object -Sum).Sum)
-
-        $totGrowthBytes      = $totEndBytes - $totStartBytes
-        $totStartFmt_local   = Format-Size $totStartBytes
-        $totEndFmt_local     = Format-Size $totEndBytes
-        $totGrowthFmt_local  = Format-Size $totGrowthBytes
-
-        if ($totStartBytes -gt 0) {
-            $totPct_local = [math]::Round(($totGrowthBytes * 100.0) / $totStartBytes, 1)
-            $totPctFmt_local = "{0:N1} %" -f $totPct_local
+        # snapshot
+        if ($snapshotByName.ContainsKey($name)) {
+            $s = $snapshotByName[$name]
         }
         else {
-            $totPctFmt_local = "N/A"
+            $s = [pscustomobject]@{
+                LogicalBytes      = 0L
+                LocalPhysical     = 0L
+                StorageConsumed   = 0L
+                ResiliencyBytes   = 0L
+                NumFilesRaw       = 0L
+                NumDirsRaw        = 0L
+                Logical           = "0 B"
+                Physical          = "0 B"
+                StorageConsumedFm = "0 B"
+                ResiliencyFm      = "0 B"
+                DataReduction     = "N/A"
+                NumFiles          = ""
+                NumDirs           = ""
+            }
         }
 
-        $totalReduction      = Compute-Reduction -LogicalBytes $totLogicalNowBytes -PhysicalBytes $totPhysicalNowBytes
-        $totLogicalNowFmt_local  = Format-Size $totLogicalNowBytes
-        $totPhysicalNowFmt_local = Format-Size $totPhysicalNowBytes
-        $totResiliencyFmt_local  = Format-Size $totResiliencyBytes
-        $totConsumedFmt_local    = Format-Size $totConsumedBytes
-        $totFilesFmt_local       = Format-K    $totFilesRaw
-        $totDirsFmt_local        = Format-K    $totDirsRaw
+        $combinedAll += [pscustomobject]@{
+            ClusterName      = $cluster_name
+            ViewName         = $name
 
-        $totalRow = [pscustomobject]@{
-            ClusterName        = $cluster_name
-            ViewName           = 'TOTAL'
+            # growth (30d)
+            StartLogical     = $g.LogicalStart
+            EndLogical       = $g.LogicalEnd
+            GrowthSize       = $g.GrowthSize
+            PercentGrowth    = $g.PercentGrowth
 
-            LogicalStart       = $totStartFmt_local
-            LogicalEnd         = $totEndFmt_local
-            GrowthSize         = $totGrowthFmt_local
-            PercentGrowth      = $totPctFmt_local
-
-            LogicalNow         = $totLogicalNowFmt_local
-            PhysicalNow        = $totPhysicalNowFmt_local
-            ReductionNow       = $totalReduction
-            ResiliencyImpact   = $totResiliencyFmt_local
-            ConsumedNow        = $totConsumedFmt_local
-            NumFiles           = $totFilesFmt_local
-            NumDirs            = $totDirsFmt_local
+            # current stats (from your picture headings)
+            Logical          = $s.Logical
+            DataReduction    = $s.DataReduction
+            Physical         = $s.Physical
+            StorageConsumed  = $s.StorageConsumedFm
+            ResiliencyImpact = $s.ResiliencyFm
+            NumFiles         = $s.NumFiles
+            NumDirs          = $s.NumDirs
         }
-
-        $clusterCombined = $clusterCombined | Sort-Object ViewName
-        $clusterCombined += $totalRow
-
-        # For single cluster, combinedAll should be exactly that table
-        $combinedAll = $clusterCombined
-
-        # remember path for later CSV export
-        $safeClusterName = ($cluster_name -replace ':', '_')
-        $clusterCsvPath  = Join-Path -Path $logDirectory -ChildPath (
-            "ViewGrowthAndCapacity_${safeClusterName}_$($startDateString)_$($endDateString).csv"
-        )
-    }
-    else {
-        # ALL clusters: no per-cluster totals or CSVs
-        continue
     }
 }
 
@@ -588,80 +434,10 @@ if (-not $combinedAll -or $combinedAll.Count -eq 0) {
 }
 
 # -------------------------------------------------------------
-# 8️⃣ Global TOTAL (only when ALL clusters selected)
-# -------------------------------------------------------------
-if ($AllClustersSelected) {
-
-    $totStartBytes       = $globalStartBytes
-    $totEndBytes         = $globalEndBytes
-    $totLogicalNowBytes  = $globalLogicalNowBytes
-    $totPhysicalNowBytes = $globalPhysicalNowBytes
-    $totResiliencyBytes  = $globalResiliencyBytes
-    $totConsumedBytes    = $globalConsumedBytes
-    $totFilesRaw         = $globalFilesRaw
-    $totDirsRaw          = $globalDirsRaw
-
-    $totGrowthBytes      = $totEndBytes - $totStartBytes
-    $totStartFmt         = Format-Size $totStartBytes
-    $totEndFmt           = Format-Size $totEndBytes
-    $totGrowthFmt        = Format-Size $totGrowthBytes
-
-    if ($totStartBytes -gt 0) {
-        $totPct        = [math]::Round(($totGrowthBytes * 100.0) / $totStartBytes, 1)
-        $totPctFmt     = "{0:N1} %" -f $totPct
-    }
-    else {
-        $totPctFmt     = "N/A"
-    }
-
-    $totalReduction      = Compute-Reduction -LogicalBytes $totLogicalNowBytes -PhysicalBytes $totPhysicalNowBytes
-    $totLogicalNowFmt    = Format-Size $totLogicalNowBytes
-    $totPhysicalNowFmt   = Format-Size $totPhysicalNowBytes
-    $totResiliencyFmt    = Format-Size $totResiliencyBytes
-    $totConsumedFmt      = Format-Size $totConsumedBytes
-    $totFilesFmt         = Format-K    $totFilesRaw
-    $totDirsFmt          = Format-K    $totDirsRaw
-
-    $globalTotalRow = [pscustomobject]@{
-        Scope             = 'ALL_SELECTED_CLUSTERS'
-        LogicalStart      = $totStartFmt
-        LogicalEnd        = $totEndFmt
-        GrowthSize        = $totGrowthFmt
-        PercentGrowth     = $totPctFmt
-        LogicalNow        = $totLogicalNowFmt
-        PhysicalNow       = $totPhysicalNowFmt
-        ReductionNow      = $totalReduction
-        ResiliencyImpact  = $totResiliencyFmt
-        ConsumedNow       = $totConsumedFmt
-        NumFiles          = $totFilesFmt
-        NumDirs           = $totDirsFmt
-    }
-
-    Write-Host ""
-    Write-Host "=== TOTAL (All Selected Clusters – Current & ${Days}d Growth) ===" -ForegroundColor Cyan
-    Write-Host ""
-
-    $globalTotalRow |
-        Format-Table `
-            Scope,
-            LogicalStart,
-            LogicalEnd,
-            GrowthSize,
-            PercentGrowth,
-            LogicalNow,
-            PhysicalNow,
-            ReductionNow,
-            ResiliencyImpact,
-            ConsumedNow,
-            NumFiles,
-            NumDirs -AutoSize
-}
-
-# -------------------------------------------------------------
-# 9️⃣ Final table output (single cluster OR all clusters)
+# 7️⃣ Print table
 # -------------------------------------------------------------
 Write-Host ""
-Write-Host "📅 ${Days}-day window (used only for growth columns below): $startDateString -> $endDateString" -ForegroundColor Yellow
+Write-Host "📅 ${Days}-day window (used only for growth columns): $startDateString -> $endDateString" -ForegroundColor Yellow
 Write-Host ""
 
 $combinedAll |
@@ -669,88 +445,47 @@ $combinedAll |
     Format-Table `
         ClusterName,
         ViewName,
-        @{ Label = "StartLogical(${Days}dAgo)"; Expression = { $_.LogicalStart } },
-        @{ Label = "EndLogical(${Days}dEnd)";   Expression = { $_.LogicalEnd } },
+        @{ Label = "StartLogical(${Days}dAgo)"; Expression = { $_.StartLogical } },
+        @{ Label = "EndLogical(${Days}dEnd)";   Expression = { $_.EndLogical } },
         @{ Label = "Growth(${Days}d)";          Expression = { $_.GrowthSize } },
         @{ Label = "Growth%(${Days}d)";         Expression = { $_.PercentGrowth } },
-        @{ Label = "LogicalNow";                Expression = { $_.LogicalNow } },
-        @{ Label = "PhysicalNow";               Expression = { $_.PhysicalNow } },
-        @{ Label = "ReductionNow";              Expression = { $_.ReductionNow } },
-        @{ Label = "ResiliencyImpact";          Expression = { $_.ResiliencyImpact } },
-        @{ Label = "ConsumedNow";               Expression = { $_.ConsumedNow } },
-        @{ Label = "NumFiles";                  Expression = { $_.NumFiles } },
-        @{ Label = "NumDirs";                   Expression = { $_.NumDirs } } `
-    -AutoSize
+        Logical,
+        DataReduction,
+        Physical,
+        StorageConsumed,
+        ResiliencyImpact,
+        NumFiles,
+        NumDirs -AutoSize
 
 # -------------------------------------------------------------
-# 🔟 CSV export + messages (AFTER all tables)
+# 8️⃣ CSV export (single cluster vs all clusters)
 # -------------------------------------------------------------
-if (-not $AllClustersSelected) {
-    # Single-cluster: one CSV for that cluster
-    if ($clusterCsvPath) {
-        $combinedAll |
-            Select-Object ClusterName,
-                          ViewName,
-                          @{Name="StartLogical(${Days}dAgo)"; Expression={ $_.LogicalStart }},
-                          @{Name="EndLogical(${Days}dEnd)";   Expression={ $_.LogicalEnd }},
-                          @{Name="Growth(${Days}d)";          Expression={ $_.GrowthSize }},
-                          @{Name="Growth%(${Days}d)";         Expression={ $_.PercentGrowth }},
-                          LogicalNow,
-                          PhysicalNow,
-                          ReductionNow,
-                          ResiliencyImpact,
-                          ConsumedNow,
-                          NumFiles,
-                          NumDirs |
-            Export-Csv -Path $clusterCsvPath -NoTypeInformation
-
-        $clusterNameMsg = $SelectedClusters[0].ClusterName
-        Write-Host ""
-        Write-Host "📄 Cluster CSV written for '$clusterNameMsg': $clusterCsvPath" -ForegroundColor Green
-    }
+if ($AllClustersSelected) {
+    $csvName = "ViewStatsGrowth_ALLCLUSTERS_${startDateString}_${endDateString}.csv"
+} else {
+    $clusterNameSafe = ($SelectedClusters[0].ClusterName -replace ':', '_')
+    $csvName = "ViewStatsGrowth_${clusterNameSafe}_${startDateString}_${endDateString}.csv"
 }
-else {
-    # ALL clusters: only one consolidated CSV
-    $allOutName        = "ViewGrowthAndCapacity_ALLCLUSTERS_${startDateString}_${endDateString}.csv"
-    $allClustersCsvPath = Join-Path -Path $logDirectory -ChildPath $allOutName
 
-    $csvRows = @()
-    $csvRows += $combinedAll | Sort-Object ClusterName, ViewName
+$csvPath = Join-Path -Path $logDirectory -ChildPath $csvName
 
-    if ($globalTotalRow) {
-        $csvRows += [pscustomobject]@{
-            ClusterName        = 'ALL_SELECTED_CLUSTERS'
-            ViewName           = 'TOTAL'
-            LogicalStart       = $globalTotalRow.LogicalStart
-            LogicalEnd         = $globalTotalRow.LogicalEnd
-            GrowthSize         = $globalTotalRow.GrowthSize
-            PercentGrowth      = $globalTotalRow.PercentGrowth
-            LogicalNow         = $globalTotalRow.LogicalNow
-            PhysicalNow        = $globalTotalRow.PhysicalNow
-            ReductionNow       = $globalTotalRow.ReductionNow
-            ResiliencyImpact   = $globalTotalRow.ResiliencyImpact
-            ConsumedNow        = $globalTotalRow.ConsumedNow
-            NumFiles           = $globalTotalRow.NumFiles
-            NumDirs            = $globalTotalRow.NumDirs
-        }
-    }
+$combinedAll |
+    Sort-Object ClusterName, ViewName |
+    Select-Object `
+        ClusterName,
+        ViewName,
+        @{Name="StartLogical(${Days}dAgo)"; Expression={ $_.StartLogical }},
+        @{Name="EndLogical(${Days}dEnd)";   Expression={ $_.EndLogical }},
+        @{Name="Growth(${Days}d)";          Expression={ $_.GrowthSize }},
+        @{Name="Growth%(${Days}d)";         Expression={ $_.PercentGrowth }},
+        Logical,
+        DataReduction,
+        Physical,
+        StorageConsumed,
+        ResiliencyImpact,
+        NumFiles,
+        NumDirs |
+    Export-Csv -Path $csvPath -NoTypeInformation
 
-    $csvRows |
-        Select-Object ClusterName,
-                      ViewName,
-                      @{Name="StartLogical(${Days}dAgo)"; Expression={ $_.LogicalStart }},
-                      @{Name="EndLogical(${Days}dEnd)";   Expression={ $_.LogicalEnd }},
-                      @{Name="Growth(${Days}d)";          Expression={ $_.GrowthSize }},
-                      @{Name="Growth%(${Days}d)";         Expression={ $_.PercentGrowth }},
-                      LogicalNow,
-                      PhysicalNow,
-                      ReductionNow,
-                      ResiliencyImpact,
-                      ConsumedNow,
-                      NumFiles,
-                      NumDirs |
-        Export-Csv -Path $allClustersCsvPath -NoTypeInformation
-
-    Write-Host ""
-    Write-Host "📄 Consolidated CSV written: $allClustersCsvPath" -ForegroundColor Green
-}
+Write-Host ""
+Write-Host "📄 CSV written: $csvPath" -ForegroundColor Green
