@@ -1,1 +1,552 @@
+// Cohesity Helios – View Growth (30d) + Data Reduction, ALL clusters
+//
+// - GET-only
+// - Uses Dynatrace classic credential vault (name -> id -> manual fallback)
+// - For every Helios cluster:
+//     - Fetch /views and /views?includeStats=true
+//     - For each view, fetch 30-day kSystemUsageBytes via timeSeriesStats
+//     - Compute:
+//         * StartLogical, EndLogical, Growth, Growth% (30 days)
+//         * Logical, Physical, UniqueData, StorageConsumed, ResiliencyImpact
+//         * DataReduction  = Logical / Physical   (~5.7x from Views page)
+//         * StorageReduction = Logical / StorageConsumed  (~3.8x from Savings)
+//         * NumFiles / NumDirs in K / M / B
+// - Output:
+//   {
+//     authMode: "vault-name" | "vault-id" | "manual",
+//     clusterCount: <number>,
+//     viewCount: <number>,
+//     globalTotals: { ... },
+//     globalMarkdown: "<markdown table for global totals>",
+//     detailMarkdown: "<markdown table for per-view rows>",
+//     rows: [ { ... per-view combined row ... } ]
+//   }
 
+import { credentialVaultClient } from "@dynatrace-sdk/client-classic-environment-v2";
+
+export default async function () {
+  const baseUrl = "https://helios.cohesity.com";
+
+  // -------------- CONFIG --------------
+  const DAYS = 30; // growth lookback window
+  const vaultName = "Cohesity_API_Key";
+  const vaultId   = "credentials_vault-312312";
+
+  // -------------- 1) Credential vault: name -> id -> manual --------------
+  let apiKey   = null;
+  let authMode = "vault-name";
+
+  async function getKeyByName(name) {
+    const all = await credentialVaultClient.getCredentials();
+    const found = all.credentials.find((c) => c.name === name);
+    if (!found) return null;
+    const detail = await credentialVaultClient.getCredentialsDetails({ id: found.id });
+    console.log("✓ Helios key from vault (name): " + found.name);
+    return (detail && (detail.token || detail.password)) || null;
+  }
+
+  try {
+    apiKey = await getKeyByName(vaultName);
+    if (!apiKey) throw new Error("not-found");
+  } catch (e) {
+    try {
+      const detail = await credentialVaultClient.getCredentialsDetails({ id: vaultId });
+      apiKey       = (detail && (detail.token || detail.password)) || null;
+      authMode     = "vault-id";
+      console.log("✓ Helios key from vault (id): " + (detail && detail.name ? detail.name : vaultId));
+    } catch (e2) {
+      authMode = "manual";
+      apiKey   = "PASTE_YOUR_API_KEY_HERE"; // last-resort; still GET-only
+      console.log("⚠️ Using manual Helios API key (fallback)");
+    }
+  }
+
+  if (!apiKey) {
+    throw new Error("No Helios API key available (vault + manual failed).");
+  }
+
+  const commonHeaders = {
+    accept: "application/json",
+    apiKey: apiKey
+  };
+
+  // -------------- 2) Helpers --------------
+
+  async function getJson(url, headers) {
+    const resp = await fetch(url, { method: "GET", headers: headers });
+    if (!resp.ok) {
+      let txt = "";
+      try { txt = await resp.text(); } catch (e) {}
+      throw new Error("GET " + url + " -> HTTP " + resp.status + " " + txt);
+    }
+    return resp.json();
+  }
+
+  function buildQuery(params) {
+    const usp = new URLSearchParams();
+    for (const k in params) {
+      if (!Object.prototype.hasOwnProperty.call(params, k)) continue;
+      const v = params[k];
+      if (v === undefined || v === null) continue;
+      if (Array.isArray(v)) {
+        v.forEach((val) => usp.append(k, String(val)));
+      } else {
+        usp.append(k, String(v));
+      }
+    }
+    return usp.toString();
+  }
+
+  function safeNum(x) {
+    const n = Number(x);
+    return Number.isFinite(n) ? n : 0;
+  }
+
+  // Decimal TB/GB/MB/KB
+  function formatSizeDecimal(bytes) {
+    const n = safeNum(bytes);
+    const abs = Math.abs(n);
+
+    if (abs >= 1e15) return `${(n / 1e15).toFixed(1)} PB`;
+    if (abs >= 1e12) return `${(n / 1e12).toFixed(1)} TB`;
+    if (abs >= 1e9)  return `${(n / 1e9).toFixed(1)} GB`;
+    if (abs >= 1e6)  return `${(n / 1e6).toFixed(1)} MB`;
+    if (abs >= 1e3)  return `${(n / 1e3).toFixed(1)} KB`;
+    return `${n} B`;
+  }
+
+  // Count -> 0 / 999 / 12.3K / 2.5M / 1.1B
+  function formatCount(value) {
+    const n = safeNum(value);
+    const abs = Math.abs(n);
+
+    if (abs < 1000)  return `${n}`;
+    if (abs < 1e6)   return `${(n / 1e3).toFixed(1)}K`;
+    if (abs < 1e9)   return `${(n / 1e6).toFixed(1)}M`;
+    return `${(n / 1e9).toFixed(1)}B`;
+  }
+
+  function computeRatio(numerator, denominator) {
+    const num = safeNum(numerator);
+    const den = safeNum(denominator);
+    if (den <= 0 || num <= 0) return "N/A";
+    const ratio = num / den;
+    return `${ratio.toFixed(1)}x`;
+  }
+
+  // -------------- 3) Time window for growth --------------
+
+  const endDateMs   = Date.now();
+  const startDateMs = endDateMs - DAYS * 24 * 60 * 60 * 1000;
+
+  const startDateStr = new Date(startDateMs).toISOString().slice(0, 10); // yyyy-MM-dd
+  const endDateStr   = new Date(endDateMs).toISOString().slice(0, 10);   // yyyy-MM-dd
+
+  // -------------- 4) Per-cluster collector --------------
+
+  async function collectClusterViews(cluster) {
+    const clusterName =
+      cluster.name ||
+      cluster.clusterName ||
+      cluster.displayName ||
+      ("Unknown-" + cluster.clusterId);
+
+    const headers = {
+      accept: "application/json",
+      apiKey: apiKey,
+      accessClusterId: String(cluster.clusterId)
+    };
+
+    // 4.1: base views list
+    let viewsData;
+    try {
+      viewsData = await getJson(
+        `${baseUrl}/irisservices/api/v1/public/views`,
+        headers
+      );
+    } catch (e) {
+      console.log(`⚠️ Failed to get views for cluster ${clusterName}: ${e.message}`);
+      return [];
+    }
+
+    const views = (viewsData && viewsData.views) || [];
+    if (!views.length) {
+      return [];
+    }
+
+    // 4.2: growth map (per viewName)
+    const growthByName = {};
+    const tsBaseUrl = `${baseUrl}/irisservices/api/v1/public/statistics/timeSeriesStats`;
+
+    for (const v of views) {
+      const viewName = v.name || "UnnamedView";
+      const viewId   = v.viewId;
+      if (!viewId) continue;
+
+      const tsQuery = buildQuery({
+        endTimeMsecs:   endDateMs,
+        startTimeMsecs: startDateMs,
+        entityId:       viewId,
+        metricName:     "kSystemUsageBytes",
+        metricUnitType: 0,
+        range:          "week",
+        rollupFunction: "latest",
+        rollupIntervalSecs: 14400,
+        schemaName:     "kBridgeViewLogicalStats"
+      });
+
+      let tsData;
+      try {
+        tsData = await getJson(`${tsBaseUrl}?${tsQuery}`, headers);
+      } catch (e) {
+        console.log(`⚠️ Failed growth stats for view ${viewName} on ${clusterName}: ${e.message}`);
+        growthByName[viewName] = {
+          startBytes: 0,
+          endBytes: 0,
+          startLogical: "0 B",
+          endLogical: "0 B",
+          growth: "0 B",
+          pct: "N/A"
+        };
+        continue;
+      }
+
+      const points = (tsData && tsData.dataPointVec) || [];
+      if (!points.length) {
+        growthByName[viewName] = {
+          startBytes: 0,
+          endBytes: 0,
+          startLogical: "0 B",
+          endLogical: "0 B",
+          growth: "0 B",
+          pct: "N/A"
+        };
+        continue;
+      }
+
+      const startBytes = safeNum(points[0].data && points[0].data.int64Value);
+      const endBytes   = safeNum(points[points.length - 1].data && points[points.length - 1].data.int64Value);
+      const growthBytes = endBytes - startBytes;
+
+      let pctStr = "N/A";
+      if (startBytes > 0) {
+        const pct = (growthBytes * 100.0) / startBytes;
+        pctStr = `${pct.toFixed(1)} %`;
+      }
+
+      growthByName[viewName] = {
+        startBytes,
+        endBytes,
+        startLogical: formatSizeDecimal(startBytes),
+        endLogical:   formatSizeDecimal(endBytes),
+        growth:       formatSizeDecimal(growthBytes),
+        pct:          pctStr
+      };
+    }
+
+    // 4.3: current includeStats view snapshot
+    let statsData;
+    try {
+      statsData = await getJson(
+        `${baseUrl}/irisservices/api/v1/public/views?includeStats=true`,
+        headers
+      );
+    } catch (e) {
+      console.log(`⚠️ Failed includeStats for cluster ${clusterName}: ${e.message}`);
+      statsData = null;
+    }
+
+    const viewsWithStats = statsData
+      ? (statsData.views || statsData)
+      : [];
+
+    const snapshotByName = {};
+
+    for (const v of viewsWithStats) {
+      const name = v.name;
+      if (!name) continue;
+
+      let du = v.stats && v.stats.dataUsageStats;
+      if (!du) continue;
+
+      // handle possible arrays
+      if (Array.isArray(du)) {
+        du = du[0];
+      }
+
+      const logicalBytes         = safeNum(du.totalLogicalUsageBytes);
+      const physicalBytes        = safeNum(du.dataWrittenBytes);
+      const uniqueBytes          = safeNum(du.uniquePhysicalDataBytes);
+      const storageConsumedBytes = safeNum(du.storageConsumedBytes);
+      const resiliencyBytes      = safeNum(du.localTierResiliencyImpactBytes);
+      const numFilesRaw          = safeNum(du.numFiles);
+      const numDirsRaw           = safeNum(du.numDirectories);
+
+      snapshotByName[name] = {
+        logicalBytes,
+        physicalBytes,
+        uniqueBytes,
+        storageConsumedBytes,
+        resiliencyBytes,
+        numFilesRaw,
+        numDirsRaw,
+        logical:          formatSizeDecimal(logicalBytes),
+        physical:         formatSizeDecimal(physicalBytes),
+        uniqueData:       formatSizeDecimal(uniqueBytes),
+        storageConsumed:  formatSizeDecimal(storageConsumedBytes),
+        resiliencyImpact: formatSizeDecimal(resiliencyBytes),
+        dataReduction:    computeRatio(logicalBytes, physicalBytes),
+        storageReduction: computeRatio(logicalBytes, storageConsumedBytes),
+        numFiles:         formatCount(numFilesRaw),
+        numDirs:          formatCount(numDirsRaw)
+      };
+    }
+
+    // 4.4: combine growth + snapshot per view
+    const rows = [];
+
+    for (const v of views) {
+      const viewName = v.name || "UnnamedView";
+
+      const g = growthByName[viewName] || {
+        startBytes: 0,
+        endBytes: 0,
+        startLogical: "0 B",
+        endLogical: "0 B",
+        growth: "0 B",
+        pct: "N/A"
+      };
+
+      const s = snapshotByName[viewName] || {
+        logicalBytes: 0,
+        physicalBytes: 0,
+        uniqueBytes: 0,
+        storageConsumedBytes: 0,
+        resiliencyBytes: 0,
+        numFilesRaw: 0,
+        numDirsRaw: 0,
+        logical: "0 B",
+        physical: "0 B",
+        uniqueData: "0 B",
+        storageConsumed: "0 B",
+        resiliencyImpact: "0 B",
+        dataReduction: "N/A",
+        storageReduction: "N/A",
+        numFiles: "",
+        numDirs: ""
+      };
+
+      rows.push({
+        ClusterName:      clusterName,
+        ViewName:         viewName,
+        // raw for global totals
+        LogicalBytes:     s.logicalBytes,
+        PhysicalBytes:    s.physicalBytes,
+        UniqueBytes:      s.uniqueBytes,
+        StorageBytes:     s.storageConsumedBytes,
+        ResiliencyBytes:  s.resiliencyBytes,
+        NumFilesRaw:      s.numFilesRaw,
+        NumDirsRaw:       s.numDirsRaw,
+        // growth
+        StartLogical:     g.startLogical,
+        EndLogical:       g.endLogical,
+        GrowthSize:       g.growth,
+        PercentGrowth:    g.pct,
+        // current
+        Logical:          s.logical,
+        Physical:         s.physical,
+        UniqueData:       s.uniqueData,
+        StorageConsumed:  s.storageConsumed,
+        ResiliencyImpact: s.resiliencyImpact,
+        DataReduction:    s.dataReduction,
+        StorageReduction: s.storageReduction,
+        NumFiles:         s.numFiles,
+        NumDirs:          s.numDirs
+      });
+    }
+
+    return rows;
+  }
+
+  // -------------- 5) All clusters: aggregate --------------
+
+  const clusterInfo = await getJson(
+    `${baseUrl}/v2/mcm/cluster-mgmt/info`,
+    commonHeaders
+  );
+
+  const clusters = (clusterInfo && clusterInfo.cohesityClusters) || [];
+  if (!clusters.length) {
+    return {
+      authMode,
+      clusterCount: 0,
+      viewCount: 0,
+      globalTotals: null,
+      globalMarkdown: "No Helios clusters found.",
+      detailMarkdown: "No view stats available.",
+      rows: []
+    };
+  }
+
+  const allRows = [];
+  for (const cluster of clusters) {
+    const rows = await collectClusterViews(cluster);
+    if (rows && rows.length) {
+      allRows.push(...rows);
+    }
+  }
+
+  if (!allRows.length) {
+    return {
+      authMode,
+      clusterCount: clusters.length,
+      viewCount: 0,
+      globalTotals: null,
+      globalMarkdown: "No view stats returned for any Helios cluster.",
+      detailMarkdown: "No view growth / current stats available.",
+      rows: []
+    };
+  }
+
+  // Sort by ClusterName, ViewName
+  allRows.sort((a, b) => {
+    const c1 = (a.ClusterName || "").localeCompare(b.ClusterName || "");
+    if (c1 !== 0) return c1;
+    return (a.ViewName || "").localeCompare(b.ViewName || "");
+  });
+
+  // -------------- 6) Global totals across all clusters --------------
+
+  const totalLogicalBytes = allRows.reduce((sum, r) => sum + safeNum(r.LogicalBytes), 0);
+  const totalPhysicalBytes = allRows.reduce((sum, r) => sum + safeNum(r.PhysicalBytes), 0);
+  const totalUniqueBytes   = allRows.reduce((sum, r) => sum + safeNum(r.UniqueBytes), 0);
+  const totalStorageBytes  = allRows.reduce((sum, r) => sum + safeNum(r.StorageBytes), 0);
+  const totalResiliency    = allRows.reduce((sum, r) => sum + safeNum(r.ResiliencyBytes), 0);
+  const totalFiles         = allRows.reduce((sum, r) => sum + safeNum(r.NumFilesRaw), 0);
+  const totalDirs          = allRows.reduce((sum, r) => sum + safeNum(r.NumDirsRaw), 0);
+
+  const globalTotals = {
+    scope: "ALL HELIOS CLUSTERS",
+    logical:          formatSizeDecimal(totalLogicalBytes),
+    physical:         formatSizeDecimal(totalPhysicalBytes),
+    uniqueData:       formatSizeDecimal(totalUniqueBytes),
+    storageConsumed:  formatSizeDecimal(totalStorageBytes),
+    resiliencyImpact: formatSizeDecimal(totalResiliency),
+    dataReduction:    computeRatio(totalLogicalBytes, totalPhysicalBytes),
+    storageReduction: computeRatio(totalLogicalBytes, totalStorageBytes),
+    numFiles:         formatCount(totalFiles),
+    numDirs:          formatCount(totalDirs)
+  };
+
+  // -------------- 7) Markdown builders --------------
+
+  function buildGlobalMarkdown(totals) {
+    const headers = [
+      "Scope",
+      "Logical",
+      "Physical",
+      "UniqueData",
+      "StorageConsumed",
+      "ResiliencyImpact",
+      "DataReduction",
+      "StorageReduction",
+      "NumFiles",
+      "NumDirs"
+    ];
+
+    const headerRow = "| " + headers.join(" | ") + " |";
+    const separator = "| " + headers.map(() => "---").join(" | ") + " |";
+
+    const row = [
+      totals.scope,
+      totals.logical,
+      totals.physical,
+      totals.uniqueData,
+      totals.storageConsumed,
+      totals.resiliencyImpact,
+      totals.dataReduction,
+      totals.storageReduction,
+      totals.numFiles,
+      totals.numDirs
+    ];
+
+    const dataRow = "| " + row.join(" | ") + " |";
+
+    return [
+      "### Cohesity Views – Global Current Totals (All Helios Clusters)",
+      "",
+      headerRow,
+      separator,
+      dataRow
+    ].join("\n");
+  }
+
+  function buildDetailMarkdown(rows) {
+    const headers = [
+      "ClusterName",
+      "ViewName",
+      `StartLogical(${DAYS}dAgo)`,
+      `EndLogical(${DAYS}dEnd)`,
+      `Growth(${DAYS}d)`,
+      `Growth%(${DAYS}d)`,
+      "Logical",
+      "Physical",
+      "UniqueData",
+      "StorageConsumed",
+      "ResiliencyImpact",
+      "DataReduction",
+      "StorageReduction",
+      "NumFiles",
+      "NumDirs"
+    ];
+
+    const headerRow = "| " + headers.join(" | ") + " |";
+    const separator = "| " + headers.map(() => "---").join(" | ") + " |";
+
+    const bodyRows = rows.map((r) => {
+      const vals = [
+        r.ClusterName,
+        r.ViewName,
+        r.StartLogical,
+        r.EndLogical,
+        r.GrowthSize,
+        r.PercentGrowth,
+        r.Logical,
+        r.Physical,
+        r.UniqueData,
+        r.StorageConsumed,
+        r.ResiliencyImpact,
+        r.DataReduction,
+        r.StorageReduction,
+        r.NumFiles,
+        r.NumDirs
+      ].map((v) => (v == null ? "" : String(v)));
+      return "| " + vals.join(" | ") + " |";
+    });
+
+    const intro = [
+      `📅 ${DAYS}-day window (used **only** for growth columns): ${startDateStr} → ${endDateStr}`,
+      "",
+      "### Cohesity Views – Growth (30d) + Current Stats (All Helios Clusters)",
+      ""
+    ];
+
+    return intro.join("\n") + "\n" +
+           [headerRow, separator, ...bodyRows].join("\n");
+  }
+
+  const globalMarkdown = buildGlobalMarkdown(globalTotals);
+  const detailMarkdown = buildDetailMarkdown(allRows);
+
+  // -------------- 8) Final result --------------
+
+  return {
+    authMode,
+    clusterCount: clusters.length,
+    viewCount: allRows.length,
+    globalTotals,
+    globalMarkdown,
+    detailMarkdown,
+    rows: allRows
+  };
+}
