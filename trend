@@ -1,7 +1,7 @@
 $ErrorActionPreference = 'Stop'
 
 # -------------------------------------------------------------------
-# 1) Read API key from file
+# 1) API key
 # -------------------------------------------------------------------
 $apiKeyPath = "X:\PowerShell\Cohesity_API_Scripts\DO_NOT_DELETE\apikey.txt"
 
@@ -16,12 +16,13 @@ $commonHeaders = @{
 }
 
 # -------------------------------------------------------------------
-# 2) Timezone / rollup settings (EST)
+# 2) Timezone / time range (EST daily, last 7 days)
 # -------------------------------------------------------------------
 # Cohesity expects an IANA TZ name like "America/New_York"
 $cohesityTimeZone = "America/New_York"
+$tzEncoded        = [uri]::EscapeDataString($cohesityTimeZone)   # "America%2FNew_York"
 
-# Windows uses a different ID; this is only for local conversion math
+# Windows timezone id only for local math
 $winTzId = "Eastern Standard Time"
 $winTz   = [System.TimeZoneInfo]::FindSystemTimeZoneById($winTzId)
 
@@ -29,7 +30,7 @@ $winTz   = [System.TimeZoneInfo]::FindSystemTimeZoneById($winTzId)
 $nowUtc  = [DateTime]::UtcNow
 $nowEst  = [System.TimeZoneInfo]::ConvertTimeFromUtc($nowUtc, $winTz)
 
-$todayEstMidnight = $nowEst.Date                     # today 00:00 in EST
+$todayEstMidnight = $nowEst.Date                     # today 00:00 EST
 $startEst         = $todayEstMidnight.AddDays(-7)    # 7 days back, 00:00 EST
 $endEst           = $todayEstMidnight.AddDays(1)     # tomorrow 00:00 EST
 
@@ -40,81 +41,110 @@ $startUsecs = [int64]([DateTimeOffset]$startUtc).ToUnixTimeMilliseconds() * 1000
 $endUsecs   = [int64]([DateTimeOffset]$endUtc).ToUnixTimeMilliseconds() * 1000
 
 # -------------------------------------------------------------------
-# 3) Heatmap helper – one bar per trendName (date)
+# 3) Helper: build pivot table rows for one cluster
 # -------------------------------------------------------------------
-function Show-ProtectedObjectHeatMap {
+function Show-DbTrendHeatTable {
     param(
         [Parameter(Mandatory)]
-        [string]     $ClusterName,
+        [string]   $ClusterName,
 
         [Parameter(Mandatory)]
-        [psobject[]] $Trends
+        [psobject] $Json
     )
 
-    if (-not $Trends) { return }
+    $protected = $Json.protectedObjects
+    if (-not $protected) {
+        Write-Host ""
+        Write-Host "===== Cluster: $ClusterName =====" -ForegroundColor Cyan
+        Write-Host "No protected objects / trends returned."
+        return
+    }
+
+    # All distinct dates across all DBs
+    $dates = $protected.trends |
+        ForEach-Object { $_.trendName } |
+        Where-Object { $_ } |
+        Sort-Object -Unique
+
+    if (-not $dates) {
+        Write-Host ""
+        Write-Host "===== Cluster: $ClusterName =====" -ForegroundColor Cyan
+        Write-Host "No trend data for selected time range."
+        return
+    }
+
+    # Sort DBs by name, then server
+    $dbs = $protected | Sort-Object name, parentSourceName
+
+    # Build table rows: one row per DB, one column per date
+    $rows = foreach ($db in $dbs) {
+
+        $row = [ordered]@{
+            'DB (Server)' = "{0} ({1})" -f $db.name, $db.parentSourceName
+        }
+
+        foreach ($date in $dates) {
+            # find that date’s trend for this DB
+            $trend = $db.trends | Where-Object trendName -eq $date
+
+            if ($trend) {
+                $succ   = [int]$trend.successful
+                $fail   = [int]$trend.failed
+                $total  = [int]$trend.total
+
+                # tiny text heat bar: successes as █, failures as x
+                $bar = ('█' * $succ) + ('x' * $fail)
+
+                # e.g. "6/7 ██████x"
+                $row[$date] = "{0}/{1} {2}" -f $succ, $total, $bar
+            }
+            else {
+                # no data for this DB on this date
+                $row[$date] = '-'
+            }
+        }
+
+        [pscustomobject]$row
+    }
 
     Write-Host ""
     Write-Host "===== Cluster: $ClusterName =====" -ForegroundColor Cyan
-
-    foreach ($t in $Trends) {
-
-        $date     = $t.trendName
-        $total    = [int]$t.total
-        $succ     = [int]$t.successful
-        $fail     = [int]$t.failed
-        $running  = [int]$t.running
-        $cancel   = [int]$t.cancelled
-
-        # sanity – avoid divide-by-zero
-        $succPct = if ($total -gt 0) { [math]::Round(($succ / $total) * 100, 1) } else { 0 }
-        $failPct = if ($total -gt 0) { [math]::Round(($fail / $total) * 100, 1) } else { 0 }
-
-        Write-Host ""
-        Write-Host ("{0}  |  Success {1}/{2} ({3}%), Failed {4} ({5}%)" -f `
-                    $date, $succ, $total, $succPct, $fail, $failPct)
-
-        # heat bar – one block per job
-        Write-Host -NoNewline "   "
-
-        for ($i = 1; $i -le $succ;    $i++) { Write-Host -NoNewline "█" -ForegroundColor Green }
-        for ($i = 1; $i -le $fail;    $i++) { Write-Host -NoNewline "█" -ForegroundColor Red }
-        for ($i = 1; $i -le $running; $i++) { Write-Host -NoNewline "█" -ForegroundColor Yellow }
-        for ($i = 1; $i -le $cancel;  $i++) { Write-Host -NoNewline "█" -ForegroundColor DarkGray }
-
-        Write-Host ""
-    }
-
+    $rows | Format-Table -AutoSize
     Write-Host ""
 }
 
 # -------------------------------------------------------------------
-# 4) Get clusters (ClusterName + ClusterId) from Helios
+# 4) Get clusters from Helios
 # -------------------------------------------------------------------
 $clusterUrl  = "https://helios.cohesity.com/v2/mcm/cluster-mgmt/info"
 $cluResponse = Invoke-WebRequest -Method Get -Uri $clusterUrl -Headers $commonHeaders
 $json_clu    = $cluResponse.Content | ConvertFrom-Json
 $json_clus   = $json_clu.cohesityClusters
 
+if (-not $json_clus) {
+    throw "No clusters returned from Helios."
+}
+
 # -------------------------------------------------------------------
-# 5) For each cluster, call protectedobjectsTrends and show heatmap
+# 5) Per-cluster: call protectedobjectsTrends, then show pivot heat table
 # -------------------------------------------------------------------
 foreach ($clus in $json_clus) {
 
     $cluster_name = $clus.clusterName
-    $cluster_id   = $clus.ClusterId
+    $cluster_id   = $clus.clusterId
 
     $headers = @{
         "apiKey"          = $ApiKey
         "accessClusterId" = "$cluster_id"
     }
 
-    # Add timezone + rollup; add environment filter if you want (e.g. &environment=kPhysical)
+    # Add any filters you want (environments, objectTypes, etc.)
     $URL_EP = "https://helios.cohesity.com/irisservices/api/v1/public/reports/protectedobjectsTrends" +
               "?startTimeUsecs=$startUsecs&endTimeUsecs=$endUsecs" +
-              "&timezone=$cohesityTimeZone&rollup=kDaily"
+              "&timezone=$tzEncoded&rollup=kDaily"
 
     $response = Invoke-WebRequest -Method Get -Uri $URL_EP -Headers $headers
     $json     = $response.Content | ConvertFrom-Json
 
-    Show-ProtectedObjectHeatMap -ClusterName $cluster_name -Trends $json.trends
+    Show-DbTrendHeatTable -ClusterName $cluster_name -Json $json
 }
