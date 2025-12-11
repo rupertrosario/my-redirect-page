@@ -1,25 +1,39 @@
-// Cohesity Helios – View Growth (30d) + Data Reduction, ALL clusters
+// Cohesity Helios – Protected Objects Trend Heatmap (Markdown, All Clusters)
 //
 // - GET-only
 // - Uses Dynatrace classic credential vault (name -> id -> manual fallback)
 // - For every Helios cluster:
-//     - Fetch /views and /views?includeStats=true
-//     - For each view, fetch 30-day kSystemUsageBytes via timeSeriesStats
-//     - Compute:
-//         * StartLogical, EndLogical, Growth, Growth% (30 days)
-//         * Logical, Physical, UniqueData, StorageConsumed, ResiliencyImpact
-//         * DataReduction  = Logical / Physical   (~5.7x from Views page)
-//         * StorageReduction = Logical / StorageConsumed  (~3.8x from Savings)
-//         * NumFiles / NumDirs in K / M / B
+//     - Fetch /public/reports/protectedobjectsTrends (kDaily rollup)
+//     - Expect objects like:
+//           {
+//             id: ...,
+//             name: "DBName",
+//             parentSourceName: "ServerName",
+//             trends: [
+//               {
+//                 trendName: "2025-12-06",
+//                 total: 7,
+//                 successful: 6,
+//                 failed: 1,
+//                 running: 0,
+//                 cancelled: 0
+//               },
+//               ...
+//             ]
+//           }
+// - Build Markdown heatmap:
+//     * Rows  = DB (Server) per cluster
+//     * Cols  = trendName (dates)
+//     * Cell  = "succ/total" + colored emoji bar:
+//           🟩 success, 🟥 failed, 🟨 running, ⬛ cancelled
+//
 // - Output:
 //   {
 //     authMode: "vault-name" | "vault-id" | "manual",
 //     clusterCount: <number>,
-//     viewCount: <number>,
-//     globalTotals: { ... },
-//     globalMarkdown: "<markdown table for global totals>",
-//     detailMarkdown: "<markdown table for per-view rows>",
-//     rows: [ { ... per-view combined row ... } ]
+//     objectCount: <number>,   // number of protected objects across clusters
+//     heatmapMarkdown: "<markdown DB × Date table>",
+//     rows: [ { ... raw per-object row from API, with clusterName added ... } ]
 //   }
 
 import { credentialVaultClient } from "@dynatrace-sdk/client-classic-environment-v2";
@@ -27,12 +41,18 @@ import { credentialVaultClient } from "@dynatrace-sdk/client-classic-environment
 export default async function () {
   const baseUrl = "https://helios.cohesity.com";
 
-  // -------------- CONFIG --------------
-  const DAYS = 30; // growth lookback window
+  // -------- CONFIG --------
+  const DAYS      = 7;  // lookback window for trends
   const vaultName = "Cohesity_API_Key";
   const vaultId   = "credentials_vault-312312";
 
-  // -------------- 1) Credential vault: name -> id -> manual --------------
+  // Timezone for Helios reports (IANA)
+  const REPORT_TIMEZONE = "America/New_York";
+
+  // Max number of emoji blocks per cell in heatmap bar
+  const MAX_BLOCKS = 6;
+
+  // -------- 1) Credential vault: name -> id -> manual --------
   let apiKey   = null;
   let authMode = "vault-name";
 
@@ -53,10 +73,13 @@ export default async function () {
       const detail = await credentialVaultClient.getCredentialsDetails({ id: vaultId });
       apiKey       = (detail && (detail.token || detail.password)) || null;
       authMode     = "vault-id";
-      console.log("✓ Helios key from vault (id): " + (detail && detail.name ? detail.name : vaultId));
+      console.log(
+        "✓ Helios key from vault (id): " +
+          (detail && detail.name ? detail.name : vaultId)
+      );
     } catch (e2) {
       authMode = "manual";
-      apiKey   = "PASTE_YOUR_API_KEY_HERE"; // last-resort; still GET-only
+      apiKey   = "PASTE_YOUR_API_KEY_HERE"; // last resort; still GET-only
       console.log("⚠️ Using manual Helios API key (fallback)");
     }
   }
@@ -70,16 +93,21 @@ export default async function () {
     apiKey: apiKey
   };
 
-  // -------------- 2) Helpers --------------
+  // -------- 2) Helpers --------
 
   async function getJson(url, headers) {
-    const resp = await fetch(url, { method: "GET", headers: headers });
+    const resp = await fetch(url, { method: "GET", headers });
     if (!resp.ok) {
       let txt = "";
       try { txt = await resp.text(); } catch (e) {}
       throw new Error("GET " + url + " -> HTTP " + resp.status + " " + txt);
     }
     return resp.json();
+  }
+
+  function safeNum(x) {
+    const n = Number(x);
+    return Number.isFinite(n) ? n : 0;
   }
 
   function buildQuery(params) {
@@ -97,54 +125,22 @@ export default async function () {
     return usp.toString();
   }
 
-  function safeNum(x) {
-    const n = Number(x);
-    return Number.isFinite(n) ? n : 0;
-  }
+  // -------- 3) Time range in microseconds --------
 
-  // Decimal TB/GB/MB/KB
-  function formatSizeDecimal(bytes) {
-    const n = safeNum(bytes);
-    const abs = Math.abs(n);
+  const endMs   = Date.now();
+  const startMs = endMs - DAYS * 24 * 60 * 60 * 1000;
 
-    if (abs >= 1e15) return `${(n / 1e15).toFixed(1)} PB`;
-    if (abs >= 1e12) return `${(n / 1e12).toFixed(1)} TB`;
-    if (abs >= 1e9)  return `${(n / 1e9).toFixed(1)} GB`;
-    if (abs >= 1e6)  return `${(n / 1e6).toFixed(1)} MB`;
-    if (abs >= 1e3)  return `${(n / 1e3).toFixed(1)} KB`;
-    return `${n} B`;
-  }
+  const startUsecs = startMs * 1000;
+  const endUsecs   = endMs * 1000;
 
-  // Count -> 0 / 999 / 12.3K / 2.5M / 1.1B
-  function formatCount(value) {
-    const n = safeNum(value);
-    const abs = Math.abs(n);
+  const startDateStr = new Date(startMs).toISOString().slice(0, 10); // yyyy-MM-dd
+  const endDateStr   = new Date(endMs).toISOString().slice(0, 10);
 
-    if (abs < 1000)  return `${n}`;
-    if (abs < 1e6)   return `${(n / 1e3).toFixed(1)}K`;
-    if (abs < 1e9)   return `${(n / 1e6).toFixed(1)}M`;
-    return `${(n / 1e9).toFixed(1)}B`;
-  }
+  const tzEncoded = encodeURIComponent(REPORT_TIMEZONE);
 
-  function computeRatio(numerator, denominator) {
-    const num = safeNum(numerator);
-    const den = safeNum(denominator);
-    if (den <= 0 || num <= 0) return "N/A";
-    const ratio = num / den;
-    return `${ratio.toFixed(1)}x`;
-  }
+  // -------- 4) Per-cluster collector: protectedobjectsTrends --------
 
-  // -------------- 3) Time window for growth --------------
-
-  const endDateMs   = Date.now();
-  const startDateMs = endDateMs - DAYS * 24 * 60 * 60 * 1000;
-
-  const startDateStr = new Date(startDateMs).toISOString().slice(0, 10); // yyyy-MM-dd
-  const endDateStr   = new Date(endDateMs).toISOString().slice(0, 10);   // yyyy-MM-dd
-
-  // -------------- 4) Per-cluster collector --------------
-
-  async function collectClusterViews(cluster) {
+  async function collectClusterProtectedObjects(cluster) {
     const clusterName =
       cluster.name ||
       cluster.clusterName ||
@@ -157,218 +153,46 @@ export default async function () {
       accessClusterId: String(cluster.clusterId)
     };
 
-    // 4.1: base views list
-    let viewsData;
+    const trendQuery = buildQuery({
+      startTimeUsecs: startUsecs,
+      endTimeUsecs:   endUsecs,
+      timezone:       REPORT_TIMEZONE, // server expects IANA; encoded separately if needed
+      rollup:         "kDaily"
+    });
+
+    const url = `${baseUrl}/irisservices/api/v1/public/reports/protectedobjectsTrends?${trendQuery}`;
+
+    let data;
     try {
-      viewsData = await getJson(
-        `${baseUrl}/irisservices/api/v1/public/views`,
-        headers
-      );
+      data = await getJson(url, headers);
     } catch (e) {
-      console.log(`⚠️ Failed to get views for cluster ${clusterName}: ${e.message}`);
+      console.log(`⚠️ Failed protectedobjectsTrends for cluster ${clusterName}: ${e.message}`);
       return [];
     }
 
-    const views = (viewsData && viewsData.views) || [];
-    if (!views.length) {
+    // Some Helios APIs embed lists; others return bare arrays.
+    // User already said "protectedObjects is not there", just array of objects.
+    const objects = Array.isArray(data)
+      ? data
+      : (data && (data.protectedObjects || data.objects || [])) || [];
+
+    if (!objects.length) {
       return [];
     }
 
-    // 4.2: growth map (per viewName)
-    const growthByName = {};
-    const tsBaseUrl = `${baseUrl}/irisservices/api/v1/public/statistics/timeSeriesStats`;
+    // Add clusterName to each row for later grouping/labeling
+    const enriched = objects.map((obj) => ({
+      clusterName: clusterName,
+      id:          obj.id,
+      name:        obj.name,
+      parentSourceName: obj.parentSourceName,
+      trends:      obj.trends || []
+    }));
 
-    for (const v of views) {
-      const viewName = v.name || "UnnamedView";
-      const viewId   = v.viewId;
-      if (!viewId) continue;
-
-      const tsQuery = buildQuery({
-        endTimeMsecs:   endDateMs,
-        startTimeMsecs: startDateMs,
-        entityId:       viewId,
-        metricName:     "kSystemUsageBytes",
-        metricUnitType: 0,
-        range:          "week",
-        rollupFunction: "latest",
-        rollupIntervalSecs: 14400,
-        schemaName:     "kBridgeViewLogicalStats"
-      });
-
-      let tsData;
-      try {
-        tsData = await getJson(`${tsBaseUrl}?${tsQuery}`, headers);
-      } catch (e) {
-        console.log(`⚠️ Failed growth stats for view ${viewName} on ${clusterName}: ${e.message}`);
-        growthByName[viewName] = {
-          startBytes: 0,
-          endBytes: 0,
-          startLogical: "0 B",
-          endLogical: "0 B",
-          growth: "0 B",
-          pct: "N/A"
-        };
-        continue;
-      }
-
-      const points = (tsData && tsData.dataPointVec) || [];
-      if (!points.length) {
-        growthByName[viewName] = {
-          startBytes: 0,
-          endBytes: 0,
-          startLogical: "0 B",
-          endLogical: "0 B",
-          growth: "0 B",
-          pct: "N/A"
-        };
-        continue;
-      }
-
-      const startBytes = safeNum(points[0].data && points[0].data.int64Value);
-      const endBytes   = safeNum(points[points.length - 1].data && points[points.length - 1].data.int64Value);
-      const growthBytes = endBytes - startBytes;
-
-      let pctStr = "N/A";
-      if (startBytes > 0) {
-        const pct = (growthBytes * 100.0) / startBytes;
-        pctStr = `${pct.toFixed(1)} %`;
-      }
-
-      growthByName[viewName] = {
-        startBytes,
-        endBytes,
-        startLogical: formatSizeDecimal(startBytes),
-        endLogical:   formatSizeDecimal(endBytes),
-        growth:       formatSizeDecimal(growthBytes),
-        pct:          pctStr
-      };
-    }
-
-    // 4.3: current includeStats view snapshot
-    let statsData;
-    try {
-      statsData = await getJson(
-        `${baseUrl}/irisservices/api/v1/public/views?includeStats=true`,
-        headers
-      );
-    } catch (e) {
-      console.log(`⚠️ Failed includeStats for cluster ${clusterName}: ${e.message}`);
-      statsData = null;
-    }
-
-    const viewsWithStats = statsData
-      ? (statsData.views || statsData)
-      : [];
-
-    const snapshotByName = {};
-
-    for (const v of viewsWithStats) {
-      const name = v.name;
-      if (!name) continue;
-
-      let du = v.stats && v.stats.dataUsageStats;
-      if (!du) continue;
-
-      // handle possible arrays
-      if (Array.isArray(du)) {
-        du = du[0];
-      }
-
-      const logicalBytes         = safeNum(du.totalLogicalUsageBytes);
-      const physicalBytes        = safeNum(du.dataWrittenBytes);
-      const uniqueBytes          = safeNum(du.uniquePhysicalDataBytes);
-      const storageConsumedBytes = safeNum(du.storageConsumedBytes);
-      const resiliencyBytes      = safeNum(du.localTierResiliencyImpactBytes);
-      const numFilesRaw          = safeNum(du.numFiles);
-      const numDirsRaw           = safeNum(du.numDirectories);
-
-      snapshotByName[name] = {
-        logicalBytes,
-        physicalBytes,
-        uniqueBytes,
-        storageConsumedBytes,
-        resiliencyBytes,
-        numFilesRaw,
-        numDirsRaw,
-        logical:          formatSizeDecimal(logicalBytes),
-        physical:         formatSizeDecimal(physicalBytes),
-        uniqueData:       formatSizeDecimal(uniqueBytes),
-        storageConsumed:  formatSizeDecimal(storageConsumedBytes),
-        resiliencyImpact: formatSizeDecimal(resiliencyBytes),
-        dataReduction:    computeRatio(logicalBytes, physicalBytes),
-        storageReduction: computeRatio(logicalBytes, storageConsumedBytes),
-        numFiles:         formatCount(numFilesRaw),
-        numDirs:          formatCount(numDirsRaw)
-      };
-    }
-
-    // 4.4: combine growth + snapshot per view
-    const rows = [];
-
-    for (const v of views) {
-      const viewName = v.name || "UnnamedView";
-
-      const g = growthByName[viewName] || {
-        startBytes: 0,
-        endBytes: 0,
-        startLogical: "0 B",
-        endLogical: "0 B",
-        growth: "0 B",
-        pct: "N/A"
-      };
-
-      const s = snapshotByName[viewName] || {
-        logicalBytes: 0,
-        physicalBytes: 0,
-        uniqueBytes: 0,
-        storageConsumedBytes: 0,
-        resiliencyBytes: 0,
-        numFilesRaw: 0,
-        numDirsRaw: 0,
-        logical: "0 B",
-        physical: "0 B",
-        uniqueData: "0 B",
-        storageConsumed: "0 B",
-        resiliencyImpact: "0 B",
-        dataReduction: "N/A",
-        storageReduction: "N/A",
-        numFiles: "",
-        numDirs: ""
-      };
-
-      rows.push({
-        ClusterName:      clusterName,
-        ViewName:         viewName,
-        // raw for global totals
-        LogicalBytes:     s.logicalBytes,
-        PhysicalBytes:    s.physicalBytes,
-        UniqueBytes:      s.uniqueBytes,
-        StorageBytes:     s.storageConsumedBytes,
-        ResiliencyBytes:  s.resiliencyBytes,
-        NumFilesRaw:      s.numFilesRaw,
-        NumDirsRaw:       s.numDirsRaw,
-        // growth
-        StartLogical:     g.startLogical,
-        EndLogical:       g.endLogical,
-        GrowthSize:       g.growth,
-        PercentGrowth:    g.pct,
-        // current
-        Logical:          s.logical,
-        Physical:         s.physical,
-        UniqueData:       s.uniqueData,
-        StorageConsumed:  s.storageConsumed,
-        ResiliencyImpact: s.resiliencyImpact,
-        DataReduction:    s.dataReduction,
-        StorageReduction: s.storageReduction,
-        NumFiles:         s.numFiles,
-        NumDirs:          s.numDirs
-      });
-    }
-
-    return rows;
+    return enriched;
   }
 
-  // -------------- 5) All clusters: aggregate --------------
+  // -------- 5) Get all clusters & aggregate --------
 
   const clusterInfo = await getJson(
     `${baseUrl}/v2/mcm/cluster-mgmt/info`,
@@ -380,182 +204,176 @@ export default async function () {
     return {
       authMode,
       clusterCount: 0,
-      viewCount: 0,
-      globalTotals: null,
-      globalMarkdown: "No Helios clusters found.",
-      detailMarkdown: "No view stats available.",
+      objectCount: 0,
+      heatmapMarkdown: "No Helios clusters found.",
       rows: []
     };
   }
 
-  const allRows = [];
+  const allObjects = [];
   for (const cluster of clusters) {
-    const rows = await collectClusterViews(cluster);
-    if (rows && rows.length) {
-      allRows.push(...rows);
+    const objs = await collectClusterProtectedObjects(cluster);
+    if (objs && objs.length) {
+      allObjects.push(...objs);
     }
   }
 
-  if (!allRows.length) {
+  if (!allObjects.length) {
     return {
       authMode,
       clusterCount: clusters.length,
-      viewCount: 0,
-      globalTotals: null,
-      globalMarkdown: "No view stats returned for any Helios cluster.",
-      detailMarkdown: "No view growth / current stats available.",
+      objectCount: 0,
+      heatmapMarkdown: "No protected object trends returned for any Helios cluster.",
       rows: []
     };
   }
 
-  // Sort by ClusterName, ViewName
-  allRows.sort((a, b) => {
-    const c1 = (a.ClusterName || "").localeCompare(b.ClusterName || "");
-    if (c1 !== 0) return c1;
-    return (a.ViewName || "").localeCompare(b.ViewName || "");
-  });
+  // -------- 6) Build Markdown heatmap (DB × Date) --------
 
-  // -------------- 6) Global totals across all clusters --------------
+  function buildHeatmapMarkdown(objects, days, maxBlocks) {
+    if (!Array.isArray(objects) || !objects.length) {
+      return "_No protected objects returned._";
+    }
 
-  const totalLogicalBytes = allRows.reduce((sum, r) => sum + safeNum(r.LogicalBytes), 0);
-  const totalPhysicalBytes = allRows.reduce((sum, r) => sum + safeNum(r.PhysicalBytes), 0);
-  const totalUniqueBytes   = allRows.reduce((sum, r) => sum + safeNum(r.UniqueBytes), 0);
-  const totalStorageBytes  = allRows.reduce((sum, r) => sum + safeNum(r.StorageBytes), 0);
-  const totalResiliency    = allRows.reduce((sum, r) => sum + safeNum(r.ResiliencyBytes), 0);
-  const totalFiles         = allRows.reduce((sum, r) => sum + safeNum(r.NumFilesRaw), 0);
-  const totalDirs          = allRows.reduce((sum, r) => sum + safeNum(r.NumDirsRaw), 0);
+    // 6.1 Collect all distinct dates (trendName)
+    const dateSet = new Set();
+    for (const obj of objects) {
+      if (!obj.trends) continue;
+      for (const t of obj.trends) {
+        if (t && t.trendName) dateSet.add(t.trendName);
+      }
+    }
+    const dates = Array.from(dateSet).sort();
+    if (!dates.length) {
+      return "_No trend data in selected range._";
+    }
 
-  const globalTotals = {
-    scope: "ALL HELIOS CLUSTERS",
-    logical:          formatSizeDecimal(totalLogicalBytes),
-    physical:         formatSizeDecimal(totalPhysicalBytes),
-    uniqueData:       formatSizeDecimal(totalUniqueBytes),
-    storageConsumed:  formatSizeDecimal(totalStorageBytes),
-    resiliencyImpact: formatSizeDecimal(totalResiliency),
-    dataReduction:    computeRatio(totalLogicalBytes, totalPhysicalBytes),
-    storageReduction: computeRatio(totalLogicalBytes, totalStorageBytes),
-    numFiles:         formatCount(totalFiles),
-    numDirs:          formatCount(totalDirs)
-  };
+    // 6.2 Sort objects by cluster, then DB name, then parentSourceName
+    const rows = [...objects].sort((a, b) => {
+      const ca = (a.clusterName || "").toLowerCase();
+      const cb = (b.clusterName || "").toLowerCase();
+      if (ca < cb) return -1;
+      if (ca > cb) return 1;
 
-  // -------------- 7) Markdown builders --------------
+      const na = (a.name || "").toLowerCase();
+      const nb = (b.name || "").toLowerCase();
+      if (na < nb) return -1;
+      if (na > nb) return 1;
 
-  function buildGlobalMarkdown(totals) {
-    const headers = [
-      "Scope",
-      "Logical",
-      "Physical",
-      "UniqueData",
-      "StorageConsumed",
-      "ResiliencyImpact",
-      "DataReduction",
-      "StorageReduction",
-      "NumFiles",
-      "NumDirs"
-    ];
+      const sa = (a.parentSourceName || "").toLowerCase();
+      const sb = (b.parentSourceName || "").toLowerCase();
+      if (sa < sb) return -1;
+      if (sa > sb) return 1;
 
-    const headerRow = "| " + headers.join(" | ") + " |";
-    const separator = "| " + headers.map(() => "---").join(" | ") + " |";
-
-    const row = [
-      totals.scope,
-      totals.logical,
-      totals.physical,
-      totals.uniqueData,
-      totals.storageConsumed,
-      totals.resiliencyImpact,
-      totals.dataReduction,
-      totals.storageReduction,
-      totals.numFiles,
-      totals.numDirs
-    ];
-
-    const dataRow = "| " + row.join(" | ") + " |";
-
-    return [
-      "### Cohesity Views – Global Current Totals (All Helios Clusters)",
-      "",
-      headerRow,
-      separator,
-      dataRow
-    ].join("\n");
-  }
-
-  function buildDetailMarkdown(rows) {
-    const headers = [
-      "ClusterName",
-      "ViewName",
-      `StartLogical(${DAYS}dAgo)`,
-      `EndLogical(${DAYS}dEnd)`,
-      `Growth(${DAYS}d)`,
-      `Growth%(${DAYS}d)`,
-      "Logical",
-      "Physical",
-      "UniqueData",
-      "StorageConsumed",
-      "ResiliencyImpact",
-      "DataReduction",
-      "StorageReduction",
-      "NumFiles",
-      "NumDirs"
-    ];
-
-    const headerRow = "| " + headers.join(" | ") + " |";
-    const separator = "| " + headers.map(() => "---").join(" | ") + " |";
-
-    const bodyRows = rows.map((r) => {
-      const vals = [
-        r.ClusterName,
-        r.ViewName,
-        r.StartLogical,
-        r.EndLogical,
-        r.GrowthSize,
-        r.PercentGrowth,
-        r.Logical,
-        r.Physical,
-        r.UniqueData,
-        r.StorageConsumed,
-        r.ResiliencyImpact,
-        r.DataReduction,
-        r.StorageReduction,
-        r.NumFiles,
-        r.NumDirs
-      ].map((v) => (v == null ? "" : String(v)));
-      return "| " + vals.join(" | ") + " |";
+      return 0;
     });
 
-    const intro = [
-      `📅 ${DAYS}-day window (used **only** for growth columns): ${startDateStr} → ${endDateStr}`,
-      "",
-      "### Cohesity Views – Growth (30d) + Current Stats (All Helios Clusters)",
-      ""
-    ];
+    // Helper: locate trend for specific date
+    function findTrendForDate(obj, date) {
+      if (!obj.trends) return null;
+      return obj.trends.find((t) => t.trendName === date) || null;
+    }
 
-    return intro.join("\n") + "\n" +
-           [headerRow, separator, ...bodyRows].join("\n");
+    // Helper: build emoji bar from trend breakdown
+    function buildEmojiBar(trend) {
+      const succ    = safeNum(trend.successful);
+      const fail    = safeNum(trend.failed);
+      const running = safeNum(trend.running);
+      const cancel  = safeNum(trend.cancelled);
+
+      let remaining = maxBlocks;
+      let bar = "";
+
+      // 🟩 successes
+      const succBlocks = Math.min(succ, remaining);
+      bar += "🟩".repeat(succBlocks);
+      remaining -= succBlocks;
+
+      // 🟥 failures
+      if (remaining > 0) {
+        const failBlocks = Math.min(fail, remaining);
+        bar += "🟥".repeat(failBlocks);
+        remaining -= failBlocks;
+      }
+
+      // 🟨 running
+      if (remaining > 0) {
+        const runBlocks = Math.min(running, remaining);
+        bar += "🟨".repeat(runBlocks);
+        remaining -= runBlocks;
+      }
+
+      // ⬛ cancelled
+      if (remaining > 0) {
+        const canBlocks = Math.min(cancel, remaining);
+        bar += "⬛".repeat(canBlocks);
+        remaining -= canBlocks;
+      }
+
+      return bar;
+    }
+
+    // 6.3 Build markdown header + legend
+    let md = "";
+
+    md += `📅 ${days}-day trend window: ${startDateStr} → ${endDateStr}\n\n`;
+    md += "**Legend:** 🟩 success, 🟥 failed, 🟨 running, ⬛ cancelled\n\n";
+
+    // Header row
+    md += "| Cluster / Object |";
+    for (const d of dates) {
+      md += " " + d + " |";
+    }
+    md += "\n";
+
+    // Separator row
+    md += "|------------------|";
+    for (let i = 0; i < dates.length; i++) {
+      md += "-----------|";
+    }
+    md += "\n";
+
+    // 6.4 Data rows
+    for (const obj of rows) {
+      const dbLabel = `${obj.clusterName || "?"} / ${obj.name || "?"} (${obj.parentSourceName || "?"})`;
+      md += `| ${dbLabel} |`;
+
+      for (const d of dates) {
+        const trend = findTrendForDate(obj, d);
+        if (!trend) {
+          md += " - |";
+          continue;
+        }
+
+        const succ  = safeNum(trend.successful);
+        const total = safeNum(trend.total);
+
+        if (total <= 0) {
+          md += " 0/0 - |";
+          continue;
+        }
+
+        const bar = buildEmojiBar(trend);
+        const cellText = `${succ}/${total} ${bar}`;
+
+        md += " " + cellText + " |";
+      }
+
+      md += "\n";
+    }
+
+    return md;
   }
 
-  const globalMarkdown = buildGlobalMarkdown(globalTotals);
-  const detailMarkdown = buildDetailMarkdown(allRows);
+  const heatmapMarkdown = buildHeatmapMarkdown(allObjects, DAYS, MAX_BLOCKS);
 
-  // -------------- 8) Final result --------------
+  // -------- 7) Final result --------
 
   return {
     authMode,
     clusterCount: clusters.length,
-    viewCount: allRows.length,
-    globalTotals,
-    globalMarkdown,
-    detailMarkdown,
-    rows: allRows
+    objectCount: allObjects.length,
+    heatmapMarkdown,
+    rows: allObjects
   };
 }
-
-
-<div style="font-size: 11px; line-height: 1.3;">
-
-{{ steps.view_stats.preview.result.globalMarkdown }}
-
-{{ steps.view_stats.preview.result.detailMarkdown }}
-
-</div>
