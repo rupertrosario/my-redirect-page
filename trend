@@ -15,6 +15,36 @@ $commonHeaders = @{
     "apiKey" = $ApiKey
 }
 
+# -------------------------------------------------------------------
+# 2) Timezone / time range (EST daily, last 7 full days)
+# -------------------------------------------------------------------
+$cohesityTimeZone = "America/New_York"
+$tzEncoded        = [uri]::EscapeDataString($cohesityTimeZone)   # America%2FNew_York
+
+$winTzId = "Eastern Standard Time"
+$winTz   = [System.TimeZoneInfo]::FindSystemTimeZoneById($winTzId)
+
+$nowUtc  = [DateTime]::UtcNow
+$nowEst  = [System.TimeZoneInfo]::ConvertTimeFromUtc($nowUtc, $winTz)
+
+$todayEstMidnight = $nowEst.Date             # today 00:00 EST
+$startEst         = $todayEstMidnight.AddDays(-7)
+$endEst           = $todayEstMidnight.AddDays(1)
+
+$startUtc = [System.TimeZoneInfo]::ConvertTimeToUtc($startEst, $winTz)
+$endUtc   = [System.TimeZoneInfo]::ConvertTimeToUtc($endEst, $winTz)
+
+$startUsecs = [int64]([DateTimeOffset]$startUtc).ToUnixTimeMilliseconds() * 1000
+$endUsecs   = [int64]([DateTimeOffset]$endUtc).ToUnixTimeMilliseconds() * 1000
+
+# -------------------------------------------------------------------
+# 3) Helper: DB rows x Date columns, cell = colored "succ/total"
+#    Color rules:
+#       Red      -> any failed > 0
+#       Yellow   -> no failed, but running > 0
+#       Green    -> succ > 0 and no failed/running
+#       DarkGray -> only cancelled or nothing
+# -------------------------------------------------------------------
 function Show-DbTrendHeatTable {
     param(
         [Parameter(Mandatory)]
@@ -24,7 +54,6 @@ function Show-DbTrendHeatTable {
         [psobject] $Json
     )
 
-    # Expect: array of objects with id, name, parentSourceName, trends[]
     $objects = @($Json)
     if (-not $objects -or $objects.Count -eq 0) {
         Write-Host ""
@@ -33,7 +62,7 @@ function Show-DbTrendHeatTable {
         return
     }
 
-    # Distinct dates (trendName)
+    # Distinct dates
     $dates = $objects |
         ForEach-Object { $_.trends | ForEach-Object { $_.trendName } } |
         Where-Object { $_ } |
@@ -46,18 +75,17 @@ function Show-DbTrendHeatTable {
         return
     }
 
-    # Sort DBs by name, then server
+    # Sort DBs
     $dbs = $objects | Sort-Object name, parentSourceName
 
-    # Fixed sizes
-    $dbColWidth = 35               # "DB (Server)" column
-    $cellWidth  = 10               # 10 blocks per cell max
-    $maxBlocks  = $cellWidth
+    # Column widths
+    $dbColWidth = 35  # DB (Server)
+    $cellWidth  = 10  # e.g. "6/12" fits easily
 
     Write-Host ""
     Write-Host "===== Cluster: $ClusterName =====" -ForegroundColor Cyan
 
-    # -------- HEADER --------
+    # ----- Header -----
     Write-Host -NoNewline ("{0,-$dbColWidth}" -f "DB (Server)")
 
     foreach ($d in $dates) {
@@ -69,96 +97,61 @@ function Show-DbTrendHeatTable {
     }
     Write-Host ""
 
-    # underline
+    # Underline
     Write-Host -NoNewline ("{0,-$dbColWidth}" -f ("-" * [Math]::Min(15,$dbColWidth)))
     foreach ($d in $dates) {
         Write-Host -NoNewline ("{0,-$cellWidth}" -f ("-" * [Math]::Min(5,$cellWidth)))
     }
     Write-Host ""
 
-    # -------- ROWS (one per DB) --------
+    # ----- Rows (DBs) -----
     foreach ($db in $dbs) {
 
         $rowTitle = "{0} ({1})" -f $db.name, $db.parentSourceName
         Write-Host -NoNewline ("{0,-$dbColWidth}" -f $rowTitle)
 
         foreach ($d in $dates) {
-
             $trend = $db.trends | Where-Object { $_.trendName -eq $d }
 
-            if (-not $trend) {
-                # No data for this DB/date
-                Write-Host -NoNewline ("{0,-$cellWidth}" -f "-") -ForegroundColor DarkGray
-                continue
+            if ($trend) {
+                $succ    = [int]$trend.successful
+                $fail    = [int]$trend.failed
+                $running = [int]$trend.running
+                $cancel  = [int]$trend.cancelled
+                $total   = [int]$trend.total
+
+                $cellText = "{0}/{1}" -f $succ, $total
+
+                if ($fail -gt 0) {
+                    $color = 'Red'
+                }
+                elseif ($running -gt 0) {
+                    $color = 'Yellow'
+                }
+                elseif ($succ -gt 0 -and $fail -eq 0 -and $running -eq 0) {
+                    $color = 'Green'
+                }
+                elseif ($cancel -gt 0 -and $succ -eq 0 -and $fail -eq 0 -and $running -eq 0) {
+                    $color    = 'DarkGray'
+                }
+                else {
+                    $color    = 'DarkGray'
+                    $cellText = "-"
+                }
+            }
+            else {
+                $color    = 'DarkGray'
+                $cellText = "-"
             }
 
-            $succ    = [int]$trend.successful
-            $fail    = [int]$trend.failed
-            $running = [int]$trend.running
-            $cancel  = [int]$trend.cancelled
-
-            $total = $succ + $fail + $running + $cancel
-            if ($total -le 0) {
-                Write-Host -NoNewline ("{0,-$cellWidth}" -f "-") -ForegroundColor DarkGray
-                continue
-            }
-
-            # --- compress to at most 10 blocks, proportional by status ---
-
-            # raw (floor) block counts
-            $succBlocks = [math]::Floor($maxBlocks * $succ    / $total)
-            $failBlocks = [math]::Floor($maxBlocks * $fail    / $total)
-            $runBlocks  = [math]::Floor($maxBlocks * $running / $total)
-            $canBlocks  = [math]::Floor($maxBlocks * $cancel  / $total)
-
-            $sumBlocks = $succBlocks + $failBlocks + $runBlocks + $canBlocks
-
-            # if we rounded down too much, distribute remaining blocks
-            while ($sumBlocks -lt $maxBlocks) {
-                if ($succ -gt 0 -and $succBlocks -lt $succ)      { $succBlocks++; $sumBlocks++; continue }
-                if ($fail -gt 0 -and $failBlocks -lt $fail)      { $failBlocks++; $sumBlocks++; continue }
-                if ($running -gt 0 -and $runBlocks -lt $running) { $runBlocks++;  $sumBlocks++; continue }
-                if ($cancel -gt 0 -and $canBlocks -lt $cancel)   { $canBlocks++;  $sumBlocks++; continue }
-                break
-            }
-
-            # if somehow we overshot (shouldn’t, but just in case)
-            while ($sumBlocks -gt $maxBlocks) {
-                if ($cancel -gt 0 -and $canBlocks -gt 0)   { $canBlocks--;  $sumBlocks--; continue }
-                if ($running -gt 0 -and $runBlocks -gt 0)  { $runBlocks--;  $sumBlocks--; continue }
-                if ($fail -gt 0 -and $failBlocks -gt 0)    { $failBlocks--; $sumBlocks--; continue }
-                if ($succBlocks -gt 0)                     { $succBlocks--; $sumBlocks--; continue }
-                break
-            }
-
-            # --- draw the blocks in order: success, fail, running, cancelled ---
-
-            for ($i = 1; $i -le $succBlocks; $i++) {
-                Write-Host -NoNewline "█" -ForegroundColor Green
-            }
-            for ($i = 1; $i -le $failBlocks; $i++) {
-                Write-Host -NoNewline "█" -ForegroundColor Red
-            }
-            for ($i = 1; $i -le $runBlocks; $i++) {
-                Write-Host -NoNewline "█" -ForegroundColor Yellow
-            }
-            for ($i = 1; $i -le $canBlocks; $i++) {
-                Write-Host -NoNewline "█" -ForegroundColor DarkGray
-            }
-
-            # pad if fewer than cellWidth (e.g. very few jobs)
-            $printed = $succBlocks + $failBlocks + $runBlocks + $canBlocks
-            if ($printed -lt $cellWidth) {
-                Write-Host -NoNewline (" " * ($cellWidth - $printed))
-            }
+            Write-Host -NoNewline ("{0,-$cellWidth}" -f $cellText) -ForegroundColor $color
         }
 
-        Write-Host ""   # end row
+        Write-Host ""  # end row
     }
 
     Write-Host ""
 }
-
 
 # -------------------------------------------------------------------
 # 4) Get clusters from Helios
@@ -173,7 +166,7 @@ if (-not $json_clus) {
 }
 
 # -------------------------------------------------------------------
-# 5) Per cluster: call protectedobjectsTrends and show DB x Date heatmap
+# 5) Per cluster: call protectedobjectsTrends and show grid
 # -------------------------------------------------------------------
 foreach ($clus in $json_clus) {
 
