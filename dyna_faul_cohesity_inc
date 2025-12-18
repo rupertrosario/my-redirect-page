@@ -1,0 +1,424 @@
+// Cohesity Helios – Long-Running Jobs (> 24h, status=Running, all clusters)
+//
+// - GET-only
+// - Uses Dynatrace classic credential vault (name -> id -> manual fallback)
+// - For every cluster + active PG:
+//     - Fetches recent runs (numRuns=5, includeObjectDetails=false)
+//     - Finds localBackupInfo entries with status = "Running"
+//     - If running for > 24 hours -> add to report
+//
+// Output:
+// {
+//   authMode: "vault-name" | "vault-id" | "manual",
+//   count: <number>,
+//   jobs: [
+//     {
+//       Cluster,
+//       Environment,
+//       ProtectionGroup,
+//       RunType,
+//       Status,
+//       StartTime,
+//       ElapsedHours,  // numeric, for sorting
+//       Elapsed        // formatted "Xd HH:MM:SS"
+//     }
+//   ],
+//   markdownTable: "<markdown for email>",
+//   incidentText:  "<plain text for ServiceNow incident>"
+// }
+
+import { credentialVaultClient } from "@dynatrace-sdk/client-classic-environment-v2";
+
+export default async function () {
+  const baseUrl = "https://helios.cohesity.com";
+
+  // ------------------------------
+  // 1) Credential vault: name -> id -> manual
+  // ------------------------------
+  const vaultName = "Cohesity_API_Key";
+  const vaultId   = "credentials_vault-312312";
+
+  let apiKey   = null;
+  let authMode = "vault-name";
+
+  async function getKeyByName(name) {
+    const all = await credentialVaultClient.getCredentials();
+    const found = all.credentials.find(function (c) { return c.name === name; });
+    if (!found) return null;
+    const detail = await credentialVaultClient.getCredentialsDetails({ id: found.id });
+    console.log("✓ Helios key from vault (name): " + found.name);
+    return (detail && (detail.token || detail.password)) || null;
+  }
+
+  try {
+    apiKey = await getKeyByName(vaultName);
+    if (!apiKey) throw new Error("not-found");
+  } catch (e) {
+    try {
+      const detail = await credentialVaultClient.getCredentialsDetails({ id: vaultId });
+      apiKey       = (detail && (detail.token || detail.password)) || null;
+      authMode     = "vault-id";
+      console.log("✓ Helios key from vault (id): " + (detail && detail.name ? detail.name : vaultId));
+    } catch (e2) {
+      authMode = "manual";
+      apiKey   = "PASTE_YOUR_API_KEY_HERE";  // last resort, still GET-only
+      console.log("⚠️ Using manual Helios API key (fallback)");
+    }
+  }
+
+  if (!apiKey) {
+    throw new Error("No Helios API key available (vault + manual failed).");
+  }
+
+  const commonHeaders = { accept: "application/json", apiKey: apiKey };
+
+  // ------------------------------
+  // 2) Helpers
+  // ------------------------------
+  async function getJson(url, headers) {
+    const resp = await fetch(url, { method: "GET", headers: headers });
+    if (!resp.ok) {
+      let txt = "";
+      try { txt = await resp.text(); } catch (e) {}
+      throw new Error("GET " + url + " -> HTTP " + resp.status + " " + txt);
+    }
+    return resp.json();
+  }
+
+  // Time in EST/EDT with suffix, e.g. "11/18/2025, 03:09:00 EST"
+  function usecsToDateString(usecs) {
+    if (!usecs) return null;
+    var ms = Number(usecs) / 1000;  // microseconds -> ms
+    if (!Number.isFinite(ms)) return null;
+
+    return new Date(ms).toLocaleString("en-US", {
+      timeZone: "America/New_York",
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+      hour12: false,
+      timeZoneName: "short"
+    });
+  }
+
+  // Format a duration in ms as "Xd HH:MM:SS" or "HH:MM:SS"
+  function formatDuration(ms) {
+    if (!Number.isFinite(ms) || ms < 0) return "";
+
+    let totalSeconds = Math.floor(ms / 1000);
+
+    const days = Math.floor(totalSeconds / (24 * 60 * 60));
+    totalSeconds -= days * 24 * 60 * 60;
+
+    const hours = Math.floor(totalSeconds / (60 * 60));
+    totalSeconds -= hours * 60 * 60;
+
+    const minutes = Math.floor(totalSeconds / 60);
+    const seconds = totalSeconds - minutes * 60;
+
+    function pad(n) {
+      return n.toString().padStart(2, "0");
+    }
+
+    const hhmmss = pad(hours) + ":" + pad(minutes) + ":" + pad(seconds);
+
+    if (days > 0) {
+      return days + "d " + hhmmss;   // e.g. "1d 02:15:30"
+    }
+    return hhmmss;                   // e.g. "02:15:30"
+  }
+
+  function buildQuery(params) {
+    const usp = new URLSearchParams();
+    for (const k in params) {
+      if (!Object.prototype.hasOwnProperty.call(params, k)) continue;
+      const v = params[k];
+      if (v === undefined || v === null) continue;
+      if (Array.isArray(v)) {
+        v.forEach(function (val) { usp.append(k, String(val)); });
+      } else {
+        usp.append(k, String(v));
+      }
+    }
+    return usp.toString();
+  }
+
+  function toInfoArray(localBackupInfo) {
+    if (!localBackupInfo) return [];
+    if (Array.isArray(localBackupInfo)) return localBackupInfo;
+    return [localBackupInfo];
+  }
+
+  const ENV_LABELS = {
+    kOracle:        "Oracle",
+    kSQL:           "SQL",
+    kPhysical:      "Physical",
+    kGenericNas:    "NAS",
+    kIsilon:        "NAS",
+    kHyperV:        "HyperV",
+    kAcropolis:     "Acropolis",
+    kRemoteAdapter: "RemoteAdapter"
+  };
+
+  function getEnvCode(pg) {
+    let envRaw = pg.environment;
+    if (!envRaw && Array.isArray(pg.environmentTypes) && pg.environmentTypes.length > 0) {
+      envRaw = pg.environmentTypes[0];
+    }
+    return envRaw || null;
+  }
+
+  function mapEnvironmentLabel(envCode) {
+    if (!envCode) return "Unknown";
+    return ENV_LABELS[envCode] || envCode;
+  }
+
+  // ------------------------------
+  // 3) Per-PG: find runs that are Running > 24h
+  // ------------------------------
+  async function collectLongRunningForPg(clusterName, headers, pg, nowMs) {
+    const pgId   = pg.id;
+    const pgName = pg.name || "Unknown PG";
+    const envLbl = mapEnvironmentLabel(getEnvCode(pg));
+
+    const runQuery = buildQuery({
+      numRuns: 5,                  // only a few recent runs; running one will be latest
+      excludeNonRestorableRuns: false,
+      includeObjectDetails: false  // we only need run status/time
+    });
+
+    let runData;
+    try {
+      runData = await getJson(
+        baseUrl + "/v2/data-protect/protection-groups/" + encodeURIComponent(pgId) + "/runs?" + runQuery,
+        headers
+      );
+    } catch (e) {
+      return [];
+    }
+
+    const runs = runData.runs || [];
+    if (!runs.length) return [];
+
+    const rows = [];
+
+    for (let i = 0; i < runs.length; i++) {
+      const run   = runs[i];
+      const infos = toInfoArray(run.localBackupInfo);
+      if (!infos.length) continue;
+
+      for (let j = 0; j < infos.length; j++) {
+        const info   = infos[j];
+        const status = info.status || "Unknown";
+
+        // Only care about actively running jobs
+        if (status !== "Running") continue;
+
+        const runType      = info.runType || "";
+        const startUsecs   = info.startTimeUsecs || 0;
+        const startMs      = Number(startUsecs) / 1000;
+        if (!Number.isFinite(startMs) || startMs <= 0) continue;
+
+        const diffMs       = nowMs - startMs;
+        const elapsedHours = diffMs / (1000 * 60 * 60);
+
+        if (elapsedHours >= 24) {
+          rows.push({
+            Cluster:         clusterName,
+            Environment:     envLbl,
+            ProtectionGroup: pgName,
+            RunType:         runType,
+            Status:          status,
+            StartTime:       usecsToDateString(startUsecs),
+            ElapsedHours:    elapsedHours,          // numeric, for sorting
+            Elapsed:         formatDuration(diffMs) // pretty "Xd HH:MM:SS"
+          });
+        }
+      }
+    }
+
+    return rows;
+  }
+
+  // ------------------------------
+  // 4) Per-cluster: iterate PGs
+  // ------------------------------
+  async function collectClusterLongRunning(cluster) {
+    const clusterName =
+      cluster.name ||
+      cluster.clusterName ||
+      cluster.displayName ||
+      ("Unknown-" + cluster.clusterId);
+
+    const headers = {
+      accept: "application/json",
+      apiKey: apiKey,
+      accessClusterId: String(cluster.clusterId)
+    };
+
+    const pgQuery = buildQuery({
+      isDeleted: false,
+      isPaused: false,
+      isActive: true
+    });
+
+    let pgData;
+    try {
+      pgData = await getJson(
+        baseUrl + "/v2/data-protect/protection-groups?" + pgQuery,
+        headers
+      );
+    } catch (e) {
+      return [];
+    }
+
+    const pgs = pgData.protectionGroups || [];
+    if (!pgs.length) return [];
+
+    const nowMs = Date.now();
+    const allRows = [];
+
+    // Sequential over PGs to stay under typical workflow timeout in big environments
+    for (let i = 0; i < pgs.length; i++) {
+      const pg = pgs[i];
+      const rows = await collectLongRunningForPg(clusterName, headers, pg, nowMs);
+      if (rows && rows.length) {
+        for (let k = 0; k < rows.length; k++) {
+          allRows.push(rows[k]);
+        }
+      }
+    }
+
+    return allRows;
+  }
+
+  // ------------------------------
+  // 5) All clusters
+  // ------------------------------
+  async function collectAllLongRunning() {
+    const clusterData = await getJson(
+      baseUrl + "/v2/mcm/cluster-mgmt/info",
+      commonHeaders
+    );
+    const clusters = clusterData.cohesityClusters || [];
+    if (!clusters.length) return [];
+
+    const clusterPromises = clusters.map(function (cluster) {
+      return collectClusterLongRunning(cluster);
+    });
+    const clusterResults = await Promise.all(clusterPromises);
+
+    const allRows = [];
+    for (let i = 0; i < clusterResults.length; i++) {
+      const arr = clusterResults[i];
+      if (arr && arr.length) {
+        for (let j = 0; j < arr.length; j++) {
+          allRows.push(arr[j]);
+        }
+      }
+    }
+
+    // Sort: Cluster, Environment, PG, RunType, ElapsedHours desc
+    allRows.sort(function (a, b) {
+      const c1 = (a.Cluster || "").localeCompare(b.Cluster || "");
+      if (c1 !== 0) return c1;
+      const c2 = (a.Environment || "").localeCompare(b.Environment || "");
+      if (c2 !== 0) return c2;
+      const c3 = (a.ProtectionGroup || "").localeCompare(b.ProtectionGroup || "");
+      if (c3 !== 0) return c3;
+      const c4 = (a.RunType || "").localeCompare(b.RunType || "");
+      if (c4 !== 0) return c4;
+      // longer running first
+      return (b.ElapsedHours || 0) - (a.ElapsedHours || 0);
+    });
+
+    return allRows;
+  }
+
+  // ------------------------------
+  // 6) Markdown for email
+  // ------------------------------
+  function toMarkdownTable(rows) {
+    if (!rows || rows.length === 0) {
+      return "✅ No backup jobs are currently Running for more than 24 hours.";
+    }
+
+    const headers = [
+      "Cluster",
+      "Environment",
+      "ProtectionGroup",
+      "RunType",
+      "Status",
+      "StartTime",
+      "Elapsed"  // formatted "Xd HH:MM:SS"
+    ];
+
+    const headerRow = "| " + headers.join(" | ") + " |";
+    const separator = "| " + headers.map(function () { return "---"; }).join(" | ") + " |";
+
+    const bodyRows = rows.map(function (r) {
+      const vals = headers.map(function (h) {
+        const v = r[h] != null ? r[h] : "";
+        return String(v);
+      });
+      return "| " + vals.join(" | ") + " |";
+    });
+
+    const introLines = [
+      "### Long-running Cohesity backup jobs (> 24 hours, status = Running)",
+      "",
+      "_Scope: All active protection groups on all Helios-managed clusters. Only runs whose status is **Running** and whose duration exceeds **24 hours** are shown._",
+      ""
+    ];
+
+    return introLines.join("\n") + "\n" + [headerRow, separator].concat(bodyRows).join("\n");
+  }
+
+  // ------------------------------
+  // 7) Plain text for ServiceNow incident
+  // ------------------------------
+  function toPlainText(rows) {
+    if (!rows || rows.length === 0) {
+      return "No backup jobs are currently Running for more than 24 hours.";
+    }
+
+    const introLines = [
+      "Long-running Cohesity backup jobs (> 24 hours, status = Running)",
+      "Scope: All active protection groups on all Helios-managed clusters.",
+      ""
+    ];
+
+    // SNOW-friendly single-line entries (no markdown/table rendering dependency)
+    const lines = rows.map(function (r) {
+      return (
+        "- Cluster: " + (r.Cluster || "") +
+        " | Env: " + (r.Environment || "") +
+        " | PG: " + (r.ProtectionGroup || "") +
+        " | RunType: " + (r.RunType || "") +
+        " | Status: " + (r.Status || "") +
+        " | Start: " + (r.StartTime || "") +
+        " | Elapsed: " + (r.Elapsed || "")
+      );
+    });
+
+    return introLines.join("\n") + lines.join("\n");
+  }
+
+  // ------------------------------
+  // 8) Run + return
+  // ------------------------------
+  const jobs          = await collectAllLongRunning();
+  const markdownTable = toMarkdownTable(jobs);
+  const incidentText  = toPlainText(jobs);
+
+  return {
+    authMode: authMode,
+    count: jobs.length,
+    jobs: jobs,
+    markdownTable: markdownTable, // for email step
+    incidentText: incidentText    // for ServiceNow incident step
+  };
+}
