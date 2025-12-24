@@ -2,8 +2,9 @@
 // Only FAILED runs with NO later successful backup (per RunType),
 // includes Host + ObjectName (object-level).
 //
-// - Uses Dynatrace classic credential vault (name -> id -> manual)
-// - All Helios calls are HTTP GET
+// TIMEZONE FIX:
+// - StartTime / EndTime are now formatted in America/New_York (EST/EDT) for BOTH incident text + markdown.
+// - Sorting no longer depends on parsing date strings; it uses EndTimeUsecs numeric.
 //
 // Output:
 // {
@@ -71,11 +72,51 @@ export default async function () {
     return resp.json();
   }
 
-  function usecsToIso(usecs) {
+  // Convert microseconds -> ms
+  function usecsToMs(usecs) {
     if (!usecs) return null;
-    const ms = Number(usecs) / 1000; // microseconds -> ms
-    if (!Number.isFinite(ms)) return null;
-    return new Date(ms).toISOString();
+    const ms = Number(usecs) / 1000;
+    if (!Number.isFinite(ms) || ms <= 0) return null;
+    return ms;
+  }
+
+  // Format a ms timestamp in ET as: "YYYY-MM-DD HH:MM:SS EST/EDT"
+  function msToEtString(ms) {
+    if (ms == null) return null;
+    const d = new Date(ms);
+
+    const dtf = new Intl.DateTimeFormat("en-US", {
+      timeZone: "America/New_York",
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+      hour12: false,
+      timeZoneName: "short"
+    });
+
+    const parts = dtf.formatToParts(d);
+    const get = (type) => {
+      const p = parts.find(x => x.type === type);
+      return p ? p.value : "";
+    };
+
+    const yyyy = get("year");
+    const mm   = get("month");
+    const dd   = get("day");
+    const hh   = get("hour");
+    const mi   = get("minute");
+    const ss   = get("second");
+    const tz   = get("timeZoneName"); // "EST" or "EDT"
+
+    return `${yyyy}-${mm}-${dd} ${hh}:${mi}:${ss} ${tz}`;
+  }
+
+  function usecsToEtString(usecs) {
+    const ms = usecsToMs(usecs);
+    return msToEtString(ms);
   }
 
   function cleanMessage(msg) {
@@ -150,7 +191,6 @@ export default async function () {
   }
 
   function isFailedStatus(status) { return status === "Failed"; }
-
   function isSuccessStatus(status) {
     return status === "Succeeded" || status === "SucceededWithWarning";
   }
@@ -222,8 +262,8 @@ export default async function () {
         runType:      runType,
         startUsecs:   startUsecs,
         endUsecs:     endUsecs,
-        startTimeStr: usecsToIso(startUsecs),
-        endTimeStr:   usecsToIso(endUsecs),
+        startTimeStr: usecsToEtString(startUsecs),
+        endTimeStr:   usecsToEtString(endUsecs),
         message:      cleanMessage(info.messages),
         run:          run
       });
@@ -246,8 +286,10 @@ export default async function () {
       const rows  = byType[rType];
       if (!rows.length) continue;
 
+      // Sort by endUsecs asc
       rows.sort(function (a, b) { return (a.endUsecs || 0) - (b.endUsecs || 0); });
 
+      // Latest Failed run
       let latestFailed = null;
       for (let i = rows.length - 1; i >= 0; i--) {
         if (isFailedStatus(rows[i].status)) { latestFailed = rows[i]; break; }
@@ -256,6 +298,7 @@ export default async function () {
 
       const failEnd = latestFailed.endUsecs || 0;
 
+      // Any later success?
       let hasLaterSuccess = false;
       for (let i = 0; i < rows.length; i++) {
         const r = rows[i];
@@ -264,15 +307,18 @@ export default async function () {
       }
       if (hasLaterSuccess) continue;
 
+      // RemoteAdapter: PG-level row
       if (envCode === "kRemoteAdapter") {
         out.push({
           Environment:     envLbl,
           Cluster:         clusterName,
           ProtectionGroup: pgName,
           RunType:         rType,
+          Status:          latestFailed.status,
+          StartTimeUsecs:  latestFailed.startUsecs,
+          EndTimeUsecs:    latestFailed.endUsecs,
           StartTime:       latestFailed.startTimeStr,
           EndTime:         latestFailed.endTimeStr,
-          Status:          latestFailed.status,
           Host:            null,
           ObjectName:      raDB || raHost || null,
           FailedMessage:   latestFailed.message
@@ -289,9 +335,11 @@ export default async function () {
           Cluster:         clusterName,
           ProtectionGroup: pgName,
           RunType:         rType,
+          Status:          latestFailed.status,
+          StartTimeUsecs:  latestFailed.startUsecs,
+          EndTimeUsecs:    latestFailed.endUsecs,
           StartTime:       latestFailed.startTimeStr,
           EndTime:         latestFailed.endTimeStr,
-          Status:          latestFailed.status,
           Host:            null,
           ObjectName:      null,
           FailedMessage:   latestFailed.message
@@ -299,6 +347,7 @@ export default async function () {
         continue;
       }
 
+      // Build id -> name map for parent-host resolution
       const idToName = {};
       for (let oi = 0; oi < objects.length; oi++) {
         const ob  = objects[oi];
@@ -311,6 +360,7 @@ export default async function () {
 
       const rowsForRunType = [];
 
+      // Host-level rows for Oracle/SQL
       if (parentHostNeeded) {
         for (let oi = 0; oi < objects.length; oi++) {
           const ob  = objects[oi];
@@ -335,9 +385,11 @@ export default async function () {
             Cluster:         clusterName,
             ProtectionGroup: pgName,
             RunType:         rType,
+            Status:          latestFailed.status,
+            StartTimeUsecs:  latestFailed.startUsecs,
+            EndTimeUsecs:    latestFailed.endUsecs,
             StartTime:       latestFailed.startTimeStr,
             EndTime:         latestFailed.endTimeStr,
-            Status:          latestFailed.status,
             Host:            obj.name || null,
             ObjectName:      "No DBs Found (Host-Level Failure)",
             FailedMessage:   msgCombined
@@ -345,6 +397,7 @@ export default async function () {
         }
       }
 
+      // Object-level rows
       for (let oi = 0; oi < objects.length; oi++) {
         const ob  = objects[oi];
         const obj = ob && ob.object ? ob.object : {};
@@ -375,9 +428,11 @@ export default async function () {
           Cluster:         clusterName,
           ProtectionGroup: pgName,
           RunType:         rType,
+          Status:          latestFailed.status,
+          StartTimeUsecs:  latestFailed.startUsecs,
+          EndTimeUsecs:    latestFailed.endUsecs,
           StartTime:       latestFailed.startTimeStr,
           EndTime:         latestFailed.endTimeStr,
-          Status:          latestFailed.status,
           Host:            hostName,
           ObjectName:      obj.name || null,
           FailedMessage:   msgCombined
@@ -390,9 +445,11 @@ export default async function () {
           Cluster:         clusterName,
           ProtectionGroup: pgName,
           RunType:         rType,
+          Status:          latestFailed.status,
+          StartTimeUsecs:  latestFailed.startUsecs,
+          EndTimeUsecs:    latestFailed.endUsecs,
           StartTime:       latestFailed.startTimeStr,
           EndTime:         latestFailed.endTimeStr,
-          Status:          latestFailed.status,
           Host:            null,
           ObjectName:      null,
           FailedMessage:   latestFailed.message
@@ -458,6 +515,7 @@ export default async function () {
       if (arr && arr.length) for (let j = 0; j < arr.length; j++) allRows.push(arr[j]);
     }
 
+    // Sort by EndTimeUsecs (desc) safely
     allRows.sort(function (a, b) {
       const c1 = (a.Cluster || "").localeCompare(b.Cluster || "");
       if (c1 !== 0) return c1;
@@ -469,9 +527,8 @@ export default async function () {
       if (c4 !== 0) return c4;
       const c5 = (a.ObjectName || "").localeCompare(b.ObjectName || "");
       if (c5 !== 0) return c5;
-      const tA = a.EndTime ? new Date(a.EndTime).getTime() : 0;
-      const tB = b.EndTime ? new Date(b.EndTime).getTime() : 0;
-      return tB - tA;
+
+      return (b.EndTimeUsecs || 0) - (a.EndTimeUsecs || 0);
     });
 
     return allRows;
@@ -481,9 +538,7 @@ export default async function () {
   // 6) Incident text builders
   // ------------------------------
   function toIncidentTextCreate(rows) {
-    if (!rows || rows.length === 0) {
-      return "✅ No FAILED backup runs without a later successful run.";
-    }
+    if (!rows || rows.length === 0) return "✅ No FAILED backup runs without a later successful run.";
 
     const lines = [];
     lines.push(`❌ Cohesity backup failures (no later success): ${rows.length}`);
@@ -497,14 +552,11 @@ export default async function () {
         `Status=${r.Status || "-"}`
       );
     }
-
     return lines.join("\n");
   }
 
   function toIncidentTextUpdate(rows) {
-    if (!rows || rows.length === 0) {
-      return "✅ No FAILED backup runs without a later successful run.";
-    }
+    if (!rows || rows.length === 0) return "✅ No FAILED backup runs without a later successful run.";
 
     const lines = [];
     lines.push(`❌ Cohesity backup failures (no later success): ${rows.length}`);
@@ -522,15 +574,13 @@ export default async function () {
       if (r.FailedMessage) {
         lines.push(`    Message: ${String(r.FailedMessage).replace(/[\r\n]+/g, " ").trim()}`);
       }
-
       lines.push("");
     }
-
     return lines.join("\n");
   }
 
   // ------------------------------
-  // 7) Markdown table for email
+  // 7) Markdown table for email (ET times)
   // ------------------------------
   function toMarkdownTable(rows) {
     if (!rows || rows.length === 0) {
