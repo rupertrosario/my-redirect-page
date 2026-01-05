@@ -1,0 +1,134 @@
+# ========= CONFIG =========
+$apiKeyPath = "X:\PowerShell\Cohesity_API_Scripts\DO_NOT_delete\apikey.txt"
+$outDir     = "X:\PowerShell\Data\Cohesity\Alerts"
+$heliosBase = "https://helios.cohesity.com"
+
+# interface flags (match your script intent)
+$bondInterfaceOnly       = $true
+$ifaceGroupAssignedOnly  = $true
+$includeUplinkSwitchInfo = $true
+$includeBondSlaveDetails = $true
+
+# ========= HELPERS =========
+function To-BlueList {
+  param([object]$v)
+
+  if ($null -eq $v) { return "" }
+
+  # If it is a scalar, return as-is
+  if ($v -isnot [System.Array]) { return "$v" }
+
+  $arr = @($v | ForEach-Object { "$_" } | Where-Object { $_ -ne "" })
+
+  if ($arr.Count -eq 0) { return "" }
+  if ($arr.Count -eq 1) { return $arr[0] }
+
+  # Blue console style: {a,b,c}
+  return "{0}" -f ("{" + ($arr -join ",") + "}")
+}
+
+function Ensure-Dir($path) {
+  if (-not (Test-Path $path)) { New-Item -ItemType Directory -Path $path | Out-Null }
+}
+
+# ========= LOAD API KEY =========
+if (-not (Test-Path $apiKeyPath)) { throw "API key file not found: $apiKeyPath" }
+$apiKey = (Get-Content -Path $apiKeyPath -Raw).Trim()
+if ([string]::IsNullOrWhiteSpace($apiKey)) { throw "API key is empty in: $apiKeyPath" }
+
+# ========= GET CLUSTERS =========
+$clusterUri  = "$heliosBase/v2/mcm/cluster-mgmt/info"
+$clusterJson = Invoke-RestMethod -Method GET -Uri $clusterUri -Headers @{ apiKey = $apiKey }
+
+$clusters = @()
+if ($clusterJson.cohesityClusters) { $clusters = @($clusterJson.cohesityClusters) }
+elseif ($clusterJson.clusters)     { $clusters = @($clusterJson.clusters) }
+else { throw "Could not find clusters array in response (expected cohesityClusters/clusters)." }
+
+if ($clusters.Count -eq 0) { throw "No clusters returned from Helios." }
+
+# ========= COLLECT ROWS =========
+$rows = New-Object System.Collections.Generic.List[object]
+
+# Build querystring (GET body is flaky)
+$qs = @(
+  "bondInterfaceOnly=$($bondInterfaceOnly.ToString().ToLower())"
+  "ifaceGroupAssignedOnly=$($ifaceGroupAssignedOnly.ToString().ToLower())"
+  "includeUplinkSwitchInfo=$($includeUplinkSwitchInfo.ToString().ToLower())"
+  "includeBondSlaveDetails=$($includeBondSlaveDetails.ToString().ToLower())"
+) -join "&"
+
+$ifaceUri = "$heliosBase/irisservices/api/v1/public/interface?$qs"
+
+foreach ($c in $clusters) {
+  $clusterName = $c.clusterName
+  $clusterId   = $c.clusterId
+
+  if ([string]::IsNullOrWhiteSpace($clusterName) -or [string]::IsNullOrWhiteSpace("$clusterId")) { continue }
+
+  try {
+    $ifaceJson = Invoke-RestMethod -Method GET -Uri $ifaceUri -Headers @{
+      apiKey          = $apiKey
+      accessClusterId = "$clusterId"
+    }
+  } catch {
+    Write-Warning "Interface API failed for $clusterName ($clusterId): $($_.Exception.Message)"
+    continue
+  }
+
+  # Some responses are { nodes: [...] }
+  $nodes = @()
+  if ($ifaceJson.nodes) { $nodes = @($ifaceJson.nodes) }
+  else { $nodes = @($ifaceJson) }
+
+  foreach ($n in $nodes) {
+    $nodeId  = $n.nodeId
+    $serial  = $n.chassisSerial
+
+    foreach ($i in @($n.interfaces)) {
+      $bondName = $i.name
+      $mtu      = $i.mtu
+
+      $bondSlaves = @($i.bondSlaves)
+
+      # bondSlavesDetails is an array of objects (linkState/macAddr/speed)
+      $details = @($i.bondSlavesDetails)
+
+      $slaveStates = @()
+      $slaveMacs   = @()
+      $slaveSpeeds = @()
+
+      foreach ($d in $details) {
+        $slaveStates += $d.linkState
+        $slaveMacs   += $d.macAddr
+        $slaveSpeeds += $d.speed
+      }
+
+      $rows.Add([pscustomobject]@{
+        Cluster       = $clusterName
+        NodeId        = $nodeId
+        ChassisSerial = $serial
+        BondName      = $bondName
+        MTU           = $mtu
+        BondSlaves    = To-BlueList $bondSlaves
+        SlaveIntStatus= To-BlueList $slaveStates
+        Mac           = To-BlueList $slaveMacs
+        SlaveSpeed    = To-BlueList $slaveSpeeds
+      })
+    }
+  }
+}
+
+# ========= EXPORT =========
+Ensure-Dir $outDir
+$stamp = Get-Date -Format "yyyy-MM-dd_HHmm"
+$csvPath = Join-Path $outDir "AllClusters_Interface_$stamp.csv"
+
+$rows |
+  Sort-Object Cluster, NodeId, BondName |
+  Export-Csv -Path $csvPath -NoTypeInformation -Encoding UTF8
+
+Write-Host "Saved CSV: $csvPath" -ForegroundColor Green
+
+# Optional: show a neat preview (console only)
+$rows | Select-Object -First 20 | Format-Table -AutoSize
