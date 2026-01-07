@@ -1,39 +1,46 @@
-// Cohesity Helios – Alerts (1105) → Match node_ip → Interface DOWN details
-// - Uses Dynatrace classic credential vault (name -> id -> manual)
-// - ALL Helios calls are HTTP GET only
-// - Uses your working pattern: alerts per cluster via accessClusterId
-// - Uses your interface check logic: /public/interface with bondSlaveDetails
-//
-// Output:
-// {
-//   authMode,
-//   alertsCount,
-//   targetsFound,
-//   downCount,
-//   alertTargets: [{ ClusterName, ClusterId, IP, AlertCode, Severity, AlertState, Id }],
-//   downRows: [ { ClusterName, ClusterId, NodeIP, NodeID, ChassisSerial, BondName, MTU, Slave, LinkState, MAC, Speed, SlotType } ],
-//   markdownTable
-// }
+// ------------------------------------------------------------
+// Dynatrace JS | Cohesity Helios Alerts (GET only)
+// Mirrors your PowerShell logic:
+// - Multiple alertTypes (comma-separated or repeated params)  ✅ (we use repeated params)
+// - Optional alertCategories, alertStates                    ✅
+// - Optional filter to multiple node_ids                      ✅ (local filter)
+// - Window: last 24 hours in ET, enforced locally via latestTimestampUsecs ✅
+// - Latest per (ClusterId + NodeId)                           ✅
+// - Output: table with IP + human readable ET time + markdown ✅
+// ------------------------------------------------------------
 
 import { credentialVaultClient } from "@dynatrace-sdk/client-classic-environment-v2";
 
 export default async function () {
   var baseUrl = "https://helios.cohesity.com";
 
-  // ------------------------------
-  // 1) Credential vault: name -> id -> manual
-  // ------------------------------
+  // ---------------------------
+  // User options (edit these)
+  // ---------------------------
   var vaultName = "Cohesity_API_Key";
   var vaultId   = "credentials_vault-312312";
 
+  var AlertTypes      = ["11001", "1105"]; // <-- add ALL your alert types here
+  var AlertStates     = ["kOpen"];         // or ["kOpen","kNote"]
+  var AlertCategories = [];                // optional; e.g. ["kNodeHealth","kNetworking"]
+  var MaxAlerts       = 200;
+
+  // Optional: only these node IDs (leave empty to include all nodes)
+  var NodeIds = []; // e.g. ["1","2","3"]
+
+  // ------------------------------
+  // 1) Credential vault: name -> id -> manual
+  // ------------------------------
   var apiKey = null;
   var authMode = "vault-name";
 
   async function getKeyByName(name) {
     var all = await credentialVaultClient.getCredentials();
+    var creds = (all && all.credentials) ? all.credentials : [];
     var found = null;
-    for (var i = 0; i < all.credentials.length; i++) {
-      if (all.credentials[i].name === name) { found = all.credentials[i]; break; }
+
+    for (var i = 0; i < creds.length; i++) {
+      if (creds[i] && creds[i].name === name) { found = creds[i]; break; }
     }
     if (!found) return null;
 
@@ -53,18 +60,16 @@ export default async function () {
       console.log("✓ Helios key from vault (id): " + (d2 && d2.name ? d2.name : vaultId));
     } catch (e2) {
       authMode = "manual";
-      apiKey = "PASTE_YOUR_API_KEY_HERE";
+      apiKey = "PASTE_YOUR_API_KEY_HERE"; // last resort
       console.log("⚠️ Using manual Helios API key (fallback)");
     }
   }
 
   if (!apiKey) throw new Error("No Helios API key available.");
 
-  var commonHeaders = { accept: "application/json", apiKey: apiKey };
-
-  // ------------------------------
-  // 2) Helpers
-  // ------------------------------
+  // ---------------------------
+  // Helpers
+  // ---------------------------
   function norm(v) {
     if (v === null || v === undefined) return "";
     return String(v).trim();
@@ -75,6 +80,8 @@ export default async function () {
     return Array.isArray(v) ? v : [v];
   }
 
+  // buildQuery supports arrays by repeating param:
+  // alertTypes=11001&alertTypes=1105
   function buildQuery(params) {
     var usp = new URLSearchParams();
     for (var k in params) {
@@ -82,11 +89,18 @@ export default async function () {
       var v = params[k];
       if (v === undefined || v === null) continue;
 
-      // arrays -> repeated params
       if (Array.isArray(v)) {
-        for (var i = 0; i < v.length; i++) usp.append(k, String(v[i]));
+        for (var i = 0; i < v.length; i++) {
+          var item = v[i];
+          if (item === undefined || item === null) continue;
+          var s = String(item).trim();
+          if (!s) continue;
+          usp.append(k, s);
+        }
       } else {
-        usp.append(k, String(v));
+        var sv = String(v).trim();
+        if (!sv) continue;
+        usp.append(k, sv);
       }
     }
     return usp.toString();
@@ -102,89 +116,119 @@ export default async function () {
     return resp.json();
   }
 
-  function looksDown(v) {
-    v = norm(v).toLowerCase();
-    // handle variations: "down", "kLinkStateDown", etc.
-    return v.indexOf("down") >= 0;
-  }
+  // Get-Prop equivalent: searches propertyList for keys; returns value OR values
+  function getProp(plist, keys) {
+    var pl = toArrayMaybe(plist);
+    for (var k = 0; k < keys.length; k++) {
+      var wanted = keys[k];
+      for (var i = 0; i < pl.length; i++) {
+        var p = pl[i] || {};
+        if (norm(p.key) !== wanted) continue;
 
-  // Extract node_ip from alert.propertyList like your PS:
-  // value fallback to values (sometimes values is array)
-  function extractNodeIpFromAlert(alertObj) {
-    var plist = alertObj ? alertObj.propertyList : null;
-    if (!plist || !Array.isArray(plist)) return "";
+        var v = p.value;
+        if (!v) v = p.values;
 
-    for (var i = 0; i < plist.length; i++) {
-      var kv = plist[i] || {};
-      if (norm(kv.key) !== "node_ip") continue;
-
-      var ip = kv.value;
-      if (!ip) ip = kv.values;
-
-      if (Array.isArray(ip)) {
-        if (ip.length > 0) return norm(ip[0]);
-        return "";
+        if (Array.isArray(v)) return v.length ? norm(v[0]) : "";
+        return norm(v);
       }
-      return norm(ip);
     }
     return "";
   }
 
-  // Index bondSlavesDetails by interface name
-  function indexSlaveDetails(details) {
-    var map = {};
-    if (!details) return map;
+  // Convert usecs-> ET string "yyyy-MM-dd HH:mm:ss" (DST-aware)
+  function usecsToEtString(usecs) {
+    if (!usecs) return "";
+    var ms = Number(usecs) / 1000; // microseconds -> ms
+    if (!Number.isFinite(ms)) return "";
 
-    var arr = toArrayMaybe(details);
-    for (var i = 0; i < arr.length; i++) {
-      var d = arr[i] || {};
-      var name = norm(d.name || d["@name"] || d.ifaceName || d.interfaceName || d.iface);
-      if (name) map[name] = d;
+    var dtf = new Intl.DateTimeFormat("en-US", {
+      timeZone: "America/New_York",
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+      hour12: false
+    });
+
+    var parts = dtf.formatToParts(new Date(ms));
+    function pick(t) {
+      for (var i = 0; i < parts.length; i++) {
+        if (parts[i].type === t) return parts[i].value;
+      }
+      return "";
     }
-    return map;
+
+    var yyyy = pick("year");
+    var mm   = pick("month");
+    var dd   = pick("day");
+    var hh   = pick("hour");
+    var mi   = pick("minute");
+    var ss   = pick("second");
+
+    return yyyy + "-" + mm + "-" + dd + " " + hh + ":" + mi + ":" + ss;
   }
 
-  // ------------------------------
-  // 3) Get clusters (ClusterName + ClusterId)
-  // ------------------------------
-  var cluUrl = baseUrl + "/v2/mcm/cluster-mgmt/info";
-  var cluData = await getJson(cluUrl, commonHeaders);
-  var clusters = toArrayMaybe(cluData && cluData.cohesityClusters);
+  function safeCell(v) {
+    if (v === null || v === undefined) return "";
+    return String(v).replace(/\|/g, " ");
+  }
+
+  // ---------------------------
+  // ET window last 24h -> epoch usecs
+  // (we enforce locally using latestTimestampUsecs, same spirit as your PS)
+  // ---------------------------
+  var nowMs = Date.now();
+  var startMs = nowMs - (24 * 60 * 60 * 1000);
+  var startUsecs = startMs * 1000;
+  var endUsecs   = nowMs * 1000;
+
+  // ---------------------------
+  // Get clusters
+  // ---------------------------
+  var commonHeaders = { accept: "application/json", apiKey: apiKey };
+
+  var clusterUrl = baseUrl + "/v2/mcm/cluster-mgmt/info";
+  var clusterData = await getJson(clusterUrl, commonHeaders);
+  var clusters = toArrayMaybe(clusterData && clusterData.cohesityClusters);
 
   if (!clusters.length) {
     return {
       authMode: authMode,
-      alertsCount: 0,
-      targetsFound: 0,
-      downCount: 0,
-      alertTargets: [],
-      downRows: [],
-      markdownTable: "⚠️ No clusters returned from /v2/mcm/cluster-mgmt/info"
+      alertsFetched: 0,
+      rowsAfterWindow: 0,
+      resultsCount: 0,
+      results: [],
+      markdownTable: "⚠️ No clusters returned."
     };
   }
 
-  // ------------------------------
-  // 4) Get Alerts per cluster (your working URL + accessClusterId)
-  // ------------------------------
-  // Keep EXACT style like your PS (comma string works in your env)
-  var alertsUrl =
-    baseUrl +
-    "/v2/alerts?" +
-    buildQuery({
-      maxAlerts: 200,
-      alertTypes: "1105",
-      alertStates: "kOpen,kNote",
-      alertCategories: "kNetworking"
-    });
+  // ---------------------------
+  // Build alerts URL (ONLY include non-empty optional params)
+  // NOTE: Uses repeated params for alertTypes/States/Categories (robust)
+  // ---------------------------
+  var params = {
+    maxAlerts: MaxAlerts,
+    alertTypes: AlertTypes,
+    startDateUsecs: String(startUsecs),
+    endDateUsecs: String(endUsecs)
+  };
+  if (AlertStates && AlertStates.length) params.alertStates = AlertStates;
+  if (AlertCategories && AlertCategories.length) params.alertCategories = AlertCategories;
 
-  var alertTargets = [];
-  var alertsCountTotal = 0;
+  var alertsUrl = baseUrl + "/v2/alerts?" + buildQuery(params);
+
+  // ---------------------------
+  // Fetch alerts per cluster and collect (raw)
+  // ---------------------------
+  var raw = [];
+  var alertsFetched = 0;
 
   for (var ci = 0; ci < clusters.length; ci++) {
     var clus = clusters[ci] || {};
     var clusterName = norm(clus.clusterName);
     var clusterId = norm(clus.clusterId);
-
     if (!clusterId) continue;
 
     var headers = {
@@ -193,179 +237,100 @@ export default async function () {
       accessClusterId: clusterId
     };
 
-    var aData;
+    var json;
     try {
-      aData = await getJson(alertsUrl, headers);
+      json = await getJson(alertsUrl, headers);
     } catch (e) {
-      console.log("⚠️ Alerts fetch failed for cluster " + clusterName + " (" + clusterId + "): " + norm(e.message || e));
+      console.log("⚠️ Alerts fetch failed for " + clusterName + " (" + clusterId + "): " + norm(e.message || e));
       continue;
     }
 
-    var alerts = toArrayMaybe(aData && aData.alerts);
-    alertsCountTotal += alerts.length;
+    var alerts = toArrayMaybe(json && json.alerts);
+    alertsFetched += alerts.length;
 
     for (var ai = 0; ai < alerts.length; ai++) {
       var alt = alerts[ai] || {};
-      var ip = extractNodeIpFromAlert(alt);
 
-      // store even if IP missing (helps debug), but targets require IP later
-      alertTargets.push({
-        AlertCode: norm(alt.alertCode),
-        IP: ip,
+      // Enforce last 24h window locally (like your PS)
+      var latestUsecs = Number(alt.latestTimestampUsecs || 0);
+      if (!latestUsecs) continue;
+      if (latestUsecs < startUsecs || latestUsecs > endUsecs) continue;
+
+      var nodeId = getProp(alt.propertyList, ["node_id", "nodeId"]);
+      var ip = getProp(alt.propertyList, [
+        "node_ip",
+        "ip",
+        "ipAddress",
+        "host_ip",
+        "source_ip",
+        "sourceIp",
+        "remote_ip",
+        "remoteIp"
+      ]);
+
+      // Optional node filter
+      if (NodeIds && NodeIds.length > 0) {
+        if (!nodeId) continue;
+        if (NodeIds.indexOf(String(nodeId)) === -1) continue;
+      }
+
+      var alertCause =
+        (alt.alertDocument && alt.alertDocument.alertCause) ||
+        (alt.alertDocument && alt.alertDocument.alertSummary && alt.alertDocument.alertSummary.alertCause) ||
+        "";
+
+      raw.push({
         ClusterName: clusterName,
         ClusterId: clusterId,
+        ClusterNodeId: nodeId,
+        IP: ip,
+        AlertCode: norm(alt.alertCode),
         Severity: norm(alt.severity),
         AlertState: norm(alt.alertState),
-        Id: norm(alt.id)
+        AlertCause: norm(alertCause),
+        LatestTimeET: usecsToEtString(latestUsecs),
+        LatestUsecs: latestUsecs
       });
     }
   }
 
-  // Keep only targets with IP, unique by ClusterId+IP
-  var uniq = {};
-  var uniqTargets = [];
-  for (var t = 0; t < alertTargets.length; t++) {
-    var r = alertTargets[t] || {};
-    if (!r.ClusterId || !r.IP) continue;
-    var key = r.ClusterId + "|" + r.IP;
-    if (uniq[key]) continue;
-    uniq[key] = true;
-    uniqTargets.push(r);
-  }
+  // ---------------------------
+  // Latest per (ClusterId + NodeId), sorted newest first
+  // ---------------------------
+  var latestMap = {}; // key => row (max LatestUsecs)
+  for (var i = 0; i < raw.length; i++) {
+    var r = raw[i];
+    if (!r.ClusterId || !r.ClusterNodeId) continue;
 
-  console.log("alertsCountTotal=" + alertsCountTotal);
-  console.log("uniqTargets (ClusterId+IP)=" + uniqTargets.length);
-
-  if (!uniqTargets.length) {
-    return {
-      authMode: authMode,
-      alertsCount: alertsCountTotal,
-      targetsFound: 0,
-      downCount: 0,
-      alertTargets: alertTargets,
-      downRows: [],
-      markdownTable: "✅ No node_ip targets extracted from 1105 networking alerts."
-    };
-  }
-
-  // Group IPs by clusterId for the interface step
-  var byCluster = {};
-  for (var ut = 0; ut < uniqTargets.length; ut++) {
-    var rr = uniqTargets[ut];
-    var cid = rr.ClusterId;
-    if (!byCluster[cid]) byCluster[cid] = { ClusterId: cid, ClusterName: rr.ClusterName, Ips: {} };
-    byCluster[cid].Ips[rr.IP] = true;
-    if (!byCluster[cid].ClusterName && rr.ClusterName) byCluster[cid].ClusterName = rr.ClusterName;
-  }
-
-  // ------------------------------
-  // 5) Interface check (use your earlier interface flags)
-  // ------------------------------
-  var ifaceQs = buildQuery({
-    bondInterfaceOnly: "true",
-    ifaceGroupAssignedOnly: "true",
-    includeUplinkSwitchInfo: "true",
-    includeBondSlaveDetails: "true"
-  });
-
-  var ifaceUrl = baseUrl + "/irisservices/api/v1/public/interface?" + ifaceQs;
-
-  var downRows = [];
-  var clusterIds = Object.keys(byCluster);
-
-  for (var k = 0; k < clusterIds.length; k++) {
-    var clusterId2 = clusterIds[k];
-    var entry = byCluster[clusterId2];
-    var clusterName2 = entry.ClusterName || ("cluster-" + clusterId2);
-
-    var headers2 = {
-      accept: "application/json",
-      apiKey: apiKey,
-      accessClusterId: String(clusterId2)
-    };
-
-    var ifaceData;
-    try {
-      ifaceData = await getJson(ifaceUrl, headers2);
-    } catch (e) {
-      console.log("⚠️ Interface fetch failed for cluster " + clusterName2 + " (" + clusterId2 + "): " + norm(e.message || e));
-      continue;
-    }
-
-    var nodes = toArrayMaybe(ifaceData);
-
-    for (var ni = 0; ni < nodes.length; ni++) {
-      var node = nodes[ni] || {};
-      var nodeIp = norm(node.nodeIp);
-      if (!nodeIp) continue;
-
-      // only nodes that appear in alerts for this cluster
-      if (!entry.Ips[nodeIp]) continue;
-
-      var nodeId = norm(node.nodeId);
-      var chassisSerial = norm(node.chassisSerial);
-
-      var ifaces = toArrayMaybe(node.interfaces);
-
-      for (var bi = 0; bi < ifaces.length; bi++) {
-        var bond = ifaces[bi] || {};
-
-        var bondName = norm(bond.name);
-        var mtu = (bond.mtu === null || bond.mtu === undefined) ? "" : String(bond.mtu);
-
-        var slaves = toArrayMaybe(bond.bondSlaves);
-        var slotTypes = toArrayMaybe(bond.bondSlavesSlotTypes);
-        var dmap = indexSlaveDetails(bond.bondSlavesDetails);
-
-        // create rows per slave; keep only DOWN
-        for (var si = 0; si < slaves.length; si++) {
-          var s = slaves[si];
-          var slaveName = norm(typeof s === "string" ? s : (s && (s.name || s["@name"] || s.ifaceName)));
-
-          if (!slaveName) continue;
-
-          var d = dmap[slaveName] || {};
-          var linkState = norm(d.linkState || d.link_state || d.state);
-
-          if (!looksDown(linkState)) continue;
-
-          downRows.push({
-            ClusterName: clusterName2,
-            ClusterId: String(clusterId2),
-            NodeIP: nodeIp,
-            NodeID: nodeId,
-            ChassisSerial: chassisSerial,
-            BondName: bondName,
-            MTU: mtu,
-            Slave: slaveName,
-            LinkState: linkState,
-            MAC: norm(d.macAddr || d.mac || d.mac_address),
-            Speed: norm(d.speed || d.linkSpeed || d.link_speed),
-            SlotType: (slotTypes[si] !== null && slotTypes[si] !== undefined) ? String(slotTypes[si]) : ""
-          });
-        }
-      }
+    var key = r.ClusterId + "|" + String(r.ClusterNodeId);
+    if (!latestMap[key] || (r.LatestUsecs > latestMap[key].LatestUsecs)) {
+      latestMap[key] = r;
     }
   }
 
-  // ------------------------------
-  // 6) Markdown table (status only for confirmed DOWN)
-  // ------------------------------
-  function safeCell(v) {
-    if (v === null || v === undefined) return "";
-    return String(v).replace(/\|/g, " ");
-  }
+  var results = Object.keys(latestMap).map(function (k) { return latestMap[k]; });
+  results.sort(function (a, b) { return (b.LatestUsecs || 0) - (a.LatestUsecs || 0); });
 
-  function toMarkdownTable(rows, targetsFound, alertsCount) {
+  // ---------------------------
+  // Output markdown table
+  // ---------------------------
+  function toMarkdownTable(rows) {
     if (!rows || rows.length === 0) {
-      return (
-        "✅ No confirmed DOWN slave interfaces found for alert node_ip.\n\n" +
-        "- Alerts scanned (total): " + alertsCount + "\n" +
-        "- node_ip targets found: " + targetsFound + "\n"
-      );
+      return "✅ No alerts in the last 24 hours (ET) for the selected filters.";
     }
 
-    var cols = ["ClusterName","ClusterId","NodeIP","NodeID","BondName","Slave","LinkState","Speed","MAC","SlotType"];
+    var cols = [
+      "ClusterName",
+      "ClusterId",
+      "ClusterNodeId",
+      "IP",
+      "AlertCode",
+      "Severity",
+      "AlertState",
+      "AlertCause",
+      "LatestTimeET"
+    ];
+
     var header = "| " + cols.join(" | ") + " |";
     var sep = "| " + cols.map(function () { return "---"; }).join(" | ") + " |";
 
@@ -375,34 +340,25 @@ export default async function () {
       return "| " + vals.join(" | ") + " |";
     });
 
-    var intro =
-      "### Cohesity: Interface DOWN details (confirmed via /public/interface)\n\n" +
-      "_Source: 1105 networking alerts → node_ip → per-cluster interface lookup._\n\n" +
-      "- Alerts scanned (total): " + alertsCount + "\n" +
-      "- node_ip targets found: " + targetsFound + "\n" +
-      "- Confirmed DOWN rows: " + rows.length + "\n\n";
-
-    return intro + [header, sep].concat(body).join("\n");
+    return (
+      "### Helios Alerts (latest per ClusterId+NodeId, last 24h ET)\n\n" +
+      "- AlertTypes: " + (AlertTypes || []).join(",") + "\n" +
+      "- AlertStates: " + (AlertStates && AlertStates.length ? AlertStates.join(",") : "(none)") + "\n" +
+      "- AlertCategories: " + (AlertCategories && AlertCategories.length ? AlertCategories.join(",") : "(none)") + "\n" +
+      "- maxAlerts: " + MaxAlerts + "\n" +
+      "- Alerts fetched (before local 24h filter): " + alertsFetched + "\n" +
+      "- Rows after local 24h filter: " + raw.length + "\n" +
+      "- Latest per ClusterId+NodeId: " + rows.length + "\n\n" +
+      [header, sep].concat(body).join("\n")
+    );
   }
-
-  // sort for readability
-  downRows.sort(function (a, b) {
-    return safeCell(a.ClusterName).localeCompare(safeCell(b.ClusterName)) ||
-           safeCell(a.NodeIP).localeCompare(safeCell(b.NodeIP)) ||
-           safeCell(a.BondName).localeCompare(safeCell(b.BondName)) ||
-           safeCell(a.Slave).localeCompare(safeCell(b.Slave));
-  });
-
-  var markdownTable = toMarkdownTable(downRows, uniqTargets.length, alertsCountTotal);
 
   return {
     authMode: authMode,
-    alertsCount: alertsCountTotal,
-    targetsFound: uniqTargets.length,
-    downCount: downRows.length,
-    alertTargets: uniqTargets,   // only unique (ClusterId+IP)
-    downRows: downRows,
-    markdownTable: markdownTable,
-    markdownEmail: markdownTable
+    alertsFetched: alertsFetched,
+    rowsAfterWindow: raw.length,
+    resultsCount: results.length,
+    results: results,
+    markdownTable: toMarkdownTable(results)
   };
 }
