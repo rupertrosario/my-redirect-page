@@ -1,0 +1,408 @@
+// Cohesity Helios – Alerts (1105) → Match node_ip → Interface DOWN details
+// - Uses Dynatrace classic credential vault (name -> id -> manual)
+// - ALL Helios calls are HTTP GET only
+// - Uses your working pattern: alerts per cluster via accessClusterId
+// - Uses your interface check logic: /public/interface with bondSlaveDetails
+//
+// Output:
+// {
+//   authMode,
+//   alertsCount,
+//   targetsFound,
+//   downCount,
+//   alertTargets: [{ ClusterName, ClusterId, IP, AlertCode, Severity, AlertState, Id }],
+//   downRows: [ { ClusterName, ClusterId, NodeIP, NodeID, ChassisSerial, BondName, MTU, Slave, LinkState, MAC, Speed, SlotType } ],
+//   markdownTable
+// }
+
+import { credentialVaultClient } from "@dynatrace-sdk/client-classic-environment-v2";
+
+export default async function () {
+  var baseUrl = "https://helios.cohesity.com";
+
+  // ------------------------------
+  // 1) Credential vault: name -> id -> manual
+  // ------------------------------
+  var vaultName = "Cohesity_API_Key";
+  var vaultId   = "credentials_vault-312312";
+
+  var apiKey = null;
+  var authMode = "vault-name";
+
+  async function getKeyByName(name) {
+    var all = await credentialVaultClient.getCredentials();
+    var found = null;
+    for (var i = 0; i < all.credentials.length; i++) {
+      if (all.credentials[i].name === name) { found = all.credentials[i]; break; }
+    }
+    if (!found) return null;
+
+    var detail = await credentialVaultClient.getCredentialsDetails({ id: found.id });
+    console.log("✓ Helios key from vault (name): " + found.name);
+    return (detail && (detail.token || detail.password)) || null;
+  }
+
+  try {
+    apiKey = await getKeyByName(vaultName);
+    if (!apiKey) throw new Error("not-found");
+  } catch (e) {
+    try {
+      var d2 = await credentialVaultClient.getCredentialsDetails({ id: vaultId });
+      apiKey = (d2 && (d2.token || d2.password)) || null;
+      authMode = "vault-id";
+      console.log("✓ Helios key from vault (id): " + (d2 && d2.name ? d2.name : vaultId));
+    } catch (e2) {
+      authMode = "manual";
+      apiKey = "PASTE_YOUR_API_KEY_HERE";
+      console.log("⚠️ Using manual Helios API key (fallback)");
+    }
+  }
+
+  if (!apiKey) throw new Error("No Helios API key available.");
+
+  var commonHeaders = { accept: "application/json", apiKey: apiKey };
+
+  // ------------------------------
+  // 2) Helpers
+  // ------------------------------
+  function norm(v) {
+    if (v === null || v === undefined) return "";
+    return String(v).trim();
+  }
+
+  function toArrayMaybe(v) {
+    if (!v) return [];
+    return Array.isArray(v) ? v : [v];
+  }
+
+  function buildQuery(params) {
+    var usp = new URLSearchParams();
+    for (var k in params) {
+      if (!Object.prototype.hasOwnProperty.call(params, k)) continue;
+      var v = params[k];
+      if (v === undefined || v === null) continue;
+
+      // arrays -> repeated params
+      if (Array.isArray(v)) {
+        for (var i = 0; i < v.length; i++) usp.append(k, String(v[i]));
+      } else {
+        usp.append(k, String(v));
+      }
+    }
+    return usp.toString();
+  }
+
+  async function getJson(url, headers) {
+    var resp = await fetch(url, { method: "GET", headers: headers });
+    if (!resp.ok) {
+      var txt = "";
+      try { txt = await resp.text(); } catch (e) {}
+      throw new Error("GET " + url + " -> HTTP " + resp.status + " " + txt);
+    }
+    return resp.json();
+  }
+
+  function looksDown(v) {
+    v = norm(v).toLowerCase();
+    // handle variations: "down", "kLinkStateDown", etc.
+    return v.indexOf("down") >= 0;
+  }
+
+  // Extract node_ip from alert.propertyList like your PS:
+  // value fallback to values (sometimes values is array)
+  function extractNodeIpFromAlert(alertObj) {
+    var plist = alertObj ? alertObj.propertyList : null;
+    if (!plist || !Array.isArray(plist)) return "";
+
+    for (var i = 0; i < plist.length; i++) {
+      var kv = plist[i] || {};
+      if (norm(kv.key) !== "node_ip") continue;
+
+      var ip = kv.value;
+      if (!ip) ip = kv.values;
+
+      if (Array.isArray(ip)) {
+        if (ip.length > 0) return norm(ip[0]);
+        return "";
+      }
+      return norm(ip);
+    }
+    return "";
+  }
+
+  // Index bondSlavesDetails by interface name
+  function indexSlaveDetails(details) {
+    var map = {};
+    if (!details) return map;
+
+    var arr = toArrayMaybe(details);
+    for (var i = 0; i < arr.length; i++) {
+      var d = arr[i] || {};
+      var name = norm(d.name || d["@name"] || d.ifaceName || d.interfaceName || d.iface);
+      if (name) map[name] = d;
+    }
+    return map;
+  }
+
+  // ------------------------------
+  // 3) Get clusters (ClusterName + ClusterId)
+  // ------------------------------
+  var cluUrl = baseUrl + "/v2/mcm/cluster-mgmt/info";
+  var cluData = await getJson(cluUrl, commonHeaders);
+  var clusters = toArrayMaybe(cluData && cluData.cohesityClusters);
+
+  if (!clusters.length) {
+    return {
+      authMode: authMode,
+      alertsCount: 0,
+      targetsFound: 0,
+      downCount: 0,
+      alertTargets: [],
+      downRows: [],
+      markdownTable: "⚠️ No clusters returned from /v2/mcm/cluster-mgmt/info"
+    };
+  }
+
+  // ------------------------------
+  // 4) Get Alerts per cluster (your working URL + accessClusterId)
+  // ------------------------------
+  // Keep EXACT style like your PS (comma string works in your env)
+  var alertsUrl =
+    baseUrl +
+    "/v2/alerts?" +
+    buildQuery({
+      maxAlerts: 200,
+      alertTypes: "1105",
+      alertStates: "kOpen,kNote",
+      alertCategories: "kNetworking"
+    });
+
+  var alertTargets = [];
+  var alertsCountTotal = 0;
+
+  for (var ci = 0; ci < clusters.length; ci++) {
+    var clus = clusters[ci] || {};
+    var clusterName = norm(clus.clusterName);
+    var clusterId = norm(clus.clusterId);
+
+    if (!clusterId) continue;
+
+    var headers = {
+      accept: "application/json",
+      apiKey: apiKey,
+      accessClusterId: clusterId
+    };
+
+    var aData;
+    try {
+      aData = await getJson(alertsUrl, headers);
+    } catch (e) {
+      console.log("⚠️ Alerts fetch failed for cluster " + clusterName + " (" + clusterId + "): " + norm(e.message || e));
+      continue;
+    }
+
+    var alerts = toArrayMaybe(aData && aData.alerts);
+    alertsCountTotal += alerts.length;
+
+    for (var ai = 0; ai < alerts.length; ai++) {
+      var alt = alerts[ai] || {};
+      var ip = extractNodeIpFromAlert(alt);
+
+      // store even if IP missing (helps debug), but targets require IP later
+      alertTargets.push({
+        AlertCode: norm(alt.alertCode),
+        IP: ip,
+        ClusterName: clusterName,
+        ClusterId: clusterId,
+        Severity: norm(alt.severity),
+        AlertState: norm(alt.alertState),
+        Id: norm(alt.id)
+      });
+    }
+  }
+
+  // Keep only targets with IP, unique by ClusterId+IP
+  var uniq = {};
+  var uniqTargets = [];
+  for (var t = 0; t < alertTargets.length; t++) {
+    var r = alertTargets[t] || {};
+    if (!r.ClusterId || !r.IP) continue;
+    var key = r.ClusterId + "|" + r.IP;
+    if (uniq[key]) continue;
+    uniq[key] = true;
+    uniqTargets.push(r);
+  }
+
+  console.log("alertsCountTotal=" + alertsCountTotal);
+  console.log("uniqTargets (ClusterId+IP)=" + uniqTargets.length);
+
+  if (!uniqTargets.length) {
+    return {
+      authMode: authMode,
+      alertsCount: alertsCountTotal,
+      targetsFound: 0,
+      downCount: 0,
+      alertTargets: alertTargets,
+      downRows: [],
+      markdownTable: "✅ No node_ip targets extracted from 1105 networking alerts."
+    };
+  }
+
+  // Group IPs by clusterId for the interface step
+  var byCluster = {};
+  for (var ut = 0; ut < uniqTargets.length; ut++) {
+    var rr = uniqTargets[ut];
+    var cid = rr.ClusterId;
+    if (!byCluster[cid]) byCluster[cid] = { ClusterId: cid, ClusterName: rr.ClusterName, Ips: {} };
+    byCluster[cid].Ips[rr.IP] = true;
+    if (!byCluster[cid].ClusterName && rr.ClusterName) byCluster[cid].ClusterName = rr.ClusterName;
+  }
+
+  // ------------------------------
+  // 5) Interface check (use your earlier interface flags)
+  // ------------------------------
+  var ifaceQs = buildQuery({
+    bondInterfaceOnly: "true",
+    ifaceGroupAssignedOnly: "true",
+    includeUplinkSwitchInfo: "true",
+    includeBondSlaveDetails: "true"
+  });
+
+  var ifaceUrl = baseUrl + "/irisservices/api/v1/public/interface?" + ifaceQs;
+
+  var downRows = [];
+  var clusterIds = Object.keys(byCluster);
+
+  for (var k = 0; k < clusterIds.length; k++) {
+    var clusterId2 = clusterIds[k];
+    var entry = byCluster[clusterId2];
+    var clusterName2 = entry.ClusterName || ("cluster-" + clusterId2);
+
+    var headers2 = {
+      accept: "application/json",
+      apiKey: apiKey,
+      accessClusterId: String(clusterId2)
+    };
+
+    var ifaceData;
+    try {
+      ifaceData = await getJson(ifaceUrl, headers2);
+    } catch (e) {
+      console.log("⚠️ Interface fetch failed for cluster " + clusterName2 + " (" + clusterId2 + "): " + norm(e.message || e));
+      continue;
+    }
+
+    var nodes = toArrayMaybe(ifaceData);
+
+    for (var ni = 0; ni < nodes.length; ni++) {
+      var node = nodes[ni] || {};
+      var nodeIp = norm(node.nodeIp);
+      if (!nodeIp) continue;
+
+      // only nodes that appear in alerts for this cluster
+      if (!entry.Ips[nodeIp]) continue;
+
+      var nodeId = norm(node.nodeId);
+      var chassisSerial = norm(node.chassisSerial);
+
+      var ifaces = toArrayMaybe(node.interfaces);
+
+      for (var bi = 0; bi < ifaces.length; bi++) {
+        var bond = ifaces[bi] || {};
+
+        var bondName = norm(bond.name);
+        var mtu = (bond.mtu === null || bond.mtu === undefined) ? "" : String(bond.mtu);
+
+        var slaves = toArrayMaybe(bond.bondSlaves);
+        var slotTypes = toArrayMaybe(bond.bondSlavesSlotTypes);
+        var dmap = indexSlaveDetails(bond.bondSlavesDetails);
+
+        // create rows per slave; keep only DOWN
+        for (var si = 0; si < slaves.length; si++) {
+          var s = slaves[si];
+          var slaveName = norm(typeof s === "string" ? s : (s && (s.name || s["@name"] || s.ifaceName)));
+
+          if (!slaveName) continue;
+
+          var d = dmap[slaveName] || {};
+          var linkState = norm(d.linkState || d.link_state || d.state);
+
+          if (!looksDown(linkState)) continue;
+
+          downRows.push({
+            ClusterName: clusterName2,
+            ClusterId: String(clusterId2),
+            NodeIP: nodeIp,
+            NodeID: nodeId,
+            ChassisSerial: chassisSerial,
+            BondName: bondName,
+            MTU: mtu,
+            Slave: slaveName,
+            LinkState: linkState,
+            MAC: norm(d.macAddr || d.mac || d.mac_address),
+            Speed: norm(d.speed || d.linkSpeed || d.link_speed),
+            SlotType: (slotTypes[si] !== null && slotTypes[si] !== undefined) ? String(slotTypes[si]) : ""
+          });
+        }
+      }
+    }
+  }
+
+  // ------------------------------
+  // 6) Markdown table (status only for confirmed DOWN)
+  // ------------------------------
+  function safeCell(v) {
+    if (v === null || v === undefined) return "";
+    return String(v).replace(/\|/g, " ");
+  }
+
+  function toMarkdownTable(rows, targetsFound, alertsCount) {
+    if (!rows || rows.length === 0) {
+      return (
+        "✅ No confirmed DOWN slave interfaces found for alert node_ip.\n\n" +
+        "- Alerts scanned (total): " + alertsCount + "\n" +
+        "- node_ip targets found: " + targetsFound + "\n"
+      );
+    }
+
+    var cols = ["ClusterName","ClusterId","NodeIP","NodeID","BondName","Slave","LinkState","Speed","MAC","SlotType"];
+    var header = "| " + cols.join(" | ") + " |";
+    var sep = "| " + cols.map(function () { return "---"; }).join(" | ") + " |";
+
+    var body = rows.map(function (r) {
+      var vals = [];
+      for (var i = 0; i < cols.length; i++) vals.push(safeCell(r[cols[i]]));
+      return "| " + vals.join(" | ") + " |";
+    });
+
+    var intro =
+      "### Cohesity: Interface DOWN details (confirmed via /public/interface)\n\n" +
+      "_Source: 1105 networking alerts → node_ip → per-cluster interface lookup._\n\n" +
+      "- Alerts scanned (total): " + alertsCount + "\n" +
+      "- node_ip targets found: " + targetsFound + "\n" +
+      "- Confirmed DOWN rows: " + rows.length + "\n\n";
+
+    return intro + [header, sep].concat(body).join("\n");
+  }
+
+  // sort for readability
+  downRows.sort(function (a, b) {
+    return safeCell(a.ClusterName).localeCompare(safeCell(b.ClusterName)) ||
+           safeCell(a.NodeIP).localeCompare(safeCell(b.NodeIP)) ||
+           safeCell(a.BondName).localeCompare(safeCell(b.BondName)) ||
+           safeCell(a.Slave).localeCompare(safeCell(b.Slave));
+  });
+
+  var markdownTable = toMarkdownTable(downRows, uniqTargets.length, alertsCountTotal);
+
+  return {
+    authMode: authMode,
+    alertsCount: alertsCountTotal,
+    targetsFound: uniqTargets.length,
+    downCount: downRows.length,
+    alertTargets: uniqTargets,   // only unique (ClusterId+IP)
+    downRows: downRows,
+    markdownTable: markdownTable,
+    markdownEmail: markdownTable
+  };
+}
