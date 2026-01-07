@@ -1,6 +1,9 @@
 # ------------------------------------------------------------
-# Helios Alerts (GET only): last 24 hours (ET), latest per (ClusterId + NodeId)
-# Output: table with LatestTimestampUsecs shown as human-readable ET time
+# Helios Alerts (GET only):
+# - last 24 hours window defined in ET (America/New_York)
+# - enforce time window locally using latestTimestampUsecs
+# - latest per (ClusterId + NodeId)
+# - show LatestTimeET + WindowStartET/WindowEndET in same format
 # ------------------------------------------------------------
 
 $ErrorActionPreference = "Stop"
@@ -15,10 +18,10 @@ if (-not (Test-Path $apikeypath)) { throw "API key file not found at $apikeypath
 $ApiKey = (Get-Content -Path $apikeypath -Raw).Trim()
 if (-not $ApiKey) { throw "API key is empty: $apikeypath" }
 
-$commonHeaders = @{ "apiKey" = $ApiKey }
+$commonHeaders = @{ apiKey = $ApiKey }
 
 # ===========================
-# Time Window: last 24h in ET -> UTC epoch usecs
+# 1) ET window (last 24h) -> epoch usecs
 # ===========================
 $tz = [System.TimeZoneInfo]::FindSystemTimeZoneById("Eastern Standard Time")  # ET (DST aware)
 
@@ -32,16 +35,26 @@ $startUtc = [System.TimeZoneInfo]::ConvertTimeToUtc($startEt, $tz)
 $endUsecs   = [int64]([DateTimeOffset]$endUtc).ToUnixTimeSeconds()   * 1000000
 $startUsecs = [int64]([DateTimeOffset]$startUtc).ToUnixTimeSeconds() * 1000000
 
+function Convert-UsecsToEtString([int64]$usecs) {
+  if (-not $usecs -or $usecs -le 0) { return $null }
+  $sec = [int64]($usecs / 1000000)
+  $utc = [DateTimeOffset]::FromUnixTimeSeconds($sec).UtcDateTime
+  $et  = [System.TimeZoneInfo]::ConvertTimeFromUtc($utc, $tz)
+  return $et.ToString("yyyy-MM-dd HH:mm:ss")
+}
+
+$windowStartEtStr = $startEt.ToString("yyyy-MM-dd HH:mm:ss")
+$windowEndEtStr   = $endEt.ToString("yyyy-MM-dd HH:mm:ss")
+
 # ===========================
-# 1) Get Clusters
+# 2) Get clusters
 # ===========================
 $uri = "https://helios.cohesity.com/v2/mcm/cluster-mgmt/info"
 $response = Invoke-WebRequest -Method Get -Uri $uri -Headers $commonHeaders -UseBasicParsing
-$json_clu = $response.Content | ConvertFrom-Json
-$json_clu = $json_clu.cohesityClusters
+$json_clu = ($response.Content | ConvertFrom-Json).cohesityClusters
 
 # ===========================
-# 2) Get Alerts per cluster, collect rows
+# 3) Get alerts per cluster (GET only), extract node_id, enforce last-24h locally
 # ===========================
 $results = @()
 
@@ -51,10 +64,11 @@ foreach ($clus in $json_clu) {
   $cluster_id   = $clus.clusterId
 
   $headers = @{
-    "apiKey"          = "$ApiKey"
-    "accessClusterId" = "$cluster_id"
+    apiKey          = $ApiKey
+    accessClusterId = "$cluster_id"
   }
 
+  # Keep your URL filters (and include start/end), BUT we will enforce locally anyway
   $URL_EP = "https://helios.cohesity.com/v2/alerts" +
             "?maxAlerts=200" +
             "&alertTypes=11001" +
@@ -69,40 +83,41 @@ foreach ($clus in $json_clu) {
 
   foreach ($alt in @($json.alerts)) {
 
+    # Enforce "last 24 hours" using latestTimestampUsecs (THIS is the key fix)
+    if (-not $alt.latestTimestampUsecs) { continue }
+    if ([int64]$alt.latestTimestampUsecs -lt $startUsecs -or [int64]$alt.latestTimestampUsecs -gt $endUsecs) { continue }
+
+    # node_id from propertyList
     $prop = $alt.propertyList | Where-Object { $_.key -eq 'node_id' } | Select-Object -First 1
     $nodeId = $prop.value
     if (-not $nodeId) { $nodeId = $prop.values }
 
     $results += [pscustomobject]@{
-      ClusterName          = $cluster_name
-      ClusterId            = $cluster_id
-      ClusterNodeId        = $nodeId
-      AlertCode            = $alt.alertCode
-      AlertState           = $alt.alertState
-      Severity             = $alt.severity
-      AlertCause           = $alt.alertDocument.alertCause
-      LatestTimestampUsecs = $alt.latestTimestampUsecs
+      ClusterName    = $cluster_name
+      ClusterId      = $cluster_id
+      ClusterNodeId  = $nodeId
+      AlertCode      = $alt.alertCode
+      Severity       = $alt.severity
+      AlertState     = $alt.alertState
+      AlertCause     = $alt.alertDocument.alertCause
+      LatestTimeET   = (Convert-UsecsToEtString ([int64]$alt.latestTimestampUsecs))
+      WindowStartET  = $windowStartEtStr
+      WindowEndET    = $windowEndEtStr
+      LatestUsecs    = [int64]$alt.latestTimestampUsecs  # keep for sorting/grouping
     }
   }
 }
 
 # ===========================
-# 3) Latest per Cluster + Node, add human-readable ET time, display
+# 4) Latest per (ClusterId + NodeId), sorted newest first
 # ===========================
-$latestPerClusterNode = $results |
+$latestPerClusterNode =
+  $results |
   Where-Object { $_.ClusterNodeId } |
   Group-Object { "$($_.ClusterId)|$($_.ClusterNodeId)" } |
-  ForEach-Object { $_.Group | Sort-Object LatestTimestampUsecs -Descending | Select-Object -First 1 } |
-  Sort-Object LatestTimestampUsecs -Descending
+  ForEach-Object { $_.Group | Sort-Object LatestUsecs -Descending | Select-Object -First 1 } |
+  Sort-Object LatestUsecs -Descending
 
 $latestPerClusterNode |
-Select-Object `
-  ClusterName, ClusterId, ClusterNodeId, AlertCode, Severity, AlertState, AlertCause,
-  @{n="LatestTimeET"; e={
-      if (-not $_.LatestTimestampUsecs) { $null; return }
-      $sec = [int64]($_.LatestTimestampUsecs / 1000000)
-      $utc = [DateTimeOffset]::FromUnixTimeSeconds($sec).UtcDateTime
-      [System.TimeZoneInfo]::ConvertTimeFromUtc($utc, $tz)
-  }},
-  LatestTimestampUsecs |
+Select-Object ClusterName, ClusterId, ClusterNodeId, AlertCode, Severity, AlertState, AlertCause, WindowStartET, WindowEndET, LatestTimeET |
 Format-Table -AutoSize
