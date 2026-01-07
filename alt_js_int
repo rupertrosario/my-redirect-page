@@ -1,81 +1,48 @@
 // ------------------------------------------------------------
-// Dynatrace JS | Cohesity Helios Interface DOWN Validator (GET only)
-// BRANCH script (downstream):
-// - DOES NOT fetch alerts
-// - Input: alertTargets[] from upstream alerts step
-// - Groups by ClusterId, matches node.nodeIp, then checks /public/interface
-// - Outputs ONLY confirmed DOWN slave interfaces
+// Cohesity Helios – Interface DOWN Validator (GET only)
+// Input (from workflow):
+//   alertTargets: Array of alert rows (already filtered to CE3601105)
+//     Each item should include at least:
+//       - ClusterId
+//       - ClusterName (optional)
+//       - IP  (node_ip)
 //
-// Expected input shape (per item):
-// { ClusterId, ClusterName, IP, AlertCode, Severity, AlertState, ... }
+// What it does:
+// - Groups IPs by ClusterId
+// - Calls /irisservices/api/v1/public/interface (GET) per cluster
+// - Finds matching node.nodeIp in targets
+// - Emits rows only when bond slave linkState is DOWN
 //
 // Output:
 // {
-//   authMode,
-//   inputCount,
-//   targetCount,
-//   clustersChecked,
+//   targetsProvided,
+//   clustersTargeted,
 //   downCount,
-//   downRows: [ { ClusterName, ClusterId, NodeIP, NodeID, ChassisSerial, BondName, MTU, Slave, LinkState, MAC, Speed, SlotType } ],
+//   downRows: [...],
 //   markdownTable
 // }
 // ------------------------------------------------------------
 
-import { credentialVaultClient } from "@dynatrace-sdk/client-classic-environment-v2";
+export default async function ({ alertTargets = [] } = {}) {
+  const baseUrl = "https://helios.cohesity.com";
 
-export default async function (args) {
-  var baseUrl = "https://helios.cohesity.com";
-
-  // ---------------------------
-  // Inputs (from workflow mapping)
-  // ---------------------------
-  // Map this from upstream step, e.g.
-  // {{ result("Get_Alerts").results | selectattr("AlertCode","equalto","1105") | list }}
-  var alertTargets = (args && args.alertTargets) ? args.alertTargets : [];
-
-  // ---------------------------
-  // Auth (same pattern)
-  // ---------------------------
-  var vaultName = "Cohesity_API_Key";
-  var vaultId   = "credentials_vault-312312";
-
-  var apiKey = null;
-  var authMode = "vault-name";
-
-  async function getKeyByName(name) {
-    var all = await credentialVaultClient.getCredentials();
-    var creds = (all && all.credentials) ? all.credentials : [];
-    var found = null;
-    for (var i = 0; i < creds.length; i++) {
-      if (creds[i] && creds[i].name === name) { found = creds[i]; break; }
-    }
-    if (!found) return null;
-    var detail = await credentialVaultClient.getCredentialsDetails({ id: found.id });
-    console.log("✓ Helios key from vault (name): " + found.name);
-    return (detail && (detail.token || detail.password)) || null;
+  // ------------------------------
+  // 0) Basic input validation
+  // ------------------------------
+  const targets = Array.isArray(alertTargets) ? alertTargets : [];
+  if (!targets.length) {
+    return {
+      targetsProvided: 0,
+      clustersTargeted: 0,
+      downCount: 0,
+      downRows: [],
+      markdownTable: "⏭️ Interface validator: no alertTargets provided as input."
+    };
   }
 
-  try {
-    apiKey = await getKeyByName(vaultName);
-    if (!apiKey) throw new Error("not-found");
-  } catch (e) {
-    try {
-      var d2 = await credentialVaultClient.getCredentialsDetails({ id: vaultId });
-      apiKey = (d2 && (d2.token || d2.password)) || null;
-      authMode = "vault-id";
-      console.log("✓ Helios key from vault (id): " + (d2 && d2.name ? d2.name : vaultId));
-    } catch (e2) {
-      authMode = "manual";
-      apiKey = "PASTE_YOUR_API_KEY_HERE"; // last resort
-      console.log("⚠️ Using manual Helios API key (fallback)");
-    }
-  }
-
-  if (!apiKey) throw new Error("No Helios API key available.");
-
-  // ---------------------------
-  // Helpers
-  // ---------------------------
+  // ------------------------------
+  // 1) Helpers
+  // ------------------------------
   function norm(v) {
     if (v === null || v === undefined) return "";
     return String(v).trim();
@@ -86,34 +53,10 @@ export default async function (args) {
     return Array.isArray(v) ? v : [v];
   }
 
-  function buildQuery(params) {
-    var usp = new URLSearchParams();
-    for (var k in params) {
-      if (!Object.prototype.hasOwnProperty.call(params, k)) continue;
-      var v = params[k];
-      if (v === undefined || v === null) continue;
-
-      if (Array.isArray(v)) {
-        for (var i = 0; i < v.length; i++) {
-          var item = v[i];
-          if (item === undefined || item === null) continue;
-          var s = String(item).trim();
-          if (!s) continue;
-          usp.append(k, s);
-        }
-      } else {
-        var sv = String(v).trim();
-        if (!sv) continue;
-        usp.append(k, sv);
-      }
-    }
-    return usp.toString();
-  }
-
   async function getJson(url, headers) {
-    var resp = await fetch(url, { method: "GET", headers: headers });
+    const resp = await fetch(url, { method: "GET", headers });
     if (!resp.ok) {
-      var txt = "";
+      let txt = "";
       try { txt = await resp.text(); } catch (e) {}
       throw new Error("GET " + url + " -> HTTP " + resp.status + " " + txt);
     }
@@ -122,162 +65,163 @@ export default async function (args) {
 
   function looksDown(v) {
     v = norm(v).toLowerCase();
-    // handles: "Down", "kLinkStateDown", "linkDown", etc.
-    return v.indexOf("down") >= 0;
+    // variations: "down", "kLinkStateDown", etc.
+    return v.includes("down");
   }
 
-  // bondSlavesDetails sometimes comes as array of objects with "@name" / name
-  // you explicitly saw: { @name= ; macAddr }
   function indexSlaveDetails(details) {
-    var map = {};
-    var arr = toArrayMaybe(details);
-
-    for (var i = 0; i < arr.length; i++) {
-      var d = arr[i] || {};
-      // name fields observed across payloads
-      var name = norm(d.name || d["@name"] || d.ifaceName || d.interfaceName || d.iface);
+    const map = {};
+    const arr = toArrayMaybe(details);
+    for (let i = 0; i < arr.length; i++) {
+      const d = arr[i] || {};
+      const name = norm(d.name || d["@name"] || d.ifaceName || d.interfaceName || d.iface);
       if (name) map[name] = d;
     }
     return map;
   }
 
-  function safeCell(v) {
-    if (v === null || v === undefined) return "";
-    return String(v).replace(/\|/g, " ");
-  }
+  // ------------------------------
+  // 2) Build cluster -> ip set map from alertTargets
+  // ------------------------------
+  const byCluster = {};
+  for (let i = 0; i < targets.length; i++) {
+    const t = targets[i] || {};
+    const clusterId = norm(t.ClusterId || t.clusterId);
+    const clusterName = norm(t.ClusterName || t.clusterName);
+    const ip = norm(t.IP || t.ip);
 
-  // ---------------------------
-  // Guard: no targets
-  // ---------------------------
-  var inputCount = Array.isArray(alertTargets) ? alertTargets.length : 0;
-  if (!inputCount) {
-    return {
-      authMode: authMode,
-      inputCount: inputCount,
-      targetCount: 0,
-      clustersChecked: 0,
-      downCount: 0,
-      downRows: [],
-      markdownTable: "⚠️ Interface validator: no alertTargets provided as input."
-    };
-  }
+    if (!clusterId || !ip) continue;
 
-  // ---------------------------
-  // Build cluster -> IP set from targets
-  // ---------------------------
-  var byCluster = {}; // { [clusterId]: { ClusterId, ClusterName, Ips: {ip:true} } }
-
-  for (var i = 0; i < alertTargets.length; i++) {
-    var t = alertTargets[i] || {};
-    var cid = norm(t.ClusterId);
-    var ip  = norm(t.IP);
-    if (!cid || !ip) continue;
-
-    if (!byCluster[cid]) {
-      byCluster[cid] = { ClusterId: cid, ClusterName: norm(t.ClusterName) || ("cluster-" + cid), Ips: {} };
+    if (!byCluster[clusterId]) {
+      byCluster[clusterId] = {
+        ClusterId: clusterId,
+        ClusterName: clusterName || ("cluster-" + clusterId),
+        Ips: {}
+      };
     }
-    byCluster[cid].Ips[ip] = true;
-    if (!byCluster[cid].ClusterName && t.ClusterName) byCluster[cid].ClusterName = norm(t.ClusterName);
+    if (!byCluster[clusterId].ClusterName && clusterName) {
+      byCluster[clusterId].ClusterName = clusterName;
+    }
+    byCluster[clusterId].Ips[ip] = true;
   }
 
-  var clusterIds = Object.keys(byCluster);
+  const clusterIds = Object.keys(byCluster);
   if (!clusterIds.length) {
     return {
-      authMode: authMode,
-      inputCount: inputCount,
-      targetCount: 0,
-      clustersChecked: 0,
+      targetsProvided: targets.length,
+      clustersTargeted: 0,
       downCount: 0,
       downRows: [],
-      markdownTable: "⚠️ Interface validator: input targets had no usable ClusterId+IP."
+      markdownTable: "⏭️ Interface validator: alertTargets had no usable ClusterId+IP."
     };
   }
 
-  // Count unique targets
-  var targetCount = 0;
-  for (var c = 0; c < clusterIds.length; c++) {
-    var ipsObj = byCluster[clusterIds[c]].Ips || {};
-    targetCount += Object.keys(ipsObj).length;
+  // ------------------------------
+  // 3) Auth: expects Helios API key to be provided by Workflow HTTP settings
+  // BUT: since your earlier scripts used Dynatrace credential vault in JS #1,
+  // the simplest here is: REQUIRE apiKey be injected as a secret or reuse the same approach.
+  //
+  // ✅ Best practice: keep auth in ONE place (JS #1), but if you want this step standalone,
+  // paste your vault auth block here.
+  //
+  // For now: assume apiKey is provided in request header by Dynatrace secret mapping:
+  //   headers.apiKey = <your Helios key>
+  // If your workflow doesn’t do that, tell me and I’ll paste the vault-auth block here.
+  // ------------------------------
+
+  // ✅ If you DO have vault auth in this script, set apiKey here.
+  // For now, placeholder:
+  const apiKey = "PASTE_YOUR_API_KEY_HERE";
+
+  if (!apiKey || apiKey === "PASTE_YOUR_API_KEY_HERE") {
+    return {
+      targetsProvided: targets.length,
+      clustersTargeted: clusterIds.length,
+      downCount: 0,
+      downRows: [],
+      markdownTable:
+        "⚠️ Interface validator: Helios apiKey not configured in JS #2. " +
+        "Paste vault auth block here OR inject apiKey via workflow secret."
+    };
   }
 
-  // ---------------------------
-  // Interface API (your flags)
-  // NOTE: We keep these as query params (GET-only)
-  // ---------------------------
-  var ifaceQs = buildQuery({
-    bondInterfaceOnly: "true",
-    ifaceGroupAssignedOnly: "true",
-    includeUplinkSwitchInfo: "true",
-    includeBondSlaveDetails: "true"
-  });
+  // ------------------------------
+  // 4) Interface endpoint (GET)
+  // ------------------------------
+  const ifaceUrl =
+    baseUrl +
+    "/irisservices/api/v1/public/interface" +
+    "?bondInterfaceOnly=true" +
+    "&ifaceGroupAssignedOnly=true" +
+    "&includeUplinkSwitchInfo=true" +
+    "&includeBondSlaveDetails=true";
 
-  var ifaceUrl = baseUrl + "/irisservices/api/v1/public/interface?" + ifaceQs;
+  const downRows = [];
 
-  // ---------------------------
-  // Collect DOWN rows
-  // ---------------------------
-  var downRows = [];
+  // ------------------------------
+  // 5) Query interface data per targeted clusterId
+  // ------------------------------
+  for (let k = 0; k < clusterIds.length; k++) {
+    const cid = clusterIds[k];
+    const entry = byCluster[cid];
+    const clusterName = entry.ClusterName || ("cluster-" + cid);
 
-  for (var k = 0; k < clusterIds.length; k++) {
-    var clusterId = clusterIds[k];
-    var entry = byCluster[clusterId];
-    var clusterName = entry.ClusterName;
-
-    var headers = {
+    const headers = {
       accept: "application/json",
       apiKey: apiKey,
-      accessClusterId: String(clusterId)
+      accessClusterId: String(cid)
     };
 
-    var ifaceData;
+    let ifaceData;
     try {
       ifaceData = await getJson(ifaceUrl, headers);
     } catch (e) {
-      console.log("⚠️ Interface fetch failed for " + clusterName + " (" + clusterId + "): " + norm(e.message || e));
+      console.log("⚠️ Interface fetch failed for " + clusterName + " (" + cid + "): " + norm(e.message || e));
       continue;
     }
 
-    var nodes = toArrayMaybe(ifaceData);
+    const nodes = toArrayMaybe(ifaceData);
 
-    for (var ni = 0; ni < nodes.length; ni++) {
-      var node = nodes[ni] || {};
-      var nodeIp = norm(node.nodeIp);
+    for (let ni = 0; ni < nodes.length; ni++) {
+      const node = nodes[ni] || {};
+      const nodeIp = norm(node.nodeIp);
       if (!nodeIp) continue;
 
-      // only nodes we care about from alerts
+      // only nodes that are in alertTargets for this cluster
       if (!entry.Ips[nodeIp]) continue;
 
-      var nodeId = norm(node.nodeId);
-      var chassisSerial = norm(node.chassisSerial);
+      const nodeId = norm(node.nodeId);
+      const chassisSerial = norm(node.chassisSerial);
 
-      var bonds = toArrayMaybe(node.interfaces);
+      const ifaces = toArrayMaybe(node.interfaces);
 
-      for (var bi = 0; bi < bonds.length; bi++) {
-        var bond = bonds[bi] || {};
+      for (let bi = 0; bi < ifaces.length; bi++) {
+        const bond = ifaces[bi] || {};
+        const bondName = norm(bond.name);
+        const mtu = (bond.mtu === null || bond.mtu === undefined) ? "" : String(bond.mtu);
 
-        var bondName = norm(bond.name);
-        var mtu = (bond.mtu === null || bond.mtu === undefined) ? "" : String(bond.mtu);
+        const slaves = toArrayMaybe(bond.bondSlaves);
+        const slotTypes = toArrayMaybe(bond.bondSlavesSlotTypes);
+        const dmap = indexSlaveDetails(bond.bondSlavesDetails);
 
-        var slaves = toArrayMaybe(bond.bondSlaves);
-        var slotTypes = toArrayMaybe(bond.bondSlavesSlotTypes);
-        var dmap = indexSlaveDetails(bond.bondSlavesDetails);
-
-        for (var si = 0; si < slaves.length; si++) {
-          var s = slaves[si];
-          var slaveName = norm(
-            (typeof s === "string") ? s :
-            (s && (s.name || s["@name"] || s.ifaceName || s.interfaceName || s.iface))
+        for (let si = 0; si < slaves.length; si++) {
+          const s = slaves[si];
+          const slaveName = norm(
+            typeof s === "string"
+              ? s
+              : (s && (s.name || s["@name"] || s.ifaceName || s.interfaceName))
           );
           if (!slaveName) continue;
 
-          var d = dmap[slaveName] || {};
-          var linkState = norm(d.linkState || d.link_state || d.state);
+          const d = dmap[slaveName] || {};
+          const linkState = norm(d.linkState || d.link_state || d.state);
 
+          // only DOWN
           if (!looksDown(linkState)) continue;
 
           downRows.push({
             ClusterName: clusterName,
-            ClusterId: String(clusterId),
+            ClusterId: String(cid),
             NodeIP: nodeIp,
             NodeID: nodeId,
             ChassisSerial: chassisSerial,
@@ -294,53 +238,51 @@ export default async function (args) {
     }
   }
 
-  // Sort for readability
-  downRows.sort(function (a, b) {
-    return safeCell(a.ClusterName).localeCompare(safeCell(b.ClusterName)) ||
-           safeCell(a.NodeIP).localeCompare(safeCell(b.NodeIP)) ||
-           safeCell(a.BondName).localeCompare(safeCell(b.BondName)) ||
-           safeCell(a.Slave).localeCompare(safeCell(b.Slave));
-  });
+  // ------------------------------
+  // 6) Markdown output
+  // ------------------------------
+  function safeCell(v) {
+    if (v === null || v === undefined) return "";
+    return String(v).replace(/\|/g, " ");
+  }
 
-  // ---------------------------
-  // Markdown output
-  // ---------------------------
-  function toMarkdownTable(rows) {
+  downRows.sort((a, b) =>
+    safeCell(a.ClusterName).localeCompare(safeCell(b.ClusterName)) ||
+    safeCell(a.NodeIP).localeCompare(safeCell(b.NodeIP)) ||
+    safeCell(a.BondName).localeCompare(safeCell(b.BondName)) ||
+    safeCell(a.Slave).localeCompare(safeCell(b.Slave))
+  );
+
+  function toMarkdownTable(rows, targetsProvided, clustersTargeted) {
     if (!rows || rows.length === 0) {
       return (
-        "✅ No confirmed DOWN slave interfaces for provided alertTargets.\n\n" +
-        "- Input targets: " + inputCount + "\n" +
-        "- Unique ClusterId+IP targets: " + targetCount + "\n" +
-        "- Clusters checked: " + clusterIds.length + "\n"
+        "✅ No confirmed DOWN slave interfaces found for CE3601105 targets.\n\n" +
+        "- Targets provided: " + targetsProvided + "\n" +
+        "- Clusters targeted: " + clustersTargeted + "\n"
       );
     }
 
-    var cols = ["ClusterName","ClusterId","NodeIP","NodeID","BondName","Slave","LinkState","Speed","MAC","SlotType"];
-    var header = "| " + cols.join(" | ") + " |";
-    var sep = "| " + cols.map(function () { return "---"; }).join(" | ") + " |";
+    const cols = ["ClusterName","ClusterId","NodeIP","NodeID","BondName","Slave","LinkState","Speed","MAC","SlotType"];
+    const header = "| " + cols.join(" | ") + " |";
+    const sep = "| " + cols.map(() => "---").join(" | ") + " |";
+    const body = rows.map(r => "| " + cols.map(c => safeCell(r[c])).join(" | ") + " |");
 
-    var body = rows.map(function (r) {
-      return "| " + cols.map(function (c) { return safeCell(r[c]); }).join(" | ") + " |";
-    });
-
-    var intro =
-      "### Cohesity: Confirmed Interface DOWN (via /public/interface)\n\n" +
-      "- Input targets: " + inputCount + "\n" +
-      "- Unique ClusterId+IP targets: " + targetCount + "\n" +
-      "- Clusters checked: " + clusterIds.length + "\n" +
-      "- DOWN rows: " + rows.length + "\n\n";
-
-    return intro + [header, sep].concat(body).join("\n");
+    return (
+      "### Cohesity: Interface DOWN details (confirmed via /public/interface)\n\n" +
+      "- Targets provided: " + targetsProvided + "\n" +
+      "- Clusters targeted: " + clustersTargeted + "\n" +
+      "- Confirmed DOWN rows: " + rows.length + "\n\n" +
+      [header, sep].concat(body).join("\n")
+    );
   }
 
+  const markdownTable = toMarkdownTable(downRows, targets.length, clusterIds.length);
+
   return {
-    authMode: authMode,
-    inputCount: inputCount,
-    targetCount: targetCount,
-    clustersChecked: clusterIds.length,
+    targetsProvided: targets.length,
+    clustersTargeted: clusterIds.length,
     downCount: downRows.length,
     downRows: downRows,
-    markdownTable: toMarkdownTable(downRows),
-    markdownEmail: toMarkdownTable(downRows)
+    markdownTable: markdownTable
   };
 }
