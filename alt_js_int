@@ -1,58 +1,98 @@
 // ------------------------------------------------------------
 // Cohesity Helios – Interface DOWN Validator (GET only)
-// Input (from workflow):
-//   alertTargets: Array of alert rows (already filtered to CE3601105)
-//     Each item should include at least:
-//       - ClusterId
-//       - ClusterName (optional)
-//       - IP  (node_ip)
+// SELF-CONTAINED AUTH (vault-name -> vault-id -> manual)
+//
+// Input (optional, recommended):
+//   alertTargets: result("Get_Alerts").results   (full list)
+// This script will internally keep only AlertCode containing "CE3601105".
 //
 // What it does:
-// - Groups IPs by ClusterId
-// - Calls /irisservices/api/v1/public/interface (GET) per cluster
-// - Finds matching node.nodeIp in targets
-// - Emits rows only when bond slave linkState is DOWN
+// - Filters alertTargets to CE3601105 (contains)
+// - Groups targets by ClusterId and node_ip
+// - Calls /irisservices/api/v1/public/interface (GET) per targeted cluster
+// - Matches node.nodeIp to alert node_ip
+// - Emits only DOWN bond slave rows
 //
 // Output:
 // {
+//   authMode,
 //   targetsProvided,
+//   targetsMatchedCE3601105,
 //   clustersTargeted,
 //   downCount,
+//   interfaceTargets: [{ClusterId, ClusterName, IP, AlertCode, Severity, AlertState, Id}],
 //   downRows: [...],
 //   markdownTable
 // }
 // ------------------------------------------------------------
 
+import { credentialVaultClient } from "@dynatrace-sdk/client-classic-environment-v2";
+
 export default async function ({ alertTargets = [] } = {}) {
   const baseUrl = "https://helios.cohesity.com";
 
   // ------------------------------
-  // 0) Basic input validation
+  // 1) AUTH: vault-name -> vault-id -> manual (same as your other scripts)
   // ------------------------------
-  const targets = Array.isArray(alertTargets) ? alertTargets : [];
-  if (!targets.length) {
+  const vaultName = "Cohesity_API_Key";
+  const vaultId   = "credentials_vault-312312";
+
+  let apiKey = null;
+  let authMode = "vault-name";
+
+  async function getKeyByName(name) {
+    const all = await credentialVaultClient.getCredentials();
+    let found = null;
+    for (let i = 0; i < (all.credentials || []).length; i++) {
+      if (all.credentials[i].name === name) { found = all.credentials[i]; break; }
+    }
+    if (!found) return null;
+
+    const detail = await credentialVaultClient.getCredentialsDetails({ id: found.id });
+    console.log("✓ Helios key from vault (name): " + found.name);
+    return (detail && (detail.token || detail.password)) || null;
+  }
+
+  try {
+    apiKey = await getKeyByName(vaultName);
+    if (!apiKey) throw new Error("not-found");
+  } catch (e) {
+    try {
+      const d2 = await credentialVaultClient.getCredentialsDetails({ id: vaultId });
+      apiKey   = (d2 && (d2.token || d2.password)) || null;
+      authMode = "vault-id";
+      console.log("✓ Helios key from vault (id): " + (d2 && d2.name ? d2.name : vaultId));
+    } catch (e2) {
+      authMode = "manual";
+      apiKey   = "PASTE_YOUR_API_KEY_HERE"; // last resort
+      console.log("⚠️ Using manual Helios API key (fallback)");
+    }
+  }
+
+  if (!apiKey) {
     return {
-      targetsProvided: 0,
+      authMode,
+      targetsProvided: Array.isArray(alertTargets) ? alertTargets.length : 0,
+      targetsMatchedCE3601105: 0,
       clustersTargeted: 0,
       downCount: 0,
+      interfaceTargets: [],
       downRows: [],
-      markdownTable: "⏭️ Interface validator: no alertTargets provided as input."
+      markdownTable: "❌ No Helios API key available (vault + manual failed)."
     };
   }
 
   // ------------------------------
-  // 1) Helpers
+  // 2) Helpers
   // ------------------------------
   function norm(v) {
     if (v === null || v === undefined) return "";
     return String(v).trim();
   }
-
   function toArrayMaybe(v) {
     if (!v) return [];
     return Array.isArray(v) ? v : [v];
   }
-
   async function getJson(url, headers) {
     const resp = await fetch(url, { method: "GET", headers });
     if (!resp.ok) {
@@ -62,13 +102,12 @@ export default async function ({ alertTargets = [] } = {}) {
     }
     return resp.json();
   }
-
   function looksDown(v) {
     v = norm(v).toLowerCase();
-    // variations: "down", "kLinkStateDown", etc.
-    return v.includes("down");
+    return v.includes("down"); // handles "down", "kLinkStateDown", etc.
   }
 
+  // bondSlavesDetails sometimes returns objects with "@name"
   function indexSlaveDetails(details) {
     const map = {};
     const arr = toArrayMaybe(details);
@@ -81,72 +120,73 @@ export default async function ({ alertTargets = [] } = {}) {
   }
 
   // ------------------------------
-  // 2) Build cluster -> ip set map from alertTargets
+  // 3) Normalize + filter alertTargets to CE3601105 (contains)
   // ------------------------------
-  const byCluster = {};
-  for (let i = 0; i < targets.length; i++) {
-    const t = targets[i] || {};
-    const clusterId = norm(t.ClusterId || t.clusterId);
-    const clusterName = norm(t.ClusterName || t.clusterName);
-    const ip = norm(t.IP || t.ip);
+  const targetsIn = Array.isArray(alertTargets) ? alertTargets : [];
+  const InterfaceTriggerAlertCode = "CE3601105";
+
+  const interfaceTargets = [];
+  for (let i = 0; i < targetsIn.length; i++) {
+    const r = targetsIn[i] || {};
+    const alertCode = norm(r.AlertCode || r.alertCode);
+    if (!alertCode) continue;
+
+    // CONTAINS match (what you asked)
+    if (alertCode.indexOf(InterfaceTriggerAlertCode) === -1) continue;
+
+    const clusterId   = norm(r.ClusterId || r.clusterId);
+    const clusterName = norm(r.ClusterName || r.clusterName);
+    const ip          = norm(r.IP || r.ip);
 
     if (!clusterId || !ip) continue;
 
-    if (!byCluster[clusterId]) {
-      byCluster[clusterId] = {
-        ClusterId: clusterId,
-        ClusterName: clusterName || ("cluster-" + clusterId),
+    interfaceTargets.push({
+      ClusterId: clusterId,
+      ClusterName: clusterName,
+      IP: ip,
+      AlertCode: alertCode,
+      Severity: norm(r.Severity || r.severity),
+      AlertState: norm(r.AlertState || r.alertState),
+      Id: norm(r.Id || r.id)
+    });
+  }
+
+  // If nothing to do, exit FAST (no interface calls)
+  if (!interfaceTargets.length) {
+    return {
+      authMode,
+      targetsProvided: targetsIn.length,
+      targetsMatchedCE3601105: 0,
+      clustersTargeted: 0,
+      downCount: 0,
+      interfaceTargets: [],
+      downRows: [],
+      markdownTable: "⏭️ Skipped interface validation (no CE3601105 targets found)."
+    };
+  }
+
+  // ------------------------------
+  // 4) Group targets by ClusterId -> IP set
+  // ------------------------------
+  const byCluster = {};
+  for (let i = 0; i < interfaceTargets.length; i++) {
+    const t = interfaceTargets[i];
+    const cid = t.ClusterId;
+    if (!byCluster[cid]) {
+      byCluster[cid] = {
+        ClusterId: cid,
+        ClusterName: t.ClusterName || ("cluster-" + cid),
         Ips: {}
       };
     }
-    if (!byCluster[clusterId].ClusterName && clusterName) {
-      byCluster[clusterId].ClusterName = clusterName;
-    }
-    byCluster[clusterId].Ips[ip] = true;
+    if (!byCluster[cid].ClusterName && t.ClusterName) byCluster[cid].ClusterName = t.ClusterName;
+    byCluster[cid].Ips[t.IP] = true;
   }
 
   const clusterIds = Object.keys(byCluster);
-  if (!clusterIds.length) {
-    return {
-      targetsProvided: targets.length,
-      clustersTargeted: 0,
-      downCount: 0,
-      downRows: [],
-      markdownTable: "⏭️ Interface validator: alertTargets had no usable ClusterId+IP."
-    };
-  }
 
   // ------------------------------
-  // 3) Auth: expects Helios API key to be provided by Workflow HTTP settings
-  // BUT: since your earlier scripts used Dynatrace credential vault in JS #1,
-  // the simplest here is: REQUIRE apiKey be injected as a secret or reuse the same approach.
-  //
-  // ✅ Best practice: keep auth in ONE place (JS #1), but if you want this step standalone,
-  // paste your vault auth block here.
-  //
-  // For now: assume apiKey is provided in request header by Dynatrace secret mapping:
-  //   headers.apiKey = <your Helios key>
-  // If your workflow doesn’t do that, tell me and I’ll paste the vault-auth block here.
-  // ------------------------------
-
-  // ✅ If you DO have vault auth in this script, set apiKey here.
-  // For now, placeholder:
-  const apiKey = "PASTE_YOUR_API_KEY_HERE";
-
-  if (!apiKey || apiKey === "PASTE_YOUR_API_KEY_HERE") {
-    return {
-      targetsProvided: targets.length,
-      clustersTargeted: clusterIds.length,
-      downCount: 0,
-      downRows: [],
-      markdownTable:
-        "⚠️ Interface validator: Helios apiKey not configured in JS #2. " +
-        "Paste vault auth block here OR inject apiKey via workflow secret."
-    };
-  }
-
-  // ------------------------------
-  // 4) Interface endpoint (GET)
+  // 5) Interface endpoint (GET only) - query params (no body)
   // ------------------------------
   const ifaceUrl =
     baseUrl +
@@ -158,9 +198,6 @@ export default async function ({ alertTargets = [] } = {}) {
 
   const downRows = [];
 
-  // ------------------------------
-  // 5) Query interface data per targeted clusterId
-  // ------------------------------
   for (let k = 0; k < clusterIds.length; k++) {
     const cid = clusterIds[k];
     const entry = byCluster[cid];
@@ -187,7 +224,7 @@ export default async function ({ alertTargets = [] } = {}) {
       const nodeIp = norm(node.nodeIp);
       if (!nodeIp) continue;
 
-      // only nodes that are in alertTargets for this cluster
+      // only nodes that appeared in CE3601105 targets for this cluster
       if (!entry.Ips[nodeIp]) continue;
 
       const nodeId = norm(node.nodeId);
@@ -216,7 +253,6 @@ export default async function ({ alertTargets = [] } = {}) {
           const d = dmap[slaveName] || {};
           const linkState = norm(d.linkState || d.link_state || d.state);
 
-          // only DOWN
           if (!looksDown(linkState)) continue;
 
           downRows.push({
@@ -239,7 +275,7 @@ export default async function ({ alertTargets = [] } = {}) {
   }
 
   // ------------------------------
-  // 6) Markdown output
+  // 6) Markdown table
   // ------------------------------
   function safeCell(v) {
     if (v === null || v === undefined) return "";
@@ -253,12 +289,12 @@ export default async function ({ alertTargets = [] } = {}) {
     safeCell(a.Slave).localeCompare(safeCell(b.Slave))
   );
 
-  function toMarkdownTable(rows, targetsProvided, clustersTargeted) {
+  function toMarkdownTable(rows) {
     if (!rows || rows.length === 0) {
       return (
         "✅ No confirmed DOWN slave interfaces found for CE3601105 targets.\n\n" +
-        "- Targets provided: " + targetsProvided + "\n" +
-        "- Clusters targeted: " + clustersTargeted + "\n"
+        "- CE3601105 targets: " + interfaceTargets.length + "\n" +
+        "- Clusters targeted: " + clusterIds.length + "\n"
       );
     }
 
@@ -269,20 +305,22 @@ export default async function ({ alertTargets = [] } = {}) {
 
     return (
       "### Cohesity: Interface DOWN details (confirmed via /public/interface)\n\n" +
-      "- Targets provided: " + targetsProvided + "\n" +
-      "- Clusters targeted: " + clustersTargeted + "\n" +
+      "- CE3601105 targets: " + interfaceTargets.length + "\n" +
+      "- Clusters targeted: " + clusterIds.length + "\n" +
       "- Confirmed DOWN rows: " + rows.length + "\n\n" +
       [header, sep].concat(body).join("\n")
     );
   }
 
-  const markdownTable = toMarkdownTable(downRows, targets.length, clusterIds.length);
-
   return {
-    targetsProvided: targets.length,
+    authMode,
+    targetsProvided: targetsIn.length,
+    targetsMatchedCE3601105: interfaceTargets.length,
     clustersTargeted: clusterIds.length,
     downCount: downRows.length,
-    downRows: downRows,
-    markdownTable: markdownTable
+    interfaceTargets,
+    downRows,
+    markdownTable: toMarkdownTable(downRows),
+    markdownEmail: toMarkdownTable(downRows)
   };
 }
