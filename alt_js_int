@@ -1,9 +1,7 @@
-// Cohesity Helios – Interface DOWN validator (GET-only)
-// Input: alertTargets = filtered rows from JS1 (already only CE030601105)
-// Output: downRows (only confirmed DOWN slave interfaces)
-
 import { credentialVaultClient } from "@dynatrace-sdk/client-classic-environment-v2";
 
+// JS2: Interface status check by IP (no alert filtering here)
+// Input: { alertTargets: [ { ClusterId, ClusterName, IP, ... } ] }
 export default async function ({ alertTargets = [] } = {}) {
   const baseUrl = "https://helios.cohesity.com";
 
@@ -20,10 +18,12 @@ export default async function ({ alertTargets = [] } = {}) {
     const all = await credentialVaultClient.getCredentials();
     let found = null;
     for (let i = 0; i < (all.credentials || []).length; i++) {
-      if (all.credentials[i].name === name) { found = all.credentials[i]; break; }
+      if (all.credentials[i].name === name) {
+        found = all.credentials[i];
+        break;
+      }
     }
     if (!found) return null;
-
     const detail = await credentialVaultClient.getCredentialsDetails({ id: found.id });
     return (detail && (detail.token || detail.password)) || null;
   }
@@ -38,7 +38,7 @@ export default async function ({ alertTargets = [] } = {}) {
       authMode = "vault-id";
     } catch (e2) {
       authMode = "manual";
-      apiKey = "PASTE_YOUR_API_KEY_HERE"; // last resort
+      apiKey = "PASTE_YOUR_API_KEY_HERE";
     }
   }
 
@@ -46,10 +46,13 @@ export default async function ({ alertTargets = [] } = {}) {
     return {
       authMode,
       targetsProvided: Array.isArray(alertTargets) ? alertTargets.length : 0,
+      targetsUsable: 0,
       clustersTargeted: 0,
+      nodesMatched: 0,
       downCount: 0,
+      debug: { reason: "No Helios API key available" },
       downRows: [],
-      message: "❌ No Helios API key available."
+      markdownTable: "❌ No Helios API key available."
     };
   }
 
@@ -60,12 +63,10 @@ export default async function ({ alertTargets = [] } = {}) {
     if (v === null || v === undefined) return "";
     return String(v).trim();
   }
-
   function toArrayMaybe(v) {
     if (!v) return [];
     return Array.isArray(v) ? v : [v];
   }
-
   async function getJson(url, headers) {
     const resp = await fetch(url, { method: "GET", headers });
     if (!resp.ok) {
@@ -75,13 +76,12 @@ export default async function ({ alertTargets = [] } = {}) {
     }
     return resp.json();
   }
-
   function looksDown(v) {
-    v = norm(v).toLowerCase();
-    return v.includes("down"); // handles: down, kLinkStateDown, etc.
+    const s = norm(v).toLowerCase();
+    return s.includes("down");
   }
 
-  // bondSlavesDetails: index by interface name
+  // build map slaveName -> detail object
   function indexSlaveDetails(details) {
     const map = {};
     const arr = toArrayMaybe(details);
@@ -94,53 +94,54 @@ export default async function ({ alertTargets = [] } = {}) {
   }
 
   // ------------------------------
-  // 3) Normalize + short-circuit
+  // 3) Normalize input -> group by ClusterId
   // ------------------------------
   const targetsIn = Array.isArray(alertTargets) ? alertTargets : [];
-  if (targetsIn.length === 0) {
-    return {
-      authMode,
-      targetsProvided: 0,
-      clustersTargeted: 0,
-      downCount: 0,
-      downRows: [],
-      message: "⏭️ Skipped interface validation (no alertTargets provided)."
-    };
-  }
 
-  // Build: ClusterId -> { ClusterName, Ips:{} }
-  const byCluster = {};
+  // Accept either ClusterId/clusterId and IP/ip/node_ip etc.
+  const usable = [];
   for (let i = 0; i < targetsIn.length; i++) {
     const r = targetsIn[i] || {};
     const clusterId = norm(r.ClusterId || r.clusterId);
     const clusterName = norm(r.ClusterName || r.clusterName);
-    const ip = norm(r.IP || r.ip);
+    const ip = norm(r.IP || r.ip || r.node_ip || r.nodeIp);
 
     if (!clusterId || !ip) continue;
 
-    if (!byCluster[clusterId]) {
-      byCluster[clusterId] = {
-        ClusterId: clusterId,
-        ClusterName: clusterName || ("cluster-" + clusterId),
-        Ips: {}
-      };
-    }
-    if (!byCluster[clusterId].ClusterName && clusterName) byCluster[clusterId].ClusterName = clusterName;
-
-    byCluster[clusterId].Ips[ip] = true;
+    usable.push({
+      ClusterId: clusterId,
+      ClusterName: clusterName,
+      IP: ip
+    });
   }
 
-  const clusterIds = Object.keys(byCluster);
-  if (clusterIds.length === 0) {
+  if (!usable.length) {
     return {
       authMode,
       targetsProvided: targetsIn.length,
+      targetsUsable: 0,
       clustersTargeted: 0,
+      nodesMatched: 0,
       downCount: 0,
+      debug: {
+        reason: "No usable targets (need ClusterId + IP).",
+        sampleInputFirst: targetsIn.length ? targetsIn[0] : null
+      },
       downRows: [],
-      message: "⏭️ Skipped interface validation (no usable ClusterId+IP in alertTargets)."
+      markdownTable: "⏭️ No usable targets (need ClusterId + IP)."
     };
   }
+
+  const byCluster = {};
+  for (let i = 0; i < usable.length; i++) {
+    const t = usable[i];
+    if (!byCluster[t.ClusterId]) {
+      byCluster[t.ClusterId] = { ClusterId: t.ClusterId, ClusterName: t.ClusterName || ("cluster-" + t.ClusterId), Ips: {} };
+    }
+    if (!byCluster[t.ClusterId].ClusterName && t.ClusterName) byCluster[t.ClusterId].ClusterName = t.ClusterName;
+    byCluster[t.ClusterId].Ips[t.IP] = true;
+  }
+  const clusterIds = Object.keys(byCluster);
 
   // ------------------------------
   // 4) Interface endpoint (GET)
@@ -154,52 +155,73 @@ export default async function ({ alertTargets = [] } = {}) {
     "&includeBondSlaveDetails=true";
 
   const downRows = [];
+  let nodesMatched = 0;
+
+  // useful debug if “no details” again:
+  const debug = {
+    targetIpsByCluster: Object.keys(byCluster).slice(0, 10).map(cid => ({
+      ClusterId: cid,
+      ClusterName: byCluster[cid].ClusterName,
+      TargetIps: Object.keys(byCluster[cid].Ips).slice(0, 10)
+    })),
+    interfaceNodeIpsSeenSample: [] // filled only when no match
+  };
 
   for (let k = 0; k < clusterIds.length; k++) {
     const cid = clusterIds[k];
     const entry = byCluster[cid];
     const clusterName = entry.ClusterName || ("cluster-" + cid);
 
-    const headers = {
-      accept: "application/json",
-      apiKey,
-      accessClusterId: String(cid)
-    };
+    const headers = { accept: "application/json", apiKey, accessClusterId: String(cid) };
 
     let ifaceData;
     try {
       ifaceData = await getJson(ifaceUrl, headers);
     } catch (e) {
-      // don’t fail whole run because one cluster failed
-      console.log("⚠️ Interface fetch failed for " + clusterName + " (" + cid + "): " + norm(e.message || e));
+      downRows.push({
+        ClusterName: clusterName,
+        ClusterId: String(cid),
+        NodeIP: "",
+        NodeID: "",
+        BondName: "",
+        Slave: "",
+        LinkState: "",
+        Speed: "",
+        MAC: "",
+        SlotType: "",
+        Note: "Interface API call failed: " + norm(e.message || e)
+      });
       continue;
     }
 
     const nodes = toArrayMaybe(ifaceData);
+
+    // If nothing matches, capture some nodeIps for you to compare quickly
+    let matchedAnyInThisCluster = false;
 
     for (let ni = 0; ni < nodes.length; ni++) {
       const node = nodes[ni] || {};
       const nodeIp = norm(node.nodeIp);
       if (!nodeIp) continue;
 
-      // only nodes that are in our alertTargets (by IP)
-      if (!entry.Ips[nodeIp]) continue;
+      if (!entry.Ips[nodeIp]) continue; // <-- THIS is the IP comparison you asked for
+
+      matchedAnyInThisCluster = true;
+      nodesMatched++;
 
       const nodeId = norm(node.nodeId);
       const chassisSerial = norm(node.chassisSerial);
-
       const ifaces = toArrayMaybe(node.interfaces);
+
+      let anyDownForNode = false;
 
       for (let bi = 0; bi < ifaces.length; bi++) {
         const bond = ifaces[bi] || {};
         const bondName = norm(bond.name);
-        const mtu = (bond.mtu === null || bond.mtu === undefined) ? "" : String(bond.mtu);
-
         const slaves = toArrayMaybe(bond.bondSlaves);
         const slotTypes = toArrayMaybe(bond.bondSlavesSlotTypes);
         const dmap = indexSlaveDetails(bond.bondSlavesDetails);
 
-        // per slave row; keep only DOWN
         for (let si = 0; si < slaves.length; si++) {
           const s = slaves[si];
           const slaveName = norm(
@@ -211,7 +233,10 @@ export default async function ({ alertTargets = [] } = {}) {
 
           const d = dmap[slaveName] || {};
           const linkState = norm(d.linkState || d.link_state || d.state);
+
           if (!looksDown(linkState)) continue;
+
+          anyDownForNode = true;
 
           downRows.push({
             ClusterName: clusterName,
@@ -220,32 +245,85 @@ export default async function ({ alertTargets = [] } = {}) {
             NodeID: nodeId,
             ChassisSerial: chassisSerial,
             BondName: bondName,
-            MTU: mtu,
             Slave: slaveName,
             LinkState: linkState,
             MAC: norm(d.macAddr || d.mac || d.mac_address),
             Speed: norm(d.speed || d.linkSpeed || d.link_speed),
-            SlotType: (slotTypes[si] !== null && slotTypes[si] !== undefined) ? String(slotTypes[si]) : ""
+            SlotType: (slotTypes[si] !== null && slotTypes[si] !== undefined) ? String(slotTypes[si]) : "",
+            Note: ""
           });
         }
       }
+
+      // If the node matched by IP but no slaves are DOWN, still show a “worked” row
+      if (!anyDownForNode) {
+        downRows.push({
+          ClusterName: clusterName,
+          ClusterId: String(cid),
+          NodeIP: nodeIp,
+          NodeID: nodeId,
+          ChassisSerial: chassisSerial,
+          BondName: "",
+          Slave: "",
+          LinkState: "",
+          MAC: "",
+          Speed: "",
+          SlotType: "",
+          Note: "Matched node IP, but no DOWN slave interfaces found right now."
+        });
+      }
+    }
+
+    if (!matchedAnyInThisCluster) {
+      // store some nodeIps returned by interface API (helps prove mismatch)
+      const sampleIps = [];
+      for (let i = 0; i < nodes.length && sampleIps.length < 10; i++) {
+        const ip = norm((nodes[i] || {}).nodeIp);
+        if (ip) sampleIps.push(ip);
+      }
+      debug.interfaceNodeIpsSeenSample.push({
+        ClusterId: String(cid),
+        ClusterName: clusterName,
+        NodeIpsFromInterfaceSample: sampleIps
+      });
     }
   }
 
-  // Sort for readability
-  function safe(v) { return norm(v); }
-  downRows.sort((a, b) =>
-    safe(a.ClusterName).localeCompare(safe(b.ClusterName)) ||
-    safe(a.NodeIP).localeCompare(safe(b.NodeIP)) ||
-    safe(a.BondName).localeCompare(safe(b.BondName)) ||
-    safe(a.Slave).localeCompare(safe(b.Slave))
-  );
+  // ------------------------------
+  // 5) Markdown (optional)
+  // ------------------------------
+  function safeCell(v) {
+    if (v === null || v === undefined) return "";
+    return String(v).replace(/\|/g, " ");
+  }
+
+  function toMarkdownTable(rows) {
+    if (!rows || rows.length === 0) return "✅ No rows returned.";
+
+    const cols = ["ClusterName","ClusterId","NodeIP","NodeID","BondName","Slave","LinkState","Speed","MAC","SlotType","Note"];
+    const header = "| " + cols.join(" | ") + " |";
+    const sep = "| " + cols.map(() => "---").join(" | ") + " |";
+    const body = rows.map(r => "| " + cols.map(c => safeCell(r[c])).join(" | ") + " |");
+
+    return (
+      "### Cohesity: Interface status for alert IPs\n\n" +
+      "- Targets usable: " + usable.length + "\n" +
+      "- Clusters targeted: " + clusterIds.length + "\n" +
+      "- Nodes matched by IP: " + nodesMatched + "\n" +
+      "- Rows: " + rows.length + "\n\n" +
+      [header, sep].concat(body).join("\n")
+    );
+  }
 
   return {
     authMode,
     targetsProvided: targetsIn.length,
+    targetsUsable: usable.length,
     clustersTargeted: clusterIds.length,
-    downCount: downRows.length,
-    downRows
+    nodesMatched,
+    downCount: downRows.filter(r => norm(r.LinkState)).length,
+    downRows,
+    markdownTable: toMarkdownTable(downRows),
+    debug
   };
 }
