@@ -3,9 +3,9 @@ import { credentialVaultClient } from "@dynatrace-sdk/client-classic-environment
 export default async function () {
   const baseUrl = "https://helios.cohesity.com";
 
-  // ============================
-  // 0) Auth (vault-name -> vault-id -> manual)
-  // ============================
+  // ------------------------------
+  // 1) AUTH (vault-name -> vault-id -> manual)
+  // ------------------------------
   const vaultName = "Cohesity_API_Key";
   const vaultId = "credentials_vault-312312";
 
@@ -14,10 +14,9 @@ export default async function () {
 
   async function getKeyByName(name) {
     const all = await credentialVaultClient.getCredentials();
-    const creds = (all && all.credentials) ? all.credentials : [];
     let found = null;
-    for (let i = 0; i < creds.length; i++) {
-      if (creds[i].name === name) { found = creds[i]; break; }
+    for (let i = 0; i < (all.credentials || []).length; i++) {
+      if (all.credentials[i].name === name) { found = all.credentials[i]; break; }
     }
     if (!found) return null;
     const detail = await credentialVaultClient.getCredentialsDetails({ id: found.id });
@@ -42,17 +41,29 @@ export default async function () {
 
   const commonHeaders = { accept: "application/json", apiKey };
 
-  // ============================
-  // Helpers
-  // ============================
+  // ------------------------------
+  // 2) USER OPTIONS (match your PowerShell)
+  // ------------------------------
+  const AlertTypes = ["11001", "1105"];     // add more: ["11001","1105","XXXXX"]
+  const AlertStates = ["kOpen"];           // or ["kOpen","kNote"]
+  const AlertCategories = [];              // optional e.g. ["kNodeHealth","kNetworking"]
+  const MaxAlerts = 200;
+
+  const NodeIds = []; // optional filter list like ["1","2","3"]
+
+  // ------------------------------
+  // 3) HELPERS
+  // ------------------------------
   function norm(v) {
     if (v === null || v === undefined) return "";
     return String(v).trim();
   }
+
   function toArrayMaybe(v) {
     if (!v) return [];
     return Array.isArray(v) ? v : [v];
   }
+
   async function getJson(url, headers) {
     const resp = await fetch(url, { method: "GET", headers });
     if (!resp.ok) {
@@ -63,9 +74,45 @@ export default async function () {
     return resp.json();
   }
 
+  function buildQuery(params) {
+    const usp = new URLSearchParams();
+    for (const k in params) {
+      if (!Object.prototype.hasOwnProperty.call(params, k)) continue;
+      const v = params[k];
+      if (v === undefined || v === null) continue;
+      if (Array.isArray(v)) {
+        // PowerShell uses comma-separated for these; Helios accepts comma-separated
+        usp.append(k, v.join(","));
+      } else {
+        usp.append(k, String(v));
+      }
+    }
+    return usp.toString();
+  }
+
+  function getProp(propertyList, keys) {
+    const plist = Array.isArray(propertyList) ? propertyList : [];
+    for (let k = 0; k < keys.length; k++) {
+      const key = keys[k];
+      for (let i = 0; i < plist.length; i++) {
+        const p = plist[i] || {};
+        if (norm(p.key) !== key) continue;
+        if (p.value) return p.value;
+        if (p.values) return p.values;
+      }
+    }
+    return null;
+  }
+
+  // ET last 24 hours -> usecs
+  function toUsecs(d) { return Math.floor(d.getTime() * 1000); } // ms -> usecs
+  const now = new Date();
+  const endUsecs = toUsecs(now);
+  const startUsecs = toUsecs(new Date(now.getTime() - (24 * 60 * 60 * 1000)));
+
   function usecsToEtString(usecs) {
     if (!usecs) return "";
-    const ms = Math.floor(Number(usecs) / 1000);
+    const ms = Math.floor(Number(usecs) / 1000); // usecs -> ms
     if (!Number.isFinite(ms)) return "";
     return new Date(ms).toLocaleString("en-US", {
       timeZone: "America/New_York",
@@ -79,187 +126,128 @@ export default async function () {
     });
   }
 
-  function getProp(plist, keys) {
-    const arr = toArrayMaybe(plist);
-    for (let k = 0; k < keys.length; k++) {
-      const key = keys[k];
-      for (let i = 0; i < arr.length; i++) {
-        const p = arr[i] || {};
-        if (norm(p.key) !== key) continue;
-        if (p.value) return norm(p.value);
-        if (p.values) {
-          if (Array.isArray(p.values)) return p.values.length ? norm(p.values[0]) : "";
-          return norm(p.values);
-        }
-        return "";
-      }
+  // ------------------------------
+  // 4) GET CLUSTERS + BUILD LOCATION MAP
+  // ------------------------------
+  const clusterData = await getJson(baseUrl + "/v2/mcm/cluster-mgmt/info", commonHeaders);
+  const clusters = toArrayMaybe(clusterData && clusterData.cohesityClusters);
+  if (!clusters.length) throw new Error("No clusters returned from Helios.");
+
+  // Map clusterId -> {name, location}
+  const clusterMap = {};
+  for (let i = 0; i < clusters.length; i++) {
+    const c = clusters[i] || {};
+    const cid = norm(c.clusterId);
+    if (!cid) continue;
+
+    // location can be string or object depending on tenant/version
+    const locRaw = c.location;
+    let loc = "";
+    if (typeof locRaw === "string") loc = locRaw;
+    else if (locRaw && typeof locRaw === "object") {
+      // try common fields
+      loc =
+        norm(locRaw.name) ||
+        norm(locRaw.city) ||
+        norm(locRaw.site) ||
+        norm(locRaw.region) ||
+        "";
     }
-    return "";
-  }
 
-  function joinCsv(arr) {
-    const a = (arr || []).map(x => norm(x)).filter(Boolean);
-    return a.length ? a.join(",") : "";
-  }
-
-  // ============================
-  // User options (match your PS intent)
-  // ============================
-  const AlertTypes = ["11001", "1105"]; // add more if needed
-  const AlertStates = ["kOpen"];        // or ["kOpen","kNote"]
-  const AlertCategories = [];           // optional
-  const MaxAlerts = 200;
-
-  // Optional: only these node IDs
-  const NodeIds = []; // e.g. ["1","2","3"]
-
-  // ============================
-  // 1) ET window last 24h in usecs (UTC)
-  // ============================
-  const endUsecs = Date.now() * 1000;
-  const startUsecs = endUsecs - (24 * 60 * 60 * 1000000);
-
-  // ============================
-  // 2) Get clusters (need location)
-  // ============================
-  const clu = await getJson(baseUrl + "/v2/mcm/cluster-mgmt/info", commonHeaders);
-  const clusters = toArrayMaybe(clu && clu.cohesityClusters);
-
-  if (!clusters.length) {
-    return {
-      authMode,
-      count: 0,
-      results: [],
-      markdownTable: "⚠️ No clusters returned from /v2/mcm/cluster-mgmt/info"
-    };
-  }
-
-  // Build lookup: clusterId -> { name, location }
-  const cluMap = {};
-  for (let i = 0; i < clusters.length; i++) {
-    const c = clusters[i] || {};
-    const id = norm(c.clusterId);
-    if (!id) continue;
-    cluMap[id] = {
+    clusterMap[cid] = {
       ClusterName: norm(c.clusterName),
-      Location: norm(c.location)
+      Location: loc,
+      ClusterLocationRaw: locRaw || null
     };
   }
 
-  // ============================
-  // 3) Build alerts query (comma-separated filters)
-  // ============================
-  const q = [];
-  q.push("maxAlerts=" + encodeURIComponent(String(MaxAlerts)));
+  // ------------------------------
+  // 5) FETCH ALERTS PER CLUSTER
+  // ------------------------------
+  const q = buildQuery({
+    maxAlerts: MaxAlerts,
+    alertTypes: AlertTypes,
+    alertStates: AlertStates,
+    ...(AlertCategories.length ? { alertCategories: AlertCategories } : {}),
+    startDateUsecs: startUsecs,
+    endDateUsecs: endUsecs
+  });
 
-  const at = joinCsv(AlertTypes);
-  if (at) q.push("alertTypes=" + encodeURIComponent(at));
+  const results = [];
 
-  const ast = joinCsv(AlertStates);
-  if (ast) q.push("alertStates=" + encodeURIComponent(ast));
-
-  const ac = joinCsv(AlertCategories);
-  if (ac) q.push("alertCategories=" + encodeURIComponent(ac));
-
-  q.push("startDateUsecs=" + encodeURIComponent(String(startUsecs)));
-  q.push("endDateUsecs=" + encodeURIComponent(String(endUsecs)));
-
-  const alertsBaseUrl = baseUrl + "/v2/alerts?" + q.join("&");
-
-  // ============================
-  // 4) Fetch alerts per cluster, collect rows
-  // ============================
-  const rows = [];
-
-  for (let i = 0; i < clusters.length; i++) {
-    const c = clusters[i] || {};
-    const clusterId = norm(c.clusterId);
+  for (let ci = 0; ci < clusters.length; ci++) {
+    const clus = clusters[ci] || {};
+    const clusterId = norm(clus.clusterId);
     if (!clusterId) continue;
 
-    const meta = cluMap[clusterId] || {};
-    const clusterName = meta.ClusterName || norm(c.clusterName);
-    const location = meta.Location || norm(c.location);
+    const meta = clusterMap[clusterId] || {};
+    const clusterName = meta.ClusterName || norm(clus.clusterName);
+    const location = meta.Location || "";
 
-    const headers = { accept: "application/json", apiKey, accessClusterId: clusterId };
+    const headers = {
+      accept: "application/json",
+      apiKey,
+      accessClusterId: clusterId
+    };
 
-    let data;
+    const alertsUrl = baseUrl + "/v2/alerts?" + q;
+
+    let aData;
     try {
-      data = await getJson(alertsBaseUrl, headers);
+      aData = await getJson(alertsUrl, headers);
     } catch (e) {
+      // keep going, one cluster failing shouldn't kill the workflow
+      console.log("⚠️ Alerts fetch failed for " + clusterName + " (" + clusterId + "): " + norm(e.message || e));
       continue;
     }
 
-    const alerts = toArrayMaybe(data && data.alerts);
+    const alerts = toArrayMaybe(aData && aData.alerts);
+    for (let ai = 0; ai < alerts.length; ai++) {
+      const alt = alerts[ai] || {};
 
-    for (let j = 0; j < alerts.length; j++) {
-      const alt = alerts[j] || {};
       const latestUsecs = Number(alt.latestTimestampUsecs || 0);
       if (!latestUsecs) continue;
 
-      // local window enforcement
+      // enforce 24h locally too (matches your PS behavior)
       if (latestUsecs < startUsecs || latestUsecs > endUsecs) continue;
 
       const nodeId = getProp(alt.propertyList, ["node_id", "nodeId"]);
-      const ip = getProp(alt.propertyList, [
-        "node_ip", "ip", "ipAddress", "host_ip",
-        "source_ip", "sourceIp", "remote_ip", "remoteIp"
-      ]);
+      const ip = getProp(alt.propertyList, ["node_ip", "ip", "ipAddress", "host_ip", "source_ip", "sourceIp", "remote_ip", "remoteIp"]);
 
       if (NodeIds.length && nodeId && !NodeIds.includes(String(nodeId))) continue;
 
-      rows.push({
-        Location: location,
+      results.push({
         ClusterName: clusterName,
         ClusterId: clusterId,
-        ClusterNodeId: nodeId,
-        IP: ip,
+        Location: location,                 // ✅ ADDED
+        ClusterNodeId: nodeId ? String(nodeId) : "",
+        IP: Array.isArray(ip) ? (ip[0] ? String(ip[0]) : "") : (ip ? String(ip) : ""),
         AlertCode: norm(alt.alertCode),
         Severity: norm(alt.severity),
         AlertState: norm(alt.alertState),
         AlertCause: norm(alt.alertDocument && alt.alertDocument.alertCause),
-        LatestUsecs: latestUsecs,
-        LatestTimeET: usecsToEtString(latestUsecs)
+        LatestTimeET: usecsToEtString(latestUsecs),
+        LatestUsecs: latestUsecs
       });
     }
   }
 
-  // ============================
-  // 5) Latest per (ClusterId + NodeId)
-  // ============================
-  const latestMap = {};
-  for (let i = 0; i < rows.length; i++) {
-    const r = rows[i];
-    if (!r.ClusterId || !r.ClusterNodeId) continue;
-    const key = r.ClusterId + "|" + r.ClusterNodeId;
-    if (!latestMap[key] || r.LatestUsecs > latestMap[key].LatestUsecs) latestMap[key] = r;
+  // ------------------------------
+  // 6) LATEST PER (ClusterId + NodeId) like your PS
+  // ------------------------------
+  const best = {};
+  for (let i = 0; i < results.length; i++) {
+    const r = results[i];
+    if (!r.ClusterNodeId) continue;
+    const k = r.ClusterId + "|" + r.ClusterNodeId;
+    if (!best[k] || (r.LatestUsecs > best[k].LatestUsecs)) best[k] = r;
   }
 
-  const latest = Object.keys(latestMap).map(k => latestMap[k]);
-  latest.sort((a, b) => (b.LatestUsecs || 0) - (a.LatestUsecs || 0));
-
-  // ============================
-  // 6) Markdown
-  // ============================
-  function safeCell(v) {
-    if (v === null || v === undefined) return "";
-    return String(v).replace(/\|/g, " ");
-  }
-
-  function toMarkdownTable(arr) {
-    if (!arr.length) return "✅ No alerts returned in last 24h (ET) window.";
-
-    const cols = ["Location","ClusterName","ClusterId","ClusterNodeId","IP","AlertCode","Severity","AlertState","AlertCause","LatestTimeET"];
-    const header = "| " + cols.join(" | ") + " |";
-    const sep = "| " + cols.map(() => "---").join(" | ") + " |";
-    const body = arr.map(r => "| " + cols.map(c => safeCell(r[c])).join(" | ") + " |");
-
-    return "### Helios Alerts (latest per ClusterId+NodeId, last 24h ET)\n\n" + [header, sep].concat(body).join("\n");
-  }
+  const latestPerClusterNode = Object.values(best).sort((a, b) => (b.LatestUsecs || 0) - (a.LatestUsecs || 0));
 
   return {
     authMode,
-    count: latest.length,
-    results: latest,
-    markdownTable: toMarkdownTable(latest)
+    count: latestPerClusterNode.length,
+    results: latestPerClusterNode
   };
 }
