@@ -1,13 +1,12 @@
 // ------------------------------------------------------------
-// Dynatrace JS2 | Cohesity Helios Interface DOWN validator (GET only)
-// NO UI inputs needed.
-// Reads JS1 output directly via workflow execution context:
-//
-//   const upstream = await wfResult("get_alerts");
+// Dynatrace JS2 | Helios Interface DOWN validator + SNOW payload prep (GET only)
+// Reads alerts from workflow step "get_alerts" (no UI inputs needed)
 //
 // Output:
-// - markdownEmail (table for email)
-// - incidentText  (short text for incident, includes Location)
+// - downRows
+// - teamIncident (one incident payload)
+// - dcIncidents  (one per location payload; allowlist controlled)
+// - markdownEmail (for later)
 // ------------------------------------------------------------
 
 import { credentialVaultClient } from "@dynatrace-sdk/client-classic-environment-v2";
@@ -15,9 +14,11 @@ import { result as wfResult } from "@dynatrace-sdk/automation-utils";
 
 export default async function () {
   const baseUrl = "https://helios.cohesity.com";
-
-  // ✅ must match your JS1 task name/id in the workflow
   const PREDECESSOR_TASK = "get_alerts";
+
+  // ---- DC allowlist toggle ----
+  const DC_ALLOWLIST_ENABLED = true; // later: set false to process ALL locations
+  const DC_ALLOWLIST = ["San Antonio", "Carrollton", "Detroit"];
 
   // ------------------------------
   // Helpers
@@ -26,8 +27,14 @@ export default async function () {
   const safe = (v) => norm(v).replace(/\|/g, " ");
   const looksDown = (v) => norm(v).toLowerCase().includes("down");
 
+  const normLoc = (s) => norm(s).toLowerCase().replace(/\s+/g, " ");
+  const slug = (s) =>
+    norm(s)
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, "_")
+      .replace(/^_+|_+$/g, "");
+
   function extractArray(maybe) {
-    // tolerate different shapes
     if (Array.isArray(maybe)) return maybe;
     if (maybe && Array.isArray(maybe.results)) return maybe.results;
     if (maybe && maybe.result && Array.isArray(maybe.result.results)) return maybe.result.results;
@@ -36,7 +43,6 @@ export default async function () {
   }
 
   function pickIP(r) {
-    // keep simple but resilient
     return norm(r?.IP || r?.ip || r?.NodeIP || r?.nodeIp || r?.node_ip);
   }
 
@@ -60,7 +66,7 @@ export default async function () {
   }
 
   // ------------------------------
-  // 0) Get JS1 output from workflow execution
+  // 0) Read JS1 output from workflow context
   // ------------------------------
   let upstream;
   try {
@@ -68,18 +74,20 @@ export default async function () {
   } catch (e) {
     return {
       ok: false,
-      reason: "Could not read predecessor task result",
+      step: "read_upstream",
       predecessorTask: PREDECESSOR_TASK,
       error: norm(e?.message || e),
-      markdownEmail: `❌ JS2 failed: cannot read result("${PREDECESSOR_TASK}"). Check the task name.`,
-      incidentText: `❌ JS2 failed: cannot read predecessor task result "${PREDECESSOR_TASK}".`
+      markdownEmail: `❌ JS2 failed: cannot read result("${PREDECESSOR_TASK}").`,
+      incidentText: `❌ JS2 failed: cannot read predecessor task "${PREDECESSOR_TASK}".`,
+      teamIncident: null,
+      dcIncidents: []
     };
   }
 
   const rowsIn = extractArray(upstream?.results ?? upstream);
 
   // ------------------------------
-  // 1) Filter interface-trigger alerts (CE030601105 / 1105)
+  // 1) Filter interface-trigger alerts
   // ------------------------------
   const TRIGGER_EXACT = "CE030601105";
   const TRIGGER_NUM = "1105";
@@ -111,6 +119,17 @@ export default async function () {
   }
 
   if (!interfaceTargets.length) {
+    const teamIncident = {
+      correlationId: "cohesity_ifdown_team",
+      shortDescription: `Cohesity Interface DOWN (CE030601105) - No targets`,
+      description: `No CE030601105/1105 targets found in get_alerts output.\nPredecessor: ${PREDECESSOR_TASK}`,
+      snow: {
+        correlation_id: "cohesity_ifdown_team",
+        short_description: `Cohesity Interface DOWN (CE030601105) - No targets`,
+        description: `No CE030601105/1105 targets found in get_alerts output.\nPredecessor: ${PREDECESSOR_TASK}`
+      }
+    };
+
     return {
       ok: true,
       predecessorTask: PREDECESSOR_TASK,
@@ -119,13 +138,21 @@ export default async function () {
       clustersTargeted: 0,
       downCount: 0,
       downRows: [],
-      markdownEmail: "⏭️ No CE030601105/1105 targets found in JS1 results.",
-      incidentText: "No CE030601105/1105 targets found. Skipping Helios interface validation."
+      markdownEmail: "⏭️ No CE030601105/1105 targets found. Skipping interface validation.",
+      incidentText: "No CE030601105/1105 targets found. Skipping interface validation.",
+      teamIncident,
+      dcIncidents: [],
+      plan: {
+        createOrUpdateTeam: false,
+        createOrUpdateDC: false,
+        dcAllowlistEnabled: DC_ALLOWLIST_ENABLED,
+        dcAllowlist: DC_ALLOWLIST
+      }
     };
   }
 
   // ------------------------------
-  // 2) Group by ClusterId -> alert IP set + meta (location routing)
+  // 2) Group by ClusterId -> IP set + meta
   // ------------------------------
   const byCluster = {};
   for (const t of interfaceTargets) {
@@ -179,6 +206,7 @@ export default async function () {
   if (!apiKey || apiKey === "PASTE_YOUR_API_KEY_HERE") {
     return {
       ok: false,
+      step: "auth",
       authMode,
       targetsProvided: rowsIn.length,
       targetsMatched: interfaceTargets.length,
@@ -186,7 +214,10 @@ export default async function () {
       downCount: 0,
       downRows: [],
       markdownEmail: "❌ No valid Helios API key available.",
-      incidentText: "❌ Helios interface validation failed: missing API key."
+      incidentText: "❌ Helios interface validation failed: missing API key.",
+      teamIncident: null,
+      dcIncidents: [],
+      plan: { createOrUpdateTeam: false, createOrUpdateDC: false }
     };
   }
 
@@ -222,8 +253,7 @@ export default async function () {
       const nodeIp = norm(node?.nodeIp || node?.ip);
       if (!nodeIp) continue;
 
-      // ✅ THIS is the IP comparison:
-      // alert IPs (from JS1) vs interface nodeIp (from /public/interface)
+      // ✅ IP comparison happens here:
       if (!entry.Ips[nodeIp]) continue;
 
       const ifaces = Array.isArray(node?.interfaces) ? node.interfaces : (node?.interfaces ? [node.interfaces] : []);
@@ -260,7 +290,7 @@ export default async function () {
   }
 
   // ------------------------------
-  // 4) Build markdownEmail + incidentText
+  // 4) Build markdownEmail (for later)
   // ------------------------------
   downRows.sort((a, b) =>
     safe(a.Location).localeCompare(safe(b.Location)) ||
@@ -295,13 +325,84 @@ export default async function () {
 
   const markdownEmail = toMarkdown(downRows);
 
-  const incidentText = !downRows.length
-    ? `Helios interface validation complete: no confirmed DOWN slave interfaces.\nTrigger: ${TRIGGER_EXACT}\nTargets: ${interfaceTargets.length}, Clusters: ${clusterIds.length}`
-    : `Confirmed DOWN slave interfaces (Location for DC routing)\nTrigger: ${TRIGGER_EXACT}\nCount: ${downRows.length}\n` +
-      downRows.slice(0, 30).map(r =>
-        `- ${r.Location} | ${r.ClusterName} | ${r.IP} | ${r.BondName}/${r.Slave} = ${r.LinkState}`
-      ).join("\n") +
-      (downRows.length > 30 ? `\n...and ${downRows.length - 30} more` : "");
+  // ------------------------------
+  // 5) Build incident payloads (Team + DC per location)
+  // ------------------------------
+  const headerLine = `Confirmed DOWN slave interfaces (Helios /public/interface)\nTrigger: ${TRIGGER_EXACT}\nCount: ${downRows.length}`;
+
+  const teamLines = downRows.map(r =>
+    `- ${r.Location} | ${r.ClusterName} | ${r.IP} | ${r.BondName}/${r.Slave} = ${r.LinkState}`
+  );
+
+  const teamDescription =
+    `${headerLine}\n\n` +
+    teamLines.join("\n");
+
+  const teamIncident = {
+    correlationId: "cohesity_ifdown_team",
+    shortDescription: `Cohesity Interface DOWN (CE030601105) | ${downRows.length} affected`,
+    description: teamDescription,
+    snow: {
+      correlation_id: "cohesity_ifdown_team",
+      short_description: `Cohesity Interface DOWN (CE030601105) | ${downRows.length} affected`,
+      description: teamDescription
+    }
+  };
+
+  const byLocation = {};
+  for (const r of downRows) {
+    const loc = norm(r.Location) || "Unknown";
+    byLocation[loc] ||= [];
+    byLocation[loc].push(r);
+  }
+
+  const allowSet = new Set(DC_ALLOWLIST.map(normLoc));
+
+  const dcIncidents = [];
+  for (const loc of Object.keys(byLocation)) {
+    const locNorm = normLoc(loc);
+    const allowed = !DC_ALLOWLIST_ENABLED || allowSet.has(locNorm);
+    if (!allowed) continue;
+
+    const rows = byLocation[loc];
+    const lines = rows.map(r =>
+      `- ${r.ClusterName} | ${r.IP} | ${r.BondName}/${r.Slave} = ${r.LinkState}`
+    );
+
+    const desc =
+      `Location: ${loc}\n` +
+      `${headerLine}\n\n` +
+      lines.join("\n");
+
+    const corr = `cohesity_ifdown_dc_${slug(loc)}`;
+
+    dcIncidents.push({
+      location: loc,
+      correlationId: corr,
+      shortDescription: `Cohesity Interface DOWN | ${loc} | ${rows.length} affected`,
+      description: desc,
+      snow: {
+        correlation_id: corr,
+        short_description: `Cohesity Interface DOWN | ${loc} | ${rows.length} affected`,
+        description: desc
+      }
+    });
+  }
+
+  const incidentText =
+    downRows.length
+      ? `${headerLine}\n` +
+        teamLines.slice(0, 30).join("\n") +
+        (teamLines.length > 30 ? `\n...and ${teamLines.length - 30} more` : "")
+      : "No confirmed DOWN slave interfaces found.";
+
+  const plan = {
+    createOrUpdateTeam: downRows.length > 0,
+    createOrUpdateDC: dcIncidents.length > 0,
+    dcAllowlistEnabled: DC_ALLOWLIST_ENABLED,
+    dcAllowlist: DC_ALLOWLIST,
+    dcLocationsPlanned: dcIncidents.map(x => x.location)
+  };
 
   return {
     ok: true,
@@ -313,7 +414,9 @@ export default async function () {
     downCount: downRows.length,
     downRows,
     markdownEmail,
-    markdownTable: markdownEmail,
-    incidentText
+    incidentText,
+    teamIncident,
+    dcIncidents,
+    plan
   };
 }
