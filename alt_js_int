@@ -1,7 +1,8 @@
 // ------------------------------------------------------------
-// Dynatrace JS2 | Helios Interface DOWN validator (clean)
-// Input: alertTargets = result("Get_Alerts").results   (or wrapper)
-// Output: markdownEmail + incidentText
+// Dynatrace JS2 | Helios Interface DOWN validator (clean + correct)
+// Input : alertTargets = result("Get_Alerts").results
+// Logic : if alert IP matches /public/interface nodeIp, validate slave linkState=DOWN
+// Output: markdownEmail + incidentText (includes Location for DC routing)
 // ------------------------------------------------------------
 
 import { credentialVaultClient } from "@dynatrace-sdk/client-classic-environment-v2";
@@ -9,26 +10,44 @@ import { credentialVaultClient } from "@dynatrace-sdk/client-classic-environment
 export default async function ({ alertTargets = [] } = {}) {
   const baseUrl = "https://helios.cohesity.com";
 
-  // ---------- tiny helpers ----------
+  // ------------------------------
+  // Helpers
+  // ------------------------------
   const norm = (v) => (v === null || v === undefined) ? "" : String(v).trim();
   const safe = (v) => norm(v).replace(/\|/g, " ");
 
   function unwrap(v) {
     if (Array.isArray(v)) return v;
-    if (v && Array.isArray(v.results)) return v.results; // ✅ common Dynatrace wrapper
+    if (v && Array.isArray(v.results)) return v.results; // tolerate wrapper
     return [];
   }
 
-  function pick(obj, keys) {
-    for (const k of keys) {
-      const val = obj?.[k];
-      const s = norm(val);
-      if (s) return s;
-    }
-    return "";
+  function looksDown(v) {
+    return norm(v).toLowerCase().includes("down");
   }
 
-  // ---------- auth ----------
+  function indexDetails(details) {
+    const map = {};
+    const arr = Array.isArray(details) ? details : (details ? [details] : []);
+    for (const d of arr) {
+      const name = norm(d?.name || d?.["@name"] || d?.ifaceName || d?.interfaceName);
+      if (name) map[name] = d;
+    }
+    return map;
+  }
+
+  async function getJson(url, headers) {
+    const resp = await fetch(url, { method: "GET", headers });
+    if (!resp.ok) {
+      const txt = await resp.text().catch(() => "");
+      throw new Error(`HTTP ${resp.status} ${txt}`);
+    }
+    return resp.json();
+  }
+
+  // ------------------------------
+  // Auth (vault-name -> vault-id -> manual)
+  // ------------------------------
   const vaultName = "Cohesity_API_Key";
   const vaultId   = "credentials_vault-312312";
 
@@ -40,6 +59,7 @@ export default async function ({ alertTargets = [] } = {}) {
     const creds = (all && all.credentials) ? all.credentials : [];
     const found = creds.find(c => c && c.name === name);
     if (!found) return null;
+
     const detail = await credentialVaultClient.getCredentialsDetails({ id: found.id });
     return (detail && (detail.token || detail.password)) || null;
   }
@@ -65,12 +85,15 @@ export default async function ({ alertTargets = [] } = {}) {
       targetsMatched: 0,
       clustersTargeted: 0,
       downCount: 0,
+      downRows: [],
       markdownEmail: "❌ No valid Helios API key available.",
       incidentText: "❌ Helios interface validation failed: missing API key."
     };
   }
 
-  // ---------- 1) filter interface alerts ----------
+  // ------------------------------
+  // 1) Filter CE030601105 / 1105
+  // ------------------------------
   const TRIGGER_EXACT = "CE030601105";
   const TRIGGER_NUM   = "1105";
 
@@ -86,15 +109,15 @@ export default async function ({ alertTargets = [] } = {}) {
 
   const interfaceTargets = [];
   for (const r of rowsIn) {
-    const alertCode = pick(r, ["AlertCode", "alertCode"]);
+    const alertCode = norm(r?.AlertCode || r?.alertCode);
     if (!isTrigger(alertCode)) continue;
 
-    const clusterId   = pick(r, ["ClusterId", "clusterId"]);
-    const clusterName = pick(r, ["ClusterName", "clusterName"]);
-    const location    = pick(r, ["Location", "location"]);
+    const clusterId   = norm(r?.ClusterId || r?.clusterId);
+    const clusterName = norm(r?.ClusterName || r?.clusterName);
+    const location    = norm(r?.Location || r?.location);
 
-    // ✅ Robust IP pickup (covers common variants)
-    const ip = pick(r, ["IP", "ip", "NodeIP", "nodeIp", "node_ip", "hostIp", "host_ip"]);
+    // ✅ IMPORTANT: pick IP from common keys (kept minimal but safe)
+    const ip = norm(r?.IP || r?.ip || r?.NodeIP || r?.nodeIp || r?.node_ip);
 
     if (!clusterId || !ip) continue;
 
@@ -108,36 +131,42 @@ export default async function ({ alertTargets = [] } = {}) {
   }
 
   if (!interfaceTargets.length) {
-    // Minimal diagnostics (clean): shows if IP keys differ
-    const firstKeys = rowsIn[0] ? Object.keys(rowsIn[0]).join(", ") : "(none)";
     return {
       authMode,
       targetsProvided: rowsIn.length,
       targetsMatched: 0,
       clustersTargeted: 0,
       downCount: 0,
-      markdownEmail: "⏭️ No CE030601105 targets found OR IP/ClusterId not picked.\n\nFirst row keys:\n" + firstKeys,
-      incidentText: "No interface-alert targets picked by JS2 (check keys: IP/ClusterId/AlertCode)."
+      downRows: [],
+      markdownEmail: "⏭️ No CE030601105/1105 targets with ClusterId+IP in input.",
+      incidentText: "No interface-alert targets (CE030601105/1105) found with ClusterId+IP."
     };
   }
 
-  // ---------- 2) group by cluster -> IP set + location ----------
+  // ------------------------------
+  // 2) Group by cluster -> alert IP set + meta
+  // ------------------------------
   const byCluster = {};
   for (const t of interfaceTargets) {
     const cid = t.ClusterId;
     if (!byCluster[cid]) {
       byCluster[cid] = {
-        Location: t.Location,
+        ClusterId: cid,
         ClusterName: t.ClusterName,
+        Location: t.Location,
         Ips: {}
       };
     }
     byCluster[cid].Ips[t.IP] = true;
+    if (!byCluster[cid].Location && t.Location) byCluster[cid].Location = t.Location;
+    if (!byCluster[cid].ClusterName && t.ClusterName) byCluster[cid].ClusterName = t.ClusterName;
   }
 
   const clusterIds = Object.keys(byCluster);
 
-  // ---------- 3) call /public/interface per cluster ----------
+  // ------------------------------
+  // 3) Call /public/interface and match by IP
+  // ------------------------------
   const ifaceUrl =
     baseUrl +
     "/irisservices/api/v1/public/interface" +
@@ -145,24 +174,6 @@ export default async function ({ alertTargets = [] } = {}) {
     "&ifaceGroupAssignedOnly=true" +
     "&includeUplinkSwitchInfo=true" +
     "&includeBondSlaveDetails=true";
-
-  async function getJson(url, headers) {
-    const resp = await fetch(url, { method: "GET", headers });
-    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-    return resp.json();
-  }
-
-  const looksDown = (v) => norm(v).toLowerCase().includes("down");
-
-  function indexDetails(details) {
-    const map = {};
-    const arr = Array.isArray(details) ? details : (details ? [details] : []);
-    for (const d of arr) {
-      const name = norm(d?.name || d?.["@name"] || d?.ifaceName || d?.interfaceName);
-      if (name) map[name] = d;
-    }
-    return map;
-  }
 
   const downRows = [];
 
@@ -177,16 +188,16 @@ export default async function ({ alertTargets = [] } = {}) {
         accessClusterId: String(cid)
       });
     } catch {
-      continue; // keep simple
+      continue;
     }
 
     const nodes = Array.isArray(data) ? data : (data ? [data] : []);
     for (const node of nodes) {
-      const nodeIp = norm(node?.nodeIp);
+      // ✅ /public/interface uses nodeIp; normalize and MATCH to alert IPs
+      const nodeIp = norm(node?.nodeIp || node?.ip);
       if (!nodeIp) continue;
 
-      // ✅ match only the IPs from alerts
-      if (!entry.Ips[nodeIp]) continue;
+      if (!entry.Ips[nodeIp]) continue; // ✅ ONLY show if IP matches
 
       const ifaces = Array.isArray(node?.interfaces) ? node.interfaces : (node?.interfaces ? [node.interfaces] : []);
       for (const bond of ifaces) {
@@ -207,7 +218,8 @@ export default async function ({ alertTargets = [] } = {}) {
           downRows.push({
             Location: entry.Location,
             ClusterName: entry.ClusterName,
-            NodeIP: nodeIp,
+            ClusterId: String(cid),
+            IP: nodeIp,                 // ✅ show as IP (not NodeIP)
             BondName: bondName,
             Slave: slaveName,
             LinkState: linkState,
@@ -220,24 +232,34 @@ export default async function ({ alertTargets = [] } = {}) {
     }
   }
 
-  // ---------- 4) markdown + incident text ----------
+  // ------------------------------
+  // 4) Markdown (email) + Incident text
+  // ------------------------------
   downRows.sort((a, b) =>
     safe(a.Location).localeCompare(safe(b.Location)) ||
     safe(a.ClusterName).localeCompare(safe(b.ClusterName)) ||
-    safe(a.NodeIP).localeCompare(safe(b.NodeIP))
+    safe(a.IP).localeCompare(safe(b.IP)) ||
+    safe(a.BondName).localeCompare(safe(b.BondName)) ||
+    safe(a.Slave).localeCompare(safe(b.Slave))
   );
 
   function toMarkdown(rows) {
     if (!rows.length) {
-      return `✅ No confirmed DOWN slave interfaces.\n\n- Targets matched: ${interfaceTargets.length}\n- Clusters targeted: ${clusterIds.length}\n`;
+      return (
+        "✅ No confirmed DOWN slave interfaces found.\n\n" +
+        `- Trigger: ${TRIGGER_EXACT}\n` +
+        `- Targets matched: ${interfaceTargets.length}\n` +
+        `- Clusters targeted: ${clusterIds.length}\n`
+      );
     }
-    const cols = ["Location","ClusterName","NodeIP","BondName","Slave","LinkState","Speed","MAC","SlotType"];
+
+    const cols = ["Location","ClusterName","ClusterId","IP","BondName","Slave","LinkState","Speed","MAC","SlotType"];
     const header = "| " + cols.join(" | ") + " |";
     const sep    = "| " + cols.map(() => "---").join(" | ") + " |";
     const body   = rows.map(r => "| " + cols.map(c => safe(r[c])).join(" | ") + " |");
 
     return (
-      "### Cohesity: Confirmed DOWN slave interfaces\n\n" +
+      "### Cohesity: Confirmed DOWN slave interfaces (Helios /public/interface)\n\n" +
       `- Trigger: ${TRIGGER_EXACT}\n` +
       `- Confirmed DOWN rows: ${rows.length}\n\n` +
       [header, sep].concat(body).join("\n")
@@ -247,12 +269,12 @@ export default async function ({ alertTargets = [] } = {}) {
   const markdownEmail = toMarkdown(downRows);
 
   const incidentText = !downRows.length
-    ? `Helios interface validation: no confirmed DOWN slave interfaces.\nTrigger: ${TRIGGER_EXACT}\nTargets: ${interfaceTargets.length}`
-    : `Confirmed DOWN slave interfaces (Location matters for DC routing)\nTrigger: ${TRIGGER_EXACT}\nCount: ${downRows.length}\n` +
-      downRows.slice(0, 25).map(r =>
-        `- ${r.Location} | ${r.ClusterName} | ${r.NodeIP} | ${r.BondName}/${r.Slave} = ${r.LinkState}`
+    ? `Helios interface validation complete: no confirmed DOWN slave interfaces.\nTrigger: ${TRIGGER_EXACT}\nTargets: ${interfaceTargets.length}, Clusters: ${clusterIds.length}`
+    : `Confirmed DOWN slave interfaces (Location for DC routing)\nTrigger: ${TRIGGER_EXACT}\nCount: ${downRows.length}\n` +
+      downRows.slice(0, 30).map(r =>
+        `- ${r.Location} | ${r.ClusterName} | ${r.IP} | ${r.BondName}/${r.Slave} = ${r.LinkState}`
       ).join("\n") +
-      (downRows.length > 25 ? `\n...and ${downRows.length - 25} more` : "");
+      (downRows.length > 30 ? `\n...and ${downRows.length - 30} more` : "");
 
   return {
     authMode,
@@ -260,6 +282,7 @@ export default async function ({ alertTargets = [] } = {}) {
     targetsMatched: interfaceTargets.length,
     clustersTargeted: clusterIds.length,
     downCount: downRows.length,
+    downRows,
     markdownEmail,
     markdownTable: markdownEmail,
     incidentText
