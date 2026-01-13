@@ -1,6 +1,13 @@
 # -------------------------------------------------------------
-# Cohesity Acropolis (AHV) Inventory – Working Baseline
-# Source of truth: LAST COMPLETED backup run per PG
+# Cohesity Acropolis (AHV) Inventory – Operational Truth
+# Inventory reflects the LAST COMPLETED backup run per Protection Group.
+#
+# InventoryAsOf definition:
+# - End time of the last COMPLETED backup run
+#   (Succeeded / SucceededWithWarning / Failed)
+# - NOT current time
+# - NOT run start time
+# - NOT running backups
 # -------------------------------------------------------------
 
 $ErrorActionPreference = "Stop"
@@ -15,7 +22,7 @@ $apiKey = (Get-Content $apikeypath -Raw).Trim()
 $commonHeaders = @{ apiKey = $apiKey }
 
 # ==============================
-# Time zone (ET)
+# Time zone (Eastern Time)
 # ==============================
 $tz = [System.TimeZoneInfo]::FindSystemTimeZoneById("Eastern Standard Time")
 
@@ -26,14 +33,10 @@ function Convert-ToET($usecs) {
 }
 
 # ==============================
-# Get clusters (sorted)
+# Get clusters (SORT ONCE)
 # ==============================
-$response = Invoke-WebRequest `
-    -Uri "$baseUrl/v2/mcm/cluster-mgmt/info" `
-    -Headers $commonHeaders `
-    -Method Get
-
-$clustersRaw = ($response.Content | ConvertFrom-Json).cohesityClusters
+$resp = Invoke-WebRequest -Uri "$baseUrl/v2/mcm/cluster-mgmt/info" -Headers $commonHeaders -Method Get
+$clustersRaw = ($resp.Content | ConvertFrom-Json).cohesityClusters
 if (-not $clustersRaw) { throw "No clusters returned from Helios" }
 
 $clustersSorted = $clustersRaw | Sort-Object clusterName
@@ -51,15 +54,13 @@ foreach ($c in $clustersSorted) {
 # ==============================
 # Menu
 # ==============================
-Write-Host ""
-Write-Host "Available Helios Clusters (A–Z):" -ForegroundColor Cyan
+Write-Host "`nAvailable Helios Clusters (A–Z):" -ForegroundColor Cyan
 $clusters | Format-Table Index, ClusterName -AutoSize
-Write-Host "[0] All clusters"
-Write-Host "[X] Exit"
-Write-Host ""
+Write-Host "`n[0] All clusters"
+Write-Host "[X] Exit`n"
 
 while ($true) {
-    $inputVal = Read-Host "Select cluster"
+    $inputVal = Read-Host "Enter 0 for ALL, 1-$($clusters.Count) for single, or X to exit"
     if ($inputVal -match '^(x|X|q|Q)$') { return }
 
     $num = 0
@@ -84,11 +85,14 @@ $PGInventory = @()
 
 foreach ($clus in $SelectedClusters) {
 
-    Write-Host "`nProcessing cluster: $($clus.ClusterName)" -ForegroundColor Cyan
+    $clusterName = $clus.ClusterName
+    $clusterId   = $clus.ClusterId
+
+    Write-Host "`nProcessing cluster: $clusterName" -ForegroundColor Cyan
 
     $headers = @{
         apiKey          = $apiKey
-        accessClusterId = $clus.ClusterId
+        accessClusterId = $clusterId
     }
 
     # --- Get Acropolis PGs ---
@@ -99,17 +103,16 @@ foreach ($clus in $SelectedClusters) {
         -Method Get
 
     $pgs = ($pgResp.Content | ConvertFrom-Json).protectionGroups
-    if (-not $pgs) {
-        Write-Host "  No Acropolis PGs found." -ForegroundColor Yellow
-        continue
-    }
+    if (-not $pgs) { continue }
 
     foreach ($pg in $pgs) {
 
-        Write-Host "  PG: $($pg.name)" -ForegroundColor DarkGray
+        $pgId   = $pg.id
+        $pgName = $pg.name
 
+        # --- Get recent runs ---
         $runResp = Invoke-WebRequest `
-            -Uri "$baseUrl/v2/data-protect/protection-groups/$($pg.id)/runs" `
+            -Uri "$baseUrl/v2/data-protect/protection-groups/$pgId/runs" `
             -Headers $headers `
             -Body @{
                 environments = "kAcropolis"
@@ -121,13 +124,17 @@ foreach ($clus in $SelectedClusters) {
         $runs = ($runResp.Content | ConvertFrom-Json).runs
         if (-not $runs) { continue }
 
-        # --- SAFE completed-run filter ---
+        # -------------------------------------------------
+        # SAFE filter: last COMPLETED run only
+        # -------------------------------------------------
         $completedRun = $runs |
             Where-Object {
                 $_.localBackupInfo -and
                 $_.localBackupInfo.Count -gt 0 -and
                 $_.localBackupInfo[0].status -in @(
-                    "Succeeded","SucceededWithWarning","Failed"
+                    "Succeeded",
+                    "SucceededWithWarning",
+                    "Failed"
                 )
             } |
             Sort-Object { $_.localBackupInfo[0].endTimeUsecs } -Descending |
@@ -135,13 +142,15 @@ foreach ($clus in $SelectedClusters) {
 
         if (-not $completedRun -or -not $completedRun.objects) { continue }
 
-        $runStatus = $completedRun.localBackupInfo[0].status
-        $inventoryAsOfET = Convert-ToET $completedRun.localBackupInfo[0].endTimeUsecs
+        $runInfo   = $completedRun.localBackupInfo[0]
+        $runStatus = $runInfo.status
+        $runEndET  = Convert-ToET $runInfo.endTimeUsecs
 
         $pgVMs = 0
         $pgFailed = 0
 
         foreach ($obj in $completedRun.objects) {
+
             if ($obj.object.environment -ne "kAcropolis") { continue }
             if ($obj.object.objectType -ne "kVirtualMachine") { continue }
 
@@ -149,34 +158,29 @@ foreach ($clus in $SelectedClusters) {
             if ($runStatus -ne "Succeeded") { $pgFailed++ }
 
             $VMInventory += [PSCustomObject]@{
-                Cluster         = $clus.ClusterName
-                ProtectionGroup = $pg.name
+                Cluster         = $clusterName
+                ProtectionGroup = $pgName
                 VMName          = $obj.object.name
                 LastRunStatus   = $runStatus
-                InventoryAsOfET = $inventoryAsOfET
+                InventoryAsOfET = $runEndET
             }
         }
 
         $PGInventory += [PSCustomObject]@{
-            Cluster         = $clus.ClusterName
-            ProtectionGroup = $pg.name
+            Cluster         = $clusterName
+            ProtectionGroup = $pgName
             TotalVMs        = $pgVMs
             FailedVMs       = $pgFailed
             LastRunStatus   = $runStatus
-            InventoryAsOfET = $inventoryAsOfET
+            InventoryAsOfET = $runEndET
         }
     }
 }
 
 # ==============================
-# OUTPUT (this WILL print)
+# Cluster roll-up
 # ==============================
-Write-Host "`nNOTE:" -ForegroundColor Yellow
-Write-Host "Inventory reflects the last completed backup run per protection group." -ForegroundColor Yellow
-Write-Host "Running backups are intentionally excluded." -ForegroundColor Yellow
-
-Write-Host "`n=== Cluster Summary ===" -ForegroundColor Cyan
-$PGInventory |
+$ClusterSummary = $PGInventory |
     Group-Object Cluster |
     ForEach-Object {
         $g = $_.Group
@@ -186,12 +190,32 @@ $PGInventory |
             TotalVMs      = ($g.TotalVMs | Measure-Object -Sum).Sum
             FailedVMs     = ($g.FailedVMs | Measure-Object -Sum).Sum
             InventoryAsOf = ($g.InventoryAsOfET | Sort-Object -Descending | Select-Object -First 1)
+            Status        = if (($g.FailedVMs | Measure-Object -Sum).Sum -eq 0) {
+                "HEALTHY"
+            } else {
+                "ATTENTION"
+            }
         }
-    } |
-    Format-Table -AutoSize
+    }
 
-Write-Host "`n=== Per Protection Group ===" -ForegroundColor Cyan
-$PGInventory | Sort-Object Cluster,ProtectionGroup | Format-Table -AutoSize
+# ==============================
+# Output
+# ==============================
+Write-Host "`nNOTE:" -ForegroundColor Yellow
+Write-Host "Inventory reflects the last completed backup run per protection group." -ForegroundColor Yellow
+Write-Host "Running backups are intentionally excluded." -ForegroundColor Yellow
 
-Write-Host "`n=== VM Details ===" -ForegroundColor Cyan
-$VMInventory | Sort-Object Cluster,ProtectionGroup,VMName | Format-Table -AutoSize
+Write-Host "`n=== Acropolis Inventory – Per Protection Group ===" -ForegroundColor Cyan
+$PGInventory |
+    Sort-Object Cluster, ProtectionGroup |
+    Format-Table Cluster,ProtectionGroup,TotalVMs,FailedVMs,LastRunStatus,InventoryAsOfET -AutoSize
+
+Write-Host "`n=== Acropolis Inventory – Cluster Summary ===" -ForegroundColor Cyan
+$ClusterSummary |
+    Sort-Object Cluster |
+    Format-Table Cluster,PGs,TotalVMs,FailedVMs,Status,InventoryAsOf -AutoSize
+
+Write-Host "`n=== Acropolis Inventory – VM Details ===" -ForegroundColor Cyan
+$VMInventory |
+    Sort-Object Cluster,ProtectionGroup,VMName |
+    Format-Table Cluster,ProtectionGroup,VMName,LastRunStatus,InventoryAsOfET -AutoSize
