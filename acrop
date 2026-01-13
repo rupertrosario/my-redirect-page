@@ -1,6 +1,6 @@
 # -------------------------------------------------------------
 # Cohesity Helios - Acropolis Backup Coverage (Current State)
-# Menu-driven | Alphabetical clusters | PG details included
+# Alphabetical clusters | PG details | Summary + Detail
 # -------------------------------------------------------------
 
 $ErrorActionPreference = "Stop"
@@ -9,44 +9,41 @@ $ErrorActionPreference = "Stop"
 # 0) API key
 # ==============================
 $apikeypath = "X:\PowerShell\Cohesity_API_Scripts\DO_NOT_Delete\apikey.txt"
-if (-not (Test-Path $apikeypath)) {
-    throw "API key file not found at $apikeypath"
-}
+if (-not (Test-Path $apikeypath)) { throw "API key file not found" }
 
-$apiKey = (Get-Content -Path $apikeypath -Raw).Trim()
+$apiKey = (Get-Content $apikeypath -Raw).Trim()
 $commonHeaders = @{ apiKey = $apiKey }
 
 # ==============================
-# 1) Get clusters (SORTED)
+# 1) Get clusters (RAW)
 # ==============================
-$resp = Invoke-WebRequest `
-    -Method Get `
+$resp = Invoke-WebRequest -Method Get `
     -Uri "https://helios.cohesity.com/v2/mcm/cluster-mgmt/info" `
     -Headers $commonHeaders
 
 $clustersRaw = ($resp.Content | ConvertFrom-Json).cohesityClusters
 if (-not $clustersRaw) { throw "No clusters returned" }
 
-$clustersSorted = $clustersRaw | Sort-Object clusterName
-
-$clusters = for ($i = 0; $i -lt $clustersSorted.Count; $i++) {
-    [PSCustomObject]@{
-        Index       = $i + 1
-        ClusterName = $clustersSorted[$i].clusterName
-        ClusterId   = $clustersSorted[$i].clusterId
+# ==============================
+# 2) Build SORTED cluster menu
+# ==============================
+$clusters = $clustersRaw |
+    Sort-Object clusterName |
+    ForEach-Object -Begin { $i = 1 } -Process {
+        [PSCustomObject]@{
+            Index       = $i++
+            ClusterName = $_.clusterName
+            ClusterId   = $_.clusterId
+        }
     }
-}
 
-Write-Host ""
-Write-Host "Available Helios Clusters (A–Z):" -ForegroundColor Cyan
-$clusters | Format-Table -AutoSize
-Write-Host ""
-Write-Host "[0] All clusters"
-Write-Host "[X] Exit"
-Write-Host ""
+Write-Host "`nAvailable Helios Clusters (A–Z):" -ForegroundColor Cyan
+$clusters | Sort-Object ClusterName | Format-Table -AutoSize
+Write-Host "`n[0] All clusters"
+Write-Host "[X] Exit`n"
 
 # ==============================
-# 2) Menu (safe pattern)
+# 3) Menu (safe)
 # ==============================
 while ($true) {
     $inputVal = Read-Host "Enter 0 for ALL, 1-$($clusters.Count) for single, or X to exit"
@@ -62,18 +59,18 @@ while ($true) {
 }
 
 $SelectedClusters = if ($selection -eq 0) {
-    $clusters
+    $clusters | Sort-Object ClusterName
 } else {
     @($clusters | Where-Object Index -eq $selection)
 }
 
 # ==============================
-# 3) Collect inventory
+# 4) Collect inventory
 # ==============================
-$AllRows = @()
+$AllRows   = @()
 $PGDetails = @()
 
-foreach ($clus in $SelectedClusters) {
+foreach ($clus in ($SelectedClusters | Sort-Object ClusterName)) {
 
     $clusterName = $clus.ClusterName
     $clusterId   = $clus.ClusterId
@@ -85,13 +82,10 @@ foreach ($clus in $SelectedClusters) {
         accessClusterId = $clusterId
     }
 
-    # ------------------------------------------
-    # A) PG lookup (SourceId → PG Name)
-    # ------------------------------------------
+    # ---- PG lookup ----
     $pgLookup = @{}
 
-    $pgResp = Invoke-WebRequest `
-        -Method Get `
+    $pgResp = Invoke-WebRequest -Method Get `
         -Uri "https://helios.cohesity.com/v2/data-protect/protection-groups" `
         -Headers $headers `
         -Body @{ environments = "kAcropolis" }
@@ -99,6 +93,83 @@ foreach ($clus in $SelectedClusters) {
     $pgJson = $pgResp.Content | ConvertFrom-Json
 
     foreach ($pg in $pgJson.protectionGroups) {
+        $ids = if ($pg.objects) { $pg.objects.id } else { $pg.sourceIds }
+        foreach ($id in $ids) {
+            if ($id) {
+                $pgLookup[$id] = $pg.name
+                $PGDetails += [PSCustomObject]@{
+                    Cluster         = $clusterName
+                    ProtectionGroup = $pg.name
+                    SourceId        = $id
+                }
+            }
+        }
+    }
 
-        $ids = @()
-        if ($pg.objects) { $ids = $pg.objects.id
+    # ---- protectionSources ----
+    $srcResp = Invoke-WebRequest -Method Get `
+        -Uri "https://helios.cohesity.com/irisservices/api/v1/public/protectionSources" `
+        -Headers $headers `
+        -Body @{ environments = "kAcropolis" }
+
+    $srcJson = $srcResp.Content | ConvertFrom-Json
+
+    foreach ($node in $srcJson.nodes) {
+        $psource = $node.protectionSource
+        if (-not $psource -or -not $psource.id) { continue }
+
+        $status = if ($node.protectedSourcesSummary.leavesCount -gt 0) {
+            "Protected"
+        } else {
+            "Unprotected"
+        }
+
+        $AllRows += [PSCustomObject]@{
+            Cluster          = $clusterName
+            VMName           = $psource.name
+            SourceId         = $psource.id
+            ProtectionGroup  = $pgLookup[$psource.id]
+            ProtectionStatus = $status
+        }
+    }
+}
+
+# ==============================
+# 5) Summary (SORTED)
+# ==============================
+$Summary = $AllRows |
+    Group-Object Cluster |
+    ForEach-Object {
+        $r = $_.Group
+        [PSCustomObject]@{
+            Cluster     = $_.Name
+            TotalVMs    = $r.Count
+            Protected   = ($r | Where-Object ProtectionStatus -eq "Protected").Count
+            Unprotected = ($r | Where-Object ProtectionStatus -eq "Unprotected").Count
+            PGs         = ($r.ProtectionGroup | Where-Object { $_ } | Select-Object -Unique).Count
+            Status      = if (($r | Where-Object ProtectionStatus -eq "Unprotected").Count -eq 0) {
+                "HEALTHY"
+            } else {
+                "ATTENTION"
+            }
+        }
+    }
+
+Write-Host "`n=== Acropolis Protection Summary ===" -ForegroundColor Cyan
+$Summary | Sort-Object Cluster | Format-Table -AutoSize
+
+# ==============================
+# 6) PG details (SORTED)
+# ==============================
+Write-Host "`n=== Protection Group → VM Mapping ===" -ForegroundColor Cyan
+$PGDetails |
+    Sort-Object Cluster, ProtectionGroup, SourceId |
+    Format-Table -AutoSize
+
+# ==============================
+# 7) Full inventory (SORTED)
+# ==============================
+Write-Host "`n=== Acropolis Inventory – Detailed View ===" -ForegroundColor Cyan
+$AllRows |
+    Sort-Object Cluster, VMName |
+    Format-Table -AutoSize
