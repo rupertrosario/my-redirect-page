@@ -60,4 +60,134 @@ Write-Host "[X] Exit`n"
 while ($true) {
     $inputVal = Read-Host "Enter 0 for ALL, 1-$($clusters.Count) for single, or X to exit"
     if ($inputVal -match '^(x|X|q|Q)$') { return }
-    if ([int]::TryPa
+    if ([int]::TryParse($inputVal, [ref]$num) -and $num -ge 0 -and $num -le $clusters.Count) {
+        $selection = $num
+        break
+    }
+}
+
+$SelectedClusters = if ($selection -eq 0) { $clusters } else { @($clusters | Where-Object Index -eq $selection) }
+
+# ==============================
+# Inventory collection
+# ==============================
+$VMInventory = @()
+$PGInventory = @()
+
+foreach ($clus in $SelectedClusters) {
+
+    $headers = @{ apiKey = $apiKey; accessClusterId = $clus.ClusterId }
+
+    # --- Get Acropolis PGs ---
+    $pgResp = Invoke-WebRequest `
+        -Uri "$baseUrl/v2/data-protect/protection-groups" `
+        -Headers $headers `
+        -Body @{ environments = "kAcropolis"; isDeleted = "False" } `
+        -Method Get
+
+    $pgs = ($pgResp.Content | ConvertFrom-Json).protectionGroups
+    if (-not $pgs) { continue }
+
+    foreach ($pg in $pgs) {
+
+        # --- Get recent runs ---
+        $runResp = Invoke-WebRequest `
+            -Uri "$baseUrl/v2/data-protect/protection-groups/$($pg.id)/runs" `
+            -Headers $headers `
+            -Body @{ environments = "kAcropolis"; numRuns = "15"; includeObjectDetails = "True" } `
+            -Method Get
+
+        $runs = ($runResp.Content | ConvertFrom-Json).runs
+        if (-not $runs) { continue }
+
+        # -----------------------------
+        # 1️⃣ Inventory source (objects)
+        # -----------------------------
+        $inventoryRun = $runs |
+            Where-Object { $_.objects } |
+            Sort-Object {
+                if ($_.localBackupInfo -and $_.localBackupInfo.Count -gt 0) {
+                    $_.localBackupInfo[0].endTimeUsecs
+                } else { 0 }
+            } -Descending |
+            Select-Object -First 1
+
+        if (-not $inventoryRun) { continue }
+
+        # -----------------------------
+        # 2️⃣ Metadata source (status/time)
+        # -----------------------------
+        $metaRun = $runs |
+            Where-Object { $_.localBackupInfo -and $_.localBackupInfo.Count -gt 0 } |
+            Sort-Object { $_.localBackupInfo[0].endTimeUsecs } -Descending |
+            Select-Object -First 1
+
+        $runInfo = if ($metaRun) { $metaRun.localBackupInfo[0] } else { $null }
+
+        $runStatus = if ($runInfo -and $runInfo.status) { $runInfo.status } else { "Unknown" }
+        $runEndET  = if ($runInfo -and $runInfo.endTimeUsecs) { Convert-ToET $runInfo.endTimeUsecs } else { $null }
+
+        $pgVMs = 0
+        $pgFailed = 0
+
+        foreach ($obj in $inventoryRun.objects) {
+            if ($obj.object.environment -ne "kAcropolis") { continue }
+            if ($obj.object.objectType -ne "kVirtualMachine") { continue }
+
+            $pgVMs++
+            if ($runStatus -ne "Succeeded") { $pgFailed++ }
+
+            $VMInventory += [PSCustomObject]@{
+                Cluster         = $clus.ClusterName
+                ProtectionGroup = $pg.name
+                VMName          = $obj.object.name
+                LastRunStatus   = $runStatus
+                InventoryAsOfET = $runEndET
+            }
+        }
+
+        $PGInventory += [PSCustomObject]@{
+            Cluster         = $clus.ClusterName
+            ProtectionGroup = $pg.name
+            TotalVMs        = $pgVMs
+            FailedVMs       = $pgFailed
+            LastRunStatus   = $runStatus
+            InventoryAsOfET = $runEndET
+        }
+    }
+}
+
+# ==============================
+# Cluster roll-up
+# ==============================
+$ClusterSummary = $PGInventory |
+    Group-Object Cluster |
+    ForEach-Object {
+        $g = $_.Group
+        [PSCustomObject]@{
+            Cluster       = $_.Name
+            PGs           = $g.Count
+            TotalVMs      = ($g.TotalVMs | Measure-Object -Sum).Sum
+            FailedVMs     = ($g.FailedVMs | Measure-Object -Sum).Sum
+            InventoryAsOf = ($g.InventoryAsOfET | Sort-Object -Descending | Select-Object -First 1)
+        }
+    }
+
+# ==============================
+# Output
+# ==============================
+Write-Host "`nNOTE:" -ForegroundColor Yellow
+Write-Host "Inventory reflects the most recent run that reported objects." -ForegroundColor Yellow
+Write-Host "Run status and InventoryAsOf are taken from the most recent completed run with metadata." -ForegroundColor Yellow
+
+Write-Host "`n=== Acropolis Inventory – Cluster Summary ===" -ForegroundColor Cyan
+$ClusterSummary | Sort-Object Cluster |
+    Format-Table Cluster,PGs,TotalVMs,FailedVMs,InventoryAsOf -AutoSize
+
+Write-Host "`n=== Acropolis Inventory – Per Protection Group ===" -ForegroundColor Cyan
+$PGInventory | Sort-Object Cluster,ProtectionGroup |
+    Format-Table Cluster,ProtectionGroup,TotalVMs,FailedVMs,LastRunStatus,InventoryAsOfET -AutoSize
+
+Write-Host "`n=== Acropolis Inventory – VM Details ===" -ForegroundColor Cyan
+$VMInventory | Sort-Object Cluster,ProtectionGroup,VMName |
+    Format-Table Cluster,ProtectionGroup,VMName,LastRunStatus,InventoryAsOfET -AutoSize
