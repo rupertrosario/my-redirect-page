@@ -1,170 +1,169 @@
 # -------------------------------------------------------------
-# Cohesity Acropolis (AHV) Inventory – Operational Truth
-# Inventory source: Last COMPLETED PG run (Succeeded / Failed)
+# Cohesity Acropolis (AHV) Backup Failures – Multi-Cluster (Helios)
+# Environment: kAcropolis | ObjectType: kVirtualMachine
 # -------------------------------------------------------------
 
-$ErrorActionPreference = "Stop"
-$baseUrl = "https://helios.cohesity.com"
+$logDirectory = "X:\PowerShell\Data\Cohesity\BackupFailures"
+if (-not (Test-Path -Path $logDirectory -PathType Container)) {
+    New-Item -Path $logDirectory -ItemType Directory | Out-Null
+}
 
-# ==============================
-# API Key
-# ==============================
+# --- Load API key ---
 $apikeypath = "X:\PowerShell\Cohesity_API_Scripts\DO_NOT_Delete\apikey.txt"
-if (-not (Test-Path $apikeypath)) { throw "API key file not found" }
-$apiKey = (Get-Content $apikeypath -Raw).Trim()
-$commonHeaders = @{ apiKey = $apiKey }
+if (-not (Test-Path $apikeypath)) { throw "API key file not found: $apikeypath" }
+$apiKey = (Get-Content -Path $apikeypath -Raw).Trim()
+$commonHeaders = @{ "apiKey" = $apiKey }
 
-# ==============================
-# Get clusters (SORT ONCE)
-# ==============================
-$resp = Invoke-WebRequest -Uri "$baseUrl/v2/mcm/cluster-mgmt/info" -Headers $commonHeaders -Method Get
-$clustersRaw = ($resp.Content | ConvertFrom-Json).cohesityClusters
-if (-not $clustersRaw) { throw "No clusters returned from Helios" }
+# --- Get all clusters from Helios ---
+$url = "https://helios.cohesity.com/v2/mcm/cluster-mgmt/info"
+$response = Invoke-WebRequest -Uri $url -Headers $commonHeaders -Method Get
+$json_clu = ($response.Content | ConvertFrom-Json).cohesityClusters
+if (-not $json_clu) { throw "No clusters returned from Helios." }
 
-$clustersSorted = $clustersRaw | Sort-Object clusterName
-
-$clusters = @()
-$i = 1
-foreach ($c in $clustersSorted) {
-    $clusters += [PSCustomObject]@{
-        Index       = $i++
-        ClusterName = $c.clusterName
-        ClusterId   = $c.clusterId
-    }
+# --- Helper for time conversion ---
+function Convert-ToLocalFromEpoch($v,$tz){
+    if(-not $v -or $v -eq 0){return $null}
+    try{
+        $utc=[DateTimeOffset]::FromUnixTimeMilliseconds([int64]($v/1000)).UtcDateTime
+        if($tz){[System.TimeZoneInfo]::ConvertTimeFromUtc($utc,$tz)}else{$utc.ToLocalTime()}
+    }catch{return $null}
 }
 
-# ==============================
-# MENU
-# ==============================
-Write-Host "`nAvailable Helios Clusters (A–Z):" -ForegroundColor Cyan
-$clusters | Format-Table Index, ClusterName -AutoSize
-Write-Host "`n[0] All clusters"
-Write-Host "[X] Exit`n"
+$tz=[System.TimeZoneInfo]::FindSystemTimeZoneById("Eastern Standard Time")
+$baseUrl="https://helios.cohesity.com"
+$globalFailures=@()
 
-while ($true) {
-    $inputVal = Read-Host "Enter 0 for ALL, 1-$($clusters.Count) for single, or X to exit"
-    if ($inputVal -match '^(x|X|q|Q)$') { return }
+# -------------------------------------------------------------
+# Iterate clusters
+# -------------------------------------------------------------
+foreach($cluster in $json_clu){
 
-    $num = 0
-    if (-not [int]::TryParse($inputVal, [ref]$num)) { continue }
-    if ($num -lt 0 -or $num -gt $clusters.Count) { continue }
+    $cluster_name = $cluster.name
+    if([string]::IsNullOrWhiteSpace($cluster_name)){$cluster_name=$cluster.clusterName}
+    if([string]::IsNullOrWhiteSpace($cluster_name)){$cluster_name=$cluster.displayName}
+    if([string]::IsNullOrWhiteSpace($cluster_name)){$cluster_name="Unknown-$($cluster.clusterId)"}
+    $cluster_id=$cluster.clusterId
 
-    $selection = $num
-    break
-}
-
-$SelectedClusters = if ($selection -eq 0) { $clusters } else { @($clusters | Where-Object Index -eq $selection) }
-
-# ==============================
-# INVENTORY COLLECTION
-# ==============================
-$Inventory = @()
-
-foreach ($clus in $SelectedClusters) {
-
-    $clusterName = $clus.ClusterName
-    $clusterId   = $clus.ClusterId
-
-    Write-Host "`nProcessing cluster: $clusterName" -ForegroundColor Cyan
-
-    $headers = @{
-        apiKey          = $apiKey
-        accessClusterId = $clusterId
-    }
+    Write-Host "`n🔹 Processing cluster: $cluster_name" -ForegroundColor Cyan
+    $headers=@{apiKey=$apiKey;accessClusterId=$cluster_id}
 
     # --- Get Acropolis PGs ---
-    $pgResp = Invoke-WebRequest `
-        -Uri "$baseUrl/v2/data-protect/protection-groups" `
-        -Headers $headers `
-        -Body @{ environments = "kAcropolis"; isDeleted = "False" } `
-        -Method Get
+    $pgResp=Invoke-WebRequest -Uri "$baseUrl/v2/data-protect/protection-groups" -Headers $headers -Body @{
+        environments="kAcropolis";isDeleted="False";isPaused="False";isActive="True"} -Method Get
+    $pgs=($pgResp.Content|ConvertFrom-Json).protectionGroups
+    if(-not $pgs){Write-Host "⚠️ No Acropolis PGs found on $cluster_name." -ForegroundColor Yellow;continue}
 
-    $pgs = ($pgResp.Content | ConvertFrom-Json).protectionGroups
-    if (-not $pgs) { continue }
+    foreach($pg in $pgs){
+        $pgId=$pg.id
+        $pgName=$pg.name
+        Write-Host "`n📦 Checking PG: $pgName" -ForegroundColor Yellow
 
-    foreach ($pg in $pgs) {
+        $runUrl="$baseUrl/v2/data-protect/protection-groups/$pgId/runs"
+        $runBody=@{
+            environments="kAcropolis"
+            numRuns="10"
+            excludeNonRestorableRuns="False"
+            includeObjectDetails="True"
+        }
 
-        $pgId   = $pg.id
-        $pgName = $pg.name
+        try{
+            $runResp=Invoke-WebRequest -Uri $runUrl -Headers $headers -Body $runBody -Method Get
+            $jsonRuns=$runResp|ConvertFrom-Json
+        }catch{
+            Write-Host "⚠️ Skipping PG $pgName on $cluster_name due to API error." -ForegroundColor Yellow
+            continue
+        }
 
-        # --- Get recent runs ---
-        $runResp = Invoke-WebRequest `
-            -Uri "$baseUrl/v2/data-protect/protection-groups/$pgId/runs" `
-            -Headers $headers `
-            -Body @{
-                environments = "kAcropolis"
-                numRuns = "10"
-                includeObjectDetails = "True"
-            } `
-            -Method Get
+        if(-not $jsonRuns.runs){continue}
 
-        $runs = ($runResp.Content | ConvertFrom-Json).runs
-        if (-not $runs) { continue }
+        $runs=$jsonRuns.runs|Sort-Object{$_.localBackupInfo[0].endTimeUsecs}-Descending
+        $latestRun=$runs|Select-Object -First 1
+        if(-not $latestRun){continue}
 
-        # --- Pick LAST COMPLETED run (ignore Running) ---
-        $completedRun = $runs |
-            Where-Object {
-                $_.localBackupInfo[0].status -ne "Running"
-            } |
-            Sort-Object { $_.localBackupInfo[0].endTimeUsecs } -Descending |
-            Select-Object -First 1
+        $info=$latestRun.localBackupInfo[0]
+        $status=$info.status
+        $runType=$info.runType
+        $startLocal=Convert-ToLocalFromEpoch $info.startTimeUsecs $tz
+        $endLocal=Convert-ToLocalFromEpoch $info.endTimeUsecs $tz
 
-        if (-not $completedRun -or -not $completedRun.objects) { continue }
+        # --- Add latest run date ---
+        if($endLocal){
+            Write-Host "   🕓 Latest Run Date: $($endLocal.ToString('dd-MMM-yyyy HH:mm:ss'))" -ForegroundColor DarkGray
+        }
 
-        $runInfo  = $completedRun.localBackupInfo[0]
-        $runStatus = $runInfo.status
-        $runEnd    = [DateTimeOffset]::FromUnixTimeMilliseconds(
-                        [int64]($runInfo.endTimeUsecs / 1000)
-                     ).ToLocalTime()
+        # --- Show success/failure summary ---
+        $isFailed = ($status -ne "Succeeded" -and $status -ne "SucceededWithWarning")
+        if ($isFailed) {
+            Write-Host "❌ $cluster_name → $pgName [$runType] – Latest run failed, collecting VM details..." -ForegroundColor Red
+        } else {
+            Write-Host "✅ $cluster_name → $pgName [$runType] – Latest run succeeded" -ForegroundColor Green
+        }
 
-        foreach ($obj in $completedRun.objects) {
+        # --- Collect failures ---
+        if($latestRun.objects){
+            $vmObjs=$latestRun.objects|Where-Object{$_.object.objectType -eq 'kVirtualMachine' -and $_.object.environment -eq 'kAcropolis'}
 
-            if ($obj.object.environment -ne "kAcropolis") { continue }
-            if ($obj.object.objectType -ne "kVirtualMachine") { continue }
-
-            $Inventory += [PSCustomObject]@{
-                Cluster         = $clusterName
-                ProtectionGroup = $pgName
-                VMName          = $obj.object.name
-                LastRunStatus   = $runStatus
-                InventoryAsOf   = $runEnd
+            foreach($vm in $vmObjs){
+                $attempts=$vm.localSnapshotInfo.failedAttempts
+                if($isFailed -or $attempts){
+                    if($attempts){
+                        foreach($fa in $attempts){
+                            $msgClean=($fa.message -replace '[\r\n]+',' ' -replace ',',' ' -replace '"','''').Trim()
+                            $globalFailures += [pscustomobject]@{
+                                Cluster=$cluster_name
+                                ProtectionGroup=$pgName
+                                RunType=$runType
+                                VMName=$vm.object.name
+                                StartTime=$startLocal
+                                EndTime=$endLocal
+                                FailedMessage=$msgClean
+                            }
+                        }
+                    } else {
+                        $globalFailures += [pscustomobject]@{
+                            Cluster=$cluster_name
+                            ProtectionGroup=$pgName
+                            RunType=$runType
+                            VMName=$vm.object.name
+                            StartTime=$startLocal
+                            EndTime=$endLocal
+                            FailedMessage="No failedAttempts[] details found — Run marked Failed"
+                        }
+                    }
+                }
             }
         }
     }
 }
 
-if (-not $Inventory) {
-    Write-Host "No inventory collected." -ForegroundColor Yellow
-    return
+# -------------------------------------------------------------
+# Smart de-duplication (null-safe)
+# -------------------------------------------------------------
+if ($globalFailures.Count -gt 0) {
+    $globalFailures = $globalFailures |
+        Group-Object {
+            $end = if ($_.EndTime) { $_.EndTime.ToString('yyyy-MM-dd HH:mm') } else { 'N/A' }
+            "$($_.Cluster)|$($_.ProtectionGroup)|$($_.RunType)|$($_.VMName)|$($_.FailedMessage)|$end"
+        } |
+        ForEach-Object {
+            $_.Group | Sort-Object EndTime -Descending | Select-Object -First 1
+        }
 }
 
-# ==============================
-# SUMMARY PER CLUSTER
-# ==============================
-$Summary = $Inventory |
-    Group-Object Cluster |
-    ForEach-Object {
-        $r = $_.Group
-        [PSCustomObject]@{
-            Cluster   = $_.Name
-            PGs       = ($r.ProtectionGroup | Select-Object -Unique).Count
-            VMs       = ($r.VMName | Select-Object -Unique).Count
-            FailedVMs = ($r | Where-Object LastRunStatus -ne "Succeeded").Count
-            Status    = if (($r | Where-Object LastRunStatus -ne "Succeeded").Count -eq 0) {
-                "HEALTHY"
-            } else {
-                "ATTENTION"
-            }
-        }
-    }
+# -------------------------------------------------------------
+# Output Section
+# -------------------------------------------------------------
+if($globalFailures.Count -gt 0){
+    Write-Host "`n🔥 Latest Failed Acropolis (AHV) Runs (All Clusters):`n" -ForegroundColor Cyan
+    $sorted=$globalFailures|Sort-Object Cluster,ProtectionGroup,EndTime -Descending
+    $sorted|Format-Table Cluster,ProtectionGroup,RunType,VMName,StartTime,EndTime,FailedMessage -AutoSize
+}else{
+    Write-Host "`n✅ All latest Acropolis runs succeeded across all clusters." -ForegroundColor Green
+}
 
-# ==============================
-# OUTPUT
-# ==============================
-Write-Host "`n=== Acropolis Inventory Summary (Last Completed Run) ===" -ForegroundColor Cyan
-$Summary | Sort-Object Cluster | Format-Table -AutoSize
-
-Write-Host "`n=== Acropolis Inventory – Detailed View ===" -ForegroundColor Cyan
-$Inventory |
-    Sort-Object Cluster, ProtectionGroup, VMName |
-    Format-Table -AutoSize
+# -------------------------------------------------------------
+# CSV Reference Path
+# -------------------------------------------------------------
+$timestamp=Get-Date -Format "yyyyMMdd_HHmm"
+$csvPath="X:\PowerShell\Data\Cohesity\BackupFailures\BackupFailures_Acropolis_AllClusters_$timestamp.csv"
+Write-Host "`n📂 (CSV path ready if needed later): $csvPath" -ForegroundColor Gray
