@@ -1,0 +1,206 @@
+# -------------------------------------------------------------
+# Cohesity Helios - Acropolis Inventory Snapshot
+# -------------------------------------------------------------
+# Tracks:
+#  - Acropolis VMs
+#  - Protection Group membership
+#  - Daily snapshot (JSON)
+# -------------------------------------------------------------
+
+$ErrorActionPreference = "Stop"
+
+# ==============================
+# 0) API Key
+# ==============================
+$apikeypath = "X:\PowerShell\Cohesity_API_Scripts\DO_NOT_Delete\apikey.txt"
+if (-not (Test-Path $apikeypath)) {
+    throw "API key file not found at $apikeypath"
+}
+
+$apiKey = (Get-Content -Path $apikeypath -Raw).Trim()
+$commonHeaders = @{ apiKey = $apiKey }
+
+# ==============================
+# 1) Get clusters from Helios
+# ==============================
+$url = "https://helios.cohesity.com/v2/mcm/cluster-mgmt/info"
+$response = Invoke-WebRequest -Method Get -Uri $url -Headers $commonHeaders
+$json = $response.Content | ConvertFrom-Json
+$json_clu = $json.cohesityClusters
+
+if (-not $json_clu -or $json_clu.Count -eq 0) {
+    throw "No clusters returned from Helios."
+}
+
+# ==============================
+# 2) Cluster menu (same style)
+# ==============================
+$sorted = $json_clu | Sort-Object clusterName
+
+$clusters = for ($i = 0; $i -lt $sorted.Count; $i++) {
+    [PSCustomObject]@{
+        Index       = $i + 1
+        ClusterName = $sorted[$i].clusterName
+        ClusterId   = $sorted[$i].clusterId
+    }
+}
+
+Write-Host ""
+Write-Host "Available Helios Clusters:" -ForegroundColor Cyan
+$clusters | Format-Table -AutoSize
+
+Write-Host ""
+Write-Host "[0] All clusters" -ForegroundColor Yellow
+Write-Host "[X] Exit" -ForegroundColor Yellow
+Write-Host ""
+
+while ($true) {
+    $inputVal = Read-Host "Enter 0 for ALL, 1-$($clusters.Count) for single, or X to exit"
+
+    if ($inputVal -match '^(x|X|q|Q)$') {
+        Write-Host "Exit selected." -ForegroundColor Cyan
+        return
+    }
+
+    [int]$num = 0
+    if (-not [int]::TryParse($inputVal, [ref]$num)) {
+        Write-Host "Invalid input." -ForegroundColor Red
+        continue
+    }
+
+    if ($num -lt 0 -or $num -gt $clusters.Count) {
+        Write-Host "Invalid selection." -ForegroundColor Red
+        continue
+    }
+
+    $selection = $num
+    break
+}
+
+if ($selection -eq 0) {
+    $SelectedClusters   = $clusters
+    $SelectedClusterIds = $clusters.ClusterId
+    Write-Host "Selected: ALL clusters" -ForegroundColor Green
+}
+else {
+    $selectedCluster    = $clusters | Where-Object Index -eq $selection
+    $SelectedClusters   = @($selectedCluster)
+    $SelectedClusterIds = @($selectedCluster.ClusterId)
+
+    Write-Host "Selected cluster:" -ForegroundColor Green
+    Write-Host "  Name: $($selectedCluster.ClusterName)"
+    Write-Host "  Id:   $($selectedCluster.ClusterId)"
+}
+
+# ==============================
+# 3) Inventory collection
+# ==============================
+$AllRows = @()
+
+foreach ($cid in $SelectedClusterIds) {
+
+    $clus = $SelectedClusters | Where-Object ClusterId -eq $cid | Select-Object -First 1
+    $cluster_name = $clus.ClusterName
+    $cluster_id   = $clus.ClusterId
+
+    Write-Host ""
+    Write-Host "Processing cluster: $cluster_name" -ForegroundColor Cyan
+
+    $headers = @{
+        apiKey          = $apiKey
+        accessClusterId = $cluster_id
+    }
+
+    # --- protectionSources ---
+    try {
+        $url = "https://helios.cohesity.com/irisservices/api/v1/public/protectionSources"
+        $resp = Invoke-WebRequest -Method Get -Uri $url -Headers $headers
+        $sources = $resp.Content | ConvertFrom-Json
+    }
+    catch {
+        Write-Host "Failed to get protectionSources for $cluster_name" -ForegroundColor Red
+        continue
+    }
+
+    $acropolisSources = $sources | Where-Object { $_.environment -eq "kAcropolis" }
+
+    # --- protectionJobs ---
+    try {
+        $url = "https://helios.cohesity.com/irisservices/api/v1/public/protectionJobs"
+        $resp = Invoke-WebRequest -Method Get -Uri $url -Headers $headers
+        $jobs = $resp.Content | ConvertFrom-Json
+    }
+    catch {
+        Write-Host "Failed to get protectionJobs for $cluster_name" -ForegroundColor Red
+        continue
+    }
+
+    $acropolisJobs = $jobs | Where-Object { $_.environment -eq "kAcropolis" }
+
+    # --- Build SourceId → PG lookup ---
+    $pgLookup = @{}
+
+    foreach ($job in $acropolisJobs) {
+        if (-not $job.sourceIds) { continue }
+
+        foreach ($sid in $job.sourceIds) {
+            $pgLookup[$sid] = @{
+                ProtectionGroup = $job.name
+                PolicyName      = $job.policyName
+            }
+        }
+    }
+
+    # --- Emit flat inventory rows ---
+    foreach ($src in $acropolisSources) {
+
+        $pg = $pgLookup[$src.id]
+
+        $AllRows += [PSCustomObject]@{
+            Cluster         = $cluster_name
+            ClusterId       = $cluster_id
+            SourceType      = "AcropolisVM"
+            SourceId        = $src.id
+            SourceName      = $src.name
+            ProtectionGroup = $pg.ProtectionGroup
+            PolicyName      = $pg.PolicyName
+            IsProtected     = [bool]$pg
+        }
+    }
+}
+
+# ==============================
+# 4) Console Table Output
+# ==============================
+if (-not $AllRows -or $AllRows.Count -eq 0) {
+    Write-Host "No inventory collected." -ForegroundColor Yellow
+    return
+}
+
+Write-Host ""
+Write-Host "=== Acropolis Inventory ===" -ForegroundColor Cyan
+Write-Host ""
+
+$AllRows |
+    Sort-Object Cluster, SourceName |
+    Format-Table -AutoSize
+
+# ==============================
+# 5) Save Snapshot (JSON)
+# ==============================
+$reportdate = Get-Date -Format "yyyy-MM-dd"
+
+$outDir = "X:\PowerShell\Data\Cohesity\Inventory"
+if (-not (Test-Path $outDir)) {
+    New-Item -ItemType Directory -Path $outDir | Out-Null
+}
+
+$jsonFile = Join-Path $outDir "Acropolis_Inventory_$reportdate.json"
+
+$AllRows |
+    Sort-Object Cluster, SourceId |
+    ConvertTo-Json -Depth 3 |
+    Set-Content -Path $jsonFile -Encoding UTF8
+
+Write-Host ""
+Write-Host "Saved inventory snapshot: $jsonFile" -ForegroundColor Green
