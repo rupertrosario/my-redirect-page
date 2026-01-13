@@ -1,12 +1,6 @@
 # -------------------------------------------------------------
 # Cohesity Acropolis (AHV) Inventory – Operational Truth
 # Inventory reflects the LAST COMPLETED backup run per Protection Group.
-#
-# InventoryAsOf definition:
-# - End time of the last COMPLETED backup run (Succeeded / SucceededWithWarning / Failed)
-# - NOT current time
-# - NOT run start time
-# - NOT running backups
 # -------------------------------------------------------------
 
 $ErrorActionPreference = "Stop"
@@ -28,11 +22,11 @@ $tz = [System.TimeZoneInfo]::FindSystemTimeZoneById("Eastern Standard Time")
 function Convert-ToET($usecs) {
     if (-not $usecs -or $usecs -eq 0) { return $null }
     $utc = [DateTimeOffset]::FromUnixTimeMilliseconds([int64]($usecs / 1000)).UtcDateTime
-    return [System.TimeZoneInfo]::ConvertTimeFromUtc($utc, $tz)
+    [System.TimeZoneInfo]::ConvertTimeFromUtc($utc, $tz)
 }
 
 # ==============================
-# Get clusters (sorted once)
+# Get clusters (SORT ONCE)
 # ==============================
 $resp = Invoke-WebRequest -Uri "$baseUrl/v2/mcm/cluster-mgmt/info" -Headers $commonHeaders -Method Get
 $clustersRaw = ($resp.Content | ConvertFrom-Json).cohesityClusters
@@ -70,11 +64,7 @@ while ($true) {
     break
 }
 
-$SelectedClusters = if ($selection -eq 0) {
-    $clusters
-} else {
-    @($clusters | Where-Object Index -eq $selection)
-}
+$SelectedClusters = if ($selection -eq 0) { $clusters } else { @($clusters | Where-Object Index -eq $selection) }
 
 # ==============================
 # Inventory collection
@@ -123,35 +113,59 @@ foreach ($clus in $SelectedClusters) {
         $runs = ($runResp.Content | ConvertFrom-Json).runs
         if (-not $runs) { continue }
 
-        # --- Select last COMPLETED run (ignore Running) ---
-        $completedRun = $runs |
-            Where-Object { $_.localBackupInfo[0].status -ne "Running" } |
+        # Completed runs only (safe)
+        $completedRuns = $runs |
+            Where-Object {
+                $_.localBackupInfo -and
+                $_.localBackupInfo.Count -gt 0 -and
+                $_.localBackupInfo[0].status -in @(
+                    "Succeeded",
+                    "SucceededWithWarning",
+                    "Failed"
+                )
+            }
+
+        if (-not $completedRuns) { continue }
+
+        # Last completed run = inventory truth
+        $inventoryRun = $completedRuns |
             Sort-Object { $_.localBackupInfo[0].endTimeUsecs } -Descending |
             Select-Object -First 1
 
-        if (-not $completedRun -or -not $completedRun.objects) { continue }
+        # Last successful run (may be older)
+        $successfulRun = $completedRuns |
+            Where-Object { $_.localBackupInfo[0].status -in @("Succeeded","SucceededWithWarning") } |
+            Sort-Object { $_.localBackupInfo[0].endTimeUsecs } -Descending |
+            Select-Object -First 1
 
-        $runInfo   = $completedRun.localBackupInfo[0]
-        $runStatus = $runInfo.status
-        $runEndET  = Convert-ToET $runInfo.endTimeUsecs
+        if (-not $inventoryRun.objects) { continue }
+
+        $inventoryStatus = $inventoryRun.localBackupInfo[0].status
+        $inventoryAsOfET = Convert-ToET $inventoryRun.localBackupInfo[0].endTimeUsecs
+        $lastSuccessET   = if ($successfulRun) {
+            Convert-ToET $successfulRun.localBackupInfo[0].endTimeUsecs
+        } else {
+            $null
+        }
 
         $pgVMs = 0
         $pgFailed = 0
 
-        foreach ($obj in $completedRun.objects) {
+        foreach ($obj in $inventoryRun.objects) {
 
             if ($obj.object.environment -ne "kAcropolis") { continue }
             if ($obj.object.objectType -ne "kVirtualMachine") { continue }
 
             $pgVMs++
-            if ($runStatus -ne "Succeeded") { $pgFailed++ }
+            if ($inventoryStatus -ne "Succeeded") { $pgFailed++ }
 
             $VMInventory += [PSCustomObject]@{
-                Cluster         = $clusterName
-                ProtectionGroup = $pgName
-                VMName          = $obj.object.name
-                LastRunStatus   = $runStatus
-                InventoryAsOfET = $runEndET
+                Cluster                   = $clusterName
+                ProtectionGroup           = $pgName
+                VMName                    = $obj.object.name
+                LastRunStatus             = $inventoryStatus
+                InventoryAsOfET           = $inventoryAsOfET
+                LastSuccessfulBackupET    = $lastSuccessET
             }
         }
 
@@ -160,8 +174,8 @@ foreach ($clus in $SelectedClusters) {
             ProtectionGroup = $pgName
             TotalVMs        = $pgVMs
             FailedVMs       = $pgFailed
-            LastRunStatus   = $runStatus
-            InventoryAsOfET = $runEndET
+            LastRunStatus   = $inventoryStatus
+            InventoryAsOfET = $inventoryAsOfET
         }
     }
 }
@@ -192,19 +206,19 @@ $ClusterSummary = $PGInventory |
 # ==============================
 Write-Host "`nNOTE:" -ForegroundColor Yellow
 Write-Host "Inventory reflects the last completed backup run per protection group." -ForegroundColor Yellow
-Write-Host "Running backups are intentionally excluded to avoid partial inventory." -ForegroundColor Yellow
-
-Write-Host "`n=== Acropolis Inventory – Per Protection Group ===" -ForegroundColor Cyan
-$PGInventory |
-    Sort-Object Cluster, ProtectionGroup |
-    Format-Table Cluster,ProtectionGroup,TotalVMs,FailedVMs,LastRunStatus,InventoryAsOfET -AutoSize
+Write-Host "Running backups are intentionally excluded." -ForegroundColor Yellow
 
 Write-Host "`n=== Acropolis Inventory – Cluster Summary ===" -ForegroundColor Cyan
 $ClusterSummary |
     Sort-Object Cluster |
     Format-Table Cluster,PGs,TotalVMs,FailedVMs,Status,InventoryAsOf -AutoSize
 
+Write-Host "`n=== Acropolis Inventory – Per Protection Group ===" -ForegroundColor Cyan
+$PGInventory |
+    Sort-Object Cluster,ProtectionGroup |
+    Format-Table Cluster,ProtectionGroup,TotalVMs,FailedVMs,LastRunStatus,InventoryAsOfET -AutoSize
+
 Write-Host "`n=== Acropolis Inventory – VM Details ===" -ForegroundColor Cyan
 $VMInventory |
     Sort-Object Cluster,ProtectionGroup,VMName |
-    Format-Table Cluster,ProtectionGroup,VMName,LastRunStatus,InventoryAsOfET -AutoSize
+    Format-Table Cluster,ProtectionGroup,VMName,LastRunStatus,LastSuccessfulBackupET,InventoryAsOfET -AutoSize
