@@ -1,17 +1,18 @@
 # -------------------------------------------------------------
-# Cohesity Acropolis (AHV) Inventory – Menu + API
+# Cohesity Acropolis (AHV) Inventory – Menu + API (OBJECT-LEVEL)
 #
-# Summary tables required:
-# 1) Cluster: PGs, TotalVMs, BBKPsuccessfulVMs, BKPFailedVMs + TOTAL row
-# 2) PG: TotalVMs, BBKPsuccessfulVMs, BKPFailedVMs + TOTAL row
-# 3) Full VM List (fine as-is) + LastSuccessfulET
+# Output:
+# 1) Cluster Summary:  PGs, TotalVMs, BBKPsuccessfulVMs, BKPFailedVMs + TOTAL row
+# 2) PG Summary:       TotalVMs, BBKPsuccessfulVMs, BKPFailedVMs + TOTAL row
+# 3) Full VM List:     VMName, BKPStatus(Object-level), LastSuccessfulET
 #
 # NOTE:
-# InventoryAsOfET = end time of the LAST COMPLETED run used for inventory.
-# If a backup is running, inventory still reflects the previous completed run.
+# Inventory As Of (ET) = end time of the LAST COMPLETED run used for inventory (per PG),
+# based on the run we pull objects from (exclude Running).
 #
-# PG filters: environments=kAcropolis, isActive=True, isPaused=False, isDeleted=False
-# localBackupInfo can be OBJECT or ARRAY -> handled via @()
+# Object-level failure detection:
+#   Failed if objects[].localSnapshotInfo.failedAttempts exists and Count > 0
+#   Else Success (no failure evidence on object)
 # -------------------------------------------------------------
 
 $ErrorActionPreference = "Stop"
@@ -25,7 +26,7 @@ $apiKey = (Get-Content $apikeypath -Raw).Trim()
 # --- ET conversion ---
 $tz = [System.TimeZoneInfo]::FindSystemTimeZoneById("Eastern Standard Time")
 function Convert-ToET([object]$usecs) {
-    if (-not $usecs) { return $null }
+    if (-not $usecs -or $usecs -eq 0) { return $null }
     try {
         $utc = [DateTimeOffset]::FromUnixTimeMilliseconds([int64]($usecs / 1000)).UtcDateTime
         return [System.TimeZoneInfo]::ConvertTimeFromUtc($utc, $tz)
@@ -34,7 +35,7 @@ function Convert-ToET([object]$usecs) {
 
 function Get-LbiFirst($runObj) {
     if (-not $runObj) { return $null }
-    $lb = @($runObj.localBackupInfo) # object/array safe
+    $lb = @($runObj.localBackupInfo)  # object/array safe
     if ($lb.Count -gt 0) { return $lb[0] }
     return $null
 }
@@ -43,6 +44,25 @@ function Get-EndUsecs([object]$runObj) {
     $info = Get-LbiFirst $runObj
     if ($info -and $info.endTimeUsecs) { return [int64]$info.endTimeUsecs }
     return 0
+}
+
+function Get-RunStatus([object]$runObj) {
+    $info = Get-LbiFirst $runObj
+    if ($info -and $info.status) { return [string]$info.status }
+    return ""
+}
+
+function Get-VmObjectBkpStatus {
+    param([object]$obj)
+
+    # Object-level: failedAttempts[] is the strongest indicator
+    $fa = $null
+    try { $fa = $obj.localSnapshotInfo.failedAttempts } catch { $fa = $null }
+
+    if ($fa -and @($fa).Count -gt 0) { return "Failed" }
+
+    # If no failedAttempts present, treat as successful (no failure evidence)
+    return "Succeeded"
 }
 
 # -------------------------------------------------------------
@@ -112,6 +132,7 @@ foreach ($cid in $SelectedClusterIds) {
                 isPaused     = "False"
             } `
             -Method Get
+
         $pgs = ($pgResp.Content | ConvertFrom-Json).protectionGroups
     } catch {
         continue
@@ -124,7 +145,7 @@ foreach ($cid in $SelectedClusterIds) {
         $pgId   = $pg.id
         $pgName = $pg.name
 
-        # --- Get runs WITH object details (needed for VM list) ---
+        # --- Get runs WITH object details ---
         try {
             $runResp = Invoke-WebRequest `
                 -Uri "$baseUrl/v2/data-protect/protection-groups/$pgId/runs" `
@@ -135,6 +156,7 @@ foreach ($cid in $SelectedClusterIds) {
                     includeObjectDetails = "True"
                 } `
                 -Method Get
+
             $runs = (($runResp.Content | ConvertFrom-Json).runs)
         } catch {
             continue
@@ -142,71 +164,74 @@ foreach ($cid in $SelectedClusterIds) {
 
         if (-not $runs) { continue }
 
-        # Inventory run = latest run that returned objects (for VM count/list)
+        # Inventory run = latest COMPLETED run that returned objects (exclude Running)
         $inventoryRun = $runs |
-            Where-Object { $_.objects } |
-            Sort-Object { Get-EndUsecs $_ } -Descending |
-            Select-Object -First 1
-        if (-not $inventoryRun -or -not $inventoryRun.objects) { continue }
-
-        # Meta completed run = latest completed status (exclude Running)
-        $metaRun = $runs |
             Where-Object {
-                $i = Get-LbiFirst $_
-                $i -and $i.status -in @("Succeeded","SucceededWithWarning","Failed") -and $i.endTimeUsecs
+                $_.objects -and
+                (Get-RunStatus $_) -ne "Running" -and
+                (Get-EndUsecs $_) -gt 0
             } |
             Sort-Object { Get-EndUsecs $_ } -Descending |
             Select-Object -First 1
 
-        $metaInfo = Get-LbiFirst $metaRun
-        $lastStatus = if ($metaInfo -and $metaInfo.status) { $metaInfo.status } else { "Unknown" }
+        if (-not $inventoryRun -or -not $inventoryRun.objects) { continue }
 
-        $invEndUsecs = if ($metaInfo -and $metaInfo.endTimeUsecs) { [int64]$metaInfo.endTimeUsecs } else { $null }
-        if ($invEndUsecs) { $InventoryAsOfUsecsAll += $invEndUsecs }
+        $runStatus = Get-RunStatus $inventoryRun
+        if ([string]::IsNullOrWhiteSpace($runStatus)) { $runStatus = "Unknown" }
+
+        $invEndUsecs = Get-EndUsecs $inventoryRun
+        if ($invEndUsecs -gt 0) { $InventoryAsOfUsecsAll += $invEndUsecs }
+
+        $invET = Convert-ToET $invEndUsecs
+        $InventoryAsOfET = if ($invET) { $invET.ToString("yyyy-MM-dd HH:mm:ss") } else { "" }
 
         # LastSuccessfulET (Succeeded or SucceededWithWarning) – VM list only
         $successRun = $runs |
             Where-Object {
-                $i = Get-LbiFirst $_
-                $i -and $i.status -in @("Succeeded","SucceededWithWarning") -and $i.endTimeUsecs
+                $s = Get-RunStatus $_
+                $_.objects -and
+                $s -in @("Succeeded","SucceededWithWarning") -and
+                (Get-EndUsecs $_) -gt 0
             } |
             Sort-Object { Get-EndUsecs $_ } -Descending |
             Select-Object -First 1
 
-        $successInfo = Get-LbiFirst $successRun
-        $succEndUsecs = if ($successInfo -and $successInfo.endTimeUsecs) { [int64]$successInfo.endTimeUsecs } else { $null }
-        $succET = if ($succEndUsecs) { Convert-ToET $succEndUsecs } else { $null }
+        $succEndUsecs = if ($successRun) { Get-EndUsecs $successRun } else { 0 }
+        $succET = if ($succEndUsecs -gt 0) { Convert-ToET $succEndUsecs } else { $null }
         $LastSuccessfulET = if ($succET) { $succET.ToString("yyyy-MM-dd HH:mm:ss") } else { "" }
 
-        # Count VMs from inventory run objects
+        # OBJECT-LEVEL counts
         $pgTotalVMs = 0
+        $pgFailedVMs = 0
+
         foreach ($obj in $inventoryRun.objects) {
+
             if ($obj.object.environment -ne "kAcropolis") { continue }
             if ($obj.object.objectType -ne "kVirtualMachine") { continue }
 
             $pgTotalVMs++
 
+            $objStatus = Get-VmObjectBkpStatus -obj $obj
+            if ($objStatus -eq "Failed") { $pgFailedVMs++ }
+
             $VMInventory += [pscustomobject]@{
                 Cluster          = $clusterName
                 ProtectionGroup  = $pgName
                 VMName           = $obj.object.name
-                LastRunStatus    = $lastStatus
+                BKPStatus        = $objStatus           # OBJECT-level
+                LastRunStatus    = $runStatus           # PG/run status (kept for reference)
                 LastSuccessfulET = $LastSuccessfulET
             }
         }
 
-        # Summary counts exactly like you want (PG-status based)
-        $pgSuccVMs = 0
-        $pgFailVMs = 0
-        if ($lastStatus -in @("Succeeded","SucceededWithWarning")) { $pgSuccVMs = $pgTotalVMs }
-        elseif ($lastStatus -eq "Failed") { $pgFailVMs = $pgTotalVMs }
+        $pgSuccVMs = $pgTotalVMs - $pgFailedVMs
 
         $PGInventory += [pscustomobject]@{
             Cluster            = $clusterName
             ProtectionGroup    = $pgName
             TotalVMs           = $pgTotalVMs
             BBKPsuccessfulVMs  = $pgSuccVMs
-            BKPFailedVMs       = $pgFailVMs
+            BKPFailedVMs       = $pgFailedVMs
         }
     }
 }
@@ -267,8 +292,7 @@ $PGTotalRow = [pscustomobject]@{
 Write-Host ""
 Write-Host "NOTE:" -ForegroundColor Yellow
 Write-Host ("Inventory As Of (ET): " + $(if ($globalAsOf) { $globalAsOf } else { "<blank>" })) -ForegroundColor Yellow
-Write-Host "Inventory reflects the last completed backup run per protection group." -ForegroundColor Yellow
-Write-Host "If a backup is currently running, inventory still reflects the previous completed run." -ForegroundColor Yellow
+Write-Host "Inventory uses the latest COMPLETED run per PG that returned objects (Running excluded)." -ForegroundColor Yellow
 Write-Host ""
 
 Write-Host "=== Summary 1: Cluster Summary ===" -ForegroundColor Cyan
@@ -284,4 +308,4 @@ Write-Host ""
 Write-Host "=== Full VM List ===" -ForegroundColor Cyan
 $VMInventory |
     Sort-Object Cluster, ProtectionGroup, VMName |
-    Format-Table Cluster, ProtectionGroup, VMName, LastRunStatus, LastSuccessfulET -AutoSize
+    Format-Table Cluster, ProtectionGroup, VMName, BKPStatus, LastSuccessfulET -AutoSize
