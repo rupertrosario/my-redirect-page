@@ -1,14 +1,14 @@
 # -------------------------------------------------------------
-# Cohesity Acropolis (AHV) Inventory – Menu + API
+# Cohesity Acropolis (AHV) Inventory – Menu + API (Clean)
 #
 # Output:
-# 1) Cluster Summary (Totals only + TOTAL row)
-# 2) Protection Group Summary (Totals only + TOTAL row)
-# 3) Full VM List (details)
+# 1) Cluster Summary (PGs / TotalVMs / FailedPGs / InventoryAsOf + TOTAL row)
+# 2) Protection Group Summary (TotalVMs / LastRunStatus / InventoryAsOfET + TOTAL row)
+# 3) Full VM List (VMName + LastRunStatus + LastSuccessfulET)
 #
-# NOTE:
-# Inventory is based on the latest COMPLETED run per PG that returns objects.
-# If a backup is currently running, inventory still reflects the previous completed run.
+# NOTE (defensible):
+# InventoryAsOfET = end time of the LAST COMPLETED run used for inventory (Succeeded/SucceededWithWarning/Failed).
+# If a backup is running, inventory reflects the previous completed run.
 #
 # PG filters: environments=kAcropolis, isActive=True, isPaused=False, isDeleted=False
 # localBackupInfo can be OBJECT or ARRAY -> handled via @()
@@ -43,34 +43,6 @@ function Get-EndUsecs([object]$runObj) {
     $info = Get-LbiFirst $runObj
     if ($info -and $info.endTimeUsecs) { return [int64]$info.endTimeUsecs }
     return 0
-}
-
-# Per-VM success/fail signal (object-level if present, else fallback to PG status)
-function Get-VmOutcome {
-    param(
-        [object]$obj,
-        [string]$pgStatus
-    )
-
-    # Prefer object-level failure details if available
-    $failedAttempts = $null
-    try { $failedAttempts = $obj.localSnapshotInfo.failedAttempts } catch { $failedAttempts = $null }
-
-    if ($failedAttempts -and @($failedAttempts).Count -gt 0) { return "Failed" }
-
-    # Some payloads have a per-object status
-    $objStatus = $null
-    try { $objStatus = $obj.localSnapshotInfo.status } catch { $objStatus = $null }
-    if ($objStatus) {
-        if ($objStatus -in @("Succeeded", "SucceededWithWarning")) { return "Succeeded" }
-        if ($objStatus -eq "Failed") { return "Failed" }
-    }
-
-    # Fallback to PG status if object-level status isn't available
-    if ($pgStatus -in @("Succeeded", "SucceededWithWarning")) { return "Succeeded" }
-    if ($pgStatus -eq "Failed") { return "Failed" }
-
-    return "Unknown"
 }
 
 # -------------------------------------------------------------
@@ -172,7 +144,7 @@ foreach ($cid in $SelectedClusterIds) {
 
         if (-not $runs) { continue }
 
-        # Inventory run = latest run that has objects (what we use to list VMs)
+        # Inventory run = latest run that returned objects
         $inventoryRun = $runs |
             Where-Object { $_.objects } |
             Sort-Object { Get-EndUsecs $_ } -Descending |
@@ -180,23 +152,29 @@ foreach ($cid in $SelectedClusterIds) {
 
         if (-not $inventoryRun -or -not $inventoryRun.objects) { continue }
 
-        # Meta run = latest run with localBackupInfo (for status/time)
+        # Completed meta run = latest run with localBackupInfo + completed status (exclude Running)
         $metaRun = $runs |
-            Where-Object { @($_.localBackupInfo).Count -gt 0 } |
+            Where-Object {
+                $i = Get-LbiFirst $_
+                $i -and $i.status -in @("Succeeded","SucceededWithWarning","Failed") -and $i.endTimeUsecs
+            } |
             Sort-Object { Get-EndUsecs $_ } -Descending |
             Select-Object -First 1
 
-        $metaInfo = Get-LbiFirst $metaRun
+        $metaInfo   = Get-LbiFirst $metaRun
         $lastStatus = if ($metaInfo -and $metaInfo.status) { $metaInfo.status } else { "Unknown" }
 
         $invEndUsecs = if ($metaInfo -and $metaInfo.endTimeUsecs) { [int64]$metaInfo.endTimeUsecs } else { $null }
         if ($invEndUsecs) { $InventoryAsOfUsecsAll += $invEndUsecs }
 
-        # Last Successful run time (Succeeded only) – used ONLY in VM list
+        $invET = if ($invEndUsecs) { Convert-ToET $invEndUsecs } else { $null }
+        $InventoryAsOfET = if ($invET) { $invET.ToString("yyyy-MM-dd HH:mm:ss") } else { "" }
+
+        # Last Successful time (Succeeded or SucceededWithWarning) – VM table only
         $successRun = $runs |
             Where-Object {
                 $i = Get-LbiFirst $_
-                $i -and $i.status -eq "Succeeded" -and $i.endTimeUsecs
+                $i -and $i.status -in @("Succeeded","SucceededWithWarning") -and $i.endTimeUsecs
             } |
             Sort-Object { Get-EndUsecs $_ } -Descending |
             Select-Object -First 1
@@ -206,21 +184,13 @@ foreach ($cid in $SelectedClusterIds) {
         $succET = if ($succEndUsecs) { Convert-ToET $succEndUsecs } else { $null }
         $LastSuccessfulET = if ($succET) { $succET.ToString("yyyy-MM-dd HH:mm:ss") } else { "" }
 
-        # Count VMs from inventoryRun.objects with per-VM success/fail
+        # Count VMs from inventory run objects
         $pgTotalVMs = 0
-        $pgSuccVMs  = 0
-        $pgFailVMs  = 0
-
         foreach ($obj in $inventoryRun.objects) {
-
             if ($obj.object.environment -ne "kAcropolis") { continue }
             if ($obj.object.objectType -ne "kVirtualMachine") { continue }
 
             $pgTotalVMs++
-
-            $outcome = Get-VmOutcome -obj $obj -pgStatus $lastStatus
-            if ($outcome -eq "Succeeded") { $pgSuccVMs++ }
-            elseif ($outcome -eq "Failed") { $pgFailVMs++ }
 
             $VMInventory += [pscustomobject]@{
                 Cluster          = $clusterName
@@ -228,16 +198,15 @@ foreach ($cid in $SelectedClusterIds) {
                 VMName           = $obj.object.name
                 LastRunStatus    = $lastStatus
                 LastSuccessfulET = $LastSuccessfulET
-                VmOutcome        = $outcome
             }
         }
 
         $PGInventory += [pscustomobject]@{
-            Cluster            = $clusterName
-            ProtectionGroup    = $pgName
-            TotalVMs           = $pgTotalVMs
-            BBKPsuccessfulVMs  = $pgSuccVMs
-            BKPFailedVMs       = $pgFailVMs
+            Cluster         = $clusterName
+            ProtectionGroup = $pgName
+            TotalVMs        = $pgTotalVMs
+            LastRunStatus   = $lastStatus
+            InventoryAsOfET = $InventoryAsOfET
         }
     }
 }
@@ -247,7 +216,7 @@ if (-not $PGInventory -or $PGInventory.Count -eq 0) {
     return
 }
 
-# InventoryAsOf (single value for the whole report)
+# Global InventoryAsOf (single time for the report)
 $globalAsOf = ""
 if ($InventoryAsOfUsecsAll.Count -gt 0) {
     $maxUsecs = ($InventoryAsOfUsecsAll | Measure-Object -Maximum).Maximum
@@ -256,40 +225,40 @@ if ($InventoryAsOfUsecsAll.Count -gt 0) {
 }
 
 # -------------------------------------------------------------
-# 3) Cluster Summary (Totals only) + TOTAL row
+# 3) Cluster Summary + TOTAL row
 # -------------------------------------------------------------
 $ClusterSummary = $PGInventory |
     Group-Object Cluster |
     ForEach-Object {
         $g = $_.Group
         [pscustomobject]@{
-            Cluster           = $_.Name
-            PGs               = $g.Count
-            TotalVMs          = ($g.TotalVMs | Measure-Object -Sum).Sum
-            BBKPsuccessfulVMs = ($g.BBKPsuccessfulVMs | Measure-Object -Sum).Sum
-            BKPFailedVMs      = ($g.BKPFailedVMs | Measure-Object -Sum).Sum
+            Cluster       = $_.Name
+            PGs           = $g.Count
+            TotalVMs      = ($g.TotalVMs | Measure-Object -Sum).Sum
+            FailedPGs     = (@($g | Where-Object { $_.LastRunStatus -eq "Failed" }).Count)
+            InventoryAsOf = (($g.InventoryAsOfET | Where-Object { $_ -ne "" }) | Sort-Object -Descending | Select-Object -First 1)
         }
     } | Sort-Object Cluster
 
 $ClusterTotalRow = [pscustomobject]@{
-    Cluster           = "TOTAL"
-    PGs               = ($ClusterSummary.PGs | Measure-Object -Sum).Sum
-    TotalVMs          = ($ClusterSummary.TotalVMs | Measure-Object -Sum).Sum
-    BBKPsuccessfulVMs = ($ClusterSummary.BBKPsuccessfulVMs | Measure-Object -Sum).Sum
-    BKPFailedVMs      = ($ClusterSummary.BKPFailedVMs | Measure-Object -Sum).Sum
+    Cluster       = "TOTAL"
+    PGs           = ($ClusterSummary.PGs | Measure-Object -Sum).Sum
+    TotalVMs      = ($ClusterSummary.TotalVMs | Measure-Object -Sum).Sum
+    FailedPGs     = ($ClusterSummary.FailedPGs | Measure-Object -Sum).Sum
+    InventoryAsOf = $globalAsOf
 }
 
 # -------------------------------------------------------------
-# 4) PG Summary (Totals only) + TOTAL row
+# 4) PG Summary + TOTAL row
 # -------------------------------------------------------------
 $PGSummary = $PGInventory | Sort-Object Cluster, ProtectionGroup
 
 $PGTotalRow = [pscustomobject]@{
-    Cluster           = "TOTAL"
-    ProtectionGroup   = ""
-    TotalVMs          = ($PGSummary.TotalVMs | Measure-Object -Sum).Sum
-    BBKPsuccessfulVMs = ($PGSummary.BBKPsuccessfulVMs | Measure-Object -Sum).Sum
-    BKPFailedVMs      = ($PGSummary.BKPFailedVMs | Measure-Object -Sum).Sum
+    Cluster         = "TOTAL"
+    ProtectionGroup = ""
+    TotalVMs        = ($PGSummary.TotalVMs | Measure-Object -Sum).Sum
+    LastRunStatus   = ""
+    InventoryAsOfET = $globalAsOf
 }
 
 # -------------------------------------------------------------
@@ -302,20 +271,21 @@ if ($globalAsOf) {
 } else {
     Write-Host "Inventory As Of (ET): <blank> (no completed run times returned)" -ForegroundColor Yellow
 }
+Write-Host "Inventory reflects the last completed backup run per protection group." -ForegroundColor Yellow
 Write-Host "If a backup is currently running, inventory still reflects the previous completed run." -ForegroundColor Yellow
 Write-Host ""
 
-Write-Host "=== Summary 1: Cluster Summary (Totals) ===" -ForegroundColor Cyan
+Write-Host "=== Summary 1: Cluster Summary ===" -ForegroundColor Cyan
 @($ClusterSummary + $ClusterTotalRow) |
-    Format-Table Cluster, PGs, TotalVMs, BBKPsuccessfulVMs, BKPFailedVMs -AutoSize
+    Format-Table Cluster, PGs, TotalVMs, FailedPGs, InventoryAsOf -AutoSize
 
 Write-Host ""
-Write-Host "=== Summary 2: Protection Group Summary (Totals) ===" -ForegroundColor Cyan
+Write-Host "=== Summary 2: Protection Group Summary ===" -ForegroundColor Cyan
 @($PGSummary + $PGTotalRow) |
-    Format-Table Cluster, ProtectionGroup, TotalVMs, BBKPsuccessfulVMs, BKPFailedVMs -AutoSize
+    Format-Table Cluster, ProtectionGroup, TotalVMs, LastRunStatus, InventoryAsOfET -AutoSize
 
 Write-Host ""
 Write-Host "=== Full VM List ===" -ForegroundColor Cyan
 $VMInventory |
     Sort-Object Cluster, ProtectionGroup, VMName |
-    Format-Table Cluster, ProtectionGroup, VMName, VmOutcome, LastRunStatus, LastSuccessfulET -AutoSize
+    Format-Table Cluster, ProtectionGroup, VMName, LastRunStatus, LastSuccessfulET -AutoSize
