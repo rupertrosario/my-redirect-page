@@ -1,5 +1,10 @@
 # -------------------------------------------------------------
-# Cohesity Acropolis – Status/InventoryAsOfET Check (Menu + API)
+# Cohesity Acropolis (AHV) Inventory (Menu + API)
+# Output:
+# 1) Cluster Summary
+# 2) Protection Group Summary
+# 3) Full VM List
+#
 # FIX: localBackupInfo can be OBJECT or ARRAY -> force array via @()
 # -------------------------------------------------------------
 
@@ -21,14 +26,30 @@ function Convert-ToET([object]$usecs) {
     } catch { return $null }
 }
 
+function Get-LbiFirst($runObj) {
+    # returns first localBackupInfo entry (object/array-safe) or $null
+    if (-not $runObj) { return $null }
+    $lb = @($runObj.localBackupInfo)
+    if ($lb.Count -gt 0) { return $lb[0] }
+    return $null
+}
+
+function Get-EndUsecs($runObj) {
+    $info = Get-LbiFirst $runObj
+    if ($info -and $info.endTimeUsecs) { return [int64]$info.endTimeUsecs }
+    return 0
+}
+
 # -------------------------------------------------------------
 # 1) Get clusters (sorted) + menu
 # -------------------------------------------------------------
-$resp = Invoke-WebRequest -Uri "$baseUrl/v2/mcm/cluster-mgmt/info" -Headers @{ apiKey = $apiKey } -Method Get
-$clustersRaw = ($resp.Content | ConvertFrom-Json).cohesityClusters
-if (-not $clustersRaw) { throw "No clusters returned from Helios." }
+$url = "$baseUrl/v2/mcm/cluster-mgmt/info"
+$response = Invoke-WebRequest -Method Get -Uri $url -Headers @{ apiKey = $apiKey }
+$json = $response.Content | ConvertFrom-Json
+$json_clu = $json.cohesityClusters
+if (-not $json_clu -or $json_clu.Count -eq 0) { throw "No clusters returned from Helios." }
 
-$sorted = $clustersRaw | Sort-Object clusterName
+$sorted = $json_clu | Sort-Object -Property clusterName
 
 $clusters = for ($i = 0; $i -lt $sorted.Count; $i++) {
     [pscustomobject]@{
@@ -39,102 +60,79 @@ $clusters = for ($i = 0; $i -lt $sorted.Count; $i++) {
 }
 
 Write-Host ""
-Write-Host "Available Helios Clusters (A-Z):" -ForegroundColor Cyan
+Write-Host "Available Helios Clusters (sorted by name):" -ForegroundColor Cyan
 $clusters | Format-Table -AutoSize
 Write-Host ""
-Write-Host "[X] Exit" -ForegroundColor Yellow
+Write-Host "[0] All clusters" -ForegroundColor Yellow
+Write-Host "[X] Exit without selecting" -ForegroundColor Yellow
 Write-Host ""
 
 while ($true) {
-    $inputVal = Read-Host "Select cluster number (1-$($clusters.Count)) or X to exit"
+    $inputVal = Read-Host "Enter 0 for ALL, 1-$($clusters.Count) for single, or X to exit"
     if ($inputVal -match '^(x|X|q|Q)$') { return }
 
-    [int]$n = 0
-    if (-not [int]::TryParse($inputVal.Trim(), [ref]$n)) { continue }
-    if ($n -lt 1 -or $n -gt $clusters.Count) { continue }
+    [int]$num = 0
+    if (-not [int]::TryParse($inputVal.Trim(), [ref]$num)) { continue }
+    if ($num -lt 0 -or $num -gt $clusters.Count) { continue }
+
+    $selection = $num
     break
 }
 
-$selCluster = $clusters | Where-Object { $_.Index -eq $n } | Select-Object -First 1
-$headers = @{ apiKey = $apiKey; accessClusterId = $selCluster.ClusterId }
+$SelectedClusters = if ($selection -eq 0) { $clusters } else { @($clusters | Where-Object { $_.Index -eq $selection }) }
+$SelectedClusterIds = $SelectedClusters.ClusterId
 
 # -------------------------------------------------------------
-# 2) Get Acropolis PGs + menu
+# 2) Collect inventories
 # -------------------------------------------------------------
-$pgResp = Invoke-WebRequest `
-    -Uri "$baseUrl/v2/data-protect/protection-groups" `
-    -Headers $headers `
-    -Body @{ environments = "kAcropolis"; isDeleted = "False" } `
-    -Method Get
+$PGInventory = @()
+$VMInventory = @()
 
-$pgs = ($pgResp.Content | ConvertFrom-Json).protectionGroups
-if (-not $pgs) { throw "No Acropolis protection groups found on $($selCluster.ClusterName)." }
+foreach ($cid in $SelectedClusterIds) {
 
-$pgMenu = for ($i = 0; $i -lt $pgs.Count; $i++) {
-    [pscustomobject]@{
-        Index  = $i + 1
-        PGName = $pgs[$i].name
-        PGId   = $pgs[$i].id
+    $clus = $SelectedClusters | Where-Object { $_.ClusterId -eq $cid } | Select-Object -First 1
+    $clusterName = $clus.ClusterName
+    $clusterId   = $clus.ClusterId
+
+    $headers = @{ apiKey = $apiKey; accessClusterId = $clusterId }
+
+    # --- Get Acropolis PGs ---
+    try {
+        $pgResp = Invoke-WebRequest `
+            -Uri "$baseUrl/v2/data-protect/protection-groups" `
+            -Headers $headers `
+            -Body @{ environments = "kAcropolis"; isDeleted = "False" } `
+            -Method Get
+        $pgs = ($pgResp.Content | ConvertFrom-Json).protectionGroups
+    } catch {
+        continue
     }
-}
 
-Write-Host ""
-Write-Host "Acropolis Protection Groups on $($selCluster.ClusterName):" -ForegroundColor Cyan
-$pgMenu | Format-Table -AutoSize
-Write-Host ""
-Write-Host "[X] Exit" -ForegroundColor Yellow
-Write-Host ""
+    if (-not $pgs) { continue }
 
-while ($true) {
-    $pgInput = Read-Host "Select PG number (1-$($pgMenu.Count)) or X to exit"
-    if ($pgInput -match '^(x|X|q|Q)$') { return }
+    foreach ($pg in $pgs) {
 
-    [int]$pn = 0
-    if (-not [int]::TryParse($pgInput.Trim(), [ref]$pn)) { continue }
-    if ($pn -lt 1 -or $pn -gt $pgMenu.Count) { continue }
-    break
-}
+        $pgId   = $pg.id
+        $pgName = $pg.name
 
-$selPG = $pgMenu | Where-Object { $_.Index -eq $pn } | Select-Object -First 1
+        # --- Get runs WITH object details (needed for VM list) ---
+        try {
+            $runResp = Invoke-WebRequest `
+                -Uri "$baseUrl/v2/data-protect/protection-groups/$pgId/runs" `
+                -Headers $headers `
+                -Body @{
+                    environments = "kAcropolis"
+                    numRuns = "10"
+                    includeObjectDetails = "True"
+                } `
+                -Method Get
 
-# -------------------------------------------------------------
-# 3) Get runs + print Status + InventoryAsOfET
-# -------------------------------------------------------------
-$runResp = Invoke-WebRequest `
-    -Uri "$baseUrl/v2/data-protect/protection-groups/$($selPG.PGId)/runs" `
-    -Headers $headers `
-    -Body @{ environments = "kAcropolis"; numRuns = "10"; includeObjectDetails = "False" } `
-    -Method Get
-
-$runs = ($runResp.Content | ConvertFrom-Json).runs
-if (-not $runs) { throw "No runs returned for PG $($selPG.PGName)." }
-
-Write-Host ""
-Write-Host "Latest run metadata (top 10) for:" -ForegroundColor Cyan
-Write-Host " Cluster: $($selCluster.ClusterName)"
-Write-Host " PG     : $($selPG.PGName)"
-Write-Host ""
-
-$runs |
-    ForEach-Object {
-
-        # ✅ FIX: localBackupInfo may be an object, so force array semantics
-        $lb = @($_.localBackupInfo)
-        $info = if ($lb.Count -gt 0) { $lb[0] } else { $null }
-
-        $endUsecs = if ($info -and $info.endTimeUsecs) { $info.endTimeUsecs } else { $null }
-
-        [pscustomobject]@{
-            RunId           = $_.runId
-            Status          = if ($info -and $info.status) { $info.status } else { "<missing>" }
-            EndTimeUsecs    = if ($endUsecs) { $endUsecs } else { "<missing>" }
-            InventoryAsOfET = if ($endUsecs) { Convert-ToET $endUsecs } else { "<blank>" }
+            $runs = (($runResp.Content | ConvertFrom-Json).runs)
+        } catch {
+            continue
         }
-    } |
-    Sort-Object {
-        $lb = @($_.localBackupInfo)
-        $info = if ($lb.Count -gt 0) { $lb[0] } else { $null }
-        if ($info -and $info.endTimeUsecs) { [int64]$info.endTimeUsecs } else { 0 }
-    } -Descending |
-    Select-Object -First 10 |
-    Format-Table -AutoSize
+
+        if (-not $runs) { continue }
+
+        # Inventory run = latest run that has objects (for VM list)
+        $in
