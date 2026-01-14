@@ -2,6 +2,349 @@
 # Cohesity Acropolis (AHV) Inventory – Menu + API (Object-level)
 #
 # Output:
+# 1) Cluster Summary:  PGs, TotalVMs, BKUP_VM_SUCCESSFUL, BKUP_VM_FAILED + TOTAL row
+# 2) PG Summary:       TotalVMs, BKUP_VM_SUCCESSFUL, BKUP_VM_FAILED + TOTAL row
+# 3) Full VM List:     VMName, BackupStatus, Last_Successful_BKUP_ET (per VM)
+#
+# NOTES:
+# - Inventory As Of (ET): end time of the latest COMPLETED run used for inventory (per PG). Running runs are ignored.
+# - Last_Successful_BKUP_ET is checked only for the last N runs (default N=10).
+#   If blank: check Helios history for that VM (older than the last N runs).
+# -------------------------------------------------------------
+
+$ErrorActionPreference = "Stop"
+$baseUrl = "https://helios.cohesity.com"
+
+# --- How many historical runs to scan per PG for per-VM last success ---
+$LastSuccessRunLookback = 10
+
+# --- API key ---
+$apikeypath = "X:\PowerShell\Cohesity_API_Scripts\DO_NOT_Delete\apikey.txt"
+if (-not (Test-Path $apikeypath)) { throw "API key file not found: $apikeypath" }
+$apiKey = (Get-Content $apikeypath -Raw).Trim()
+
+# --- ET conversion ---
+$tz = [System.TimeZoneInfo]::FindSystemTimeZoneById("Eastern Standard Time")
+function Convert-ToET([object]$usecs) {
+    if (-not $usecs -or $usecs -eq 0) { return $null }
+    try {
+        $utc = [DateTimeOffset]::FromUnixTimeMilliseconds([int64]($usecs / 1000)).UtcDateTime
+        return [System.TimeZoneInfo]::ConvertTimeFromUtc($utc, $tz)
+    } catch { return $null }
+}
+
+function Get-LbiFirst($runObj) {
+    if (-not $runObj) { return $null }
+    $lb = @($runObj.localBackupInfo)  # object/array safe
+    if ($lb.Count -gt 0) { return $lb[0] }
+    return $null
+}
+
+function Get-EndUsecs([object]$runObj) {
+    $info = Get-LbiFirst $runObj
+    if ($info -and $info.endTimeUsecs) { return [int64]$info.endTimeUsecs }
+    return 0
+}
+
+function Get-RunStatus([object]$runObj) {
+    $info = Get-LbiFirst $runObj
+    if ($info -and $info.status) { return [string]$info.status }
+    return ""
+}
+
+function Test-ObjFailed {
+    param([object]$obj)
+    $fa = $null
+    try { $fa = $obj.localSnapshotInfo.failedAttempts } catch { $fa = $null }
+    return ($fa -and @($fa).Count -gt 0)
+}
+
+function Get-ObjStatus {
+    param([object]$obj)
+    if (Test-ObjFailed $obj) { return "Failed" }
+    return "Succeeded"
+}
+
+# -------------------------------------------------------------
+# 1) Get clusters (sorted) + menu
+# -------------------------------------------------------------
+$response = Invoke-WebRequest -Method Get -Uri "$baseUrl/v2/mcm/cluster-mgmt/info" -Headers @{ apiKey = $apiKey }
+$json = $response.Content | ConvertFrom-Json
+$json_clu = $json.cohesityClusters
+if (-not $json_clu -or $json_clu.Count -eq 0) { throw "No clusters returned from Helios." }
+
+$sorted = $json_clu | Sort-Object -Property clusterName
+
+$clusters = for ($i = 0; $i -lt $sorted.Count; $i++) {
+    [pscustomobject]@{
+        Index       = $i + 1
+        ClusterName = $sorted[$i].clusterName
+        ClusterId   = $sorted[$i].clusterId
+    }
+}
+
+Write-Host ""
+Write-Host "Available Helios Clusters (A–Z):" -ForegroundColor Cyan
+$clusters | Format-Table -AutoSize
+Write-Host ""
+Write-Host "[0] All clusters" -ForegroundColor Yellow
+Write-Host "[X] Exit" -ForegroundColor Yellow
+Write-Host ""
+
+while ($true) {
+    $inputVal = Read-Host "Enter 0 for ALL, 1-$($clusters.Count) for single, or X to exit"
+    if ($inputVal -match '^(x|X|q|Q)$') { return }
+
+    [int]$num = 0
+    if (-not [int]::TryParse($inputVal.Trim(), [ref]$num)) { continue }
+    if ($num -lt 0 -or $num -gt $clusters.Count) { continue }
+
+    $selection = $num
+    break
+}
+
+$SelectedClusters   = if ($selection -eq 0) { $clusters } else { @($clusters | Where-Object { $_.Index -eq $selection }) }
+$SelectedClusterIds = $SelectedClusters.ClusterId
+
+# -------------------------------------------------------------
+# 2) Collect inventories
+# -------------------------------------------------------------
+$PGInventory = @()
+$VMInventory = @()
+$InventoryAsOfUsecsAll = @()
+
+foreach ($cid in $SelectedClusterIds) {
+
+    $clus = $SelectedClusters | Where-Object { $_.ClusterId -eq $cid } | Select-Object -First 1
+    $clusterName = $clus.ClusterName
+    $clusterId   = $clus.ClusterId
+    $headers = @{ apiKey = $apiKey; accessClusterId = $clusterId }
+
+    # --- Get Acropolis PGs (active only) ---
+    try {
+        $pgResp = Invoke-WebRequest `
+            -Uri "$baseUrl/v2/data-protect/protection-groups" `
+            -Headers $headers `
+            -Body @{
+                environments = "kAcropolis"
+                isDeleted    = "False"
+                isActive     = "True"
+                isPaused     = "False"
+            } `
+            -Method Get
+        $pgs = ($pgResp.Content | ConvertFrom-Json).protectionGroups
+    } catch {
+        continue
+    }
+
+    if (-not $pgs) { continue }
+
+    foreach ($pg in $pgs) {
+
+        $pgId   = $pg.id
+        $pgName = $pg.name
+
+        # --- Pull runs WITH object details ---
+        # Only enough for: inventory run + last-success scan for last N runs
+        $numRunsToPull = [Math]::Max($LastSuccessRunLookback, 10)
+
+        try {
+            $runResp = Invoke-WebRequest `
+                -Uri "$baseUrl/v2/data-protect/protection-groups/$pgId/runs" `
+                -Headers $headers `
+                -Body @{
+                    environments         = "kAcropolis"
+                    numRuns              = "$numRunsToPull"
+                    includeObjectDetails = "True"
+                } `
+                -Method Get
+            $runs = (($runResp.Content | ConvertFrom-Json).runs)
+        } catch {
+            continue
+        }
+
+        if (-not $runs) { continue }
+
+        $runsSorted = $runs | Sort-Object { Get-EndUsecs $_ } -Descending
+
+        # Inventory run = latest COMPLETED run that returned objects (exclude Running)
+        $inventoryRun = $null
+        foreach ($r in $runsSorted) {
+            if (-not $r.objects) { continue }
+            if ((Get-RunStatus $r) -eq "Running") { continue }
+            if ((Get-EndUsecs $r) -le 0) { continue }
+            $inventoryRun = $r
+            break
+        }
+        if (-not $inventoryRun -or -not $inventoryRun.objects) { continue }
+
+        $invEndUsecs = Get-EndUsecs $inventoryRun
+        if ($invEndUsecs -gt 0) { $InventoryAsOfUsecsAll += $invEndUsecs }
+
+        # VMs in the inventory run
+        $inventoryVms = @()
+        foreach ($obj in $inventoryRun.objects) {
+            if ($obj.object.environment -ne "kAcropolis") { continue }
+            if ($obj.object.objectType -ne "kVirtualMachine") { continue }
+            if (-not $obj.object.name) { continue }
+            $inventoryVms += $obj.object.name
+        }
+        if ($inventoryVms.Count -eq 0) { continue }
+
+        # Per-VM last success map (scan only last N completed runs)
+        $lastSuccessMap = @{}
+        foreach ($vmName in $inventoryVms) { $lastSuccessMap[$vmName] = "" }
+
+        $remaining = $inventoryVms.Count
+        $checkedRuns = 0
+
+        foreach ($r in $runsSorted) {
+
+            if ($remaining -le 0) { break }
+            if ($checkedRuns -ge $LastSuccessRunLookback) { break }
+
+            if (-not $r.objects) { continue }
+            if ((Get-RunStatus $r) -eq "Running") { continue }
+
+            $endUsecs = Get-EndUsecs $r
+            if ($endUsecs -le 0) { continue }
+
+            $checkedRuns++
+
+            foreach ($obj in $r.objects) {
+                if ($obj.object.environment -ne "kAcropolis") { continue }
+                if ($obj.object.objectType -ne "kVirtualMachine") { continue }
+
+                $vm = $obj.object.name
+                if (-not $vm) { continue }
+                if (-not $lastSuccessMap.ContainsKey($vm)) { continue }
+                if ($lastSuccessMap[$vm] -ne "") { continue }
+
+                if (-not (Test-ObjFailed $obj)) {
+                    $et = Convert-ToET $endUsecs
+                    if ($et) {
+                        $lastSuccessMap[$vm] = $et.ToString("yyyy-MM-dd HH:mm:ss")
+                        $remaining--
+                    }
+                }
+            }
+        }
+
+        # Object-level success/fail for the INVENTORY RUN itself
+        $pgTotalVMs  = 0
+        $pgFailedVMs = 0
+
+        foreach ($obj in $inventoryRun.objects) {
+
+            if ($obj.object.environment -ne "kAcropolis") { continue }
+            if ($obj.object.objectType -ne "kVirtualMachine") { continue }
+
+            $vmName = $obj.object.name
+            if (-not $vmName) { continue }
+
+            $pgTotalVMs++
+
+            $bkpStatus = Get-ObjStatus $obj
+            if ($bkpStatus -eq "Failed") { $pgFailedVMs++ }
+
+            $VMInventory += [pscustomobject]@{
+                Cluster                = $clusterName
+                ProtectionGroup        = $pgName
+                VMName                 = $vmName
+                BackupStatus           = $bkpStatus
+                Last_Successful_BKUP_ET= $lastSuccessMap[$vmName]
+            }
+        }
+
+        $pgSuccVMs = $pgTotalVMs - $pgFailedVMs
+
+        $PGInventory += [pscustomobject]@{
+            Cluster           = $clusterName
+            ProtectionGroup   = $pgName
+            TotalVMs          = $pgTotalVMs
+            BKUP_VM_SUCCESSFUL= $pgSuccVMs
+            BKUP_VM_FAILED    = $pgFailedVMs
+        }
+    }
+}
+
+if (-not $PGInventory -or $PGInventory.Count -eq 0) {
+    Write-Host "`nNo Acropolis inventory collected." -ForegroundColor Yellow
+    return
+}
+
+# One global "as-of" for the report (max end time across PG inventory runs)
+$globalAsOf = ""
+if ($InventoryAsOfUsecsAll.Count -gt 0) {
+    $maxUsecs = ($InventoryAsOfUsecsAll | Measure-Object -Maximum).Maximum
+    $dt = Convert-ToET $maxUsecs
+    if ($dt) { $globalAsOf = $dt.ToString("yyyy-MM-dd HH:mm:ss") }
+}
+
+# -------------------------------------------------------------
+# 3) Cluster Summary + TOTAL row
+# -------------------------------------------------------------
+$ClusterSummary = $PGInventory |
+    Group-Object Cluster |
+    ForEach-Object {
+        $g = $_.Group
+        [pscustomobject]@{
+            Cluster            = $_.Name
+            PGs                = $g.Count
+            TotalVMs           = ($g.TotalVMs | Measure-Object -Sum).Sum
+            BKUP_VM_SUCCESSFUL = ($g.BKUP_VM_SUCCESSFUL | Measure-Object -Sum).Sum
+            BKUP_VM_FAILED     = ($g.BKUP_VM_FAILED | Measure-Object -Sum).Sum
+        }
+    } | Sort-Object Cluster
+
+$ClusterTotalRow = [pscustomobject]@{
+    Cluster            = "TOTAL"
+    PGs                = ($ClusterSummary.PGs | Measure-Object -Sum).Sum
+    TotalVMs           = ($ClusterSummary.TotalVMs | Measure-Object -Sum).Sum
+    BKUP_VM_SUCCESSFUL = ($ClusterSummary.BKUP_VM_SUCCESSFUL | Measure-Object -Sum).Sum
+    BKUP_VM_FAILED     = ($ClusterSummary.BKUP_VM_FAILED | Measure-Object -Sum).Sum
+}
+
+# -------------------------------------------------------------
+# 4) PG Summary + TOTAL row
+# -------------------------------------------------------------
+$PGSummary = $PGInventory | Sort-Object Cluster, ProtectionGroup
+
+$PGTotalRow = [pscustomobject]@{
+    Cluster            = "TOTAL"
+    ProtectionGroup    = ""
+    TotalVMs           = ($PGSummary.TotalVMs | Measure-Object -Sum).Sum
+    BKUP_VM_SUCCESSFUL = ($PGSummary.BKUP_VM_SUCCESSFUL | Measure-Object -Sum).Sum
+    BKUP_VM_FAILED     = ($PGSummary.BKUP_VM_FAILED | Measure-Object -Sum).Sum
+}
+
+# -------------------------------------------------------------
+# 5) Output (safe concat)
+# -------------------------------------------------------------
+Write-Host ""
+Write-Host "NOTE:" -ForegroundColor Yellow
+Write-Host ("Inventory As Of (ET): " + $(if ($globalAsOf) { $globalAsOf } else { "<blank>" })) -ForegroundColor Yellow
+Write-Host ("Last_Successful_BKUP_ET is checked only for the last {0} runs. If blank, check Helios for older history." -f $LastSuccessRunLookback) -ForegroundColor Yellow
+Write-Host ""
+
+Write-Host "=== Summary 1: Cluster Summary ===" -ForegroundColor Cyan
+$ClusterOut = @($ClusterSummary) + @($ClusterTotalRow)
+$ClusterOut | Format-Table Cluster, PGs, TotalVMs, BKUP_VM_SUCCESSFUL, BKUP_VM_FAILED -AutoSize
+
+Write-Host ""
+Write-Host "=== Summary 2: Protection Group Summary ===" -ForegroundColor Cyan
+$PGOut = @($PGSummary) + @($PGTotalRow)
+$PGOut | Format-Table Cluster, ProtectionGroup, TotalVMs, BKUP_VM_SUCCESSFUL, BKUP_VM_FAILED -AutoSize
+
+Write-Host ""
+Write-Host "=== Full VM List ===" -ForegroundColor Cyan
+$VMInventory |
+    Sort-Object Cluster, ProtectionGroup, VMName |
+    Format-Table Cluster, ProtectionGroup, VMName, BackupStatus, Last_Successful_BKUP_ET -AutoSize
+# -------------------------------------------------------------
+# Cohesity Acropolis (AHV) Inventory – Menu + API (Object-level)
+#
+# Output:
 # 1) Cluster Summary:  PGs, TotalVMs, BKUP_SUCC_VM, BKUP_FAIL_VM + TOTAL row
 # 2) PG Summary:       TotalVMs, BKUP_SUCC_VM, BKUP_FAIL_VM + TOTAL row
 # 3) Full VM List:     VMName, BackupStatus, LastSuccessfulET (per VM)
