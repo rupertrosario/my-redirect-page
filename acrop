@@ -1,18 +1,22 @@
 # -------------------------------------------------------------
 # Cohesity Acropolis (AHV) Inventory – Menu + API (OBJECT-LEVEL)
 #
-# Output:
-# 1) Cluster Summary:  PGs, TotalVMs, BBKPsuccessfulVMs, BKPFailedVMs + TOTAL row
-# 2) PG Summary:       TotalVMs, BBKPsuccessfulVMs, BKPFailedVMs + TOTAL row
-# 3) Full VM List:     VMName, BKPStatus(Object-level), LastSuccessfulET
+# Summary tables required:
+# 1) Cluster: PGs, TotalVMs, BBKPsuccessfulVMs, BKPFailedVMs + TOTAL row
+# 2) PG:      TotalVMs, BBKPsuccessfulVMs, BKPFailedVMs + TOTAL row
+# 3) VM List: VMName, BKPStatus (object-level for INVENTORY RUN), LastSuccessfulET (object-level)
 #
 # NOTE:
-# Inventory As Of (ET) = end time of the LAST COMPLETED run used for inventory (per PG),
+# Inventory As Of (ET) = end time of the latest COMPLETED run used for inventory (per PG),
 # using the latest COMPLETED run that returned objects (Running excluded).
 #
-# Object-level failure detection:
+# Object-level failure detection (per VM object in a run):
 #   Failed if objects[].localSnapshotInfo.failedAttempts exists and Count > 0
-#   Else Success
+#   Else Succeeded
+#
+# Object-level LastSuccessfulET:
+#   For each VM in inventoryRun, scan prior completed runs (newest->oldest) and
+#   set VM's LastSuccessfulET to the first run where that VM has NO failedAttempts.
 # -------------------------------------------------------------
 
 $ErrorActionPreference = "Stop"
@@ -52,13 +56,16 @@ function Get-RunStatus([object]$runObj) {
     return ""
 }
 
-function Get-VmObjectBkpStatus {
+function Test-ObjFailed {
     param([object]$obj)
-
     $fa = $null
     try { $fa = $obj.localSnapshotInfo.failedAttempts } catch { $fa = $null }
+    return ($fa -and @($fa).Count -gt 0)
+}
 
-    if ($fa -and @($fa).Count -gt 0) { return "Failed" }
+function Get-ObjStatus {
+    param([object]$obj)
+    if (Test-ObjFailed $obj) { return "Failed" }
     return "Succeeded"
 }
 
@@ -110,6 +117,9 @@ $PGInventory = @()
 $VMInventory = @()
 $InventoryAsOfUsecsAll = @()
 
+# Tuning: how many runs to pull per PG (object-level last-success needs history)
+$numRunsToPull = 50
+
 foreach ($cid in $SelectedClusterIds) {
 
     $clus = $SelectedClusters | Where-Object { $_.ClusterId -eq $cid } | Select-Object -First 1
@@ -129,7 +139,6 @@ foreach ($cid in $SelectedClusterIds) {
                 isPaused     = "False"
             } `
             -Method Get
-
         $pgs = ($pgResp.Content | ConvertFrom-Json).protectionGroups
     } catch {
         continue
@@ -149,11 +158,10 @@ foreach ($cid in $SelectedClusterIds) {
                 -Headers $headers `
                 -Body @{
                     environments         = "kAcropolis"
-                    numRuns              = "15"
+                    numRuns              = "$numRunsToPull"
                     includeObjectDetails = "True"
                 } `
                 -Method Get
-
             $runs = (($runResp.Content | ConvertFrom-Json).runs)
         } catch {
             continue
@@ -161,37 +169,75 @@ foreach ($cid in $SelectedClusterIds) {
 
         if (-not $runs) { continue }
 
-        # Inventory run = latest COMPLETED run that returned objects (exclude Running)
-        $inventoryRun = $runs |
-            Where-Object {
-                $_.objects -and
-                (Get-RunStatus $_) -ne "Running" -and
-                (Get-EndUsecs $_) -gt 0
-            } |
-            Sort-Object { Get-EndUsecs $_ } -Descending |
-            Select-Object -First 1
+        # Sort runs by endTime desc (completed ones have endTimeUsecs)
+        $runsSorted = $runs | Sort-Object { Get-EndUsecs $_ } -Descending
 
+        # Inventory run = latest COMPLETED run that returned objects (exclude Running)
+        $inventoryRun = $null
+        foreach ($r in $runsSorted) {
+            if (-not $r.objects) { continue }
+            $st = Get-RunStatus $r
+            if ($st -eq "Running") { continue }
+            if ((Get-EndUsecs $r) -le 0) { continue }
+            $inventoryRun = $r
+            break
+        }
         if (-not $inventoryRun -or -not $inventoryRun.objects) { continue }
 
         $invEndUsecs = Get-EndUsecs $inventoryRun
         if ($invEndUsecs -gt 0) { $InventoryAsOfUsecsAll += $invEndUsecs }
 
-        # LastSuccessfulET (Succeeded or SucceededWithWarning) – VM list only
-        $successRun = $runs |
-            Where-Object {
-                $s = Get-RunStatus $_
-                $_.objects -and
-                $s -in @("Succeeded","SucceededWithWarning") -and
-                (Get-EndUsecs $_) -gt 0
-            } |
-            Sort-Object { Get-EndUsecs $_ } -Descending |
-            Select-Object -First 1
+        # Build list of VMs in the inventory run
+        $inventoryVms = @()
+        foreach ($obj in $inventoryRun.objects) {
+            if ($obj.object.environment -ne "kAcropolis") { continue }
+            if ($obj.object.objectType -ne "kVirtualMachine") { continue }
+            if (-not $obj.object.name) { continue }
+            $inventoryVms += $obj.object.name
+        }
+        if ($inventoryVms.Count -eq 0) { continue }
 
-        $succEndUsecs = if ($successRun) { Get-EndUsecs $successRun } else { 0 }
-        $succET = if ($succEndUsecs -gt 0) { Convert-ToET $succEndUsecs } else { $null }
-        $LastSuccessfulET = if ($succET) { $succET.ToString("yyyy-MM-dd HH:mm:ss") } else { "" }
+        # Object-level LastSuccessfulET per VM:
+        # Initialize map with blank; fill by scanning runs newest->oldest until all set or history ends
+        $lastSuccessMap = @{}
+        foreach ($vmName in $inventoryVms) { $lastSuccessMap[$vmName] = "" }
 
-        # OBJECT-LEVEL counts from run objects
+        $remaining = $inventoryVms.Count
+
+        foreach ($r in $runsSorted) {
+
+            if ($remaining -le 0) { break }
+
+            if (-not $r.objects) { continue }
+            $st = Get-RunStatus $r
+            if ($st -eq "Running") { continue }
+
+            $endUsecs = Get-EndUsecs $r
+            if ($endUsecs -le 0) { continue }
+
+            # Check objects in this run
+            foreach ($obj in $r.objects) {
+
+                if ($obj.object.environment -ne "kAcropolis") { continue }
+                if ($obj.object.objectType -ne "kVirtualMachine") { continue }
+
+                $vm = $obj.object.name
+                if (-not $vm) { continue }
+                if (-not $lastSuccessMap.ContainsKey($vm)) { continue }     # only track VMs from inventoryRun
+                if ($lastSuccessMap[$vm] -ne "") { continue }              # already have last-success
+
+                # Success if NO failedAttempts on this VM in this run
+                if (-not (Test-ObjFailed $obj)) {
+                    $et = Convert-ToET $endUsecs
+                    if ($et) {
+                        $lastSuccessMap[$vm] = $et.ToString("yyyy-MM-dd HH:mm:ss")
+                        $remaining--
+                    }
+                }
+            }
+        }
+
+        # Now compute object-level success/fail for the INVENTORY RUN itself
         $pgTotalVMs  = 0
         $pgFailedVMs = 0
 
@@ -200,17 +246,19 @@ foreach ($cid in $SelectedClusterIds) {
             if ($obj.object.environment -ne "kAcropolis") { continue }
             if ($obj.object.objectType -ne "kVirtualMachine") { continue }
 
-            $pgTotalVMs++
+            $vmName = $obj.object.name
+            if (-not $vmName) { continue }
 
-            $objStatus = Get-VmObjectBkpStatus -obj $obj
-            if ($objStatus -eq "Failed") { $pgFailedVMs++ }
+            $pgTotalVMs++
+            $bkpStatus = Get-ObjStatus $obj
+            if ($bkpStatus -eq "Failed") { $pgFailedVMs++ }
 
             $VMInventory += [pscustomobject]@{
                 Cluster          = $clusterName
                 ProtectionGroup  = $pgName
-                VMName           = $obj.object.name
-                BKPStatus        = $objStatus
-                LastSuccessfulET = $LastSuccessfulET
+                VMName           = $vmName
+                BKPStatus        = $bkpStatus
+                LastSuccessfulET = $lastSuccessMap[$vmName]   # OBJECT-level
             }
         }
 
@@ -277,7 +325,7 @@ $PGTotalRow = [pscustomobject]@{
 }
 
 # -------------------------------------------------------------
-# 5) Output (FIXED concat issue)
+# 5) Output (safe concat)
 # -------------------------------------------------------------
 Write-Host ""
 Write-Host "NOTE:" -ForegroundColor Yellow
