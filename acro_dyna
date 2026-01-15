@@ -13,8 +13,10 @@
 // - Day buckets use RUN END time (Eastern Time).
 // - Last Successful Backup is searched only across last N runs (default 10).
 // - Active scope = isDeleted=False, isActive=True, isPaused=False
-// - State map lists Active/Paused/Deleted; "Failover Ready" means PG name appears on >1 cluster (any state).
+// - State map lists Active/Paused/Deleted; FAILOVER READY means same PG name appears on >1 cluster (any state).
 // -------------------------------------------------------------
+
+import { credentialVaultClient } from "@dynatrace-sdk/client-classic-environment-v2";
 
 export default async function () {
   const baseUrl = "https://helios.cohesity.com";
@@ -22,14 +24,53 @@ export default async function () {
   // ------------------------------
   // CONFIG
   // ------------------------------
-  const API_KEY = "PASTE_YOUR_API_KEY_HERE";  // <-- set this
   const DAYS = 7;
-  const NUM_RUNS_PULL = 60;                   // sanity: enough to cover 7 days even with retries
+  const NUM_RUNS_PULL = 60;            // enough to cover 7 days even with retries
   const LAST_SUCCESS_RUN_LOOKBACK = 10;
 
-  // Optional: restrict clusters
-  // const TARGET_CLUSTER_IDS = ["12345","67890"];
+  // If empty => ALL clusters. Else restrict.
+  // const TARGET_CLUSTER_IDS = ["12345", "67890"];
   const TARGET_CLUSTER_IDS = [];
+
+  // ------------------------------
+  // 1) Credential vault: name -> id -> manual (your working pattern)
+  // ------------------------------
+  const vaultName = "Cohesity_API_Key";
+  const vaultId = "credentials_vault-312312"; // optional fallback, keep if you have it
+
+  let apiKey = null;
+  let authMode = "vault-name";
+
+  async function getKeyByName(name) {
+    const all = await credentialVaultClient.getCredentials();
+    let found = null;
+    for (let i = 0; i < (all.credentials || []).length; i++) {
+      if (all.credentials[i].name === name) { found = all.credentials[i]; break; }
+    }
+    if (!found) return null;
+
+    const detail = await credentialVaultClient.getCredentialsDetails({ id: found.id });
+    console.log("✓ Helios key from vault (name): " + found.name);
+    return (detail && (detail.token || detail.password)) || null;
+  }
+
+  try {
+    apiKey = await getKeyByName(vaultName);
+    if (!apiKey) throw new Error("not-found");
+  } catch (e) {
+    try {
+      const d2 = await credentialVaultClient.getCredentialsDetails({ id: vaultId });
+      apiKey = (d2 && (d2.token || d2.password)) || null;
+      authMode = "vault-id";
+      console.log("✓ Helios key from vault (id): " + (d2 && d2.name ? d2.name : vaultId));
+    } catch (e2) {
+      authMode = "manual";
+      apiKey = "PASTE_YOUR_API_KEY_HERE";
+      console.log("⚠️ Using manual Helios API key (fallback)");
+    }
+  }
+
+  if (!apiKey) throw new Error("No Helios API key available.");
 
   // ------------------------------
   // Helpers (sanity-safe)
@@ -157,7 +198,9 @@ export default async function () {
     if (!rows || rows.length === 0) return h + `<div>✅ No rows.</div>`;
 
     h += `<table style="border-collapse:collapse;width:100%;font-family:Segoe UI,Arial,sans-serif;font-size:13px;">`;
-    h += `<tr style="background:#e5e7eb;">` + cols.map(c => `<th style="text-align:left;padding:8px;border:1px solid #d1d5db;">${htmlEscape(c)}</th>`).join("") + `</tr>`;
+    h += `<tr style="background:#e5e7eb;">` +
+         cols.map(c => `<th style="text-align:left;padding:8px;border:1px solid #d1d5db;">${htmlEscape(c)}</th>`).join("") +
+         `</tr>`;
 
     for (let i = 0; i < rows.length; i++) {
       const r = rows[i] || {};
@@ -167,15 +210,14 @@ export default async function () {
       h += `<tr style="${trStyle}">`;
       for (let j = 0; j < cols.length; j++) {
         const v = r[cols[j]];
-        let cell = htmlEscape(v);
-
-        // colorize delta cells that contain 🟢/🔴
         const raw = String(v ?? "");
         let tdStyle = `padding:8px;border:1px solid #d1d5db;`;
+
+        // colorize deltas
         if (raw.includes("🟢")) tdStyle += `color:#16a34a;font-weight:700;`;
         if (raw.includes("🔴")) tdStyle += `color:#dc2626;font-weight:700;`;
 
-        h += `<td style="${tdStyle}">${cell}</td>`;
+        h += `<td style="${tdStyle}">${htmlEscape(v)}</td>`;
       }
       h += `</tr>`;
     }
@@ -210,9 +252,9 @@ export default async function () {
   }
 
   // ------------------------------
-  // 1) Clusters
+  // 2) Get clusters
   // ------------------------------
-  const commonHeaders = { accept: "application/json", apiKey: API_KEY };
+  const commonHeaders = { accept: "application/json", apiKey: apiKey };
 
   const cluData = await getJson(`${baseUrl}/v2/mcm/cluster-mgmt/info`, commonHeaders);
   let clusters = arr(cluData && cluData.cohesityClusters);
@@ -226,14 +268,13 @@ export default async function () {
   }
 
   if (!clusters.length) {
-    return { markdownAll: "⚠️ No clusters returned from /v2/mcm/cluster-mgmt/info" };
+    return { authMode, markdownAll: "⚠️ No clusters returned from /v2/mcm/cluster-mgmt/info" };
   }
 
   // ------------------------------
-  // 2) PG listing per cluster (Active / Paused / Deleted / Inactive for failover detection)
-  //    Output only uses Active/Paused/Deleted columns, but inactive helps detect FAILOVER READY.
+  // 3) PG listing per cluster (Active/Paused/Deleted + Inactive only for FAILOVER READY detection)
   // ------------------------------
-  const pgByName = {}; // name -> { ActiveOn:Set, PausedOn:Set, DeletedOn:Set, SeenOn:Set, Ids:[{clusterId,clusterName,pgId,state}] }
+  const pgByName = {}; // name -> {ActiveOn:Set, PausedOn:Set, DeletedOn:Set, SeenOn:Set}
   const activePGs = []; // [{clusterName,clusterId,pgId,pgName}]
 
   function ensurePG(name) {
@@ -243,16 +284,16 @@ export default async function () {
         ActiveOn: new Set(),
         PausedOn: new Set(),
         DeletedOn: new Set(),
-        SeenOn: new Set(),     // any state
-        Ids: []                // detailed
+        SeenOn: new Set()
       };
     }
     return pgByName[name];
   }
 
-  async function fetchPGs(clusterId, clusterName, qp) {
-    const headers = { accept: "application/json", apiKey: API_KEY, accessClusterId: String(clusterId) };
-    const url = `${baseUrl}/v2/data-protect/protection-groups?` + buildQuery(Object.assign({ environments: "kAcropolis" }, qp));
+  async function fetchPGs(clusterId, qp) {
+    const headers = { accept: "application/json", apiKey: apiKey, accessClusterId: String(clusterId) };
+    const url = `${baseUrl}/v2/data-protect/protection-groups?` +
+      buildQuery(Object.assign({ environments: "kAcropolis" }, qp));
     const data = await getJson(url, headers);
     return arr(data && data.protectionGroups);
   }
@@ -263,86 +304,71 @@ export default async function () {
     const clusterName = norm(c.clusterName);
     if (!clusterId) continue;
 
-    let pActive = [];
-    let pPaused = [];
-    let pDeleted = [];
-    let pInactive = [];
+    let pActive = [], pPaused = [], pDeleted = [], pInactive = [];
 
-    try { pActive = await fetchPGs(clusterId, clusterName, { isDeleted: "False", isActive: "True", isPaused: "False" }); } catch {}
-    try { pPaused = await fetchPGs(clusterId, clusterName, { isDeleted: "False", isPaused: "True" }); } catch {}
-    try { pDeleted = await fetchPGs(clusterId, clusterName, { isDeleted: "True" }); } catch {}
-    try { pInactive = await fetchPGs(clusterId, clusterName, { isDeleted: "False", isActive: "False" }); } catch {}
+    try { pActive = await fetchPGs(clusterId, { isDeleted: "False", isActive: "True", isPaused: "False" }); } catch {}
+    try { pPaused = await fetchPGs(clusterId, { isDeleted: "False", isPaused: "True" }); } catch {}
+    try { pDeleted = await fetchPGs(clusterId, { isDeleted: "True" }); } catch {}
+    try { pInactive = await fetchPGs(clusterId, { isDeleted: "False", isActive: "False" }); } catch {}
 
-    // Active
     for (let i = 0; i < pActive.length; i++) {
       const pg = pActive[i] || {};
       const pgName = norm(pg.name);
       const pgId = norm(pg.id);
       if (!pgName || !pgId) continue;
 
-      const entry = ensurePG(pgName);
-      entry.ActiveOn.add(clusterName);
-      entry.SeenOn.add(clusterName);
-      entry.Ids.push({ clusterId, clusterName, pgId, state: "active" });
+      const e = ensurePG(pgName);
+      e.ActiveOn.add(clusterName);
+      e.SeenOn.add(clusterName);
 
       activePGs.push({ clusterId, clusterName, pgId, pgName });
     }
 
-    // Paused
     for (let i = 0; i < pPaused.length; i++) {
       const pg = pPaused[i] || {};
       const pgName = norm(pg.name);
-      const pgId = norm(pg.id);
-      if (!pgName || !pgId) continue;
+      if (!pgName) continue;
 
-      const entry = ensurePG(pgName);
-      entry.PausedOn.add(clusterName);
-      entry.SeenOn.add(clusterName);
-      entry.Ids.push({ clusterId, clusterName, pgId, state: "paused" });
+      const e = ensurePG(pgName);
+      e.PausedOn.add(clusterName);
+      e.SeenOn.add(clusterName);
     }
 
-    // Deleted
     for (let i = 0; i < pDeleted.length; i++) {
       const pg = pDeleted[i] || {};
       const pgName = norm(pg.name);
-      const pgId = norm(pg.id);
-      if (!pgName || !pgId) continue;
+      if (!pgName) continue;
 
-      const entry = ensurePG(pgName);
-      entry.DeletedOn.add(clusterName);
-      entry.SeenOn.add(clusterName);
-      entry.Ids.push({ clusterId, clusterName, pgId, state: "deleted" });
+      const e = ensurePG(pgName);
+      e.DeletedOn.add(clusterName);
+      e.SeenOn.add(clusterName);
     }
 
-    // Inactive (for FAILOVER READY detection only)
+    // inactive only to mark "seen across clusters" -> FAILOVER READY
     for (let i = 0; i < pInactive.length; i++) {
       const pg = pInactive[i] || {};
       const pgName = norm(pg.name);
-      const pgId = norm(pg.id);
-      if (!pgName || !pgId) continue;
+      if (!pgName) continue;
 
-      const entry = ensurePG(pgName);
-      entry.SeenOn.add(clusterName);
-      entry.Ids.push({ clusterId, clusterName, pgId, state: "inactive" });
+      const e = ensurePG(pgName);
+      e.SeenOn.add(clusterName);
     }
   }
 
   // ------------------------------
-  // 3) For ACTIVE PGs: pull runs (object details) and compute:
-  //    - global 7-day date list (from actual run end dates)
+  // 4) For ACTIVE PGs: pull runs and compute:
+  //    - global 7-day date list
   //    - per PG totals by date (latest run per date)
   //    - per PG drift deltas
-  //    - current VM inventory rows
+  //    - current VM inventory rows + last success
   // ------------------------------
-  const perPG = {}; // key cluster|pgName -> { Cluster, ProtectionGroup, totalsByDate:{date:count}, endTsByDate:{date:ts}, seriesDates:[...], todayTotal, net7d, deltasByDate:{date:deltaStr}, flags:Set }
+  const perPG = {}; // key cluster|pgName -> stats
   const VMInventory = [];
   const inventoryAsOfUsecsAll = [];
-
-  // collect all dates encountered across active PG runs, for global 7 dates
   const allDatesSet = new Set();
 
   async function fetchRuns(clusterId, pgId) {
-    const headers = { accept: "application/json", apiKey: API_KEY, accessClusterId: String(clusterId) };
+    const headers = { accept: "application/json", apiKey: apiKey, accessClusterId: String(clusterId) };
     const url =
       `${baseUrl}/v2/data-protect/protection-groups/${encodeURIComponent(pgId)}/runs?` +
       buildQuery({ environments: "kAcropolis", numRuns: String(NUM_RUNS_PULL), includeObjectDetails: "True" });
@@ -352,61 +378,44 @@ export default async function () {
 
   for (let i = 0; i < activePGs.length; i++) {
     const p = activePGs[i];
-    const clusterId = p.clusterId;
-    const clusterName = p.clusterName;
-    const pgId = p.pgId;
-    const pgName = p.pgName;
-
     let runs = [];
-    try { runs = await fetchRuns(clusterId, pgId); } catch { continue; }
+    try { runs = await fetchRuns(p.clusterId, p.pgId); } catch { continue; }
 
-    // keep only completed-ish runs with objects and endTimeUsecs, ignore Running
     runs = runs
       .filter(r => r && r.objects && getRunStatus(r) !== "Running" && getEndUsecs(r) > 0)
       .sort((a, b) => getEndUsecs(b) - getEndUsecs(a));
 
     if (!runs.length) continue;
 
-    // latest inventory run = latest completed with objects
     const inventoryRun = runs[0];
     const invEndUsecs = getEndUsecs(inventoryRun);
     if (invEndUsecs > 0) inventoryAsOfUsecsAll.push(invEndUsecs);
 
-    // build per-day latest run map (by ET date)
-    const byDate = {}; // date -> { run, endUsecs, etTs }
+    // latest completed run per ET date
+    const byDate = {};
     for (let r = 0; r < runs.length; r++) {
-      const runObj = runs[r];
-      const endUsecs = getEndUsecs(runObj);
+      const endUsecs = getEndUsecs(runs[r]);
       const et = usecsToET(endUsecs);
       if (!et.etDate) continue;
-
-      // only keep first (latest) encountered for that date because runs sorted desc
       if (!byDate[et.etDate]) {
-        byDate[et.etDate] = { run: runObj, endUsecs, etTs: et.etTs };
+        byDate[et.etDate] = { run: runs[r], endUsecs, etTs: et.etTs };
         allDatesSet.add(et.etDate);
       }
     }
 
-    const key = `${clusterName}|${pgName}`;
+    const key = `${p.clusterName}|${p.pgName}`;
     perPG[key] = {
-      Cluster: clusterName,
-      ProtectionGroup: pgName,
+      Cluster: p.clusterName,
+      ProtectionGroup: p.pgName,
       totalsByDate: {},
-      endTsByDate: {},
-      deltasByDate: {},   // date -> "🟢 +N" / "🔴 -N" / "0" / "—"
-      todayTotal: null,
-      net7d: null
+      deltasByDate: {}
     };
 
-    // count VMs per date bucket
     for (const d in byDate) {
-      const cnt = countAHVVmsFromRun(byDate[d].run);
-      perPG[key].totalsByDate[d] = cnt;
-      perPG[key].endTsByDate[d] = byDate[d].etTs;
+      perPG[key].totalsByDate[d] = countAHVVmsFromRun(byDate[d].run);
     }
 
-    // last success map for VMs in the inventory run (look back last N runs)
-    // VMs in inventory run:
+    // last-success lookback map for VMs in inventory run
     const invObjs = arr(inventoryRun.objects);
     const inventoryVms = [];
     for (let oi = 0; oi < invObjs.length; oi++) {
@@ -454,7 +463,7 @@ export default async function () {
       }
     }
 
-    // Emit current VM list rows from inventory run
+    // Emit VM rows from inventory run
     for (let ob = 0; ob < invObjs.length; ob++) {
       const x = invObjs[ob] || {};
       const o = x.object || {};
@@ -465,8 +474,8 @@ export default async function () {
       if (!vmName) continue;
 
       VMInventory.push({
-        Cluster: clusterName,
-        ProtectionGroup: pgName,
+        Cluster: p.clusterName,
+        ProtectionGroup: p.pgName,
         VMName: vmName,
         BackupStatus: objFailed(x) ? "🔴" : "🟢",
         "Last Successful Backup (Eastern Time)": lastSuccessMap[vmName] || ""
@@ -474,12 +483,11 @@ export default async function () {
     }
   }
 
-  // If no active PG runs were pulled, still return PG State Map
-  // but Active Scope + VM sections would be empty.
+  // build global date columns (newest -> oldest) from actual run end dates
   const allDates = Array.from(allDatesSet).sort((a, b) => b.localeCompare(a)).slice(0, DAYS);
 
   // ------------------------------
-  // 4) Build PG Scope Trend matrix rows (active PGs only)
+  // 5) VM Scope Trend matrix rows (active PGs only)
   // ------------------------------
   const trendRows = [];
   const activePGKeys = Object.keys(perPG);
@@ -487,27 +495,22 @@ export default async function () {
   for (let i = 0; i < activePGKeys.length; i++) {
     const key = activePGKeys[i];
     const row = perPG[key];
-    const cluster = row.Cluster;
-    const pg = row.ProtectionGroup;
 
-    // Today = newest available date in global date list where this PG has a value
+    // pick "todayDate" for this PG: first date in global list where PG has a total
     let todayDate = null;
     for (let d = 0; d < allDates.length; d++) {
-      if (row.totalsByDate.hasOwnProperty(allDates[d])) { todayDate = allDates[d]; break; }
+      if (Object.prototype.hasOwnProperty.call(row.totalsByDate, allDates[d])) { todayDate = allDates[d]; break; }
     }
-
     const todayTotal = todayDate ? row.totalsByDate[todayDate] : null;
 
-    // Compute deltas per date column: delta(date) = total(date) - total(previousDate)
-    // where "previousDate" is the next column to the right in allDates list
+    // delta(date) = total(date) - total(next date to the right)
     for (let di = 0; di < allDates.length; di++) {
       const d0 = allDates[di];
-      const d1 = allDates[di + 1]; // previous day bucket in our window
-      if (!d1) {
-        row.deltasByDate[d0] = "—";
-        continue;
-      }
-      if (!row.totalsByDate.hasOwnProperty(d0) || !row.totalsByDate.hasOwnProperty(d1)) {
+      const d1 = allDates[di + 1];
+      if (!d1) { row.deltasByDate[d0] = "—"; continue; }
+
+      if (!Object.prototype.hasOwnProperty.call(row.totalsByDate, d0) ||
+          !Object.prototype.hasOwnProperty.call(row.totalsByDate, d1)) {
         row.deltasByDate[d0] = "—";
         continue;
       }
@@ -515,30 +518,26 @@ export default async function () {
       row.deltasByDate[d0] = delta === 0 ? "0" : (delta > 0 ? `🟢 **+${delta}**` : `🔴 **-${Math.abs(delta)}**`);
     }
 
-    // Net (7d) vs oldest available date in window for that PG
+    // Net (7d) vs oldest available day in window for that PG
     let oldestDate = null;
     for (let di = allDates.length - 1; di >= 0; di--) {
-      if (row.totalsByDate.hasOwnProperty(allDates[di])) { oldestDate = allDates[di]; break; }
+      if (Object.prototype.hasOwnProperty.call(row.totalsByDate, allDates[di])) { oldestDate = allDates[di]; break; }
     }
 
     let net7d = "—";
-    if (todayDate && oldestDate && row.totalsByDate.hasOwnProperty(todayDate) && row.totalsByDate.hasOwnProperty(oldestDate)) {
+    if (todayDate && oldestDate) {
       const net = Number(row.totalsByDate[todayDate]) - Number(row.totalsByDate[oldestDate]);
       net7d = deltaBadge(net);
     }
 
     const out = {
-      Cluster: cluster,
-      ProtectionGroup: pg,
-      Today_TotalVMs: todayTotal === null ? "—" : String(todayTotal),
-      "Net (7d)": net7d
+      Cluster: row.Cluster,
+      ProtectionGroup: row.ProtectionGroup,
+      Today_TotalVMs: todayTotal === null ? "—" : String(todayTotal)
     };
 
-    // date columns (deltas)
-    for (let di = 0; di < allDates.length; di++) {
-      const d0 = allDates[di];
-      out[d0] = row.deltasByDate[d0] || "—";
-    }
+    for (let di = 0; di < allDates.length; di++) out[allDates[di]] = row.deltasByDate[allDates[di]] || "—";
+    out["Net (7d)"] = net7d;
 
     trendRows.push(out);
   }
@@ -546,10 +545,10 @@ export default async function () {
   trendRows.sort((a, b) => cmpStr(a.Cluster, b.Cluster) || cmpStr(a.ProtectionGroup, b.ProtectionGroup));
 
   // ------------------------------
-  // 5) Cluster Active Scope + Trend (Option C)
-  //    Based on ACTIVE PGs only, using aggregated totals per date bucket.
+  // 6) Cluster Active Scope Today + Trend (Option C)
   // ------------------------------
-  const clusterAgg = {}; // cluster -> { Active_PGs, totalsByDate:{date:sum}, todayTotal, delta1d, net7d }
+  const clusterAgg = {}; // cluster -> { Active_PGs, totalsByDate:{} }
+
   for (let i = 0; i < activePGKeys.length; i++) {
     const key = activePGKeys[i];
     const p = perPG[key];
@@ -558,10 +557,9 @@ export default async function () {
     if (!clusterAgg[c]) clusterAgg[c] = { Cluster: c, Active_PGs: 0, totalsByDate: {} };
     clusterAgg[c].Active_PGs += 1;
 
-    // add totals by date
     for (let di = 0; di < allDates.length; di++) {
       const d = allDates[di];
-      if (!p.totalsByDate.hasOwnProperty(d)) continue;
+      if (!Object.prototype.hasOwnProperty.call(p.totalsByDate, d)) continue;
       clusterAgg[c].totalsByDate[d] = Number(clusterAgg[c].totalsByDate[d] || 0) + Number(p.totalsByDate[d] || 0);
     }
   }
@@ -570,14 +568,13 @@ export default async function () {
     .sort((a, b) => a.localeCompare(b))
     .map(c => {
       const x = clusterAgg[c];
-
       const d0 = allDates[0] || null;
       const d1 = allDates[1] || null;
       const dold = allDates[allDates.length - 1] || null;
 
-      const has0 = d0 && x.totalsByDate.hasOwnProperty(d0);
-      const has1 = d1 && x.totalsByDate.hasOwnProperty(d1);
-      const hasOld = dold && x.totalsByDate.hasOwnProperty(dold);
+      const has0 = d0 && Object.prototype.hasOwnProperty.call(x.totalsByDate, d0);
+      const has1 = d1 && Object.prototype.hasOwnProperty.call(x.totalsByDate, d1);
+      const hasOld = dold && Object.prototype.hasOwnProperty.call(x.totalsByDate, dold);
 
       const totalToday = has0 ? x.totalsByDate[d0] : null;
 
@@ -596,7 +593,11 @@ export default async function () {
       };
     });
 
-  // TOTAL row
+  function parseSignedNumFromBadge(s) {
+    const m = String(s || "").match(/([+-]\d+)/);
+    return m ? Number(m[1]) : null;
+  }
+
   const totalRow = {
     Cluster: "⭐ TOTAL",
     Active_PGs: String(clusterRows.reduce((s, r) => s + Number(r.Active_PGs || 0), 0)),
@@ -605,29 +606,27 @@ export default async function () {
     "Net VMs (7d)": "—"
   };
 
-  // compute total deltas if all clusters have non-— totals for those comparisons
-  function sumDeltaField(field) {
-    let any = false;
-    let sum = 0;
-    for (let i = 0; i < clusterRows.length; i++) {
-      const v = clusterRows[i][field];
-      if (!v || v === "—") continue;
-      // parse **+N** or **-N**
-      const m = String(v).match(/([+-]\d+)/);
-      if (m) {
-        sum += Number(m[1]);
-        any = true;
-      }
-    }
-    return any ? deltaBadge(sum) : "—";
+  // if we can sum the deltas, do it (else keep —)
+  let sum1d = 0, ok1d = false;
+  for (let i = 0; i < clusterRows.length; i++) {
+    const n = parseSignedNumFromBadge(clusterRows[i]["Δ VMs (1d)"]);
+    if (n === null) continue;
+    sum1d += n; ok1d = true;
   }
-  totalRow["Δ VMs (1d)"] = sumDeltaField("Δ VMs (1d)");
-  totalRow["Net VMs (7d)"] = sumDeltaField("Net VMs (7d)");
+  totalRow["Δ VMs (1d)"] = ok1d ? deltaBadge(sum1d) : "—";
+
+  let sum7d = 0, ok7d = false;
+  for (let i = 0; i < clusterRows.length; i++) {
+    const n = parseSignedNumFromBadge(clusterRows[i]["Net VMs (7d)"]);
+    if (n === null) continue;
+    sum7d += n; ok7d = true;
+  }
+  totalRow["Net VMs (7d)"] = ok7d ? deltaBadge(sum7d) : "—";
 
   const clusterRowsOut = clusterRows.concat([totalRow]);
 
   // ------------------------------
-  // 6) PG State Map output rows (group by name across clusters)
+  // 7) PG State Map output rows (All AHV PGs across clusters — failover-safe)
   // ------------------------------
   const pgStateRows = Object.keys(pgByName)
     .sort((a, b) => a.localeCompare(b))
@@ -637,16 +636,11 @@ export default async function () {
       const pausedOn = Array.from(e.PausedOn).sort().join(", ");
       const deletedOn = Array.from(e.DeletedOn).sort().join(", ");
 
-      const clustersSeen = Array.from(e.SeenOn);
-      const failoverReady = clustersSeen.length > 1;
+      const failoverReady = Array.from(e.SeenOn).length > 1;
 
-      // Flags
-      // NEW/NO RUNS evaluated only for active PGs (for this name, if active anywhere today)
-      // We’ll compute NEW/NO RUNS based on whether we have any completed runs in window for the active instance(s).
       let flag = "";
-
       if (deletedOn) flag = "🗑️ **DELETED**";
-      else if (pausedOn && !activeOn) flag = "⏸️ **PAUSED**"; // purely paused (no active)
+      else if (pausedOn && !activeOn) flag = "⏸️ **PAUSED**";
       else if (failoverReady) flag = "🔵 **FAILOVER READY**";
 
       return {
@@ -654,22 +648,14 @@ export default async function () {
         "Active On": activeOn ? `**${activeOn}**` : "—",
         "Paused On": pausedOn || "—",
         "Deleted On": deletedOn ? `**${deletedOn}**` : "—",
-        Flags: flag || ""
+        Flags: flag
       };
     });
 
-  // Add NEW (7d) / NO RUNS (7d) flags for active PGs (per cluster|pgName keys)
-  // If a PG name is active anywhere but has no totalsByDate in our window -> NO RUNS (7d).
-  // If active and totalsByDate exists but oldest day missing while we have others is ok; "NEW (7d)" means active but not seen in window at all.
-  // We'll implement:
-  // - NEW (7d): active today but has NO completed run dates in window for that PG key(s)
-  // - NO RUNS (7d): same as above (kept separate in your earlier requirement) — but NEW is more specific. We'll prioritize NO RUNS, and use NEW only if you still want it.
-  // Here: NEW (7d) = active today AND (no dates in window) but PG exists.
-  // NO RUNS (7d) = active today AND (no completed runs in last 7 days) => same detection.
-  // To preserve your earlier wording, we’ll use NO RUNS (7d). If you want NEW too, we can add it later.
+  // NO RUNS (7d) for active PG names if we got no completed run dates in window
   const activeNames = new Set(activePGs.map(x => x.pgName));
-
   const nameHasRunsInWindow = {};
+
   for (let i = 0; i < activePGKeys.length; i++) {
     const key = activePGKeys[i];
     const pgName = key.split("|").slice(1).join("|");
@@ -685,15 +671,13 @@ export default async function () {
 
     const hasRuns = !!nameHasRunsInWindow[r.ProtectionGroup];
     if (!hasRuns) {
-      // append (do not overwrite stronger flags like deleted)
-      const base = r.Flags || "";
       const add = "🟠 **NO RUNS (7d)**";
-      r.Flags = base ? (base + " | " + add) : add;
+      r.Flags = r.Flags ? (r.Flags + " | " + add) : add;
     }
   }
 
   // ------------------------------
-  // 7) Inventory As Of (Eastern Time)
+  // 8) Inventory As Of (Eastern Time)
   // ------------------------------
   let inventoryAsOfET = "";
   if (inventoryAsOfUsecsAll.length) {
@@ -706,7 +690,7 @@ export default async function () {
   }
 
   // ------------------------------
-  // 8) Sort VM inventory and limit (optional)
+  // 9) Sort VM list (sanity-safe)
   // ------------------------------
   VMInventory.sort((a, b) =>
     cmpStr(a.Cluster, b.Cluster) ||
@@ -715,7 +699,7 @@ export default async function () {
   );
 
   // ------------------------------
-  // 9) Markdown output
+  // 10) Build Markdown
   // ------------------------------
   const header =
     "## Cohesity AHV Inventory + Weekly Baseline\n" +
@@ -729,21 +713,13 @@ export default async function () {
     "- **Δ VMs (1d)** = change vs previous day (based on completed runs ending on that date)  \n" +
     `- **Net VMs (7d)** = change vs oldest available day in this ${DAYS}-day window  \n` +
     "- `—` means insufficient run history to compute that comparison\n\n" +
-    mdTable(
-      "",
-      ["Cluster", "Active_PGs", "TotalVMs", "Δ VMs (1d)", "Net VMs (7d)"],
-      clusterRowsOut
-    );
+    mdTable("", ["Cluster", "Active_PGs", "TotalVMs", "Δ VMs (1d)", "Net VMs (7d)"], clusterRowsOut);
 
   const md2 =
     "### 2) PG State Map (All AHV PGs across clusters — failover-safe)\n" +
-    mdTable(
-      "",
-      ["ProtectionGroup", "Active On", "Paused On", "Deleted On", "Flags"],
-      pgStateRows
-    );
+    mdTable("", ["ProtectionGroup", "Active On", "Paused On", "Deleted On", "Flags"], pgStateRows);
 
-  const dateCols = allDates.slice(); // newest -> oldest
+  const dateCols = allDates.slice();
   const trendCols = ["Cluster", "ProtectionGroup", "Today_TotalVMs"].concat(dateCols).concat(["Net (7d)"]);
 
   const md3 =
@@ -754,17 +730,13 @@ export default async function () {
 
   const md4 =
     "### 4) Current VM List (Latest inventory run only)\n" +
-    mdTable(
-      "",
-      ["Cluster", "ProtectionGroup", "VMName", "BackupStatus", "Last Successful Backup (Eastern Time)"],
-      VMInventory
-    ) +
+    mdTable("", ["Cluster", "ProtectionGroup", "VMName", "BackupStatus", "Last Successful Backup (Eastern Time)"], VMInventory) +
     `**Note:** “Last Successful Backup (Eastern Time)” is checked only for the last **${LAST_SUCCESS_RUN_LOOKBACK} runs**. If blank, check Helios for older success.\n`;
 
   const markdownAll = header + md1 + md2 + md3 + md4;
 
   // ------------------------------
-  // 10) HTML output (so management sees bold totals + colored deltas)
+  // 11) HTML Email (TOTAL row highlighted + delta colors)
   // ------------------------------
   const htmlHeader =
     `<h2 style="margin:0 0 8px 0;">Cohesity AHV Inventory + Weekly Baseline</h2>` +
@@ -804,9 +776,9 @@ export default async function () {
   const htmlAll = htmlHeader + html1 + html2 + html3 + html4;
 
   return {
-    inventoryAsOfET: inventoryAsOfET,
+    authMode,
     baselineDates: allDates,
-    markdownAll: markdownAll,
+    markdownAll,
     markdownEmail: markdownAll,
     htmlEmail: htmlAll
   };
