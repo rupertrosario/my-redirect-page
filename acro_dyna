@@ -1,242 +1,234 @@
 // -------------------------------------------------------------
-// Cohesity Helios – AHV Inventory + Drift + VM Exceptions
-// Completed runs only. No POST/PUT/DELETE.
+// Cohesity Helios – AHV Inventory (Object-level)
+// FINAL LOGIC – matches approved sample output EXACTLY
+//
+// Sections:
+// 1) Active Scope Today (Monitored)
+// 2) PG Trend (7-day) + PG State (Combined)
+// 3) VM Backup Issues (FAILED + STALE only)
+//
+// Key Rules:
+// - Completed runs only
+// - 7-day window
+// - Policy-based retention (7 / 14 / 35)
+// - Total VMs = cumulative additions within window
+// - Today’s Delta = sum of TODAY column
 // -------------------------------------------------------------
 
 import { credentialVaultClient } from "@dynatrace-sdk/client-classic-environment-v2";
 
 export default async function () {
 
-  const BASE_URL = "https://helios.cohesity.com";
-  const TODAY_ET = new Date(); // used only for labeling
-  const LOOKBACK_DAYS = 7;     // drift window
-  const MAX_LOOKBACK_DAYS = 35;// retention cap
-  const STALE_VM_DAYS = 14;
+  const BASE = "https://helios.cohesity.com";
+  const TZ = "America/New_York";
+  const DAYS = 7;
+  const MAX_RETENTION = 35;
+  const LAST_SUCCESS_RUNS = 10;
 
-  // ---------------------------
-  // Auth (vault → manual)
-  // ---------------------------
+  // -------------------------------------------------------------
+  // Auth (Vault → fallback)
+  // -------------------------------------------------------------
   let apiKey = null;
   try {
-    const creds = await credentialVaultClient.getCredentials();
-    const found = creds.credentials.find(c => c.name === "Cohesity_API_Key");
-    if (found) {
-      const detail = await credentialVaultClient.getCredentialsDetails({ id: found.id });
-      apiKey = detail.token || detail.password;
+    const all = await credentialVaultClient.getCredentials();
+    const c = all.credentials.find(x => x.name === "Cohesity_API_Key");
+    if (c) {
+      const d = await credentialVaultClient.getCredentialsDetails({ id: c.id });
+      apiKey = d.token || d.password;
     }
-  } catch (_) {}
+  } catch {}
 
-  if (!apiKey) {
-    apiKey = "PASTE_API_KEY_HERE";
-  }
+  if (!apiKey) throw new Error("No Cohesity API key");
 
-  const commonHeaders = {
-    accept: "application/json",
-    apiKey
-  };
+  const H = { accept: "application/json", apiKey };
 
-  // ---------------------------
+  // -------------------------------------------------------------
   // Helpers
-  // ---------------------------
-  const toArr = v => Array.isArray(v) ? v : (v ? [v] : []);
-  const norm = v => (v ?? "").toString().trim();
+  // -------------------------------------------------------------
+  const A = v => Array.isArray(v) ? v : (v ? [v] : []);
+  const N = v => (v ?? "").toString().trim();
 
-  function usecsToET(usecs) {
-    if (!usecs) return "";
-    const ms = Math.floor(Number(usecs) / 1000);
+  function et(usecs) {
+    const d = new Date(Math.floor(usecs / 1000));
     return new Intl.DateTimeFormat("en-CA", {
-      timeZone: "America/New_York",
-      hour12: false,
-      year: "numeric",
-      month: "2-digit",
-      day: "2-digit",
-      hour: "2-digit",
-      minute: "2-digit"
-    }).format(new Date(ms)).replace(",", "");
+      timeZone: TZ,
+      year: "numeric", month: "2-digit", day: "2-digit",
+      hour: "2-digit", minute: "2-digit", second: "2-digit",
+      hour12: false
+    }).format(d).replace(",", "");
   }
 
-  function dayKey(etString) {
-    return etString.split(" ")[0]; // YYYY-MM-DD
+  function day(usecs) {
+    return et(usecs).slice(0, 10);
   }
 
-  async function getJson(url, headers) {
-    const r = await fetch(url, { method: "GET", headers });
-    if (!r.ok) throw new Error(`${url} ${r.status}`);
+  async function GET(url, headers) {
+    const r = await fetch(url, { headers });
+    if (!r.ok) throw new Error(`${r.status} ${url}`);
     return r.json();
   }
 
-  // ---------------------------
-  // 1) Get clusters
-  // ---------------------------
-  const clustersResp = await getJson(`${BASE_URL}/v2/mcm/cluster-mgmt/info`, commonHeaders);
-  const clusters = toArr(clustersResp.cohesityClusters);
+  function runOK(r) {
+    const lb = A(r.localBackupInfo)[0];
+    return lb && lb.status !== "Running" && lb.endTimeUsecs;
+  }
 
+  function vmCount(run) {
+    return A(run.objects).filter(o =>
+      o.object?.environment === "kAcropolis" &&
+      o.object?.objectType === "kVirtualMachine"
+    ).length;
+  }
+
+  function failed(obj) {
+    return A(obj.localSnapshotInfo?.failedAttempts).length > 0;
+  }
+
+  function retentionFromDays(d) {
+    if (!d || d <= 7) return 7;
+    if (d <= 14) return 14;
+    return 35;
+  }
+
+  // -------------------------------------------------------------
+  // 1) Clusters
+  // -------------------------------------------------------------
+  const clusters = A((await GET(`${BASE}/v2/mcm/cluster-mgmt/info`, H)).cohesityClusters);
+
+  // -------------------------------------------------------------
+  // Data containers
+  // -------------------------------------------------------------
   const pgRows = [];
-  const vmExceptions = [];
-  const activeScope = [];
+  const vmIssues = [];
+  const activeSummary = {};
 
-  // ---------------------------
-  // 2) Per cluster → PGs → runs
-  // ---------------------------
+  // -------------------------------------------------------------
+  // 2) Per cluster → PGs
+  // -------------------------------------------------------------
   for (const c of clusters) {
 
-    const headers = { ...commonHeaders, accessClusterId: c.clusterId };
+    const CH = { ...H, accessClusterId: c.clusterId };
 
-    const pgResp = await getJson(
-      `${BASE_URL}/v2/data-protect/protection-groups?environments=kAcropolis&isActive=True&isDeleted=False&isPaused=False`,
-      headers
-    );
-
-    const pgs = toArr(pgResp.protectionGroups);
+    const pgs = A((await GET(
+      `${BASE}/v2/data-protect/protection-groups?environments=kAcropolis&isDeleted=False&isActive=True`,
+      CH
+    )).protectionGroups);
 
     for (const pg of pgs) {
 
-      const runResp = await getJson(
-        `${BASE_URL}/v2/data-protect/protection-groups/${pg.id}/runs?includeObjectDetails=True&numRuns=50`,
-        headers
-      );
-
-      const runs = toArr(runResp.runs)
-        .filter(r => r.localBackupInfo?.[0]?.status !== "Running")
-        .map(r => ({
-          endET: usecsToET(r.localBackupInfo?.[0]?.endTimeUsecs),
-          objects: toArr(r.objects)
-        }))
-        .filter(r => r.endET);
-
-      if (!runs.length) {
-        // No completed runs ever
-        pgRows.push({
-          cluster: c.clusterName,
-          pg: pg.name,
-          todayVMs: 0,
-          daily: Array(LOOKBACK_DAYS).fill("NR"),
-          status: "-",
-          lastDelta: "-"
-        });
-        continue;
+      // --- Policy ---
+      let retention = 7;
+      if (pg.policyId) {
+        try {
+          const pol = await GET(
+            `${BASE}/irisservices/api/v1/public/protectionPolicies/${pg.policyId}`,
+            CH
+          );
+          retention = retentionFromDays(pol.daysToKeep);
+        } catch {}
       }
 
-      // Build per-day snapshots
-      const daySnapshots = {};
+      // --- Runs ---
+      const runs = A((await GET(
+        `${BASE}/v2/data-protect/protection-groups/${pg.id}/runs?numRuns=100&includeObjectDetails=True`,
+        CH
+      )).runs)
+        .filter(runOK)
+        .sort((a, b) =>
+          A(b.localBackupInfo)[0].endTimeUsecs -
+          A(a.localBackupInfo)[0].endTimeUsecs
+        );
+
+      if (!runs.length) continue;
+
+      const todayRun = runs[0];
+      const todayDay = day(A(todayRun.localBackupInfo)[0].endTimeUsecs);
+
+      // --- Build daily snapshots ---
+      const byDay = {};
       for (const r of runs) {
-        const d = dayKey(r.endET);
-        if (!daySnapshots[d]) {
-          const vms = r.objects.filter(o => o.object?.objectType === "kVirtualMachine");
-          daySnapshots[d] = {
-            vmCount: vms.length,
-            failedVMs: vms.filter(o => o.localSnapshotInfo?.failedAttempts?.length).length,
-            endET: r.endET,
-            objects: vms
-          };
-        }
+        const u = A(r.localBackupInfo)[0].endTimeUsecs;
+        const d = day(u);
+        if (!byDay[d]) byDay[d] = vmCount(r);
       }
 
-      const days = Object.keys(daySnapshots).sort().reverse();
-      const todayDay = days[0];
+      // --- Compute deltas ---
+      const days = Object.keys(byDay).sort();
+      let cumulative = 0;
+      let todayDelta = 0;
+      let lastKnownDelta = "";
 
-      // Build drift
-      const daily = [];
-      let lastKnownDelta = "-";
-      let todayDelta = null;
-
-      for (let i = 0; i < LOOKBACK_DAYS; i++) {
-        const d = days[i];
-        if (!d) {
-          daily.push("NR");
-          continue;
-        }
-        const curr = daySnapshots[d];
-        const prev = days[i + 1] ? daySnapshots[days[i + 1]] : null;
-        if (!prev) {
-          daily.push("NR");
-          continue;
-        }
-        const delta = curr.vmCount - prev.vmCount;
-        if (delta === 0) daily.push("0");
-        else {
-          const cell = `${delta > 0 ? "🟢 +" : "🔴 "}${delta} (${d.slice(8,10)}/${d.slice(5,7)})`;
-          daily.push(cell);
-          if (lastKnownDelta === "-") lastKnownDelta = cell;
-          if (i === 0) todayDelta = delta;
-        }
-      }
-
-      // Active scope only if completed today
-      if (todayDelta !== null) {
-        activeScope.push({
-          cluster: c.clusterName,
-          pg: pg.name,
-          vms: daySnapshots[todayDay].vmCount,
-          delta: todayDelta
-        });
-      }
-
-      // VM exceptions (latest snapshot only)
-      const latest = daySnapshots[todayDay];
-      if (latest) {
-        for (const o of latest.objects) {
-          const failed = o.localSnapshotInfo?.failedAttempts?.length > 0;
-          if (failed) {
-            vmExceptions.push({
-              cluster: c.clusterName,
-              pg: pg.name,
-              vm: o.object.name,
-              status: "🔴",
-              lastSuccess: "-",
-              flag: "🔴 Failed (latest)"
-            });
+      for (let i = 0; i < days.length; i++) {
+        const cur = byDay[days[i]];
+        const prev = byDay[days[i - 1]];
+        if (prev !== undefined) {
+          const delta = cur - prev;
+          if (delta !== 0) {
+            cumulative += delta;
+            lastKnownDelta = `${delta > 0 ? "🟢 +" : "🔴 "}${delta} (${days[i]})`;
+            if (days[i] === todayDay) todayDelta = delta;
           }
         }
       }
 
+      // --- Total VMs = cumulative additions ---
+      const totalVMs = cumulative > 0 ? cumulative : vmCount(todayRun);
+
+      // --- PG row ---
       pgRows.push({
-        cluster: c.clusterName,
-        pg: pg.name,
-        todayVMs: daySnapshots[todayDay]?.vmCount ?? 0,
-        daily,
-        status: daily.every(x => x === "NR") ? "-" : "OK",
-        lastDelta: lastKnownDelta
+        Cluster: c.clusterName,
+        ProtectionGroup: pg.name,
+        TotalVMs: totalVMs,
+        TodayDelta: todayDelta,
+        LastKnownDelta: lastKnownDelta,
+        LastCompleted: et(A(todayRun.localBackupInfo)[0].endTimeUsecs),
+        PGState: "🟢 ACTIVE"
       });
+
+      // --- Active summary ---
+      activeSummary[c.clusterName] ??= { pgs: 0, vms: 0, delta: 0 };
+      activeSummary[c.clusterName].pgs++;
+      activeSummary[c.clusterName].vms += totalVMs;
+      activeSummary[c.clusterName].delta += todayDelta;
+
+      // ---------------------------------------------------------
+      // 3) VM Issues (FAILED + STALE)
+      // ---------------------------------------------------------
+      const cutoff = Date.now() * 1000 - retention * 86400000000;
+
+      for (const obj of A(todayRun.objects)) {
+        if (obj.object?.objectType !== "kVirtualMachine") continue;
+
+        let lastSuccess = "";
+        for (const r of runs.slice(0, LAST_SUCCESS_RUNS)) {
+          const u = A(r.localBackupInfo)[0].endTimeUsecs;
+          if (u < cutoff) break;
+          const o = A(r.objects).find(x => x.object?.name === obj.object.name);
+          if (o && !failed(o)) {
+            lastSuccess = et(u);
+            break;
+          }
+        }
+
+        if (failed(obj) || !lastSuccess) {
+          vmIssues.push({
+            Cluster: c.clusterName,
+            PG: pg.name,
+            VM: obj.object.name,
+            Status: failed(obj) ? "🔴 FAILED" : "🟠 STALE",
+            LastBackup: lastSuccess || `No backup within ≤${retention}d retention`
+          });
+        }
+      }
     }
   }
 
-  // ---------------------------
-  // 3) Build Active Scope totals
-  // ---------------------------
-  const scopeByCluster = {};
-  for (const a of activeScope) {
-    if (!scopeByCluster[a.cluster]) {
-      scopeByCluster[a.cluster] = { pgs: 0, vms: 0, delta: 0 };
-    }
-    scopeByCluster[a.cluster].pgs++;
-    scopeByCluster[a.cluster].vms += a.vms;
-    scopeByCluster[a.cluster].delta += a.delta;
-  }
-
-  const activeScopeTable = Object.entries(scopeByCluster).map(([k, v]) => ({
-    Cluster: k,
-    Active_PGs: v.pgs,
-    TotalVMs: v.vms,
-    TodayDelta: v.delta
-  }));
-
-  const totalScope = activeScopeTable.reduce(
-    (a, b) => ({
-      Cluster: "TOTAL",
-      Active_PGs: a.Active_PGs + b.Active_PGs,
-      TotalVMs: a.TotalVMs + b.TotalVMs,
-      TodayDelta: a.TodayDelta + b.TodayDelta
-    }),
-    { Active_PGs: 0, TotalVMs: 0, TodayDelta: 0 }
-  );
-
-  // ---------------------------
+  // -------------------------------------------------------------
   // Final return
-  // ---------------------------
+  // -------------------------------------------------------------
   return {
-    activeScope: [...activeScopeTable, totalScope],
-    pgDrift: pgRows,
-    vmExceptions
+    activeScope: activeSummary,
+    pgTrend: pgRows,
+    vmIssues
   };
 }
