@@ -1,130 +1,1002 @@
-# -------------------------------------------------------------
-# Cohesity – Protection Policy Details (id, name, daysToKeep)
-# Menu-based cluster selection (0=ALL or single cluster)
-# Source of policyIds: Protection Groups (v2)
-# Policy details: GET /irisservices/api/v1/public/protectionPolicies/{policyId}
-# -------------------------------------------------------------
+// -------------------------------------------------------------
+// Cohesity Helios – AHV (Acropolis) Inventory + Trend (Object-level)
+// Dynatrace Workflow JS (GET-only) + Markdown tables
+//
+// Adds POLICY-BASED LOOKBACK (capped at 35d):
+// - daysToKeep <= 7  -> lookback = 7 days
+// - daysToKeep <= 14 -> lookback = 14 days
+// - else             -> lookback = 35 days (cap even if 6M etc)
+//
+// Output Markdown:
+// 1) Active Scope Today (Monitored) + 7-day Delta
+// 2) VM Scope Trend (change-days only, within max 35d; per-PG window 7/14/35)
+// 3) PG State Changes (changes only)
+// 4) Current VM List (latest completed inventory run per PG)
+//
+// Rules:
+// - COMPLETED runs only. Running ignored.
+// - Day bucket uses run END TIME in Eastern Time (America/New_York).
+// - Missing day cell: "-" (no completed snapshot ended that day)
+// - NEW +X: no prior completed snapshot found within that PG’s lookback window.
+// - VM list is built from the SAME latest completed snapshot used for Today_TotalVMs (prevents missing VMs).
+// - Last Successful Backup (ET): default scan last 10 completed runs;
+//   if still blank for a VM that is currently 🔴, extend scan up to that PG’s lookback window (max 35d).
+// -------------------------------------------------------------
 
-$ErrorActionPreference = "Stop"
-$baseUrl = "https://helios.cohesity.com"
+import { credentialVaultClient } from "@dynatrace-sdk/client-classic-environment-v2";
 
-# ==============================
-# API key
-# ==============================
-$apikeypath = "X:\PowerShell\Cohesity_API_Scripts\DO_NOT_Delete\apikey.txt"
-if (-not (Test-Path $apikeypath)) { throw "API key file not found: $apikeypath" }
-$apiKey = (Get-Content $apikeypath -Raw).Trim()
-$commonHeaders = @{ apiKey = $apiKey }
+export default async function () {
+  var baseUrl = "https://helios.cohesity.com";
 
-# ==============================
-# Get clusters (sorted) + menu
-# ==============================
-$resp = Invoke-WebRequest -Method Get -Uri "$baseUrl/v2/mcm/cluster-mgmt/info" -Headers $commonHeaders
-$clustersRaw = ($resp.Content | ConvertFrom-Json).cohesityClusters
-if (-not $clustersRaw -or $clustersRaw.Count -eq 0) { throw "No clusters returned from Helios." }
+  // ------------------------------
+  // CONFIG
+  // ------------------------------
+  var LAST_SUCCESS_RUN_LOOKBACK = 10;  // fast path
+  var MAX_LOOKBACK_CAP_DAYS = 35;      // never exceed this
+  var SHOW_CHANGE_DAYS_ONLY = true;
 
-$sorted = $clustersRaw | Sort-Object -Property clusterName
+  // Runs pull tuning (keep sane for 120s)
+  var INITIAL_RUNS_TO_PULL = 80;
+  var MAX_RUNS_TO_PULL = 220;
 
-$clusters = for ($i = 0; $i -lt $sorted.Count; $i++) {
-    [pscustomobject]@{
-        Index       = $i + 1
-        ClusterName = $sorted[$i].clusterName
-        ClusterId   = $sorted[$i].clusterId
-    }
-}
+  // Concurrency control (important for 120s)
+  var MAX_CONCURRENT_PGS = 6;
 
-Write-Host ""
-Write-Host "Available Helios Clusters (A–Z):" -ForegroundColor Cyan
-$clusters | Format-Table -AutoSize
-Write-Host ""
-Write-Host "[0] All clusters" -ForegroundColor Yellow
-Write-Host "[X] Exit" -ForegroundColor Yellow
-Write-Host ""
+  // Optional: filter clusters. Empty => ALL
+  var TARGET_CLUSTER_IDS = [];
 
-while ($true) {
-    $inputVal = Read-Host "Enter 0 for ALL, 1-$($clusters.Count) for single, or X to exit"
-    if ($inputVal -match '^(x|X|q|Q)$') { return }
+  // ------------------------------
+  // 1) Credential vault: name -> id -> manual fallback
+  // ------------------------------
+  var vaultName = "Cohesity_API_Key";
+  var vaultId = "credentials_vault-312312";
 
-    [int]$num = 0
-    if (-not [int]::TryParse($inputVal.Trim(), [ref]$num)) { continue }
-    if ($num -lt 0 -or $num -gt $clusters.Count) { continue }
+  var apiKey = null;
+  var authMode = "vault-name";
 
-    $selection = $num
-    break
-}
+  function norm(v) {
+    if (v === null || v === undefined) return "";
+    return String(v).trim();
+  }
 
-$SelectedClusters   = if ($selection -eq 0) { $clusters } else { @($clusters | Where-Object { $_.Index -eq $selection }) }
-$SelectedClusterIds = $SelectedClusters.ClusterId
-
-# ==============================
-# Collect policies
-# ==============================
-$Rows = @()
-
-foreach ($cid in $SelectedClusterIds) {
-
-    $clus = $SelectedClusters | Where-Object { $_.ClusterId -eq $cid } | Select-Object -First 1
-    $clusterName = $clus.ClusterName
-    $clusterId   = $clus.ClusterId
-
-    $headers = @{
-        apiKey          = $apiKey
-        accessClusterId = $clusterId
-    }
-
-    # --- Get Protection Groups (v2) to obtain policyIds ---
+  async function tryGetKeyFromVault() {
     try {
-        $pgResp = Invoke-WebRequest `
-            -Method Get `
-            -Uri "$baseUrl/v2/data-protect/protection-groups" `
-            -Headers $headers `
-            -Body @{ isDeleted = "False" }
+      var all = await credentialVaultClient.getCredentials();
+      var found = null;
+      if (all && all.credentials && Array.isArray(all.credentials)) {
+        for (var i = 0; i < all.credentials.length; i++) {
+          if (all.credentials[i].name === vaultName) { found = all.credentials[i]; break; }
+        }
+      }
+      if (found && found.id) {
+        var detail = await credentialVaultClient.getCredentialsDetails({ id: found.id });
+        var k = (detail && (detail.token || detail.password)) || null;
+        if (k) { authMode = "vault-name"; return k; }
+      }
+    } catch (e) {}
 
-        $pgs = ($pgResp.Content | ConvertFrom-Json).protectionGroups
-    } catch {
-        continue
+    try {
+      var d2 = await credentialVaultClient.getCredentialsDetails({ id: vaultId });
+      var k2 = (d2 && (d2.token || d2.password)) || null;
+      if (k2) { authMode = "vault-id"; return k2; }
+    } catch (e2) {}
+
+    return null;
+  }
+
+  apiKey = await tryGetKeyFromVault();
+  if (!apiKey) {
+    authMode = "manual";
+    apiKey = "PASTE_YOUR_API_KEY_HERE";
+    console.log("⚠️ Using manual Helios API key (fallback)");
+  }
+  if (!apiKey || apiKey === "PASTE_YOUR_API_KEY_HERE") {
+    throw new Error("No Helios API key available. Update vault or paste key in code.");
+  }
+
+  // ------------------------------
+  // 2) Helpers
+  // ------------------------------
+  function toArrayMaybe(v) { return !v ? [] : (Array.isArray(v) ? v : [v]); }
+
+  function buildQuery(params) {
+    var usp = new URLSearchParams();
+    for (var k in params) {
+      if (!Object.prototype.hasOwnProperty.call(params, k)) continue;
+      var v = params[k];
+      if (v === undefined || v === null) continue;
+      if (Array.isArray(v)) for (var i = 0; i < v.length; i++) usp.append(k, String(v[i]));
+      else usp.append(k, String(v));
+    }
+    return usp.toString();
+  }
+
+  async function getJson(url, headers) {
+    var resp = await fetch(url, { method: "GET", headers: headers });
+    if (!resp.ok) {
+      var txt = "";
+      try { txt = await resp.text(); } catch (e) {}
+      throw new Error("GET " + url + " -> HTTP " + resp.status + " " + txt);
+    }
+    return resp.json();
+  }
+
+  function lbiFirst(runObj) {
+    if (!runObj) return null;
+    var lb = runObj.localBackupInfo;
+    if (!lb) return null;
+    return Array.isArray(lb) ? (lb.length ? lb[0] : null) : lb;
+  }
+
+  function getEndUsecs(runObj) {
+    var info = lbiFirst(runObj);
+    var v = info && info.endTimeUsecs;
+    if (!v) return 0;
+    var n = Number(v);
+    return Number.isFinite(n) ? n : 0;
+  }
+
+  function getRunStatus(runObj) {
+    var info = lbiFirst(runObj);
+    return norm(info && info.status);
+  }
+
+  function runIsUsableCompleted(runObj) {
+    if (!runObj) return false;
+    if (getRunStatus(runObj) === "Running") return false;
+    if (getEndUsecs(runObj) <= 0) return false;
+    if (!runObj.objects) return false;
+    return true;
+  }
+
+  function objFailed(obj) {
+    try {
+      var fa = obj && obj.localSnapshotInfo && obj.localSnapshotInfo.failedAttempts;
+      if (!fa) return false;
+      var arr = Array.isArray(fa) ? fa : [fa];
+      return arr.length > 0;
+    } catch (e) { return false; }
+  }
+
+  function statusDot(obj) { return objFailed(obj) ? "🔴" : "🟢"; }
+
+  function usecsToETParts(usecs) {
+    if (!usecs || usecs === 0) return null;
+    var ms = Math.floor(Number(usecs) / 1000);
+    if (!Number.isFinite(ms) || ms <= 0) return null;
+    var d = new Date(ms);
+    try {
+      var fmt = new Intl.DateTimeFormat("en-CA", {
+        timeZone: "America/New_York",
+        year: "numeric", month: "2-digit", day: "2-digit",
+        hour: "2-digit", minute: "2-digit", second: "2-digit",
+        hour12: false
+      });
+      var parts = fmt.formatToParts(d);
+      var map = {};
+      for (var i = 0; i < parts.length; i++) map[parts[i].type] = parts[i].value;
+      return map;
+    } catch (e) {
+      var iso = d.toISOString();
+      return {
+        year: iso.slice(0, 4), month: iso.slice(5, 7), day: iso.slice(8, 10),
+        hour: iso.slice(11, 13), minute: iso.slice(14, 16), second: iso.slice(17, 19)
+      };
+    }
+  }
+
+  function etDateKeyFromUsecs(usecs) {
+    var p = usecsToETParts(usecs);
+    if (!p) return "";
+    return p.year + "-" + p.month + "-" + p.day;
+  }
+
+  function etDateTimeString(usecs) {
+    var p = usecsToETParts(usecs);
+    if (!p) return "";
+    return p.year + "-" + p.month + "-" + p.day + " " + p.hour + ":" + p.minute + ":" + p.second;
+  }
+
+  function ordinalDayLabelFromKey(yyyyMMdd) {
+    if (!yyyyMMdd || yyyyMMdd.length < 10) return "";
+    var d = Number(yyyyMMdd.slice(8, 10));
+    if (!Number.isFinite(d)) return "";
+    var suf = "th";
+    if (d % 100 < 11 || d % 100 > 13) {
+      if (d % 10 === 1) suf = "st";
+      else if (d % 10 === 2) suf = "nd";
+      else if (d % 10 === 3) suf = "rd";
+    }
+    return String(d) + suf;
+  }
+
+  function dateKeyMinusDays(dateKey, days) {
+    var y = Number(dateKey.slice(0, 4));
+    var m = Number(dateKey.slice(5, 7));
+    var d = Number(dateKey.slice(8, 10));
+    var dt = new Date(Date.UTC(y, m - 1, d));
+    dt.setUTCDate(dt.getUTCDate() - days);
+    var yy = String(dt.getUTCFullYear());
+    var mm = String(dt.getUTCMonth() + 1).padStart(2, "0");
+    var dd = String(dt.getUTCDate()).padStart(2, "0");
+    return yy + "-" + mm + "-" + dd;
+  }
+
+  function safeCell(v) {
+    if (v === null || v === undefined) return "";
+    return String(v).replace(/\|/g, " ");
+  }
+
+  function toMarkdownTable(title, columns, rows) {
+    if (!rows || rows.length === 0) return "### " + title + "\n\n- (no rows)\n";
+    var header = "| " + columns.join(" | ") + " |";
+    var sep = "| " + columns.map(function () { return "---"; }).join(" | ") + " |";
+    var body = rows.map(function (r) {
+      var vals = [];
+      for (var i = 0; i < columns.length; i++) vals.push(safeCell(r[columns[i]]));
+      return "| " + vals.join(" | ") + " |";
+    });
+    return "### " + title + "\n\n" + [header, sep].concat(body).join("\n") + "\n";
+  }
+
+  function sum(nums) {
+    var s = 0;
+    for (var i = 0; i < nums.length; i++) s += Number(nums[i] || 0);
+    return s;
+  }
+
+  function signed(n) {
+    if (!Number.isFinite(n)) return "-";
+    if (n > 0) return "🟢 **+" + n + "**";
+    if (n < 0) return "🔴 **" + n + "**";
+    return "0";
+  }
+
+  function signedNew(n) {
+    if (!Number.isFinite(n)) return "🟢 **NEW**";
+    return "🟢 **NEW +" + n + "**";
+  }
+
+  function parseNumericFromCell(cell) {
+    if (!cell) return 0;
+    var s = String(cell);
+    var mNew = s.match(/NEW\s*\+(\d+)/i);
+    if (mNew && mNew[1]) return Number(mNew[1]) || 0;
+    var m = s.match(/([+-]?\d+)/);
+    if (m && m[1]) return Number(m[1]) || 0;
+    return 0;
+  }
+
+  // Concurrency pool
+  async function asyncPool(limit, arr, worker) {
+    var i = 0;
+    var ret = [];
+    var executing = [];
+    async function enqueue() {
+      if (i >= arr.length) return Promise.resolve();
+      var idx = i++;
+      var p = Promise.resolve().then(function () { return worker(arr[idx], idx); })
+        .then(function (res) { ret[idx] = res; });
+      executing.push(p);
+      var clean = function () {
+        var pos = executing.indexOf(p);
+        if (pos >= 0) executing.splice(pos, 1);
+      };
+      p.then(clean).catch(clean);
+
+      var r = Promise.resolve();
+      if (executing.length >= limit) r = Promise.race(executing);
+      return r.then(enqueue);
+    }
+    await enqueue();
+    await Promise.all(executing);
+    return ret;
+  }
+
+  // ------------------------------
+  // 3) Get clusters
+  // ------------------------------
+  var commonHeaders = { accept: "application/json", apiKey: apiKey };
+  var cluData = await getJson(baseUrl + "/v2/mcm/cluster-mgmt/info", commonHeaders);
+  var clusters = toArrayMaybe(cluData && cluData.cohesityClusters);
+  if (!clusters.length) return { authMode: authMode, markdownAll: "⚠️ No clusters returned." };
+
+  clusters.sort(function (a, b) { return norm(a.clusterName).localeCompare(norm(b.clusterName)); });
+
+  if (TARGET_CLUSTER_IDS && TARGET_CLUSTER_IDS.length) {
+    var allowed = {};
+    for (var iA = 0; iA < TARGET_CLUSTER_IDS.length; iA++) allowed[String(TARGET_CLUSTER_IDS[iA])] = true;
+    clusters = clusters.filter(function (c) { return allowed[String(c.clusterId)]; });
+  }
+  if (!clusters.length) return { authMode: authMode, markdownAll: "⚠️ No clusters matched TARGET_CLUSTER_IDS." };
+
+  // ------------------------------
+  // 4) Per-cluster: active PGs + policy lookup cache
+  // ------------------------------
+  // We will:
+  // - get active PGs
+  // - collect unique policyIds
+  // - fetch policy details (cached) -> daysToKeep
+  // - decide lookbackDays per PG (7/14/35 capped)
+  //
+  var pgCatalog = []; // {ClusterName,ClusterId,PGId,PGName,PolicyId,LookbackDays}
+
+  // global policy cache: key clusterId|policyId -> {daysToKeep,name}
+  var policyCache = {};
+
+  async function getPolicyDetails(clusterId, policyId) {
+    var k = clusterId + "|" + policyId;
+    if (policyCache[k]) return policyCache[k];
+
+    var headers = { accept: "application/json", apiKey: apiKey, accessClusterId: clusterId };
+    var url = baseUrl + "/irisservices/api/v1/public/protectionPolicies/" + encodeURIComponent(String(policyId));
+
+    try {
+      var pol = await getJson(url, headers);
+      var daysToKeep = null;
+      if (pol && Object.prototype.hasOwnProperty.call(pol, "daysToKeep")) daysToKeep = Number(pol.daysToKeep);
+      var name = norm(pol && pol.name);
+      policyCache[k] = { daysToKeep: Number.isFinite(daysToKeep) ? daysToKeep : null, name: name || "" };
+      return policyCache[k];
+    } catch (e) {
+      policyCache[k] = { daysToKeep: null, name: "" };
+      return policyCache[k];
+    }
+  }
+
+  function lookbackFromDaysToKeep(daysToKeep) {
+    // You asked: 7 / 14 / 35, capped
+    if (!Number.isFinite(daysToKeep) || daysToKeep <= 0) return 7;
+    if (daysToKeep <= 7) return 7;
+    if (daysToKeep <= 14) return 14;
+    return MAX_LOOKBACK_CAP_DAYS; // even if 6M etc
+  }
+
+  // Collect PGs and policyIds, then fetch policies in batches (per cluster)
+  for (var ci = 0; ci < clusters.length; ci++) {
+    var clus = clusters[ci] || {};
+    var clusterName = norm(clus.clusterName);
+    var clusterId = norm(clus.clusterId);
+    if (!clusterId) continue;
+
+    var headers = { accept: "application/json", apiKey: apiKey, accessClusterId: clusterId };
+
+    var pgUrl =
+      baseUrl +
+      "/v2/data-protect/protection-groups?" +
+      buildQuery({
+        environments: "kAcropolis",
+        isDeleted: "False",
+        isActive: "True",
+        isPaused: "False"
+      });
+
+    var pgsData;
+    try { pgsData = await getJson(pgUrl, headers); }
+    catch (ePg) {
+      console.log("⚠️ PG fetch failed for " + clusterName + " (" + clusterId + "): " + norm(ePg.message || ePg));
+      continue;
     }
 
-    if (-not $pgs) { continue }
+    var pgs = toArrayMaybe(pgsData && pgsData.protectionGroups);
+    if (!pgs.length) continue;
 
-    $policyIds = @(
-        $pgs |
-        Where-Object { $_.policyId -and "$($_.policyId)".Trim() -ne "" } |
-        Select-Object -ExpandProperty policyId -Unique
-    )
+    pgs.sort(function (a, b) { return norm(a.name).localeCompare(norm(b.name)); });
 
-    foreach ($policyId in $policyIds) {
-
-        $pol = $null
-        try {
-            $polResp = Invoke-WebRequest `
-                -Method Get `
-                -Uri "$baseUrl/irisservices/api/v1/public/protectionPolicies/$policyId" `
-                -Headers $headers
-            $pol = $polResp.Content | ConvertFrom-Json
-        } catch {
-            $pol = $null
-        }
-
-        $Rows += [pscustomobject]@{
-            Cluster     = $clusterName
-            Id          = $(if ($pol -and $pol.id) { $pol.id } else { $policyId })
-            Name        = $(if ($pol -and $pol.name) { $pol.name } else { "<missing>" })
-            DaysToKeep  = $(if ($pol -and ($pol.PSObject.Properties.Name -contains "daysToKeep")) { $pol.daysToKeep } else { "" })
-        }
+    // collect unique policyIds for this cluster
+    var uniqPol = {};
+    for (var pi = 0; pi < pgs.length; pi++) {
+      var pg = pgs[pi] || {};
+      var polId = norm(pg.policyId);
+      if (polId) uniqPol[polId] = true;
     }
-}
 
-if (-not $Rows -or $Rows.Count -eq 0) {
-    Write-Host "`nNo policy details collected." -ForegroundColor Yellow
-    return
-}
+    var polIds = Object.keys(uniqPol);
+    // fetch policy details (cached)
+    await asyncPool(8, polIds, async function (policyId) {
+      return getPolicyDetails(clusterId, policyId);
+    });
 
-# ==============================
-# Output
-# ==============================
-Write-Host ""
-Write-Host "=== Protection Policy Details (id, name, daysToKeep) ===" -ForegroundColor Cyan
-$Rows |
-    Sort-Object Cluster, Name, Id |
-    Format-Table Cluster, Id, Name, DaysToKeep -AutoSize
+    // build catalog
+    for (var pi2 = 0; pi2 < pgs.length; pi2++) {
+      var pg2 = pgs[pi2] || {};
+      var pgId = norm(pg2.id);
+      var pgName = norm(pg2.name);
+      if (!pgId || !pgName) continue;
+
+      var policyId2 = norm(pg2.policyId);
+      var polKey = clusterId + "|" + policyId2;
+      var polInfo = policyId2 ? (policyCache[polKey] || { daysToKeep: null }) : { daysToKeep: null };
+
+      var lookbackDays = lookbackFromDaysToKeep(polInfo.daysToKeep);
+
+      pgCatalog.push({
+        ClusterName: clusterName,
+        ClusterId: clusterId,
+        PGId: pgId,
+        PGName: pgName,
+        PolicyId: policyId2,
+        PolicyDaysToKeep: polInfo.daysToKeep,
+        LookbackDays: lookbackDays
+      });
+    }
+  }
+
+  if (!pgCatalog.length) {
+    return { authMode: authMode, markdownAll: "⚠️ No active AHV protection groups found." };
+  }
+
+  // ------------------------------
+  // 5) Determine global anchor (latest completed snapshot across all active PGs)
+  // ------------------------------
+  async function fetchRuns(clusterId, pgId, numRuns) {
+    var headers = { accept: "application/json", apiKey: apiKey, accessClusterId: clusterId };
+    var runUrl =
+      baseUrl +
+      "/v2/data-protect/protection-groups/" +
+      encodeURIComponent(pgId) +
+      "/runs?" +
+      buildQuery({
+        environments: "kAcropolis",
+        numRuns: String(numRuns),
+        includeObjectDetails: "True"
+      });
+    return getJson(runUrl, headers);
+  }
+
+  async function findLatestCompletedRunWithObjects(clusterId, pgId) {
+    // try small pull first, then grow (but don't exceed MAX_RUNS_TO_PULL)
+    var pulled = INITIAL_RUNS_TO_PULL;
+    while (true) {
+      var data = await fetchRuns(clusterId, pgId, pulled);
+      var runs = toArrayMaybe(data && data.runs);
+      var usable = [];
+      for (var i = 0; i < runs.length; i++) if (runIsUsableCompleted(runs[i])) usable.push(runs[i]);
+      usable.sort(function (a, b) { return getEndUsecs(b) - getEndUsecs(a); });
+
+      if (usable.length) return usable[0];
+
+      if (pulled >= MAX_RUNS_TO_PULL) return null;
+      pulled = Math.min(MAX_RUNS_TO_PULL, pulled + 60);
+    }
+  }
+
+  // Fetch latest completed run per PG (concurrent limited), compute anchor as max endUsecs
+  var latestRunByPGKey = {}; // key clusterId|pgId -> runObj
+  await asyncPool(MAX_CONCURRENT_PGS, pgCatalog, async function (pg) {
+    var k = pg.ClusterId + "|" + pg.PGId;
+    try {
+      var r = await findLatestCompletedRunWithObjects(pg.ClusterId, pg.PGId);
+      if (r) latestRunByPGKey[k] = r;
+    } catch (e) {
+      // keep empty
+    }
+    return true;
+  });
+
+  var anchorUsecs = 0;
+  var anchorKey = "";
+  for (var k in latestRunByPGKey) {
+    if (!Object.prototype.hasOwnProperty.call(latestRunByPGKey, k)) continue;
+    var eu = getEndUsecs(latestRunByPGKey[k]);
+    if (eu > anchorUsecs) { anchorUsecs = eu; anchorKey = k; }
+  }
+  if (!anchorUsecs) return { authMode: authMode, markdownAll: "⚠️ No completed runs found for active PGs." };
+
+  var anchorET = etDateTimeString(anchorUsecs);
+  var anchorDayKey = etDateKeyFromUsecs(anchorUsecs);
+
+  // Build up to max 35-day date keys from anchor for column candidates
+  var maxWindowKeys = [];
+  for (var dd = 0; dd < MAX_LOOKBACK_CAP_DAYS; dd++) maxWindowKeys.push(dateKeyMinusDays(anchorDayKey, dd));
+  var maxDayLabels = maxWindowKeys.map(function (k) { return ordinalDayLabelFromKey(k) || k; });
+
+  // ------------------------------
+  // 6) Build per-PG snapshots within per-PG lookback (7/14/35)
+  // ------------------------------
+  function countVMsInRun(runObj) {
+    var objs = toArrayMaybe(runObj && runObj.objects);
+    var count = 0;
+    for (var o = 0; o < objs.length; o++) {
+      var obj = objs[o] || {};
+      var meta = obj.object || {};
+      if (norm(meta.environment) !== "kAcropolis") continue;
+      if (norm(meta.objectType) !== "kVirtualMachine") continue;
+      if (!norm(meta.name)) continue;
+      count++;
+    }
+    return count;
+  }
+
+  function buildByDayFromRuns(usableRuns, minUsecs, maxUsecs) {
+    // dayKey -> {count,endUsecs,runObj} (latest per day)
+    var byDay = {};
+    for (var i = 0; i < usableRuns.length; i++) {
+      var r = usableRuns[i];
+      var eu = getEndUsecs(r);
+      if (eu <= 0) continue;
+      if (maxUsecs && eu > maxUsecs) continue;
+      if (minUsecs && eu < minUsecs) continue;
+
+      var dayKey = etDateKeyFromUsecs(eu);
+      if (!dayKey) continue;
+
+      var c = countVMsInRun(r);
+      if (!byDay[dayKey] || eu > byDay[dayKey].endUsecs) {
+        byDay[dayKey] = { count: c, endUsecs: eu, runObj: r };
+      }
+    }
+
+    var snapsAsc = Object.keys(byDay)
+      .map(function (k) { return { dayKey: k, count: byDay[k].count, endUsecs: byDay[k].endUsecs }; })
+      .sort(function (a, b) { return a.endUsecs - b.endUsecs; });
+
+    return { byDay: byDay, snapsAsc: snapsAsc };
+  }
+
+  function findPrevSnapshot(snapsAsc, endUsecs) {
+    var prev = null;
+    for (var i = snapsAsc.length - 1; i >= 0; i--) {
+      if (snapsAsc[i].endUsecs < endUsecs) { prev = snapsAsc[i]; break; }
+    }
+    return prev;
+  }
+
+  // Results
+  var pgRows = [];       // for matrix + rollups
+  var pgChanges = [];    // changes only
+  var vmRows = [];       // current VM list
+
+  await asyncPool(MAX_CONCURRENT_PGS, pgCatalog, async function (pg) {
+    var clusterId = pg.ClusterId;
+    var clusterName = pg.ClusterName;
+    var pgId = pg.PGId;
+    var pgName = pg.PGName;
+    var lookbackDays = pg.LookbackDays;
+
+    var pgKey = clusterId + "|" + pgId;
+    var latestRun = latestRunByPGKey[pgKey];
+    if (!latestRun) return null;
+
+    // Lookback cutoff (usecs)
+    var minUsecs = anchorUsecs - (lookbackDays * 24 * 60 * 60 * 1000000);
+
+    // Pull runs once (bounded), then filter to completed+objects and within lookback window.
+    // If we can't build even a single snapshot in lookback, still keep the latest run (stale PG).
+    var pulled = INITIAL_RUNS_TO_PULL;
+    var usable = [];
+    while (true) {
+      var data = await fetchRuns(clusterId, pgId, pulled);
+      var runs = toArrayMaybe(data && data.runs);
+
+      usable = [];
+      for (var i = 0; i < runs.length; i++) if (runIsUsableCompleted(runs[i])) usable.push(runs[i]);
+      usable.sort(function (a, b) { return getEndUsecs(b) - getEndUsecs(a); });
+
+      // If the oldest usable run is older than minUsecs, we likely covered lookback.
+      var oldest = usable.length ? getEndUsecs(usable[usable.length - 1]) : 0;
+      if (oldest > 0 && oldest <= minUsecs) break;
+
+      if (pulled >= MAX_RUNS_TO_PULL) break;
+      pulled = Math.min(MAX_RUNS_TO_PULL, pulled + 60);
+    }
+
+    // Build snapshots within per-PG lookback days (but also <= anchorUsecs)
+    var snapPack = buildByDayFromRuns(usable, minUsecs, anchorUsecs);
+    var byDay = snapPack.byDay;
+    var snapsAsc = snapPack.snapsAsc;
+
+    // Today_TotalVMs = from latest completed run (same run used for VM list)
+    var todayUsecs = getEndUsecs(latestRun);
+    var todayDayKey = etDateKeyFromUsecs(todayUsecs);
+    var todayCount = countVMsInRun(latestRun);
+
+    // Build cells for ALL max 35 day candidates but only within lookbackDays; beyond that show "-"
+    // Then we later drop columns that have no changes (change-days only).
+    var row = {
+      Cluster: clusterName,
+      ProtectionGroup: pgName,
+      Today_TotalVMs: todayCount,
+      __lookbackDays: lookbackDays
+    };
+
+    // Build drift per day within lookback window, else "-"
+    // For each dayKey in maxWindowKeys:
+    for (var di = 0; di < maxWindowKeys.length; di++) {
+      var dk = maxWindowKeys[di];
+      var label = maxDayLabels[di];
+
+      // if this day is outside lookback window: "-"
+      var dayMinKey = dateKeyMinusDays(anchorDayKey, lookbackDays - 1);
+      // Compare strings YYYY-MM-DD (lexicographically works)
+      if (dk < dayMinKey) {
+        row[label] = "-";
+        continue;
+      }
+
+      var snap = byDay[dk];
+      if (!snap) { row[label] = "-"; continue; }
+
+      var prev = findPrevSnapshot(snapsAsc, snap.endUsecs);
+      if (!prev) row[label] = signedNew(snap.count);
+      else row[label] = signed(snap.count - prev.count);
+    }
+
+    // Net within lookback window: Today - oldest snapshot found within lookback; if none older -> NEW +today
+    var netCell = "";
+    if (!snapsAsc.length) {
+      netCell = signedNew(todayCount);
+    } else {
+      // oldest snapshot within lookback is snapsAsc[0]
+      var oldestSnap = snapsAsc[0];
+      // If oldestSnap is actually the same as today and there's no previous, treat as NEW
+      var prevForToday = findPrevSnapshot(snapsAsc, todayUsecs);
+      if (!prevForToday && snapsAsc.length === 1) netCell = signedNew(todayCount);
+      else netCell = signed(todayCount - oldestSnap.count);
+    }
+    row["Net VMs (" + lookbackDays + "d)"] = netCell;
+
+    // PG changes:
+    // - if no snapshots in last 7d (health) => NO RUNS (7d)
+    // - if first snapshot in lookback window is within last 7d => NEW (lookback window)
+    var has7d = false;
+    for (var i7 = 0; i7 < 7; i7++) {
+      var k7 = dateKeyMinusDays(anchorDayKey, i7);
+      if (byDay[k7]) { has7d = true; break; }
+    }
+    if (!has7d) {
+      pgChanges.push({ Cluster: clusterName, ProtectionGroup: pgName, Status: "🟠 **NO RUNS (7d)**" });
+    } else {
+      // NEW if earliest snapshot in lookback window is within last 7 days and has no previous
+      var first = snapsAsc.length ? snapsAsc[0] : null;
+      if (first) {
+        var firstIsIn7 = false;
+        for (var j7 = 0; j7 < 7; j7++) if (first.dayKey === dateKeyMinusDays(anchorDayKey, j7)) { firstIsIn7 = true; break; }
+        var prevFirst = findPrevSnapshot(snapsAsc, first.endUsecs);
+        if (firstIsIn7 && !prevFirst) {
+          pgChanges.push({ Cluster: clusterName, ProtectionGroup: pgName, Status: "🟢 **NEW (" + lookbackDays + "d)**" });
+        }
+      }
+    }
+
+    // ------------------------------
+    // VM LIST for this PG:
+    // Use LATEST completed run (latestRun) => ensures full VMs for this PG snapshot.
+    // ------------------------------
+    var invObjs = toArrayMaybe(latestRun.objects);
+
+    // Build inventory VM list first
+    var invVmNames = [];
+    var invVmFailed = {}; // name -> true if currently failed
+    for (var oi = 0; oi < invObjs.length; oi++) {
+      var ob = invObjs[oi] || {};
+      var meta = ob.object || {};
+      if (norm(meta.environment) !== "kAcropolis") continue;
+      if (norm(meta.objectType) !== "kVirtualMachine") continue;
+      var nm = norm(meta.name);
+      if (!nm) continue;
+      invVmNames.push(nm);
+      if (objFailed(ob)) invVmFailed[nm] = true;
+    }
+
+    // Last success lookup:
+    // Fast: scan last 10 completed runs
+    // Extend (up to lookbackDays, capped 35): only for VMs that are currently 🔴 and still blank
+    var lastSuccessMap = {};
+    for (var vv = 0; vv < invVmNames.length; vv++) lastSuccessMap[invVmNames[vv]] = "";
+
+    async function scanLastSuccess(numRuns) {
+      var headers = { accept: "application/json", apiKey: apiKey, accessClusterId: clusterId };
+      var runUrl =
+        baseUrl +
+        "/v2/data-protect/protection-groups/" +
+        encodeURIComponent(pgId) +
+        "/runs?" +
+        buildQuery({
+          environments: "kAcropolis",
+          numRuns: String(numRuns),
+          includeObjectDetails: "True"
+        });
+
+      var rd = await getJson(runUrl, headers);
+      var runs = toArrayMaybe(rd && rd.runs);
+
+      var usable2 = [];
+      for (var i = 0; i < runs.length; i++) if (runIsUsableCompleted(runs[i])) usable2.push(runs[i]);
+      usable2.sort(function (a, b) { return getEndUsecs(b) - getEndUsecs(a); });
+
+      return usable2;
+    }
+
+    function fillFromRuns(runsArr, maxRunsToCheck, minUsecsCutoff, onlyTheseVmNames) {
+      var remaining = 0;
+      var target = {};
+      for (var i = 0; i < onlyTheseVmNames.length; i++) {
+        var vmn = onlyTheseVmNames[i];
+        if (!lastSuccessMap[vmn]) { target[vmn] = true; remaining++; }
+      }
+
+      var checked = 0;
+
+      for (var ri = 0; ri < runsArr.length; ri++) {
+        if (remaining <= 0) break;
+        if (checked >= maxRunsToCheck) break;
+
+        var r = runsArr[ri];
+        var eu = getEndUsecs(r);
+        if (eu <= 0) continue;
+        if (minUsecsCutoff && eu < minUsecsCutoff) break; // older than allowed window
+
+        checked++;
+
+        var objs = toArrayMaybe(r.objects);
+        for (var oi = 0; oi < objs.length; oi++) {
+          var obj = objs[oi] || {};
+          var meta = obj.object || {};
+          if (norm(meta.environment) !== "kAcropolis") continue;
+          if (norm(meta.objectType) !== "kVirtualMachine") continue;
+
+          var vm = norm(meta.name);
+          if (!vm) continue;
+          if (!target[vm]) continue;
+          if (lastSuccessMap[vm]) continue;
+
+          if (!objFailed(obj)) {
+            lastSuccessMap[vm] = etDateTimeString(eu);
+            remaining--;
+          }
+        }
+      }
+    }
+
+    // Fast scan (10 runs) for ALL VMs
+    try {
+      var runsFast = await scanLastSuccess(Math.max(LAST_SUCCESS_RUN_LOOKBACK, 10));
+      fillFromRuns(runsFast, LAST_SUCCESS_RUN_LOOKBACK, null, invVmNames);
+    } catch (e) {
+      // ignore; keep blanks
+    }
+
+    // Extend only for currently FAILED VMs still blank, up to lookbackDays (capped 35)
+    var needExtend = [];
+    for (var iE = 0; iE < invVmNames.length; iE++) {
+      var nm2 = invVmNames[iE];
+      if (!invVmFailed[nm2]) continue;         // only failed VMs
+      if (lastSuccessMap[nm2]) continue;       // already found
+      needExtend.push(nm2);
+    }
+
+    if (needExtend.length) {
+      // Cutoff for extended scan
+      var extendDays = Math.min(lookbackDays, MAX_LOOKBACK_CAP_DAYS);
+      var minUsecs2 = anchorUsecs - (extendDays * 24 * 60 * 60 * 1000000);
+
+      try {
+        // Pull more runs, but bounded
+        var runsMore = await scanLastSuccess(MAX_RUNS_TO_PULL);
+        fillFromRuns(runsMore, MAX_RUNS_TO_PULL, minUsecs2, needExtend);
+      } catch (e2) {}
+    }
+
+    // Push VM rows (current snapshot only)
+    for (var obx = 0; obx < invObjs.length; obx++) {
+      var vobj = invObjs[obx] || {};
+      var vmeta = vobj.object || {};
+      if (norm(vmeta.environment) !== "kAcropolis") continue;
+      if (norm(vmeta.objectType) !== "kVirtualMachine") continue;
+
+      var vmName = norm(vmeta.name);
+      if (!vmName) continue;
+
+      vmRows.push({
+        Cluster: clusterName,
+        ProtectionGroup: pgName,
+        VMName: vmName,
+        BackupStatus: statusDot(vobj),
+        "Last Successful Backup (Eastern Time)": lastSuccessMap[vmName] || ""
+      });
+    }
+
+    // Store row
+    pgRows.push(row);
+    return true;
+  });
+
+  // ------------------------------
+  // 7) Build day-columns to DISPLAY (change-days only)
+  // ------------------------------
+  // Determine which day labels have any change across any PG:
+  // show column if any PG has NEW/+/- (non-zero) on that day label.
+  var dayLabelKeep = [];
+  for (var di = 0; di < maxDayLabels.length; di++) {
+    var label = maxDayLabels[di];
+    var keep = !SHOW_CHANGE_DAYS_ONLY ? true : false;
+
+    if (SHOW_CHANGE_DAYS_ONLY) {
+      for (var r = 0; r < pgRows.length; r++) {
+        var cell = pgRows[r][label];
+        if (!cell || cell === "-" || cell === "0") continue;
+
+        // keep if NEW or +/- non-zero
+        if (/NEW/i.test(cell)) { keep = true; break; }
+        var n = parseNumericFromCell(cell);
+        if (n !== 0) { keep = true; break; }
+      }
+    }
+
+    if (keep) dayLabelKeep.push(label);
+  }
+
+  // If no change days at all, keep just today's label (so table isn’t weird)
+  if (!dayLabelKeep.length) dayLabelKeep.push(maxDayLabels[0]);
+
+  // ------------------------------
+  // 8) Build Active Scope Today (Monitored) summary
+  // ------------------------------
+  // You wanted: summary always based on "today_totalvms" and a 7-day delta.
+  // We keep 7-day delta as a fixed 7-day net derived from "Net VMs (Xd)" but normalized:
+  // - If PG is 7d lookback: Net VMs (7d)
+  // - If PG is 14/35: for summary we still report NET 7-day by using the 7-day drift columns sum on kept window (within last 7 days).
+  // To keep it SIMPLE + consistent with your earlier requirement, we use:
+  //   cluster 7-day delta = sum of per-PG drift from last 7 days (not the longer net)
+  //
+  // That is: sum of (day deltas for last 7 days) across PGs.
+  //
+  function labelForDayOffset(offset) {
+    var dk = dateKeyMinusDays(anchorDayKey, offset);
+    var idx = maxWindowKeys.indexOf(dk);
+    if (idx < 0) return null;
+    return maxDayLabels[idx];
+  }
+
+  var last7Labels = [];
+  for (var o = 0; o < 7; o++) {
+    var lab = labelForDayOffset(o);
+    if (lab) last7Labels.push(lab);
+  }
+
+  var clusterMap = {};
+  for (var i = 0; i < pgRows.length; i++) {
+    var r = pgRows[i];
+    var c = r.Cluster;
+    if (!clusterMap[c]) clusterMap[c] = { Cluster: c, Active_PGs: 0, TotalVMs: 0, delta7: 0 };
+    clusterMap[c].Active_PGs += 1;
+    clusterMap[c].TotalVMs += Number(r.Today_TotalVMs || 0);
+
+    // sum last 7 day columns for this PG (only numeric deltas and NEW +X count as +X)
+    for (var j = 0; j < last7Labels.length; j++) {
+      clusterMap[c].delta7 += parseNumericFromCell(r[last7Labels[j]]);
+    }
+  }
+
+  var activeSummary = Object.keys(clusterMap)
+    .sort(function (a, b) { return a.localeCompare(b); })
+    .map(function (k) {
+      return {
+        Cluster: k,
+        Active_PGs: clusterMap[k].Active_PGs,
+        TotalVMs: clusterMap[k].TotalVMs.toLocaleString("en-US"),
+        "7-day Delta": signed(clusterMap[k].delta7)
+      };
+    });
+
+  var totalActivePGs = sum(activeSummary.map(function (x) { return Number(String(x.Active_PGs).replace(/\D/g, "")) || 0; }));
+  var totalVMs = 0;
+  var totalDelta7 = 0;
+  for (var x = 0; x < activeSummary.length; x++) {
+    totalVMs += Number(String(activeSummary[x].TotalVMs).replace(/,/g, "")) || 0;
+    totalDelta7 += parseNumericFromCell(activeSummary[x]["7-day Delta"]);
+  }
+
+  activeSummary.push({
+    Cluster: "⭐ **TOTAL**",
+    Active_PGs: "**" + totalActivePGs + "**",
+    TotalVMs: "**" + totalVMs.toLocaleString("en-US") + "**",
+    "7-day Delta": signed(totalDelta7)
+  });
+
+  // ------------------------------
+  // 9) VM Scope Trend matrix + TOTAL row
+  // ------------------------------
+  pgRows.sort(function (a, b) {
+    return norm(a.Cluster).localeCompare(norm(b.Cluster)) ||
+           norm(a.ProtectionGroup).localeCompare(norm(b.ProtectionGroup));
+  });
+
+  // matrix columns
+  var netColName = "Net (policy window)";
+  var matrixCols = ["Cluster", "ProtectionGroup", "Today_TotalVMs"].concat(dayLabelKeep).concat([netColName]);
+
+  // Add net column resolved per row
+  for (var iR = 0; iR < pgRows.length; iR++) {
+    var lb = pgRows[iR].__lookbackDays || 7;
+    var col = "Net VMs (" + lb + "d)";
+    pgRows[iR][netColName] = pgRows[iR][col] || "0";
+    delete pgRows[iR].__lookbackDays;
+  }
+
+  // TOTAL row: sum today + per day deltas + net (sum of numeric from per-row netColName)
+  var totalRow = { Cluster: "⭐ **TOTAL (Active PGs)**", ProtectionGroup: "", Today_TotalVMs: "**" + totalVMs.toLocaleString("en-US") + "**" };
+  for (var d = 0; d < dayLabelKeep.length; d++) {
+    var lab2 = dayLabelKeep[d];
+    var s = 0;
+    for (var r2 = 0; r2 < pgRows.length; r2++) s += parseNumericFromCell(pgRows[r2][lab2]);
+    totalRow[lab2] = signed(s);
+  }
+  var netS = 0;
+  for (var r3 = 0; r3 < pgRows.length; r3++) netS += parseNumericFromCell(pgRows[r3][netColName]);
+  totalRow[netColName] = signed(netS);
+
+  var matrixRows = pgRows.slice();
+  matrixRows.push(totalRow);
+
+  // ------------------------------
+  // 10) PG State Changes (changes only)
+  // ------------------------------
+  pgChanges.sort(function (a, b) {
+    return norm(a.Cluster).localeCompare(norm(b.Cluster)) ||
+           norm(a.ProtectionGroup).localeCompare(norm(b.ProtectionGroup));
+  });
+
+  // ------------------------------
+  // 11) Current VM List sort
+  // ------------------------------
+  vmRows.sort(function (a, b) {
+    return norm(a.Cluster).localeCompare(norm(b.Cluster)) ||
+           norm(a.ProtectionGroup).localeCompare(norm(b.ProtectionGroup)) ||
+           norm(a.VMName).localeCompare(norm(b.VMName));
+  });
+
+  // ------------------------------
+  // 12) Markdown
+  // ------------------------------
+  var note =
+    "## Cohesity AHV Inventory (Object-level)\n\n" +
+    "- Inventory As Of (Eastern Time): **" + (anchorET || "<blank>") + "**\n" +
+    "- Runs used: **Completed only** (Running ignored)\n" +
+    "- Missing day cell: **-**\n" +
+    "- Policy-based lookback: **7d / 14d / 35d (cap)** using policy **daysToKeep**\n" +
+    "- Last Successful Backup (ET): scan last **" + LAST_SUCCESS_RUN_LOOKBACK + "** completed runs; if still blank for 🔴 VM, extend up to policy window (max 35d)\n\n";
+
+  var activeIntro =
+    "### 1) Active Scope Today (Monitored)\n\n" +
+    "**Source:** latest **completed** run per active PG (Running ignored).\n" +
+    "**7-day Delta:** sum of daily VM drift across the last 7 days.\n\n";
+
+  var activeMd = activeIntro + toMarkdownTable(
+    "",
+    ["Cluster", "Active_PGs", "TotalVMs", "7-day Delta"],
+    activeSummary
+  );
+
+  var matrixTitle =
+    "2) VM Scope Trend (" + (SHOW_CHANGE_DAYS_ONLY ? "change-days only" : "days") + ")\n\n" +
+    "_Day columns are daily VM drift (Completed snapshots only). Net is within each PG’s policy-based window._";
+
+  var matrixMd = toMarkdownTable(matrixTitle, matrixCols, matrixRows);
+
+  var pgChangesMd = toMarkdownTable(
+    "3) PG State Changes (changes only)",
+    ["Cluster", "ProtectionGroup", "Status"],
+    pgChanges
+  );
+
+  var vmMd = toMarkdownTable(
+    "4) Current VM List (latest completed snapshot per PG)",
+    ["Cluster", "ProtectionGroup", "VMName", "BackupStatus", "Last Successful Backup (Eastern Time)"],
+    vmRows
+  );
+
+  var markdownAll = note + activeMd + "\n" + matrixMd + "\n" + pgChangesMd + "\n" + vmMd;
+
+  return {
+    authMode: authMode,
+    anchorET: anchorET,
+    anchorDayET: anchorDayKey,
+    pgCount: pgCatalog.length,
+    vmCount: vmRows.length,
+    changeDayColumnsShown: dayLabelKeep.length,
+    markdownAll: markdownAll,
+    markdownEmail: markdownAll
+  };
+}
