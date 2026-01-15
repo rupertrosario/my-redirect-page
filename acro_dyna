@@ -1,53 +1,86 @@
 // -------------------------------------------------------------
-// Cohesity Helios – AHV Inventory (Object-level)
+// Dynatrace JS2 | Cohesity AHV Inventory (Object-level)
 // READ ONLY — GET requests only
 // NO POST / PUT / DELETE
 //
 // OUTPUT:
 // - markdownEmail (email-safe Markdown tables)
 //
-// LOGIC (LOCKED):
-// - Completed runs only
-// - 7-day trend window
-// - Policy-based retention (7 / 14 / 35, capped)
-// - Today’s Delta = sum of TODAY column
-// - VM issues = FAILED + STALE only
+// SECTIONS:
+// 1) Active Scope Today (Monitored)
+// 2) PG Trend (7-day) + PG State (Combined)
+// 3) VM Backup Issues (FAILED + STALE only)
+//
+// Vault handling: NAME → ID → manual (matches Interface-DOWN script)
 // -------------------------------------------------------------
 
-import { credentialVaultClient } from "@dynatrace-sdk/client-classic-environment-v2";
+import { credentialVaultClient as vault } from "@dynatrace-sdk/client-classic-environment-v2";
 
 export default async function () {
 
-  const BASE = "https://helios.cohesity.com";
+  const baseUrl = "https://helios.cohesity.com";
   const TZ = "America/New_York";
+
   const TREND_DAYS = 7;
   const MAX_RETENTION = 35;
   const LAST_SUCCESS_RUNS = 10;
 
   // -------------------------------------------------------------
-  // AUTH (Vault only)
+  // Vault (NAME → ID → manual fallback) — SAME AS SAMPLE
   // -------------------------------------------------------------
-  let apiKey = null;
   const vaultName = "Cohesity_API_Key";
+  const vaultId   = "credentials_vault-312312";
+
+  let apiKey = null;
+  let authMode = "vault-name";
+
+  async function getKeyByName(name) {
+    const all = await vault.getCredentials();
+    const creds = (all && all.credentials) ? all.credentials : [];
+    const found = creds.find(c => c && c.name === name);
+    if (!found) return null;
+
+    const detail = await vault.getCredentialsDetails({ id: found.id });
+    return (detail && (detail.token || detail.password)) || null;
+  }
 
   try {
-    const all = await credentialVaultClient.getCredentials();
-    const found = all.credentials.find(c => c.name === vaultName);
-    if (found) {
-      const d = await credentialVaultClient.getCredentialsDetails({ id: found.id });
-      apiKey = d.token || d.password;
+    apiKey = await getKeyByName(vaultName);
+    if (!apiKey) throw new Error("not-found");
+  } catch {
+    try {
+      const d2 = await vault.getCredentialsDetails({ id: vaultId });
+      apiKey = (d2 && (d2.token || d2.password)) || null;
+      authMode = "vault-id";
+    } catch {
+      authMode = "manual";
+      apiKey = "PASTE_YOUR_API_KEY_HERE";
     }
-  } catch {}
+  }
 
-  if (!apiKey) throw new Error("No Cohesity API key in vault");
+  if (!apiKey || apiKey === "PASTE_YOUR_API_KEY_HERE") {
+    throw new Error("No valid Helios API key available.");
+  }
 
-  const H = { accept: "application/json", apiKey };
+  const commonHeaders = {
+    accept: "application/json",
+    apiKey
+  };
 
   // -------------------------------------------------------------
-  // HELPERS
+  // Helpers
   // -------------------------------------------------------------
   const A = v => Array.isArray(v) ? v : (v ? [v] : []);
-  const N = v => (v ?? "").toString().trim();
+  const N = v => (v === null || v === undefined) ? "" : String(v).trim();
+
+  async function getJson(url, headers) {
+    const r = await fetch(url, { method: "GET", headers });
+    if (!r.ok) {
+      const t = await r.text().catch(() => "");
+      throw new Error(`HTTP ${r.status} ${t}`);
+    }
+    return r.json();
+  }
 
   function et(usecs) {
     const d = new Date(Math.floor(usecs / 1000));
@@ -61,12 +94,6 @@ export default async function () {
 
   function day(usecs) {
     return et(usecs).slice(0, 10);
-  }
-
-  async function GET(url, headers) {
-    const r = await fetch(url, { method: "GET", headers });
-    if (!r.ok) throw new Error(`${r.status} ${url}`);
-    return r.json();
   }
 
   function runCompleted(r) {
@@ -108,48 +135,51 @@ export default async function () {
   }
 
   // -------------------------------------------------------------
-  // DATA HOLDERS
+  // Data holders
   // -------------------------------------------------------------
   const activeSummary = {};
   const pgTrend = [];
   const vmIssues = [];
 
   // -------------------------------------------------------------
-  // CLUSTERS
+  // Clusters
   // -------------------------------------------------------------
-  const clusters = A((await GET(`${BASE}/v2/mcm/cluster-mgmt/info`, H)).cohesityClusters);
+  const clusters = A((await getJson(
+    `${baseUrl}/v2/mcm/cluster-mgmt/info`,
+    commonHeaders
+  )).cohesityClusters);
 
   for (const c of clusters) {
 
-    const CH = { ...H, accessClusterId: c.clusterId };
+    const CH = { ...commonHeaders, accessClusterId: c.clusterId };
 
-    // Active + Paused PGs only
-    const pgs = A((await GET(
-      `${BASE}/v2/data-protect/protection-groups?environments=kAcropolis&isDeleted=False`,
+    // Active + Paused PGs only (Deleted excluded)
+    const pgs = A((await getJson(
+      `${baseUrl}/v2/data-protect/protection-groups?environments=kAcropolis&isDeleted=False`,
       CH
     )).protectionGroups).filter(pg => pg.isActive || pg.isPaused);
 
     for (const pg of pgs) {
 
-      // -----------------------------
-      // POLICY → RETENTION
-      // -----------------------------
+      // ---------------------------------------------------------
+      // Policy → retention
+      // ---------------------------------------------------------
       let retention = 7;
       if (pg.policyId) {
         try {
-          const pol = await GET(
-            `${BASE}/irisservices/api/v1/public/protectionPolicies/${pg.policyId}`,
+          const pol = await getJson(
+            `${baseUrl}/irisservices/api/v1/public/protectionPolicies/${pg.policyId}`,
             CH
           );
           retention = retentionFromDays(pol.daysToKeep);
         } catch {}
       }
 
-      // -----------------------------
-      // RUNS
-      // -----------------------------
-      const runs = A((await GET(
-        `${BASE}/v2/data-protect/protection-groups/${pg.id}/runs?numRuns=120&includeObjectDetails=True`,
+      // ---------------------------------------------------------
+      // Runs (completed only)
+      // ---------------------------------------------------------
+      const runs = A((await getJson(
+        `${baseUrl}/v2/data-protect/protection-groups/${pg.id}/runs?numRuns=150&includeObjectDetails=True`,
         CH
       )).runs)
         .filter(runCompleted)
@@ -163,9 +193,9 @@ export default async function () {
       const todayRun = runs[0];
       const todayDay = day(A(todayRun.localBackupInfo)[0].endTimeUsecs);
 
-      // -----------------------------
-      // DAILY SNAPSHOTS
-      // -----------------------------
+      // ---------------------------------------------------------
+      // Daily deltas (7-day window)
+      // ---------------------------------------------------------
       const byDay = {};
       for (const r of runs) {
         const u = A(r.localBackupInfo)[0].endTimeUsecs;
@@ -185,37 +215,34 @@ export default async function () {
         }
       }
 
-      // -----------------------------
-      // TOTAL VMs (AS-OF TODAY)
-      // -----------------------------
       const totalVMs = vmCount(todayRun);
 
-      // -----------------------------
-      // PG TREND ROW
-      // -----------------------------
-      const row = {
+      // ---------------------------------------------------------
+      // PG Trend row
+      // ---------------------------------------------------------
+      pgTrend.push({
         Cluster: c.clusterName,
         ProtectionGroup: pg.name,
         TotalVMs: totalVMs,
-        "01/15 (Today)": todayDelta ? (todayDelta > 0 ? `🟢 +${todayDelta}` : `🔴 ${todayDelta}`) : "0",
+        "Today (Δ)": todayDelta > 0 ? `🟢 +${todayDelta}` :
+                     todayDelta < 0 ? `🔴 ${todayDelta}` : "0",
         "Last Known Delta": lastKnownDelta || "-",
         "Last Completed Job (ET)": et(A(todayRun.localBackupInfo)[0].endTimeUsecs),
         "PG State": pg.isPaused ? "🟡 PAUSED" : "🟢 ACTIVE"
-      };
-      pgTrend.push(row);
+      });
 
-      // -----------------------------
-      // ACTIVE SUMMARY
-      // -----------------------------
+      // ---------------------------------------------------------
+      // Active summary
+      // ---------------------------------------------------------
       activeSummary[c.clusterName] ??= { pgs: 0, vms: 0, delta: 0 };
       activeSummary[c.clusterName].pgs++;
       activeSummary[c.clusterName].vms += totalVMs;
       activeSummary[c.clusterName].delta += todayDelta;
 
-      // -----------------------------
-      // VM ISSUES (FAILED + STALE)
-      // -----------------------------
-      const cutoff = Date.now() * 1000 - retention * 86400000000;
+      // ---------------------------------------------------------
+      // VM Backup Issues (FAILED + STALE only)
+      // ---------------------------------------------------------
+      const cutoffUsecs = Date.now() * 1000 - (retention * 86400000000);
 
       for (const obj of A(todayRun.objects)) {
         if (obj.object?.objectType !== "kVirtualMachine") continue;
@@ -223,7 +250,8 @@ export default async function () {
         let lastSuccess = "";
         for (const r of runs.slice(0, LAST_SUCCESS_RUNS)) {
           const u = A(r.localBackupInfo)[0].endTimeUsecs;
-          if (u < cutoff) break;
+          if (u < cutoffUsecs) break;
+
           const o = A(r.objects).find(x => x.object?.name === obj.object.name);
           if (o && !failed(o)) {
             lastSuccess = et(u);
@@ -245,31 +273,39 @@ export default async function () {
   }
 
   // -------------------------------------------------------------
-  // MARKDOWN EMAIL
+  // Build markdownEmail
   // -------------------------------------------------------------
   const activeRows = Object.keys(activeSummary).map(k => ({
     Cluster: k,
     Active_PGs: activeSummary[k].pgs,
     TotalVMs: activeSummary[k].vms,
-    "Today’s Delta": activeSummary[k].delta > 0 ? `🟢 +${activeSummary[k].delta}` :
-                     activeSummary[k].delta < 0 ? `🔴 ${activeSummary[k].delta}` : "0"
+    "Today’s Delta":
+      activeSummary[k].delta > 0 ? `🟢 +${activeSummary[k].delta}` :
+      activeSummary[k].delta < 0 ? `🔴 ${activeSummary[k].delta}` : "0"
   }));
 
   const markdownEmail =
     "## Cohesity AHV Inventory (Object-level)\n\n" +
     `Inventory As Of (ET): **${et(Date.now() * 1000)}**\n\n` +
-    mdTable("1) Active Scope Today (Monitored)",
+    mdTable(
+      "1) Active Scope Today (Monitored)",
       ["Cluster", "Active_PGs", "TotalVMs", "Today’s Delta"],
       activeRows
     ) +
-    mdTable("2) PG Trend (7-day) + PG State (Combined)",
-      ["Cluster", "ProtectionGroup", "TotalVMs", "01/15 (Today)", "Last Known Delta", "Last Completed Job (ET)", "PG State"],
+    mdTable(
+      "2) PG Trend (7-day) + PG State (Combined)",
+      ["Cluster", "ProtectionGroup", "TotalVMs", "Today (Δ)", "Last Known Delta", "Last Completed Job (ET)", "PG State"],
       pgTrend
     ) +
-    mdTable("3) VM Backup Issues (FAILED + STALE only)",
+    mdTable(
+      "3) VM Backup Issues (FAILED + STALE only)",
       ["Cluster", "ProtectionGroup", "VMName", "Status", "Last Backup"],
       vmIssues
     );
 
-  return { markdownEmail };
+  return {
+    ok: true,
+    authMode,
+    markdownEmail
+  };
 }
