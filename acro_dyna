@@ -1,912 +1,136 @@
-// -------------------------------------------------------------
-// Cohesity Helios – AHV (Acropolis) Inventory (Object-level)
-// Dynatrace Workflow JS (GET-only) + Markdown tables
-//
-// Output Markdown:
-// 1) Active Scope Today (Monitored) + 7-day Delta
-// 2) VM Scope Trend (7 days) – Matrix (PG rows, day drift columns)
-// 3) PG State Changes (changes only)
-// 4) Current VM List (latest inventory run only)
-//
-// RULES (finalized):
-// - COMPLETED runs only. Running runs ignored.
-// - Day bucket uses RUN END TIME in Eastern Time (America/New_York).
-// - Daily drift (day column) compares that day's snapshot vs previous AVAILABLE completed snapshot (lookback up to 35d).
-//   If no snapshot for that day => "-"
-//   If snapshot exists but no previous snapshot within 35d => "🟢 NEW +<count>"
-// - Net VMs (7d) always shows a value:
-//   If baseline exists (oldest snapshot within 7d window) => Today - Baseline
-//   Else if an older baseline exists within 35d => Today - OldestFound
-//   Else => "🟢 NEW +<Today_TotalVMs>"
-// - Missing day cells show "-" (not "NO SNAPSHOT").
-// - VM list shows BackupStatus as 🟢 / 🔴 and Last Successful Backup (ET) from last N completed runs.
-//
-// -------------------------------------------------------------
+# -------------------------------------------------------------
+# Cohesity – Protection Policies Lookup (by PolicyId)
+# Menu-based cluster selection (0=ALL or single cluster)
+# Pulls Protection Groups -> collects policyId -> fetches policy details:
+#   GET /irisservices/api/v1/public/protectionPolicies/{id}
+# -------------------------------------------------------------
 
-import { credentialVaultClient } from "@dynatrace-sdk/client-classic-environment-v2";
+$ErrorActionPreference = "Stop"
+$baseUrl = "https://helios.cohesity.com"
 
-export default async function () {
-  var baseUrl = "https://helios.cohesity.com";
+# ==============================
+# API key
+# ==============================
+$apikeypath = "X:\PowerShell\Cohesity_API_Scripts\DO_NOT_Delete\apikey.txt"
+if (-not (Test-Path $apikeypath)) { throw "API key file not found: $apikeypath" }
+$apiKey = (Get-Content $apikeypath -Raw).Trim()
+$commonHeaders = @{ apiKey = $apiKey }
 
-  // ------------------------------
-  // CONFIG
-  // ------------------------------
-  var LAST_SUCCESS_RUN_LOOKBACK = 10;   // per-VM last success scan
-  var DRIFT_WINDOW_DAYS = 7;            // show 7 days (today + 6 back)
-  var RETENTION_LOOKBACK_DAYS = 35;     // for NEW detection / previous snapshot
-  var MIN_RUNS_TO_PULL = 20;
-  var MAX_RUNS_TO_PULL = 250;          // keep sane; adjust if needed
-  var INITIAL_RUNS_TO_PULL = 80;       // usually enough; we retry with more if needed
+# ==============================
+# 1) Get clusters (sorted) + menu (same structure as your working script)
+# ==============================
+$resp = Invoke-WebRequest -Method Get -Uri "$baseUrl/v2/mcm/cluster-mgmt/info" -Headers $commonHeaders
+$json = $resp.Content | ConvertFrom-Json
+$json_clu = $json.cohesityClusters
+if (-not $json_clu -or $json_clu.Count -eq 0) { throw "No clusters returned from Helios." }
 
-  // If empty => ALL clusters. Else use exact clusterIds.
-  // Example: var TARGET_CLUSTER_IDS = ["12345", "67890"];
-  var TARGET_CLUSTER_IDS = [];
+$sorted = $json_clu | Sort-Object -Property clusterName
 
-  // ------------------------------
-  // 1) Credential vault: name -> id -> manual fallback
-  // ------------------------------
-  var vaultName = "Cohesity_API_Key";
-  var vaultId = "credentials_vault-312312";
-
-  var apiKey = null;
-  var authMode = "vault-name";
-
-  function norm(v) {
-    if (v === null || v === undefined) return "";
-    return String(v).trim();
-  }
-
-  async function tryGetKeyFromVault() {
-    // Some tenants don't have vault access in workflows; keep hard fallback.
-    try {
-      var all = await credentialVaultClient.getCredentials();
-      var found = null;
-      if (all && all.credentials && Array.isArray(all.credentials)) {
-        for (var i = 0; i < all.credentials.length; i++) {
-          if (all.credentials[i].name === vaultName) { found = all.credentials[i]; break; }
-        }
-      }
-      if (found && found.id) {
-        var detail = await credentialVaultClient.getCredentialsDetails({ id: found.id });
-        var k = (detail && (detail.token || detail.password)) || null;
-        if (k) {
-          console.log("✓ Helios key from vault (name): " + found.name);
-          authMode = "vault-name";
-          return k;
-        }
-      }
-    } catch (e) {}
-
-    try {
-      var d2 = await credentialVaultClient.getCredentialsDetails({ id: vaultId });
-      var k2 = (d2 && (d2.token || d2.password)) || null;
-      if (k2) {
-        console.log("✓ Helios key from vault (id): " + (d2 && d2.name ? d2.name : vaultId));
-        authMode = "vault-id";
-        return k2;
-      }
-    } catch (e2) {}
-
-    return null;
-  }
-
-  apiKey = await tryGetKeyFromVault();
-  if (!apiKey) {
-    authMode = "manual";
-    apiKey = "PASTE_YOUR_API_KEY_HERE";
-    console.log("⚠️ Using manual Helios API key (fallback)");
-  }
-  if (!apiKey || apiKey === "PASTE_YOUR_API_KEY_HERE") {
-    throw new Error("No Helios API key available. Update vault settings or paste key in code.");
-  }
-
-  // ------------------------------
-  // 2) Helpers
-  // ------------------------------
-  function toArrayMaybe(v) { return !v ? [] : (Array.isArray(v) ? v : [v]); }
-
-  function buildQuery(params) {
-    var usp = new URLSearchParams();
-    for (var k in params) {
-      if (!Object.prototype.hasOwnProperty.call(params, k)) continue;
-      var v = params[k];
-      if (v === undefined || v === null) continue;
-      if (Array.isArray(v)) {
-        for (var i = 0; i < v.length; i++) usp.append(k, String(v[i]));
-      } else {
-        usp.append(k, String(v));
-      }
+$clusters = for ($i = 0; $i -lt $sorted.Count; $i++) {
+    [pscustomobject]@{
+        Index       = $i + 1
+        ClusterName = $sorted[$i].clusterName
+        ClusterId   = $sorted[$i].clusterId
     }
-    return usp.toString();
-  }
-
-  async function getJson(url, headers) {
-    var resp = await fetch(url, { method: "GET", headers: headers });
-    if (!resp.ok) {
-      var txt = "";
-      try { txt = await resp.text(); } catch (e) {}
-      throw new Error("GET " + url + " -> HTTP " + resp.status + " " + txt);
-    }
-    return resp.json();
-  }
-
-  function lbiFirst(runObj) {
-    if (!runObj) return null;
-    var lb = runObj.localBackupInfo;
-    if (!lb) return null;
-    return Array.isArray(lb) ? (lb.length ? lb[0] : null) : lb;
-  }
-
-  function getEndUsecs(runObj) {
-    var info = lbiFirst(runObj);
-    var v = info && info.endTimeUsecs;
-    if (!v) return 0;
-    var n = Number(v);
-    return Number.isFinite(n) ? n : 0;
-  }
-
-  function getRunStatus(runObj) {
-    var info = lbiFirst(runObj);
-    return norm(info && info.status);
-  }
-
-  function runIsUsableCompleted(runObj) {
-    if (!runObj) return false;
-    if (getRunStatus(runObj) === "Running") return false;
-    if (getEndUsecs(runObj) <= 0) return false;
-    if (!runObj.objects) return false; // must have objects for inventory snapshot
-    return true;
-  }
-
-  // object-level fail
-  function objFailed(obj) {
-    try {
-      var fa = obj && obj.localSnapshotInfo && obj.localSnapshotInfo.failedAttempts;
-      if (!fa) return false;
-      var arr = Array.isArray(fa) ? fa : [fa];
-      return arr.length > 0;
-    } catch (e) { return false; }
-  }
-
-  function statusDot(obj) { return objFailed(obj) ? "🔴" : "🟢"; }
-
-  // ---- ET day key + formatting ----
-  // Convert usecs->Date(ms) and format in America/New_York
-  function usecsToETParts(usecs) {
-    if (!usecs || usecs === 0) return null;
-    var ms = Math.floor(Number(usecs) / 1000);
-    if (!Number.isFinite(ms) || ms <= 0) return null;
-    var d = new Date(ms);
-    try {
-      var fmt = new Intl.DateTimeFormat("en-CA", {
-        timeZone: "America/New_York",
-        year: "numeric", month: "2-digit", day: "2-digit",
-        hour: "2-digit", minute: "2-digit", second: "2-digit",
-        hour12: false
-      });
-      var parts = fmt.formatToParts(d);
-      var map = {};
-      for (var i = 0; i < parts.length; i++) map[parts[i].type] = parts[i].value;
-      return map; // {year,month,day,hour,minute,second}
-    } catch (e) {
-      // fallback: UTC
-      var iso = d.toISOString(); // YYYY-MM-DDTHH:mm:ss.sssZ
-      return {
-        year: iso.slice(0, 4),
-        month: iso.slice(5, 7),
-        day: iso.slice(8, 10),
-        hour: iso.slice(11, 13),
-        minute: iso.slice(14, 16),
-        second: iso.slice(17, 19)
-      };
-    }
-  }
-
-  function etDateKeyFromUsecs(usecs) {
-    var p = usecsToETParts(usecs);
-    if (!p) return "";
-    return p.year + "-" + p.month + "-" + p.day; // YYYY-MM-DD
-  }
-
-  function etDateTimeString(usecs) {
-    var p = usecsToETParts(usecs);
-    if (!p) return "";
-    return p.year + "-" + p.month + "-" + p.day + " " + p.hour + ":" + p.minute + ":" + p.second;
-  }
-
-  function ordinalDayLabelFromKey(yyyyMMdd) {
-    // yyyy-MM-dd -> "15th"
-    if (!yyyyMMdd || yyyyMMdd.length < 10) return "";
-    var d = Number(yyyyMMdd.slice(8, 10));
-    if (!Number.isFinite(d)) return "";
-    var suf = "th";
-    if (d % 100 < 11 || d % 100 > 13) {
-      if (d % 10 === 1) suf = "st";
-      else if (d % 10 === 2) suf = "nd";
-      else if (d % 10 === 3) suf = "rd";
-    }
-    return String(d) + suf;
-  }
-
-  function safeCell(v) {
-    if (v === null || v === undefined) return "";
-    return String(v).replace(/\|/g, " ");
-  }
-
-  function toMarkdownTable(title, columns, rows) {
-    if (!rows || rows.length === 0) return "### " + title + "\n\n- (no rows)\n";
-    var header = "| " + columns.join(" | ") + " |";
-    var sep = "| " + columns.map(function () { return "---"; }).join(" | ") + " |";
-    var body = rows.map(function (r) {
-      var vals = [];
-      for (var i = 0; i < columns.length; i++) vals.push(safeCell(r[columns[i]]));
-      return "| " + vals.join(" | ") + " |";
-    });
-    return "### " + title + "\n\n" + [header, sep].concat(body).join("\n") + "\n";
-  }
-
-  function sum(nums) {
-    var s = 0;
-    for (var i = 0; i < nums.length; i++) s += Number(nums[i] || 0);
-    return s;
-  }
-
-  function signed(n) {
-    if (!Number.isFinite(n)) return "";
-    if (n > 0) return "🟢 **+" + n + "**";
-    if (n < 0) return "🔴 **" + n + "**";
-    return "0";
-  }
-
-  function signedNew(n) {
-    // NEW value is always shown as positive "NEW +X"
-    if (!Number.isFinite(n)) return "🟢 **NEW**";
-    return "🟢 **NEW +" + n + "**";
-  }
-
-  function parseNetNumeric(cell) {
-    // For cluster/total 7-day delta: treat NEW +X as +X, normal +/-(n) as numeric, 0 as 0.
-    if (!cell) return 0;
-    var s = String(cell);
-    // NEW +80
-    var mNew = s.match(/NEW\s*\+(\d+)/i);
-    if (mNew && mNew[1]) return Number(mNew[1]) || 0;
-    // +5 or -3
-    var m = s.match(/([+-]?\d+)/);
-    if (m && m[1]) return Number(m[1]) || 0;
-    return 0;
-  }
-
-  // ------------------------------
-  // 3) Get clusters
-  // ------------------------------
-  var commonHeaders = { accept: "application/json", apiKey: apiKey };
-  var cluUrl = baseUrl + "/v2/mcm/cluster-mgmt/info";
-  var cluData = await getJson(cluUrl, commonHeaders);
-  var clusters = toArrayMaybe(cluData && cluData.cohesityClusters);
-
-  if (!clusters.length) {
-    return { authMode: authMode, markdownAll: "⚠️ No clusters returned from /v2/mcm/cluster-mgmt/info" };
-  }
-
-  // sort A–Z
-  clusters.sort(function (a, b) { return norm(a.clusterName).localeCompare(norm(b.clusterName)); });
-
-  // filter if requested
-  if (TARGET_CLUSTER_IDS && TARGET_CLUSTER_IDS.length) {
-    var allowed = {};
-    for (var i = 0; i < TARGET_CLUSTER_IDS.length; i++) allowed[String(TARGET_CLUSTER_IDS[i])] = true;
-    clusters = clusters.filter(function (c) { return allowed[String(c.clusterId)]; });
-  }
-  if (!clusters.length) {
-    return { authMode: authMode, markdownAll: "⚠️ No clusters matched TARGET_CLUSTER_IDS." };
-  }
-
-  // ------------------------------
-  // 4) Collect PGs + Runs (inventory + drift snapshots + VM list)
-  // ------------------------------
-  var pgRows = [];            // per PG computed stats for matrix + summary
-  var vmRows = [];            // current VM list (latest inventory run)
-  var pgStateChanges = [];    // changes only
-  var inventoryEndUsecsAll = [];
-
-  // For "anchor day" (PG that completes last)
-  // We choose the maximum completed inventory run endTimeUsecs across all PGs scanned.
-  var inventoryRunByPG = {}; // key: clusterId|pgId => inventoryRun object
-  var pgMetaByKey = {};      // key -> {ClusterName, ClusterId, PGName, PGId}
-
-  // Pull active PGs for each cluster
-  for (var ci = 0; ci < clusters.length; ci++) {
-    var clus = clusters[ci] || {};
-    var clusterName = norm(clus.clusterName);
-    var clusterId = norm(clus.clusterId);
-    if (!clusterId) continue;
-
-    var headers = { accept: "application/json", apiKey: apiKey, accessClusterId: clusterId };
-
-    var pgUrl =
-      baseUrl +
-      "/v2/data-protect/protection-groups?" +
-      buildQuery({
-        environments: "kAcropolis",
-        isDeleted: "False",
-        isActive: "True",
-        isPaused: "False"
-      });
-
-    var pgsData;
-    try { pgsData = await getJson(pgUrl, headers); }
-    catch (ePg) {
-      console.log("⚠️ PG fetch failed for " + clusterName + " (" + clusterId + "): " + norm(ePg.message || ePg));
-      continue;
-    }
-
-    var pgs = toArrayMaybe(pgsData && pgsData.protectionGroups);
-    if (!pgs.length) continue;
-
-    // stable PG sort
-    pgs.sort(function (a, b) { return norm(a.name).localeCompare(norm(b.name)); });
-
-    // For each PG: pull runs enough to find inventory run + snapshots
-    for (var pi = 0; pi < pgs.length; pi++) {
-      var pg = pgs[pi] || {};
-      var pgId = norm(pg.id);
-      var pgName = norm(pg.name);
-      if (!pgId || !pgName) continue;
-
-      var key = clusterId + "|" + pgId;
-      pgMetaByKey[key] = { ClusterName: clusterName, ClusterId: clusterId, PGName: pgName, PGId: pgId };
-
-      // Runs fetch helper (retry larger if needed)
-      async function fetchRunsWithRetry(numRuns) {
-        var runUrl =
-          baseUrl +
-          "/v2/data-protect/protection-groups/" +
-          encodeURIComponent(pgId) +
-          "/runs?" +
-          buildQuery({
-            environments: "kAcropolis",
-            numRuns: String(numRuns),
-            includeObjectDetails: "True"
-          });
-        return getJson(runUrl, headers);
-      }
-
-      var runData = null;
-      var pulled = INITIAL_RUNS_TO_PULL;
-
-      try {
-        runData = await fetchRunsWithRetry(pulled);
-      } catch (eRun1) {
-        console.log("⚠️ Runs fetch failed for PG " + pgName + " on " + clusterName + ": " + norm(eRun1.message || eRun1));
-        continue;
-      }
-
-      var runs = toArrayMaybe(runData && runData.runs);
-      if (!runs.length) continue;
-
-      // filter usable completed
-      var usable = [];
-      for (var r0 = 0; r0 < runs.length; r0++) if (runIsUsableCompleted(runs[r0])) usable.push(runs[r0]);
-
-      // Sort by endUsecs desc
-      usable.sort(function (a, b) { return getEndUsecs(b) - getEndUsecs(a); });
-
-      // inventory run = latest usable completed
-      var inventoryRun = usable.length ? usable[0] : null;
-
-      // If no usable run with objects, skip this PG from scope (can't inventory)
-      if (!inventoryRun) continue;
-
-      inventoryRunByPG[key] = inventoryRun;
-      var invEndUsecs = getEndUsecs(inventoryRun);
-      if (invEndUsecs > 0) inventoryEndUsecsAll.push(invEndUsecs);
-    }
-  }
-
-  if (!Object.keys(inventoryRunByPG).length) {
-    return { authMode: authMode, markdownAll: "⚠️ No Acropolis inventory collected." };
-  }
-
-  // Determine global anchor usecs and anchor date key (ET)
-  var anchorUsecs = 0;
-  for (var kk in inventoryRunByPG) {
-    if (!Object.prototype.hasOwnProperty.call(inventoryRunByPG, kk)) continue;
-    var eu = getEndUsecs(inventoryRunByPG[kk]);
-    if (eu > anchorUsecs) anchorUsecs = eu;
-  }
-  var anchorET = etDateTimeString(anchorUsecs);
-  var anchorDayKey = etDateKeyFromUsecs(anchorUsecs); // YYYY-MM-DD
-
-  // Build the 7-day window keys (anchor day inclusive)
-  // We need date arithmetic in ET; simplest is to treat dateKey as yyyy-mm-dd and subtract days using JS Date in UTC,
-  // then format back as yyyy-mm-dd (works for day stepping in most cases; ET DST shifts don't matter for date key stepping).
-  function dateKeyMinusDays(dateKey, days) {
-    // dateKey "YYYY-MM-DD"
-    var y = Number(dateKey.slice(0, 4));
-    var m = Number(dateKey.slice(5, 7));
-    var d = Number(dateKey.slice(8, 10));
-    var dt = new Date(Date.UTC(y, m - 1, d));
-    dt.setUTCDate(dt.getUTCDate() - days);
-    var yy = String(dt.getUTCFullYear());
-    var mm = String(dt.getUTCMonth() + 1).padStart(2, "0");
-    var dd = String(dt.getUTCDate()).padStart(2, "0");
-    return yy + "-" + mm + "-" + dd;
-  }
-
-  var windowKeys = [];
-  for (var wd = 0; wd < DRIFT_WINDOW_DAYS; wd++) {
-    windowKeys.push(dateKeyMinusDays(anchorDayKey, wd)); // [today, -1, ...]
-  }
-  // reverse for display oldest->newest? Your format wants 15th..9th, newest->oldest left-to-right.
-  // We'll keep left-to-right as [today..oldest] like you showed (15th,14th,...,9th).
-  // windowKeys is already [today, yesterday, ...].
-
-  var dayLabels = windowKeys.map(function (k) { return ordinalDayLabelFromKey(k); }); // ["15th","14th"...]
-  // sanity: ensure no empty labels
-  for (var dl = 0; dl < dayLabels.length; dl++) if (!dayLabels[dl]) dayLabels[dl] = windowKeys[dl];
-
-  // Helper: build snapshot map (dayKey -> {count,endUsecs,runObj}) from runs
-  async function buildSnapshotsForPG(clusterId, pgId, minLookbackDays) {
-    // We may need more runs than initially fetched to cover 35 days.
-    // We'll pull progressively until earliest usable run is older than (anchorUsecs - minLookbackDays) OR we hit MAX_RUNS_TO_PULL.
-    var headers = { accept: "application/json", apiKey: apiKey, accessClusterId: clusterId };
-
-    var targetOldestUsecs = anchorUsecs - (minLookbackDays * 24 * 60 * 60 * 1000000); // usecs
-    var pulled = Math.max(INITIAL_RUNS_TO_PULL, MIN_RUNS_TO_PULL);
-    var bestUsable = [];
-
-    while (true) {
-      var runUrl =
-        baseUrl +
-        "/v2/data-protect/protection-groups/" +
-        encodeURIComponent(pgId) +
-        "/runs?" +
-        buildQuery({
-          environments: "kAcropolis",
-          numRuns: String(pulled),
-          includeObjectDetails: "True"
-        });
-
-      var data = await getJson(runUrl, headers);
-      var runs = toArrayMaybe(data && data.runs);
-
-      bestUsable = [];
-      for (var i = 0; i < runs.length; i++) if (runIsUsableCompleted(runs[i])) bestUsable.push(runs[i]);
-      bestUsable.sort(function (a, b) { return getEndUsecs(b) - getEndUsecs(a); });
-
-      // Check oldest endUsecs
-      var oldest = bestUsable.length ? getEndUsecs(bestUsable[bestUsable.length - 1]) : 0;
-
-      if (oldest > 0 && oldest <= targetOldestUsecs) break;
-      if (pulled >= MAX_RUNS_TO_PULL) break;
-
-      // increase
-      pulled = Math.min(MAX_RUNS_TO_PULL, pulled + 60);
-    }
-
-    // Build day snapshots: keep the latest run per dayKey
-    var byDay = {}; // dayKey -> {count,endUsecs,runObj}
-    for (var r = 0; r < bestUsable.length; r++) {
-      var runObj = bestUsable[r];
-      var endUsecs = getEndUsecs(runObj);
-      if (endUsecs <= 0 || endUsecs > anchorUsecs) continue; // stay within anchor scope
-      var dayKey = etDateKeyFromUsecs(endUsecs);
-      if (!dayKey) continue;
-
-      // count VMs in this run
-      var objs = toArrayMaybe(runObj.objects);
-      var count = 0;
-      for (var o = 0; o < objs.length; o++) {
-        var obj = objs[o] || {};
-        var meta = obj.object || {};
-        if (norm(meta.environment) !== "kAcropolis") continue;
-        if (norm(meta.objectType) !== "kVirtualMachine") continue;
-        if (!norm(meta.name)) continue;
-        count++;
-      }
-
-      // keep latest per day
-      if (!byDay[dayKey] || endUsecs > byDay[dayKey].endUsecs) {
-        byDay[dayKey] = { count: count, endUsecs: endUsecs, runObj: runObj };
-      }
-    }
-
-    // Also keep list of snapshots sorted by time ascending for "previous available snapshot" lookup
-    var snapsAsc = Object.keys(byDay)
-      .map(function (k) { return { dayKey: k, count: byDay[k].count, endUsecs: byDay[k].endUsecs }; })
-      .sort(function (a, b) { return a.endUsecs - b.endUsecs; });
-
-    return { byDay: byDay, snapsAsc: snapsAsc };
-  }
-
-  // For PG state change detection, we need to know if a PG has any completed snapshot within last 7d window
-  function hasAnySnapshotInWindow(byDay) {
-    for (var i = 0; i < windowKeys.length; i++) {
-      if (byDay[windowKeys[i]]) return true;
-    }
-    return false;
-  }
-
-  function findPreviousSnapshot(snapsAsc, currentEndUsecs) {
-    // Find latest snapshot with endUsecs < currentEndUsecs
-    var prev = null;
-    for (var i = snapsAsc.length - 1; i >= 0; i--) {
-      if (snapsAsc[i].endUsecs < currentEndUsecs) { prev = snapsAsc[i]; break; }
-    }
-    return prev;
-  }
-
-  // Build PG rows now
-  var pgKeys = Object.keys(inventoryRunByPG);
-  for (var idx = 0; idx < pgKeys.length; idx++) {
-    var key = pgKeys[idx];
-    var meta = pgMetaByKey[key];
-    if (!meta) continue;
-
-    var clusterName = meta.ClusterName;
-    var clusterId = meta.ClusterId;
-    var pgName = meta.PGName;
-    var pgId = meta.PGId;
-
-    // Build snapshots (look back 35d for NEW and previous available deltas)
-    var snapPack;
-    try {
-      snapPack = await buildSnapshotsForPG(clusterId, pgId, RETENTION_LOOKBACK_DAYS);
-    } catch (eSnap) {
-      console.log("⚠️ Snapshot build failed for " + clusterName + " / " + pgName + ": " + norm(eSnap.message || eSnap));
-      continue;
-    }
-
-    var byDay = snapPack.byDay;
-    var snapsAsc = snapPack.snapsAsc;
-
-    // Determine today's snapshot for this PG (must be on anchor dayKey if present; else use latest <= anchor)
-    // We use latest completed snapshot <= anchorUsecs as "Today_TotalVMs"
-    var latestSnap = null;
-    if (snapsAsc.length) latestSnap = snapsAsc[snapsAsc.length - 1];
-    if (!latestSnap) continue;
-
-    var todayCount = latestSnap.count;
-
-    // Build day drift cells for windowKeys (today..oldest)
-    var dayCells = [];
-    var anyInWindow = false;
-
-    // We also need a flag: is NEW (no previous snapshot within 35d) for the first snapshot found in retention
-    // Since we pulled snapshots across 35d, "NEW" means there is no snapshot earlier than the first one in snapsAsc
-    // (within the retrieved window). Practically: if prev snapshot does not exist for a day that has a snapshot.
-    // We'll compute NEW per-day when previous snapshot is missing.
-    for (var w = 0; w < windowKeys.length; w++) {
-      var dayKey = windowKeys[w];
-      var snap = byDay[dayKey];
-
-      if (!snap) {
-        dayCells.push("-");
-        continue;
-      }
-
-      anyInWindow = true;
-
-      var prev = findPreviousSnapshot(snapsAsc, snap.endUsecs);
-
-      if (!prev) {
-        // First snapshot we can find in 35d => NEW
-        dayCells.push(signedNew(snap.count)); // NEW +count
-      } else {
-        var drift = snap.count - prev.count;
-        dayCells.push(signed(drift));
-      }
-    }
-
-    // Net VMs (7d) ALWAYS a value:
-    // baseline = oldest snapshot within the 7d window (oldest dayKey in window that exists), else oldest snapshot within 35d.
-    // If no older snapshot at all (prev null for latest) => NEW +today
-    var baselineSnap = null;
-
-    // find oldest in window (which is last element in windowKeys list: 9th) but we scan from oldest->newest
-    for (var ww = windowKeys.length - 1; ww >= 0; ww--) {
-      var dk = windowKeys[ww];
-      if (byDay[dk]) { baselineSnap = byDay[dk]; break; }
-    }
-
-    // if baseline is still null, use oldest overall snapshot in retention
-    if (!baselineSnap && snapsAsc.length) {
-      var oldestOverall = snapsAsc[0];
-      // map to byDay entry might exist; create a baseline object
-      baselineSnap = { count: oldestOverall.count, endUsecs: oldestOverall.endUsecs };
-    }
-
-    var netCell = "";
-    var prevForLatest = findPreviousSnapshot(snapsAsc, latestSnap.endUsecs);
-
-    if (!prevForLatest) {
-      // No baseline at all in 35d
-      netCell = signedNew(todayCount);
-    } else if (baselineSnap && Number.isFinite(baselineSnap.count)) {
-      var net = todayCount - baselineSnap.count;
-      netCell = signed(net);
-      // If baselineSnap is actually the same snapshot as latest (only one snapshot in retention),
-      // net would be 0; but you still want NEW if truly no older exists (handled above).
-    } else {
-      // should not happen; keep NEW+count to avoid blank
-      netCell = signedNew(todayCount);
-    }
-
-    // PG State Changes (changes only)
-    // - NEW (35d): first ever snapshot in retention AND appears in window
-    // - NO RUNS (7d): PG exists (has snapshots in retention) but none in last 7d window
-    // (Paused/Deleted are out-of-scope for active-only list; handled elsewhere if you expand scope later.)
-    if (anyInWindow) {
-      // check if first snapshot in retention is within window (NEW in this window)
-      var firstSnap = snapsAsc.length ? snapsAsc[0] : null;
-      var firstDay = firstSnap ? firstSnap.dayKey : "";
-      // If no previous snapshot exists for first snap, and first snap is within the 7d window, treat as NEW (35d)
-      if (firstDay && windowKeys.indexOf(firstDay) >= 0) {
-        pgStateChanges.push({ Cluster: clusterName, ProtectionGroup: pgName, Status: "🟢 **NEW (35d)**" });
-      }
-    } else {
-      // No snapshot in last 7 days
-      pgStateChanges.push({ Cluster: clusterName, ProtectionGroup: pgName, Status: "🟠 **NO RUNS (7d)**" });
-    }
-
-    // Store PG row (for matrix + summary rollups)
-    var row = {
-      Cluster: clusterName,
-      ProtectionGroup: pgName,
-      Today_TotalVMs: todayCount
-    };
-    for (var c = 0; c < dayLabels.length; c++) row[dayLabels[c]] = dayCells[c];
-    row["Net VMs (7d)"] = netCell;
-
-    pgRows.push(row);
-
-    // Build Current VM List from the latest inventory run for this PG (object-level)
-    // Use inventory run already within anchor scope: latest snapshot <= anchorUsecs
-    // We'll use the latest snapshot's runObj if available; else fallback to inventoryRunByPG.
-    var invRunObj = (byDay[anchorDayKey] && byDay[anchorDayKey].runObj) ? byDay[anchorDayKey].runObj : inventoryRunByPG[key];
-    if (!invRunObj || !invRunObj.objects) continue;
-
-    // Build last-success map per VM name (scan last N completed runs for this PG)
-    // We'll reuse the same usable runs approach but limited to LAST_SUCCESS_RUN_LOOKBACK.
-    // For speed, pull enough runs to cover that lookback, with object details.
-    var headersForVm = { accept: "application/json", apiKey: apiKey, accessClusterId: clusterId };
-    var numRunsForLastSuccess = Math.max(LAST_SUCCESS_RUN_LOOKBACK, MIN_RUNS_TO_PULL);
-    var runUrlVm =
-      baseUrl +
-      "/v2/data-protect/protection-groups/" +
-      encodeURIComponent(pgId) +
-      "/runs?" +
-      buildQuery({
-        environments: "kAcropolis",
-        numRuns: String(numRunsForLastSuccess),
-        includeObjectDetails: "True"
-      });
-
-    var runsForVm = [];
-    try {
-      var rd = await getJson(runUrlVm, headersForVm);
-      runsForVm = toArrayMaybe(rd && rd.runs);
-    } catch (eVmRuns) {
-      runsForVm = [];
-    }
-
-    var usableForVm = [];
-    for (var rr = 0; rr < runsForVm.length; rr++) if (runIsUsableCompleted(runsForVm[rr])) usableForVm.push(runsForVm[rr]);
-    usableForVm.sort(function (a, b) { return getEndUsecs(b) - getEndUsecs(a); });
-
-    // Inventory VMs (from invRunObj)
-    var invObjs = toArrayMaybe(invRunObj.objects);
-    var invVmNames = [];
-    for (var oi = 0; oi < invObjs.length; oi++) {
-      var ob = invObjs[oi] || {};
-      var obm = ob.object || {};
-      if (norm(obm.environment) !== "kAcropolis") continue;
-      if (norm(obm.objectType) !== "kVirtualMachine") continue;
-      var nm = norm(obm.name);
-      if (!nm) continue;
-      invVmNames.push(nm);
-    }
-
-    // last success map init
-    var lastSuccessMap = {};
-    for (var vv = 0; vv < invVmNames.length; vv++) lastSuccessMap[invVmNames[vv]] = "";
-
-    var remaining = invVmNames.length;
-    var checkedRuns = 0;
-
-    for (var rrr = 0; rrr < usableForVm.length; rrr++) {
-      if (remaining <= 0) break;
-      if (checkedRuns >= LAST_SUCCESS_RUN_LOOKBACK) break;
-
-      var runObj2 = usableForVm[rrr];
-      var endUsecs2 = getEndUsecs(runObj2);
-      if (endUsecs2 <= 0) continue;
-
-      checkedRuns++;
-
-      var objs2 = toArrayMaybe(runObj2.objects);
-      for (var oo = 0; oo < objs2.length; oo++) {
-        var obj2 = objs2[oo] || {};
-        var meta2 = obj2.object || {};
-        if (norm(meta2.environment) !== "kAcropolis") continue;
-        if (norm(meta2.objectType) !== "kVirtualMachine") continue;
-
-        var vmName = norm(meta2.name);
-        if (!vmName) continue;
-        if (!Object.prototype.hasOwnProperty.call(lastSuccessMap, vmName)) continue;
-        if (lastSuccessMap[vmName]) continue;
-
-        if (!objFailed(obj2)) {
-          lastSuccessMap[vmName] = etDateTimeString(endUsecs2);
-          remaining--;
-        }
-      }
-    }
-
-    // VM list rows
-    for (var obx = 0; obx < invObjs.length; obx++) {
-      var vobj = invObjs[obx] || {};
-      var vmeta = vobj.object || {};
-      if (norm(vmeta.environment) !== "kAcropolis") continue;
-      if (norm(vmeta.objectType) !== "kVirtualMachine") continue;
-
-      var vmName2 = norm(vmeta.name);
-      if (!vmName2) continue;
-
-      vmRows.push({
-        Cluster: clusterName,
-        ProtectionGroup: pgName,
-        VMName: vmName2,
-        BackupStatus: statusDot(vobj), // 🟢/🔴
-        "Last Successful Backup (Eastern Time)": lastSuccessMap[vmName2] || ""
-      });
-    }
-  }
-
-  // If no PG rows, bail
-  if (!pgRows.length) {
-    return { authMode: authMode, markdownAll: "⚠️ No Acropolis inventory collected (after processing)." };
-  }
-
-  // ------------------------------
-  // 5) Build Active Scope Today (Monitored) summary with 7-day Delta
-  // ------------------------------
-  var clusterMap = {};
-  for (var i = 0; i < pgRows.length; i++) {
-    var r = pgRows[i];
-    var c = r.Cluster;
-    if (!clusterMap[c]) clusterMap[c] = { Cluster: c, Active_PGs: 0, TotalVMs: 0, "7-day Delta": 0 };
-    clusterMap[c].Active_PGs += 1;
-    clusterMap[c].TotalVMs += Number(r.Today_TotalVMs || 0);
-    clusterMap[c]["7-day Delta"] += parseNetNumeric(r["Net VMs (7d)"]);
-  }
-
-  var activeSummary = Object.keys(clusterMap)
-    .sort(function (a, b) { return a.localeCompare(b); })
-    .map(function (k) {
-      return {
-        Cluster: k,
-        Active_PGs: clusterMap[k].Active_PGs,
-        TotalVMs: clusterMap[k].TotalVMs,
-        "7-day Delta": signed(clusterMap[k]["7-day Delta"])
-      };
-    });
-
-  var totalActivePGs = sum(activeSummary.map(function (x) { return x.Active_PGs; }));
-  var totalVMs = sum(activeSummary.map(function (x) { return x.TotalVMs; }));
-  var totalDelta7 = 0;
-  for (var t = 0; t < activeSummary.length; t++) totalDelta7 += parseNetNumeric(activeSummary[t]["7-day Delta"]);
-
-  activeSummary.push({
-    Cluster: "⭐ **TOTAL**",
-    Active_PGs: "**" + totalActivePGs + "**",
-    TotalVMs: "**" + totalVMs.toLocaleString("en-US") + "**",
-    "7-day Delta": signed(totalDelta7)
-  });
-
-  // ------------------------------
-  // 6) VM Scope Trend (matrix) + TOTAL row
-  // ------------------------------
-  // Sort PG rows: Cluster, PG
-  pgRows.sort(function (a, b) {
-    var c1 = norm(a.Cluster), c2 = norm(b.Cluster);
-    if (c1 !== c2) return c1.localeCompare(c2);
-    return norm(a.ProtectionGroup).localeCompare(norm(b.ProtectionGroup));
-  });
-
-  // Add TOTAL row (Active PGs)
-  var totalRow = { Cluster: "⭐ **TOTAL (Active PGs)**", ProtectionGroup: "", Today_TotalVMs: "**" + totalVMs.toLocaleString("en-US") + "**" };
-  // Sum each day column: NEW +X counts as +X, signed deltas sum as numeric; "-" counts as 0.
-  for (var dcol = 0; dcol < dayLabels.length; dcol++) {
-    var label = dayLabels[dcol];
-    var s = 0;
-    for (var pr = 0; pr < pgRows.length; pr++) s += parseNetNumeric(pgRows[pr][label]);
-    totalRow[label] = signed(s);
-  }
-  // Total net is sum of PG nets
-  var totalNet = 0;
-  for (var pr2 = 0; pr2 < pgRows.length; pr2++) totalNet += parseNetNumeric(pgRows[pr2]["Net VMs (7d)"]);
-  totalRow["Net VMs (7d)"] = signed(totalNet);
-
-  var matrixRows = pgRows.slice();
-  matrixRows.push(totalRow);
-
-  // ------------------------------
-  // 7) PG State Changes (changes only) – sort
-  // ------------------------------
-  pgStateChanges.sort(function (a, b) {
-    return norm(a.Cluster).localeCompare(norm(b.Cluster)) || norm(a.ProtectionGroup).localeCompare(norm(b.ProtectionGroup));
-  });
-
-  // ------------------------------
-  // 8) VM List – sort
-  // ------------------------------
-  vmRows.sort(function (a, b) {
-    return (
-      norm(a.Cluster).localeCompare(norm(b.Cluster)) ||
-      norm(a.ProtectionGroup).localeCompare(norm(b.ProtectionGroup)) ||
-      norm(a.VMName).localeCompare(norm(b.VMName))
-    );
-  });
-
-  // ------------------------------
-  // 9) Build Markdown
-  // ------------------------------
-  var note =
-    "## Cohesity AHV Inventory (Object-level)\n\n" +
-    "- Inventory As Of (Eastern Time): **" + (anchorET || "<blank>") + "**\n" +
-    "- Runs used: **Completed only** (Running ignored)\n" +
-    "- Missing day cell is shown as **-** (no completed snapshot ended on that ET day)\n" +
-    "- **NEW +X** means no prior completed snapshot found within **" + RETENTION_LOOKBACK_DAYS + " days**\n\n";
-
-  var activeIntro =
-    "### 1) Active Scope Today (Monitored)\n\n" +
-    "**Source:** latest **completed** run per active PG (Running ignored).\n" +
-    "**7-day Delta:** net VM change over last 7 days; **NEW +X** contributes **+X**.\n\n";
-
-  var activeMd = activeIntro + toMarkdownTable(
-    "",
-    ["Cluster", "Active_PGs", "TotalVMs", "7-day Delta"],
-    activeSummary
-  );
-
-  var matrixCols = ["Cluster", "ProtectionGroup", "Today_TotalVMs"]
-    .concat(dayLabels)
-    .concat(["Net VMs (7d)"]);
-
-  var matrixTitle =
-    "2) VM Scope Trend (7 days) — Active PGs only\n\n" +
-    "_Columns " + dayLabels[0] + " → " + dayLabels[dayLabels.length - 1] + " are daily VM drift (Completed snapshots only)._";
-
-  var matrixMd = toMarkdownTable(
-    matrixTitle,
-    matrixCols,
-    matrixRows
-  );
-
-  var pgChangesMd = toMarkdownTable(
-    "3) PG State Changes (last 7 days — changes only)",
-    ["Cluster", "ProtectionGroup", "Status"],
-    pgStateChanges
-  );
-
-  var vmMd = toMarkdownTable(
-    "4) Current VM List (latest completed inventory run only)",
-    ["Cluster", "ProtectionGroup", "VMName", "BackupStatus", "Last Successful Backup (Eastern Time)"],
-    vmRows
-  );
-
-  var markdownAll = note + activeMd + "\n" + matrixMd + "\n" + pgChangesMd + "\n" + vmMd;
-
-  return {
-    authMode: authMode,
-    anchorET: anchorET,
-    anchorDayET: anchorDayKey,
-    dayLabels: dayLabels,
-    pgCount: pgRows.length,
-    vmCount: vmRows.length,
-    markdownAll: markdownAll,
-    markdownEmail: markdownAll
-  };
 }
+
+Write-Host ""
+Write-Host "Available Helios Clusters (A–Z):" -ForegroundColor Cyan
+$clusters | Format-Table -AutoSize
+Write-Host ""
+Write-Host "[0] All clusters" -ForegroundColor Yellow
+Write-Host "[X] Exit" -ForegroundColor Yellow
+Write-Host ""
+
+while ($true) {
+    $inputVal = Read-Host "Enter 0 for ALL, 1-$($clusters.Count) for single, or X to exit"
+    if ($inputVal -match '^(x|X|q|Q)$') { return }
+
+    [int]$num = 0
+    if (-not [int]::TryParse($inputVal.Trim(), [ref]$num)) { continue }
+    if ($num -lt 0 -or $num -gt $clusters.Count) { continue }
+
+    $selection = $num
+    break
+}
+
+$SelectedClusters   = if ($selection -eq 0) { $clusters } else { @($clusters | Where-Object { $_.Index -eq $selection }) }
+$SelectedClusterIds = $SelectedClusters.ClusterId
+
+# ==============================
+# 2) For each cluster: pull PGs -> policyIds -> fetch policy details
+# ==============================
+$Out = @()
+
+foreach ($cid in $SelectedClusterIds) {
+
+    $clus = $SelectedClusters | Where-Object { $_.ClusterId -eq $cid } | Select-Object -First 1
+    $clusterName = $clus.ClusterName
+    $clusterId   = $clus.ClusterId
+
+    $headers = @{
+        apiKey          = $apiKey
+        accessClusterId = $clusterId
+    }
+
+    # --- Get Protection Groups (v2) ---
+    # Keep this broad; you can filter env later if needed.
+    try {
+        $pgResp = Invoke-WebRequest `
+            -Method Get `
+            -Uri "$baseUrl/v2/data-protect/protection-groups" `
+            -Headers $headers `
+            -Body @{
+                isDeleted = "False"
+            }
+
+        $pgs = ($pgResp.Content | ConvertFrom-Json).protectionGroups
+    } catch {
+        continue
+    }
+
+    if (-not $pgs) { continue }
+
+    # collect unique policyIds on this cluster
+    $policyIds = @(
+        $pgs |
+        Where-Object { $_.policyId -and "$($_.policyId)".Trim() -ne "" } |
+        Select-Object -ExpandProperty policyId -Unique
+    )
+
+    foreach ($pid in $policyIds) {
+
+        # --- Get Policy details (v1 irisservices) ---
+        $pol = $null
+        try {
+            $polResp = Invoke-WebRequest `
+                -Method Get `
+                -Uri "$baseUrl/irisservices/api/v1/public/protectionPolicies/$pid" `
+                -Headers $headers
+            $pol = $polResp.Content | ConvertFrom-Json
+        } catch {
+            $pol = $null
+        }
+
+        $Out += [pscustomobject]@{
+            Cluster       = $clusterName
+            PolicyId      = $pid
+            PolicyName    = $(if ($pol -and $pol.name) { $pol.name } else { "<missing>" })
+            PolicyType    = $(if ($pol -and $pol.policyType) { $pol.policyType } else { "" })
+            Description   = $(if ($pol -and $pol.description) { $pol.description } else { "" })
+            IsActive      = $(if ($pol -and ($pol.PSObject.Properties.Name -contains "isActive")) { $pol.isActive } else { "" })
+        }
+    }
+}
+
+if (-not $Out -or $Out.Count -eq 0) {
+    Write-Host "`nNo policy details collected." -ForegroundColor Yellow
+    return
+}
+
+# ==============================
+# 3) Output
+# ==============================
+Write-Host ""
+Write-Host "=== Protection Policy Details (by PolicyId) ===" -ForegroundColor Cyan
+$Out | Sort-Object Cluster, PolicyName, PolicyId | Format-Table Cluster, PolicyId, PolicyName, PolicyType, IsActive -AutoSize
