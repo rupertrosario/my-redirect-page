@@ -1,0 +1,164 @@
+# -------------------------------------------------------------
+# Cohesity AHV Inventory – Object-level (API-correct)
+# -------------------------------------------------------------
+
+$ErrorActionPreference = "Stop"
+$baseUrl = "https://helios.cohesity.com"
+$LastSuccessRunLookback = 10
+
+# --- API Key ---
+$apiKeyPath = "X:\PowerShell\Cohesity_API_Scripts\DO_NOT_Delete\apikey.txt"
+$apiKey = (Get-Content $apiKeyPath -Raw).Trim()
+
+# --- ET conversion ---
+$tz = [System.TimeZoneInfo]::FindSystemTimeZoneById("Eastern Standard Time")
+function Convert-ToET($usecs) {
+    if (-not $usecs) { return $null }
+    $utc = [DateTimeOffset]::FromUnixTimeMilliseconds($usecs / 1000).UtcDateTime
+    [System.TimeZoneInfo]::ConvertTimeFromUtc($utc, $tz)
+}
+
+# --- Helpers ---
+function Get-EndUsecs($r) {
+    if ($r.localBackupInfo -and $r.localBackupInfo[0].endTimeUsecs) {
+        return [int64]$r.localBackupInfo[0].endTimeUsecs
+    }
+    return 0
+}
+
+function Get-RunStatus($r) {
+    if ($r.localBackupInfo -and $r.localBackupInfo[0].status) {
+        return $r.localBackupInfo[0].status
+    }
+    return ""
+}
+
+function Test-ObjFailed($obj) {
+    try {
+        return ($obj.localSnapshotInfo.failedAttempts.Count -gt 0)
+    } catch { return $false }
+}
+
+# -------------------------------------------------------------
+# 1) Get clusters
+# -------------------------------------------------------------
+$clusters = (Invoke-RestMethod `
+    -Uri "$baseUrl/v2/mcm/cluster-mgmt/info" `
+    -Headers @{ apiKey = $apiKey }).cohesityClusters |
+    Sort-Object clusterName
+
+# -------------------------------------------------------------
+# 2) Inventory collection
+# -------------------------------------------------------------
+$PGInventory = @()
+$VMInventory = @()
+$AsOfUsecs = @()
+
+foreach ($clus in $clusters) {
+
+    $headers = @{
+        apiKey = $apiKey
+        accessClusterId = $clus.clusterId
+    }
+
+    # --- Active AHV PGs ---
+    $pgs = (Invoke-RestMethod `
+        -Uri "$baseUrl/v2/data-protect/protection-groups?environments=kAcropolis&isActive=true&isDeleted=false&isPaused=false" `
+        -Headers $headers).protectionGroups
+
+    foreach ($pg in $pgs) {
+
+        # --- Runs (INLINE objects – critical) ---
+        $runs = (Invoke-RestMethod `
+            -Uri "$baseUrl/v2/data-protect/protection-groups/$($pg.id)/runs?numRuns=15&includeObjectDetails=true" `
+            -Headers $headers).runs
+
+        if (-not $runs) { continue }
+
+        $runsSorted = $runs |
+            Where-Object { $_.objects -and (Get-RunStatus $_) -ne "Running" } |
+            Sort-Object { Get-EndUsecs $_ } -Descending
+
+        $inventoryRun = $runsSorted | Select-Object -First 1
+        if (-not $inventoryRun) { continue }
+
+        $endUsecs = Get-EndUsecs $inventoryRun
+        if ($endUsecs -gt 0) { $AsOfUsecs += $endUsecs }
+
+        $pgTotal = 0
+        $pgFail  = 0
+
+        foreach ($obj in $inventoryRun.objects) {
+
+            if ($obj.object.environment -ne "kAcropolis") { continue }
+            if ($obj.object.objectType -ne "kVirtualMachine") { continue }
+
+            $vm = $obj.object.name
+            if (-not $vm) { continue }
+
+            $pgTotal++
+            $status = if (Test-ObjFailed $obj) { "Failed" } else { "Succeeded" }
+            if ($status -eq "Failed") { $pgFail++ }
+
+            # --- Last successful backup (limited lookback) ---
+            $lastSuccess = ""
+
+            foreach ($r in $runsSorted | Select-Object -First $LastSuccessRunLookback) {
+                foreach ($o in $r.objects) {
+                    if ($o.object.name -eq $vm -and -not (Test-ObjFailed $o)) {
+                        $dt = Convert-ToET (Get-EndUsecs $r)
+                        if ($dt) { $lastSuccess = $dt.ToString("yyyy-MM-dd HH:mm:ss") }
+                        break
+                    }
+                }
+                if ($lastSuccess) { break }
+            }
+
+            $VMInventory += [pscustomobject]@{
+                Cluster         = $clus.clusterName
+                ProtectionGroup = $pg.name
+                VMName          = $vm
+                BackupStatus    = $status
+                LastSuccessfulET= $lastSuccess
+            }
+        }
+
+        $PGInventory += [pscustomobject]@{
+            Cluster         = $clus.clusterName
+            ProtectionGroup = $pg.name
+            TotalVMs        = $pgTotal
+            BKUP_SUCC_VM    = ($pgTotal - $pgFail)
+            BKUP_FAIL_VM    = $pgFail
+        }
+    }
+}
+
+# -------------------------------------------------------------
+# 3) Output
+# -------------------------------------------------------------
+$asOf = if ($AsOfUsecs.Count) {
+    (Convert-ToET (($AsOfUsecs | Measure-Object -Maximum).Maximum)).ToString("yyyy-MM-dd HH:mm:ss")
+}
+
+Write-Host "`nInventory As Of (ET): $asOf" -ForegroundColor Yellow
+
+Write-Host "`n=== Cluster Summary ===" -ForegroundColor Cyan
+$PGInventory |
+    Group-Object Cluster |
+    ForEach-Object {
+        [pscustomobject]@{
+            Cluster      = $_.Name
+            PGs          = $_.Count
+            TotalVMs     = ($_.Group.TotalVMs | Measure-Object -Sum).Sum
+            BKUP_SUCC_VM = ($_.Group.BKUP_SUCC_VM | Measure-Object -Sum).Sum
+            BKUP_FAIL_VM = ($_.Group.BKUP_FAIL_VM | Measure-Object -Sum).Sum
+        }
+    } | Format-Table -AutoSize
+
+Write-Host "`n=== Protection Group Summary ===" -ForegroundColor Cyan
+$PGInventory | Format-Table -AutoSize
+
+Write-Host "`n=== Full VM Inventory ===" -ForegroundColor Cyan
+$VMInventory |
+    Sort-Object Cluster, ProtectionGroup, VMName |
+    Format-Table -AutoSize
