@@ -2,170 +2,254 @@ import { credentialVaultClient } from "@dynatrace-sdk/client-classic-environment
 
 export default async function () {
 
-  const baseUrl = "https://helios.cohesity.com";
-  const vaultName = "Cohesity_API_Key";
-  const LOOKBACK_DAYS_CAP = 35;
+  /* ================= CONFIG ================= */
+  const BASE_URL = "https://helios.cohesity.com";
+  const VAULT_NAME = "Cohesity_API_Key";
+  const DAYS = 7;
+  const LOOKBACK_CAP_DAYS = 35;
+  const DAY_MS = 86400000;
 
-  /* ---------------- AUTH ---------------- */
-  const all = await credentialVaultClient.getCredentials();
-  const cred = all.credentials.find(c => c.name === vaultName);
-  if (!cred) throw new Error("API key not found");
+  /* ================= AUTH (VAULT) ================= */
+  let apiKey;
+  let authMode = "vault-name";
 
-  const det = await credentialVaultClient.getCredentialsDetails({ id: cred.id });
-  const apiKey = det.token || det.password;
-  if (!apiKey) throw new Error("Empty API key");
+  const allCreds = await credentialVaultClient.getCredentials();
+  const found = (allCreds.credentials || []).find(c => c.name === VAULT_NAME);
+  if (!found) throw new Error("Credential Vault entry not found");
+
+  const detail = await credentialVaultClient.getCredentialsDetails({ id: found.id });
+  apiKey = detail.token || detail.password;
+  if (!apiKey) throw new Error("Credential Vault secret empty");
 
   const commonHeaders = { apiKey, accept: "application/json" };
 
-  /* ---------------- HELPERS ---------------- */
+  /* ================= HELPERS ================= */
   const toArr = v => Array.isArray(v) ? v : (v ? [v] : []);
-  const norm = v => v ? String(v).trim() : "";
-  const dayMs = 86400000;
+  const norm  = v => (v === null || v === undefined) ? "" : String(v).trim();
 
   async function getJson(url, headers) {
     const r = await fetch(url, { method: "GET", headers });
-    if (!r.ok) throw new Error(`${r.status} ${await r.text()}`);
+    if (!r.ok) throw new Error(`GET ${url} → ${r.status} ${await r.text()}`);
     return r.json();
   }
 
-  function getCompletedRuns(runs) {
+  function completedRuns(runs) {
     return runs.filter(r =>
-      r.localBackupInfo &&
-      r.localBackupInfo[0] &&
+      r?.localBackupInfo?.[0] &&
       r.localBackupInfo[0].status !== "Running" &&
       r.localBackupInfo[0].endTimeUsecs
     );
   }
 
-  function extractVMSet(run) {
-    const set = new Set();
-    if (!run.objects) return set;
-    for (const o of run.objects) {
+  function vmSet(run) {
+    const s = new Set();
+    for (const o of toArr(run.objects)) {
       if (
-        o.object?.environment === "kAcropolis" &&
-        o.object?.objectType === "kVirtualMachine" &&
-        o.object?.name
-      ) {
-        set.add(o.object.name);
-      }
+        o?.object?.environment === "kAcropolis" &&
+        o?.object?.objectType === "kVirtualMachine" &&
+        o?.object?.name
+      ) s.add(o.object.name);
     }
-    return set;
+    return s;
   }
 
-  function diffSets(today, baseline) {
-    const added = [...today].filter(x => !baseline.has(x));
-    const removed = [...baseline].filter(x => !today.has(x));
-    return { added, removed };
+  function pgState(pg) {
+    if (pg.isDeleted) return "Deleted";
+    if (pg.isPaused)  return "Paused";
+    if (pg.isActive)  return "Active";
+    return "Inactive";
   }
 
-  /* ---------------- CLUSTERS ---------------- */
+  function formatET(sec) {
+    return new Date(sec * 1000).toISOString().replace("T", " ").slice(0, 19);
+  }
+
+  /* ================= CLUSTERS ================= */
   const clu = await getJson(
-    `${baseUrl}/v2/mcm/cluster-mgmt/info`,
+    `${BASE_URL}/v2/mcm/cluster-mgmt/info`,
     commonHeaders
   );
-
   const clusters = toArr(clu.cohesityClusters);
-  const driftRows = [];
-  let globalAdded = 0;
-  let globalRemoved = 0;
-  let totalVMsToday = 0;
 
-  /* ---------------- PROCESS ---------------- */
+  /* ================= DATA ================= */
+  const pgTrendRows = [];
+  const aggregate = {
+    totalVMsToday: 0,
+    netDrift: 0,
+    newPGs: 0,
+    removedPGs: 0,
+    newPGVMs: 0,
+    removedVMs: 0
+  };
+
+  /* ================= MAIN LOGIC ================= */
   for (const c of clusters) {
 
     const clusterName = norm(c.clusterName);
-    const clusterId = norm(c.clusterId);
+    const clusterId   = norm(c.clusterId);
     if (!clusterId) continue;
 
     const headers = { ...commonHeaders, accessClusterId: clusterId };
 
     const pgData = await getJson(
-      `${baseUrl}/v2/data-protect/protection-groups?environments=kAcropolis&isActive=true`,
+      `${BASE_URL}/v2/data-protect/protection-groups?environments=kAcropolis`,
       headers
     );
-
     const pgs = toArr(pgData.protectionGroups);
 
     for (const pg of pgs) {
 
-      const pgId = pg.id;
-      const pgName = pg.name;
-
       const runsData = await getJson(
-        `${baseUrl}/v2/data-protect/protection-groups/${pgId}/runs?numRuns=50&includeObjectDetails=true`,
+        `${BASE_URL}/v2/data-protect/protection-groups/${pg.id}/runs?numRuns=50&includeObjectDetails=true`,
         headers
       );
 
-      const completed = getCompletedRuns(toArr(runsData.runs));
-      if (completed.length < 2) continue;
+      const runs = completedRuns(toArr(runsData.runs))
+        .sort((a,b)=>b.localBackupInfo[0].endTimeUsecs - a.localBackupInfo[0].endTimeUsecs);
 
-      const todayRun = completed[0];
-      const todayTime = todayRun.localBackupInfo[0].endTimeUsecs / 1000;
-      const todaySet = extractVMSet(todayRun);
+      if (!runs.length) continue;
 
-      totalVMsToday += todaySet.size;
+      const todayRun = runs[0];
+      const todayTs  = todayRun.localBackupInfo[0].endTimeUsecs / 1000;
+      const todaySet = vmSet(todayRun);
 
-      let baselineRun = null;
-      for (let i = 1; i < completed.length; i++) {
-        const t = completed[i].localBackupInfo[0].endTimeUsecs / 1000;
-        if ((todayTime - t) / dayMs <= LOOKBACK_DAYS_CAP) {
-          baselineRun = completed[i];
-          break;
+      aggregate.totalVMsToday += todaySet.size;
+
+      /* ---- Daily sets ---- */
+      const dailySets = {};
+      dailySets[0] = todaySet;
+
+      for (let d = 1; d < DAYS; d++) {
+        const targetTs = todayTs - d * DAY_MS;
+        const r = runs.find(x => {
+          const t = x.localBackupInfo[0].endTimeUsecs / 1000;
+          return (todayTs - t) / DAY_MS <= LOOKBACK_CAP_DAYS &&
+                 Math.abs(t - targetTs) <= DAY_MS;
+        });
+        dailySets[d] = r ? vmSet(r) : null;
+      }
+
+      /* ---- Delta calc ---- */
+      const dayCells = [];
+      let lastDelta = "0";
+
+      for (let d = DAYS-1; d >= 0; d--) {
+        if (!dailySets[d]) {
+          dayCells.push("–");
+          continue;
+        }
+        if (d === DAYS-1) {
+          dayCells.push("0");
+          continue;
+        }
+
+        const cur = dailySets[d];
+        const prev = dailySets[d+1];
+
+        if (!prev) {
+          aggregate.newPGs++;
+          aggregate.newPGVMs += cur.size;
+          lastDelta = `🟢 +${cur.size}`;
+          dayCells.push("🟢 NEW");
+          continue;
+        }
+
+        const added = [...cur].filter(x=>!prev.has(x)).length;
+        const removed = [...prev].filter(x=>!cur.has(x)).length;
+        const net = added - removed;
+
+        if (added || removed) {
+          aggregate.netDrift += net;
+          aggregate.removedVMs += removed;
+          lastDelta = `${net>=0?"🟢 +":"🔴 "}${Math.abs(net)}`;
+          dayCells.push(net>=0?`🟢 +${added}`:`🔴 −${removed}`);
+        } else {
+          dayCells.push("0");
         }
       }
 
-      if (!baselineRun) continue;
-
-      const baselineSet = extractVMSet(baselineRun);
-      const { added, removed } = diffSets(todaySet, baselineSet);
-
-      globalAdded += added.length;
-      globalRemoved += removed.length;
-
-      driftRows.push({
+      pgTrendRows.push({
         Cluster: clusterName,
-        ProtectionGroup: pgName,
-        VMsToday: todaySet.size,
-        Added: added.length,
-        Removed: removed.length,
-        Net: added.length - removed.length,
-        LastCompletedET: new Date(todayTime).toISOString().replace("T", " ").slice(0, 19)
+        ProtectionGroup: pg.name,
+        TotalVMsToday: todaySet.size || "–",
+        Days: dayCells.reverse(),
+        LastKnownDelta: lastDelta,
+        PGState: pgState(pg),
+        LastCompletedJob: todayRun.localBackupInfo[0].status === "Succeeded" ? "OK" : "—",
+        LastCompletedET: formatET(todayTs)
       });
     }
   }
 
-  /* ---------------- OUTPUT ---------------- */
-  const netDrift = globalAdded - globalRemoved;
+  /* ================= MARKDOWN RENDER ================= */
+  function renderMarkdown(rows, aggregate) {
 
-  const markdownEmail = [
-    "## Cohesity AHV Inventory Drift (Object-level)",
-    "",
-    `**Drift Window:** Policy-bounded (≤ ${LOOKBACK_DAYS_CAP} days)`,
-    `**Total VMs Today:** ${totalVMsToday}`,
-    "",
-    "### Global Drift Summary",
-    `- VMs Added: **+${globalAdded}**`,
-    `- VMs Removed: **−${globalRemoved}**`,
-    `- **Net Drift:** ${netDrift >= 0 ? "🟢 +" : "🔴 "}${netDrift}`,
-    "",
-    "### PG-Level Drift",
-    "| Cluster | ProtectionGroup | VMs Today | Added | Removed | Net | Last Completed Run |",
-    "| --- | --- | --- | --- | --- | --- | --- |",
-    ...driftRows.map(r =>
-      `| ${r.Cluster} | ${r.ProtectionGroup} | ${r.VMsToday} | +${r.Added} | −${r.Removed} | ${r.Net >= 0 ? "🟢 +" : "🔴 "}${r.Net} | ${r.LastCompletedET} |`
-    ),
-    "",
-    "### Reconciliation",
-    `Computed Net Drift = ${netDrift}`,
-    `Reconciliation Result: ${netDrift === (totalVMsToday - (totalVMsToday - netDrift)) ? "✅ MATCH" : "❌ MISMATCH"}`
-  ].join("\n");
+    const dayHeaders = [];
+    for (let i = DAYS - 1; i >= 0; i--) {
+      dayHeaders.push(i === 0 ? "Today" : `${i}d`);
+    }
 
+    const header = [
+      "Cluster",
+      "Protection Group",
+      "Total VMs (Today)",
+      ...dayHeaders,
+      "Last Known Delta",
+      "PG State",
+      "Last Completed Job"
+    ];
+
+    const table = [
+      "| " + header.join(" | ") + " |",
+      "| " + header.map(()=> "---").join(" | ") + " |",
+      ...rows.map(r =>
+        "| " + [
+          r.Cluster,
+          r.ProtectionGroup,
+          r.TotalVMsToday,
+          ...r.Days,
+          r.LastKnownDelta,
+          r.PGState,
+          r.LastCompletedJob
+        ].join(" | ") + " |"
+      )
+    ].join("\n");
+
+    const summary = [
+      "### ⭐ 7-Day Aggregate View",
+      "",
+      "| Metric | Value |",
+      "|------|-------|",
+      `| Total VMs (Today) | **${aggregate.totalVMsToday}** |`,
+      `| Net VM change (7-day) | ${aggregate.netDrift>=0?"🟢":"🔴"} **${aggregate.netDrift>=0?"+":""}${aggregate.netDrift}** |`,
+      `| New PGs detected | **${aggregate.newPGs}** |`,
+      `| PGs removed | **${aggregate.removedPGs}** |`,
+      `| Net VM additions from NEW PGs | **+${aggregate.newPGVMs}** |`,
+      `| Net VM removals | **−${aggregate.removedVMs}** |`
+    ].join("\n");
+
+    return [
+      "## 2) Protection Group Trend (7-Day) + PG State (Combined)",
+      "",
+      "**What this shows:**  ",
+      "Daily **VM membership delta** per Protection Group over the last 7 days, derived from **completed backup jobs only**, combined with the **current PG state** and **last known completed job result**.",
+      "",
+      table,
+      "",
+      summary,
+      "",
+      "*Derived exclusively from completed backup jobs. No inference from failed or partial runs.*"
+    ].join("\n");
+  }
+
+  const markdownEmail = renderMarkdown(pgTrendRows, aggregate);
+
+  /* ================= RETURN ================= */
   return {
-    totalVMsToday,
-    added: globalAdded,
-    removed: globalRemoved,
-    netDrift,
-    rows: driftRows,
+    authMode,
+    days: DAYS,
+    rows: pgTrendRows,
+    aggregate,
     markdownEmail,
     markdownTable: markdownEmail
   };
