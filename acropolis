@@ -1,169 +1,172 @@
-# -------------------------------------------------------------
-# Cohesity Acropolis (AHV) Backup Failures – Multi-Cluster (Helios)
-# Environment: kAcropolis | ObjectType: kVirtualMachine
-# -------------------------------------------------------------
+import { credentialVaultClient } from "@dynatrace-sdk/client-classic-environment-v2";
 
-$logDirectory = "X:\PowerShell\Data\Cohesity\BackupFailures"
-if (-not (Test-Path -Path $logDirectory -PathType Container)) {
-    New-Item -Path $logDirectory -ItemType Directory | Out-Null
-}
+export default async function () {
 
-# --- Load API key ---
-$apikeypath = "X:\PowerShell\Cohesity_API_Scripts\DO_NOT_Delete\apikey.txt"
-if (-not (Test-Path $apikeypath)) { throw "API key file not found: $apikeypath" }
-$apiKey = (Get-Content -Path $apikeypath -Raw).Trim()
-$commonHeaders = @{ "apiKey" = $apiKey }
+  const baseUrl = "https://helios.cohesity.com";
+  const vaultName = "Cohesity_API_Key";
+  const LOOKBACK_DAYS_CAP = 35;
 
-# --- Get all clusters from Helios ---
-$url = "https://helios.cohesity.com/v2/mcm/cluster-mgmt/info"
-$response = Invoke-WebRequest -Uri $url -Headers $commonHeaders -Method Get
-$json_clu = ($response.Content | ConvertFrom-Json).cohesityClusters
-if (-not $json_clu) { throw "No clusters returned from Helios." }
+  /* ---------------- AUTH ---------------- */
+  const all = await credentialVaultClient.getCredentials();
+  const cred = all.credentials.find(c => c.name === vaultName);
+  if (!cred) throw new Error("API key not found");
 
-# --- Helper for time conversion ---
-function Convert-ToLocalFromEpoch($v,$tz){
-    if(-not $v -or $v -eq 0){return $null}
-    try{
-        $utc=[DateTimeOffset]::FromUnixTimeMilliseconds([int64]($v/1000)).UtcDateTime
-        if($tz){[System.TimeZoneInfo]::ConvertTimeFromUtc($utc,$tz)}else{$utc.ToLocalTime()}
-    }catch{return $null}
-}
+  const det = await credentialVaultClient.getCredentialsDetails({ id: cred.id });
+  const apiKey = det.token || det.password;
+  if (!apiKey) throw new Error("Empty API key");
 
-$tz=[System.TimeZoneInfo]::FindSystemTimeZoneById("Eastern Standard Time")
-$baseUrl="https://helios.cohesity.com"
-$globalFailures=@()
+  const commonHeaders = { apiKey, accept: "application/json" };
 
-# -------------------------------------------------------------
-# Iterate clusters
-# -------------------------------------------------------------
-foreach($cluster in $json_clu){
+  /* ---------------- HELPERS ---------------- */
+  const toArr = v => Array.isArray(v) ? v : (v ? [v] : []);
+  const norm = v => v ? String(v).trim() : "";
+  const dayMs = 86400000;
 
-    $cluster_name = $cluster.name
-    if([string]::IsNullOrWhiteSpace($cluster_name)){$cluster_name=$cluster.clusterName}
-    if([string]::IsNullOrWhiteSpace($cluster_name)){$cluster_name=$cluster.displayName}
-    if([string]::IsNullOrWhiteSpace($cluster_name)){$cluster_name="Unknown-$($cluster.clusterId)"}
-    $cluster_id=$cluster.clusterId
+  async function getJson(url, headers) {
+    const r = await fetch(url, { method: "GET", headers });
+    if (!r.ok) throw new Error(`${r.status} ${await r.text()}`);
+    return r.json();
+  }
 
-    Write-Host "`n🔹 Processing cluster: $cluster_name" -ForegroundColor Cyan
-    $headers=@{apiKey=$apiKey;accessClusterId=$cluster_id}
+  function getCompletedRuns(runs) {
+    return runs.filter(r =>
+      r.localBackupInfo &&
+      r.localBackupInfo[0] &&
+      r.localBackupInfo[0].status !== "Running" &&
+      r.localBackupInfo[0].endTimeUsecs
+    );
+  }
 
-    # --- Get Acropolis PGs ---
-    $pgResp=Invoke-WebRequest -Uri "$baseUrl/v2/data-protect/protection-groups" -Headers $headers -Body @{
-        environments="kAcropolis";isDeleted="False";isPaused="False";isActive="True"} -Method Get
-    $pgs=($pgResp.Content|ConvertFrom-Json).protectionGroups
-    if(-not $pgs){Write-Host "⚠️ No Acropolis PGs found on $cluster_name." -ForegroundColor Yellow;continue}
-
-    foreach($pg in $pgs){
-        $pgId=$pg.id
-        $pgName=$pg.name
-        Write-Host "`n📦 Checking PG: $pgName" -ForegroundColor Yellow
-
-        $runUrl="$baseUrl/v2/data-protect/protection-groups/$pgId/runs"
-        $runBody=@{
-            environments="kAcropolis"
-            numRuns="10"
-            excludeNonRestorableRuns="False"
-            includeObjectDetails="True"
-        }
-
-        try{
-            $runResp=Invoke-WebRequest -Uri $runUrl -Headers $headers -Body $runBody -Method Get
-            $jsonRuns=$runResp|ConvertFrom-Json
-        }catch{
-            Write-Host "⚠️ Skipping PG $pgName on $cluster_name due to API error." -ForegroundColor Yellow
-            continue
-        }
-
-        if(-not $jsonRuns.runs){continue}
-
-        $runs=$jsonRuns.runs|Sort-Object{$_.localBackupInfo[0].endTimeUsecs}-Descending
-        $latestRun=$runs|Select-Object -First 1
-        if(-not $latestRun){continue}
-
-        $info=$latestRun.localBackupInfo[0]
-        $status=$info.status
-        $runType=$info.runType
-        $startLocal=Convert-ToLocalFromEpoch $info.startTimeUsecs $tz
-        $endLocal=Convert-ToLocalFromEpoch $info.endTimeUsecs $tz
-
-        # --- Add latest run date ---
-        if($endLocal){
-            Write-Host "   🕓 Latest Run Date: $($endLocal.ToString('dd-MMM-yyyy HH:mm:ss'))" -ForegroundColor DarkGray
-        }
-
-        # --- Show success/failure summary ---
-        $isFailed = ($status -ne "Succeeded" -and $status -ne "SucceededWithWarning")
-        if ($isFailed) {
-            Write-Host "❌ $cluster_name → $pgName [$runType] – Latest run failed, collecting VM details..." -ForegroundColor Red
-        } else {
-            Write-Host "✅ $cluster_name → $pgName [$runType] – Latest run succeeded" -ForegroundColor Green
-        }
-
-        # --- Collect failures ---
-        if($latestRun.objects){
-            $vmObjs=$latestRun.objects|Where-Object{$_.object.objectType -eq 'kVirtualMachine' -and $_.object.environment -eq 'kAcropolis'}
-
-            foreach($vm in $vmObjs){
-                $attempts=$vm.localSnapshotInfo.failedAttempts
-                if($isFailed -or $attempts){
-                    if($attempts){
-                        foreach($fa in $attempts){
-                            $msgClean=($fa.message -replace '[\r\n]+',' ' -replace ',',' ' -replace '"','''').Trim()
-                            $globalFailures += [pscustomobject]@{
-                                Cluster=$cluster_name
-                                ProtectionGroup=$pgName
-                                RunType=$runType
-                                VMName=$vm.object.name
-                                StartTime=$startLocal
-                                EndTime=$endLocal
-                                FailedMessage=$msgClean
-                            }
-                        }
-                    } else {
-                        $globalFailures += [pscustomobject]@{
-                            Cluster=$cluster_name
-                            ProtectionGroup=$pgName
-                            RunType=$runType
-                            VMName=$vm.object.name
-                            StartTime=$startLocal
-                            EndTime=$endLocal
-                            FailedMessage="No failedAttempts[] details found — Run marked Failed"
-                        }
-                    }
-                }
-            }
-        }
+  function extractVMSet(run) {
+    const set = new Set();
+    if (!run.objects) return set;
+    for (const o of run.objects) {
+      if (
+        o.object?.environment === "kAcropolis" &&
+        o.object?.objectType === "kVirtualMachine" &&
+        o.object?.name
+      ) {
+        set.add(o.object.name);
+      }
     }
-}
+    return set;
+  }
 
-# -------------------------------------------------------------
-# Smart de-duplication (null-safe)
-# -------------------------------------------------------------
-if ($globalFailures.Count -gt 0) {
-    $globalFailures = $globalFailures |
-        Group-Object {
-            $end = if ($_.EndTime) { $_.EndTime.ToString('yyyy-MM-dd HH:mm') } else { 'N/A' }
-            "$($_.Cluster)|$($_.ProtectionGroup)|$($_.RunType)|$($_.VMName)|$($_.FailedMessage)|$end"
-        } |
-        ForEach-Object {
-            $_.Group | Sort-Object EndTime -Descending | Select-Object -First 1
+  function diffSets(today, baseline) {
+    const added = [...today].filter(x => !baseline.has(x));
+    const removed = [...baseline].filter(x => !today.has(x));
+    return { added, removed };
+  }
+
+  /* ---------------- CLUSTERS ---------------- */
+  const clu = await getJson(
+    `${baseUrl}/v2/mcm/cluster-mgmt/info`,
+    commonHeaders
+  );
+
+  const clusters = toArr(clu.cohesityClusters);
+  const driftRows = [];
+  let globalAdded = 0;
+  let globalRemoved = 0;
+  let totalVMsToday = 0;
+
+  /* ---------------- PROCESS ---------------- */
+  for (const c of clusters) {
+
+    const clusterName = norm(c.clusterName);
+    const clusterId = norm(c.clusterId);
+    if (!clusterId) continue;
+
+    const headers = { ...commonHeaders, accessClusterId: clusterId };
+
+    const pgData = await getJson(
+      `${baseUrl}/v2/data-protect/protection-groups?environments=kAcropolis&isActive=true`,
+      headers
+    );
+
+    const pgs = toArr(pgData.protectionGroups);
+
+    for (const pg of pgs) {
+
+      const pgId = pg.id;
+      const pgName = pg.name;
+
+      const runsData = await getJson(
+        `${baseUrl}/v2/data-protect/protection-groups/${pgId}/runs?numRuns=50&includeObjectDetails=true`,
+        headers
+      );
+
+      const completed = getCompletedRuns(toArr(runsData.runs));
+      if (completed.length < 2) continue;
+
+      const todayRun = completed[0];
+      const todayTime = todayRun.localBackupInfo[0].endTimeUsecs / 1000;
+      const todaySet = extractVMSet(todayRun);
+
+      totalVMsToday += todaySet.size;
+
+      let baselineRun = null;
+      for (let i = 1; i < completed.length; i++) {
+        const t = completed[i].localBackupInfo[0].endTimeUsecs / 1000;
+        if ((todayTime - t) / dayMs <= LOOKBACK_DAYS_CAP) {
+          baselineRun = completed[i];
+          break;
         }
-}
+      }
 
-# -------------------------------------------------------------
-# Output Section
-# -------------------------------------------------------------
-if($globalFailures.Count -gt 0){
-    Write-Host "`n🔥 Latest Failed Acropolis (AHV) Runs (All Clusters):`n" -ForegroundColor Cyan
-    $sorted=$globalFailures|Sort-Object Cluster,ProtectionGroup,EndTime -Descending
-    $sorted|Format-Table Cluster,ProtectionGroup,RunType,VMName,StartTime,EndTime,FailedMessage -AutoSize
-}else{
-    Write-Host "`n✅ All latest Acropolis runs succeeded across all clusters." -ForegroundColor Green
-}
+      if (!baselineRun) continue;
 
-# -------------------------------------------------------------
-# CSV Reference Path
-# -------------------------------------------------------------
-$timestamp=Get-Date -Format "yyyyMMdd_HHmm"
-$csvPath="X:\PowerShell\Data\Cohesity\BackupFailures\BackupFailures_Acropolis_AllClusters_$timestamp.csv"
-Write-Host "`n📂 (CSV path ready if needed later): $csvPath" -ForegroundColor Gray
+      const baselineSet = extractVMSet(baselineRun);
+      const { added, removed } = diffSets(todaySet, baselineSet);
+
+      globalAdded += added.length;
+      globalRemoved += removed.length;
+
+      driftRows.push({
+        Cluster: clusterName,
+        ProtectionGroup: pgName,
+        VMsToday: todaySet.size,
+        Added: added.length,
+        Removed: removed.length,
+        Net: added.length - removed.length,
+        LastCompletedET: new Date(todayTime).toISOString().replace("T", " ").slice(0, 19)
+      });
+    }
+  }
+
+  /* ---------------- OUTPUT ---------------- */
+  const netDrift = globalAdded - globalRemoved;
+
+  const markdownEmail = [
+    "## Cohesity AHV Inventory Drift (Object-level)",
+    "",
+    `**Drift Window:** Policy-bounded (≤ ${LOOKBACK_DAYS_CAP} days)`,
+    `**Total VMs Today:** ${totalVMsToday}`,
+    "",
+    "### Global Drift Summary",
+    `- VMs Added: **+${globalAdded}**`,
+    `- VMs Removed: **−${globalRemoved}**`,
+    `- **Net Drift:** ${netDrift >= 0 ? "🟢 +" : "🔴 "}${netDrift}`,
+    "",
+    "### PG-Level Drift",
+    "| Cluster | ProtectionGroup | VMs Today | Added | Removed | Net | Last Completed Run |",
+    "| --- | --- | --- | --- | --- | --- | --- |",
+    ...driftRows.map(r =>
+      `| ${r.Cluster} | ${r.ProtectionGroup} | ${r.VMsToday} | +${r.Added} | −${r.Removed} | ${r.Net >= 0 ? "🟢 +" : "🔴 "}${r.Net} | ${r.LastCompletedET} |`
+    ),
+    "",
+    "### Reconciliation",
+    `Computed Net Drift = ${netDrift}`,
+    `Reconciliation Result: ${netDrift === (totalVMsToday - (totalVMsToday - netDrift)) ? "✅ MATCH" : "❌ MISMATCH"}`
+  ].join("\n");
+
+  return {
+    totalVMsToday,
+    added: globalAdded,
+    removed: globalRemoved,
+    netDrift,
+    rows: driftRows,
+    markdownEmail,
+    markdownTable: markdownEmail
+  };
+}
