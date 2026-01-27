@@ -1,0 +1,216 @@
+# -------------------------------------------------------------
+# Cohesity Helios - Cluster GFlags (GET Only) - Picture Script
+# -------------------------------------------------------------
+# ✅ Menu: [0] All clusters OR [1..N] single cluster
+# ✅ GET only (no set/clear/import/restart)
+# ✅ CSV output fixed: no System.Object[]
+# ✅ Node/cluster targeting via accessClusterId header
+# -------------------------------------------------------------
+
+$ErrorActionPreference = "Stop"
+
+# ==============================
+# 0) API key from your path
+# ==============================
+$apikeypath = "X:\PowerShell\Cohesity_API_Scripts\DO_NOT_Delete\apikey.txt"
+if (-not (Test-Path $apikeypath)) { throw "API key file not found at $apikeypath" }
+
+$apiKey = (Get-Content -Path $apikeypath -Raw).Trim()
+$commonHeaders = @{ "apiKey" = $apiKey }
+
+# -------------------------------------------------------------
+# CSV helper: Converts arrays -> strings (prevents System.Object[])
+# -------------------------------------------------------------
+function To-CsvList {
+    param([object]$v)
+    if ($null -eq $v) { return "" }
+    if ($v -isnot [System.Array]) { return "$v" }
+
+    $arr = @($v | ForEach-Object { "$_" } | Where-Object { $_ -ne "" })
+    if ($arr.Count -eq 0) { return "" }
+    if ($arr.Count -eq 1) { return $arr[0] }
+
+    $uniq = @($arr | Select-Object -Unique)
+    if ($uniq.Count -eq 1) { return $uniq[0] }
+
+    return "{" + ($arr -join ",") + "}"
+}
+
+# -------------------------------------------------------------
+# Timestamp helper (best-effort; empty if missing/0)
+# Note: gflag timestamp units may vary by backend; this normalizes safely.
+# -------------------------------------------------------------
+function Convert-CohesityTimestampToDateString {
+    param([double]$ts)
+    if (-not $ts -or $ts -eq 0) { return "" }
+
+    # seconds ~1e9, millis ~1e12, micros ~1e15
+    try {
+        if ($ts -lt 1e11) {
+            return ([DateTimeOffset]::FromUnixTimeSeconds([int64]$ts)).UtcDateTime.ToString("yyyy-MM-dd")
+        } elseif ($ts -lt 1e14) {
+            return ([DateTimeOffset]::FromUnixTimeMilliseconds([int64]$ts)).UtcDateTime.ToString("yyyy-MM-dd")
+        } else {
+            # micros -> ms
+            $ms = [int64]($ts / 1000)
+            return ([DateTimeOffset]::FromUnixTimeMilliseconds($ms)).UtcDateTime.ToString("yyyy-MM-dd")
+        }
+    } catch {
+        return ""
+    }
+}
+
+# ==========================================
+# 1) Get Clusters (ClusterName + ClusterId)
+# ==========================================
+$url      = "https://helios.cohesity.com/v2/mcm/cluster-mgmt/info"
+$response = Invoke-WebRequest -Method Get -Uri $url -Headers $commonHeaders
+$json     = $response.Content | ConvertFrom-Json
+$json_clu = $json.cohesityClusters
+
+if (-not $json_clu -or $json_clu.Count -eq 0) {
+    throw "No clusters returned from Helios."
+}
+
+# ==========================================
+# 2) Build menu + pick ALL or SINGLE
+# ==========================================
+$sorted = $json_clu | Sort-Object -Property clusterName
+
+$clusters = for ($i = 0; $i -lt $sorted.Count; $i++) {
+    [pscustomobject]@{
+        Index       = $i + 1
+        ClusterName = $sorted[$i].clusterName
+        ClusterId   = $sorted[$i].clusterId
+    }
+}
+
+Write-Host ""
+Write-Host "Available Helios Clusters (sorted by name):" -ForegroundColor Cyan
+$clusters | Format-Table -AutoSize
+
+Write-Host ""
+Write-Host "[0] All clusters" -ForegroundColor Yellow
+Write-Host "[X] Exit without selecting" -ForegroundColor Yellow
+Write-Host ""
+
+while ($true) {
+    $inputVal = Read-Host "Enter 0 for ALL, 1-$($clusters.Count) for single, or X to exit"
+
+    if ($inputVal -match '^(x|X|q|Q)$') {
+        Write-Host "Exit selected. No clusters chosen." -ForegroundColor Cyan
+        return
+    }
+
+    [int]$num = 0
+    if (-not [int]::TryParse($inputVal, [ref]$num)) {
+        Write-Host "Please enter a valid number or X to exit." -ForegroundColor Red
+        continue
+    }
+
+    if ($num -lt 0 -or $num -gt $clusters.Count) {
+        Write-Host "Please enter 0, 1-$($clusters.Count), or X to exit." -ForegroundColor Red
+        continue
+    }
+
+    $selection = $num
+    break
+}
+
+if ($selection -eq 0) {
+    $SelectedClusters   = $clusters
+    $SelectedClusterIds = $clusters.ClusterId
+    Write-Host ""
+    Write-Host "You selected: ALL clusters" -ForegroundColor Green
+}
+else {
+    $selectedCluster    = $clusters | Where-Object { $_.Index -eq $selection }
+    $SelectedClusters   = @($selectedCluster)
+    $SelectedClusterIds = @($selectedCluster.ClusterId)
+
+    Write-Host ""
+    Write-Host "You selected cluster:" -ForegroundColor Green
+    Write-Host "  Name: $($selectedCluster.ClusterName)"
+    Write-Host "  Id:   $($selectedCluster.ClusterId)"
+    Write-Host ""
+}
+
+# ==========================================
+# 3) For each selected cluster, GET gflags
+# ==========================================
+$AllRows = @()
+
+foreach ($cid in $SelectedClusterIds) {
+
+    $clus = $SelectedClusters | Where-Object { $_.ClusterId -eq $cid } | Select-Object -First 1
+    $cluster_name = $clus.ClusterName
+    $cluster_id   = $clus.ClusterId
+
+    $urlG = "https://helios.cohesity.com/irisservices/api/v1/public/clusters/gflag"
+    $headers = @{ "apiKey" = $apiKey; "accessClusterId" = $cluster_id }
+
+    try {
+        $respG = Invoke-WebRequest -Method Get -Uri $urlG -Headers $headers
+        $jsonG = $respG.Content | ConvertFrom-Json
+    }
+    catch {
+        Write-Host "Failed to get gflags for cluster '$cluster_name' (Id: $cluster_id): $_" -ForegroundColor Red
+        continue
+    }
+
+    if (-not $jsonG) {
+        Write-Host "No gflags returned for cluster '$cluster_name' (Id: $cluster_id)." -ForegroundColor Yellow
+        continue
+    }
+
+    foreach ($svc in $jsonG) {
+        $svcName = $svc.serviceName
+        Write-Host "`n$cluster_name :: $svcName" -ForegroundColor Cyan
+
+        foreach ($gf in ($svc.gflags | Where-Object { $_ })) {
+            $dateStr = Convert-CohesityTimestampToDateString -ts $gf.timestamp
+            Write-Host ("    {0}: {1} ({2}) ({3})" -f $gf.name, $gf.value, $gf.reason, $dateStr)
+
+            $AllRows += [pscustomobject]@{
+                Cluster     = $cluster_name
+                ClusterId   = "$cluster_id"
+                ServiceName = $svcName
+                FlagName    = $gf.name
+                FlagValue   = $gf.value
+                Reason      = $gf.reason
+                Date        = $dateStr
+            }
+        }
+    }
+}
+
+if (-not $AllRows -or $AllRows.Count -eq 0) {
+    Write-Host "No rows collected from gflag API." -ForegroundColor Yellow
+    return
+}
+
+# =======================
+# 4) Export to CSV
+# =======================
+$reportdate = Get-Date -Format "yyyy-MM-dd_HHmm"
+
+$csvDir = "X:\PowerShell\Data\Cohesity\Alerts"
+if (-not (Test-Path $csvDir)) { New-Item -ItemType Directory -Path $csvDir | Out-Null }
+
+$excelFile = Join-Path $csvDir "All_Cluster_GFlags_$reportdate.csv"
+
+$csvRows = $AllRows | Select-Object `
+    Cluster,
+    ClusterId,
+    ServiceName,
+    FlagName,
+    @{n="FlagValue"; e={ To-CsvList $_.FlagValue }},
+    @{n="Reason"; e={ To-CsvList $_.Reason }},
+    Date
+
+$csvRows |
+    Sort-Object Cluster, ServiceName, FlagName |
+    Export-Csv -Path $excelFile -NoTypeInformation -Encoding UTF8
+
+Write-Host ""
+Write-Host "Saved CSV report at: $excelFile" -ForegroundColor Green
