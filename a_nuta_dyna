@@ -4,9 +4,9 @@ export default async function () {
   const baseUrl = "https://helios.cohesity.com";
 
   // ==============================
-  // CONFIG
+  // CONFIG (AHV / Acropolis)
   // ==============================
-  const ENV = "kHyperV";              // change to kAcropolis for AHV
+  const ENV = "kAcropolis";
   const TREND_DAYS = 7;               // show last 7 ET days (today inclusive)
   const ACTIVE_SCOPE_HOURS = 48;      // "Today" snapshot = latest COMPLETED run within last 48h
   const RUNS_LOOKBACK = 250;          // per-PG runs to pull (avoid time-window edge cases)
@@ -132,7 +132,7 @@ export default async function () {
   }
 
   // ------------------------------
-  // Cohesity run parsing (v2 shape used in your PS)
+  // Cohesity run parsing (v2 shapes)
   // ------------------------------
   function lbi0(run) {
     const lb = arr(run && run.localBackupInfo);
@@ -163,7 +163,6 @@ export default async function () {
     const s = runStatus(run).toLowerCase();
     const end = Number(runEndUsecs(run) || 0);
     if (!end || !Number.isFinite(end)) return false;
-    // treat "Running" as not completed; everything else is a completed snapshot we can evidence
     if (s === "running") return false;
     return true;
   }
@@ -198,7 +197,7 @@ export default async function () {
   }
 
   // ==============================
-  // 3) Build ET day keys (last 7 days incl today)
+  // 3) Build ET day keys
   // ==============================
   const asOfEt = nowEtString();
   const now = new Date();
@@ -227,19 +226,13 @@ export default async function () {
   const clusters = arr(cluData && cluData.cohesityClusters);
 
   if (!clusters.length) {
-    return {
-      authMode,
-      totalClusters: 0,
-      markdownEmail: "⚠️ No clusters returned from Helios.",
-      errors
-    };
+    return { authMode, totalClusters: 0, markdownEmail: "⚠️ No clusters returned from Helios.", errors };
   }
 
   // ==============================
   // 5) GET-only API helpers (NO POST)
   // ==============================
   async function fetchPGs(clusterHeaders, clusterMeta) {
-    // IMPORTANT: JS must use query params. PowerShell used GET with body which is not reliable in JS.
     const url =
       `${baseUrl}/v2/data-protect/protection-groups` +
       `?environments=${encodeURIComponent(ENV)}` +
@@ -250,7 +243,6 @@ export default async function () {
   }
 
   async function fetchRuns(clusterHeaders, pgId, meta) {
-    // Pull enough history then filter by endTimeUsecs + ET day key (avoids missing “first day”)
     const url =
       `${baseUrl}/v2/data-protect/protection-groups/${encodeURIComponent(pgId)}/runs` +
       `?numRuns=${encodeURIComponent(String(RUNS_LOOKBACK))}` +
@@ -261,7 +253,6 @@ export default async function () {
   }
 
   async function fetchObjectsForRun(clusterHeaders, pgId, runId, meta) {
-    // GET-only fallback when runs[] does not embed objects
     const url =
       `${baseUrl}/v2/data-protect/protection-groups/${encodeURIComponent(pgId)}` +
       `/runs/${encodeURIComponent(runId)}/objects?includeDetails=true`;
@@ -286,16 +277,11 @@ export default async function () {
   }
 
   // ==============================
-  // 6) Compute (management-friendly)
-  //    - No PG "NEW"
-  //    - Day cells are deltas vs previous available snapshot
-  //    - Missing day snapshot => "No run"
-  //    - 0 => no add/remove between snapshots
-  //    - Today counts are from Active Scope snapshot (48h) per PG
+  // 6) Compute
   // ==============================
   const clusterAgg = {};      // cluster -> { activePGs,totalVMs,added,removed,net }
-  const pgRows = [];          // section 2
-  const issuesRows = [];      // section 4 (failed VMs w/ message)
+  const pgRows = [];
+  const issuesRows = [];
 
   const clustersSorted = clusters
     .map((c) => ({
@@ -326,7 +312,6 @@ export default async function () {
       const runsRaw = await fetchRuns(clusterHeaders, pgId, { clusterName, clusterId, protectionGroup: pgName });
       if (!runsRaw.length) continue;
 
-      // Keep completed runs, with usable endTimeUsecs
       const runs = runsRaw
         .filter((r) => isCompletedRun(r))
         .map((r) => ({
@@ -341,16 +326,15 @@ export default async function () {
 
       if (!runs.length) continue;
 
-      // Build ET-day -> latest completed run
+      // ET-day -> latest completed run in trend window
       const dayToRun = {};
       for (let i = 0; i < runs.length; i++) {
-        // Filter to drift window by endUsecs (hard fence) but with enough lookback to fill day keys
         if (runs[i].endUsecs < trendStartUsecs || runs[i].endUsecs > trendEndUsecs) continue;
         const key = dateKeyET(new Date(Math.floor(runs[i].endUsecs / 1000)));
         if (!dayToRun[key] || runs[i].endUsecs > dayToRun[key].endUsecs) dayToRun[key] = runs[i];
       }
 
-      // Get per-day VM sets (unique VM names)
+      // Per-day VM sets
       const dayVmSets = {};
       for (let i = 0; i < etKeys.length; i++) dayVmSets[etKeys[i]] = null;
 
@@ -361,13 +345,9 @@ export default async function () {
 
         let objs = extractObjectsInline(pick.raw);
         if (!objs) {
-          // fallback GET to objects endpoint
           const runId = norm(pick.raw && (pick.raw.id || pick.raw.runId || pick.raw.protectionGroupRunId || pick.raw.instanceId));
-          if (runId) {
-            objs = await fetchObjectsForRun(clusterHeaders, pgId, runId, { clusterName, clusterId, protectionGroup: pgName });
-          } else {
-            objs = [];
-          }
+          if (runId) objs = await fetchObjectsForRun(clusterHeaders, pgId, runId, { clusterName, clusterId, protectionGroup: pgName });
+          else objs = [];
         }
 
         const vmSet = new Set();
@@ -379,25 +359,21 @@ export default async function () {
         dayVmSets[k] = vmSet;
       }
 
-      // Active Scope snapshot: latest completed run within last 48h (by endUsecs)
+      // Active Scope snapshot: latest completed run within last 48h
       let activeRun = null;
       for (let i = 0; i < runs.length; i++) {
         if (runs[i].endUsecs >= activeScopeStartUsecs) { activeRun = runs[i]; break; }
       }
-      if (!activeRun) continue; // PG not in “today” scope
+      if (!activeRun) continue;
 
-      // Load activeRun objects (prefer inline; else fallback)
       let activeObjs = extractObjectsInline(activeRun.raw);
       if (!activeObjs) {
         const runId = norm(activeRun.raw && (activeRun.raw.id || activeRun.raw.runId || activeRun.raw.protectionGroupRunId || activeRun.raw.instanceId));
-        if (runId) {
-          activeObjs = await fetchObjectsForRun(clusterHeaders, pgId, runId, { clusterName, clusterId, protectionGroup: pgName });
-        } else {
-          activeObjs = [];
-        }
+        if (runId) activeObjs = await fetchObjectsForRun(clusterHeaders, pgId, runId, { clusterName, clusterId, protectionGroup: pgName });
+        else activeObjs = [];
       }
 
-      // Today counts MUST be from ALL VM objects (not just failed ones)
+      // Today counts from ALL VM objects
       const todayVmSet = new Set();
       let todayFailed = 0;
 
@@ -411,22 +387,16 @@ export default async function () {
         const fa = failedAttempts(o);
         if (fa.length) {
           todayFailed += 1;
-
           const msgs = failureMessages(o);
           const msg = msgs.length ? msgs[0] : "Failed (no failedAttempts message)";
-          issuesRows.push({
-            Cluster: clusterName,
-            ProtectionGroup: pgName,
-            VMName: name,
-            FailedMessage: msg
-          });
+          issuesRows.push({ Cluster: clusterName, ProtectionGroup: pgName, VMName: name, FailedMessage: msg });
         }
       }
 
       const todayTotal = todayVmSet.size;
       const todaySuccess = Math.max(0, todayTotal - todayFailed);
 
-      // Per-day delta cells (vs previous available snapshot)
+      // Day delta cells (vs previous available snapshot)
       const dayCells = {};
       let prevSet = null;
 
@@ -440,7 +410,6 @@ export default async function () {
         }
 
         if (prevSet === null) {
-          // First available snapshot in the 7-day display window: show 0 (no baseline inference)
           dayCells[k] = "0";
           prevSet = curSet;
           continue;
@@ -458,7 +427,7 @@ export default async function () {
         prevSet = curSet;
       }
 
-      // PG drift for summary: compare first available snapshot vs last available snapshot (within 7-day window)
+      // Added/Removed/Net for summary: first vs last available snapshot in 7-day display
       let firstSnap = null;
       let lastSnap = null;
 
@@ -478,7 +447,7 @@ export default async function () {
         pgNet = lastSnap.size - firstSnap.size;
       }
 
-      // Update cluster aggregates
+      // Cluster aggregates
       clusterAgg[clusterName].activePGs += 1;
       clusterAgg[clusterName].totalVMs += todayTotal;
       clusterAgg[clusterName].added += pgAdded;
@@ -545,9 +514,7 @@ export default async function () {
     "Net(7d)": gNetStr
   });
 
-  const s2Headers = ["Cluster", "ProtectionGroup", "VMsToday", "SuccessfulToday", "FailedToday"]
-    .concat(dayLabels);
-
+  const s2Headers = ["Cluster", "ProtectionGroup", "VMsToday", "SuccessfulToday", "FailedToday"].concat(dayLabels);
   const s2Rows = pgRows
     .sort((a, b) => a.Cluster.localeCompare(b.Cluster) || a.ProtectionGroup.localeCompare(b.ProtectionGroup))
     .map((r) => {
@@ -562,8 +529,8 @@ export default async function () {
       return o;
     });
 
-  const s4Headers = ["Cluster", "ProtectionGroup", "VMName", "FailedMessage"];
-  const s4Rows = issuesRows
+  const s3Headers = ["Cluster", "ProtectionGroup", "VMName", "FailedMessage"];
+  const s3Rows = issuesRows
     .slice(0, EMAIL_ISSUES_CAP)
     .map((r) => ({
       Cluster: r.Cluster,
@@ -588,7 +555,7 @@ export default async function () {
     mdTable(s2Headers, s2Rows),
     "",
     "## 3) Failed VMs (from Today snapshots)",
-    (s4Rows.length ? mdTable(s4Headers, s4Rows) : "No failed VMs detected in the Active Scope snapshots."),
+    (s3Rows.length ? mdTable(s3Headers, s3Rows) : "No failed VMs detected in the Active Scope snapshots."),
     "",
     "_Notes:_",
     "- _VM counts are computed from **all VM objects** in the selected snapshot (not from failures only)._",
@@ -605,11 +572,7 @@ export default async function () {
     dayLabels,
     markdownEmail,
     markdownTable: markdownEmail,
-    rows: {
-      section1: s1Rows,
-      section2: s2Rows,
-      section3_failedVMs: s4Rows
-    },
+    rows: { section1: s1Rows, section2: s2Rows, failedVMs: s3Rows },
     errors
   };
 }
