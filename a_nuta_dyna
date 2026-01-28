@@ -3,18 +3,17 @@ import { credentialVaultClient } from "@dynatrace-sdk/client-classic-environment
 export default async function () {
   const baseUrl = "https://helios.cohesity.com";
 
-  // ==============================
-  // CONFIG (AHV / Acropolis)
-  // ==============================
-  const ENV = "kAcropolis";
-  const TREND_DAYS = 7;               // show last 7 ET days (today inclusive)
-  const ACTIVE_SCOPE_HOURS = 48;      // "Today" snapshot = latest COMPLETED run within last 48h
-  const RUNS_LOOKBACK = 250;          // per-PG runs to pull (avoid time-window edge cases)
-  const EMAIL_ISSUES_CAP = 300;
+  // ==========================================================
+  // CONFIG (management-friendly)
+  // ==========================================================
+  const TREND_DAYS = 7;               // display last 7 ET days
+  const ACTIVE_SCOPE_HOURS = 48;      // "Today" uses latest completed snapshot within last 48h (per Active PG)
+  const RUNS_TO_PULL = 60;            // enough to cover 7/14/35/6mo schedules
+  const EMAIL_ISSUES_CAP = 200;       // cap issues rows
 
-  // ==============================
-  // 1) Auth (vault name -> id -> manual)
-  // ==============================
+  // ==========================================================
+  // 1) AUTH (vault name -> vault id -> manual)
+  // ==========================================================
   const vaultName = "Cohesity_API_Key";
   const vaultId = "credentials_vault-312312";
 
@@ -49,24 +48,20 @@ export default async function () {
 
   if (!apiKey) throw new Error("No Helios API key available.");
 
-  // ==============================
-  // 2) Helpers
-  // ==============================
-  const errors = [];
-
+  // ==========================================================
+  // 2) HELPERS (ET time, parsing, HTTP)
+  // ==========================================================
   function norm(v) {
     if (v === null || v === undefined) return "";
     return String(v).trim();
   }
-
-  function arr(v) {
+  function toArrayMaybe(v) {
     if (!v) return [];
     return Array.isArray(v) ? v : [v];
   }
-
   function safeCell(v) {
     if (v === null || v === undefined) return "";
-    return String(v).replace(/\|/g, " ").replace(/\r?\n/g, " ").trim();
+    return String(v).replace(/\|/g, " ");
   }
 
   function nowEtString() {
@@ -110,95 +105,109 @@ export default async function () {
     return String(Math.floor(d.getTime() * 1000)); // ms -> usecs
   }
 
-  async function getJson(url, headers, meta) {
+  function usecsToEtString(usecs) {
+    if (!usecs) return "";
+    const ms = Math.floor(Number(usecs) / 1000);
+    if (!Number.isFinite(ms)) return "";
+    return new Date(ms).toLocaleString("en-US", { timeZone: "America/New_York" });
+  }
+
+  async function getJson(url, headers) {
     const resp = await fetch(url, { method: "GET", headers });
     if (!resp.ok) {
       let txt = "";
       try { txt = await resp.text(); } catch (_) {}
-      errors.push({
-        scope: meta?.scope || "api",
-        clusterName: meta?.clusterName,
-        clusterId: meta?.clusterId,
-        protectionGroup: meta?.protectionGroup,
-        protectionGroupId: meta?.protectionGroupId,
-        runId: meta?.runId,
-        httpStatus: resp.status,
-        url,
-        body: txt
-      });
-      return null;
+      const err = new Error(`GET ${url} -> HTTP ${resp.status} ${txt}`);
+      err.httpStatus = resp.status;
+      err.bodyText = txt;
+      err.url = url;
+      throw err;
     }
     return resp.json();
   }
 
-  // ------------------------------
-  // Cohesity run parsing (v2 shapes)
-  // ------------------------------
+  async function getJsonSafe(url, headers) {
+    try {
+      const data = await getJson(url, headers);
+      return { ok: true, data, status: 200, bodyText: "", url };
+    } catch (e) {
+      return {
+        ok: false,
+        data: null,
+        status: e && e.httpStatus ? e.httpStatus : 0,
+        bodyText: e && e.bodyText ? e.bodyText : String(e || ""),
+        url: e && e.url ? e.url : url
+      };
+    }
+  }
+
+  // ---- Run schema aligned to your working PowerShell (localBackupInfo[0]) ----
   function lbi0(run) {
-    const lb = arr(run && run.localBackupInfo);
-    return lb.length ? lb[0] : null;
+    const v = run && run.localBackupInfo;
+    if (!v) return null;
+    return Array.isArray(v) ? (v[0] || null) : v;
   }
-
-  function runStatus(run) {
-    const i = lbi0(run);
-    return norm(i && i.status) || norm(run && run.status) || norm(run && run.runStatus);
+  function pickRunEndUsecs(run) {
+    const l = lbi0(run);
+    return norm(l && l.endTimeUsecs) || norm(run && run.endTimeUsecs) || "";
   }
-
-  function runType(run) {
-    const i = lbi0(run);
-    return norm(i && i.runType) || norm(run && run.runType);
+  function pickRunStatus(run) {
+    const l = lbi0(run);
+    return norm(l && l.status) || norm(run && run.status) || norm(run && run.runStatus) || "";
   }
-
-  function runEndUsecs(run) {
-    const i = lbi0(run);
-    return norm(i && i.endTimeUsecs) || norm(run && run.endTimeUsecs) || "";
+  function isRunFinished(run) {
+    const x = pickRunStatus(run).toLowerCase();
+    return x && x !== "running" && x !== "krunning";
   }
-
-  function runStartUsecs(run) {
-    const i = lbi0(run);
-    return norm(i && i.startTimeUsecs) || norm(run && run.startTimeUsecs) || "";
-  }
-
-  function isCompletedRun(run) {
-    const s = runStatus(run).toLowerCase();
-    const end = Number(runEndUsecs(run) || 0);
-    if (!end || !Number.isFinite(end)) return false;
-    if (s === "running") return false;
-    return true;
-  }
-
-  function isVmObject(obj) {
-    const o = obj && obj.object;
+  function isRunOK(run) {
+    const x = pickRunStatus(run).toLowerCase();
     return (
-      norm(o && o.environment) === ENV &&
-      norm(o && o.objectType) === "kVirtualMachine" &&
-      !!norm(o && o.name)
+      x === "ksuccess" || x === "success" || x === "succeeded" ||
+      x === "succeededwithwarning" || x === "kwarning" || x === "warning"
     );
   }
-
-  function vmName(obj) {
-    return norm(obj && obj.object && obj.object.name);
+  function pickRunId(run) {
+    return norm(run && run.runId) || norm(run && run.id) || norm(run && run.instanceId) || "";
   }
 
+  // ---- Object schema aligned to your PowerShell evidence ----
+  function extractObjectsFromRun(runRaw) {
+    return toArrayMaybe(runRaw && runRaw.objects); // requires includeObjectDetails=true
+  }
+  function isAhvVm(obj) {
+    const env = norm(obj && obj.object && obj.object.environment);
+    const typ = norm(obj && obj.object && obj.object.objectType);
+    return (env === "kAcropolis" && typ === "kVirtualMachine");
+  }
+  function extractVmName(obj) {
+    return norm(obj && obj.object && obj.object.name) || "";
+  }
   function failedAttempts(obj) {
-    const fa = obj && obj.localSnapshotInfo && obj.localSnapshotInfo.failedAttempts;
-    return arr(fa);
+    return toArrayMaybe(obj && obj.localSnapshotInfo && obj.localSnapshotInfo.failedAttempts);
   }
+  function objectErrorBestEffort(obj) {
+    // Best-effort: different tenants expose different fields.
+    // We prefer explicit error strings if present; else show failedAttempts count.
+    const candidates = [
+      norm(obj && obj.localSnapshotInfo && obj.localSnapshotInfo.error),
+      norm(obj && obj.localSnapshotInfo && obj.localSnapshotInfo.errorMessage),
+      norm(obj && obj.localSnapshotInfo && obj.localSnapshotInfo.failureReason),
+      norm(obj && obj.localSnapshotInfo && obj.localSnapshotInfo.reason),
+      norm(obj && obj.failureReason),
+      norm(obj && obj.errorMessage),
+      norm(obj && obj.error)
+    ].filter(Boolean);
 
-  function failureMessages(obj) {
+    if (candidates.length) return candidates[0];
+
     const fa = failedAttempts(obj);
-    if (!fa.length) return [];
-    const out = [];
-    for (let i = 0; i < fa.length; i++) {
-      const m = norm(fa[i] && fa[i].message);
-      if (m) out.push(m);
-    }
-    return out;
+    if (fa.length) return `failedAttempts=${fa.length}`;
+    return "";
   }
 
-  // ==============================
-  // 3) Build ET day keys
-  // ==============================
+  // ==========================================================
+  // 3) BUILD ET DAY KEYS (last 7 days incl today)
+  // ==========================================================
   const asOfEt = nowEtString();
   const now = new Date();
 
@@ -209,267 +218,305 @@ export default async function () {
   }
   const dayLabels = etKeys.map(dayLabelFromETKey);
 
-  const trendStart = new Date(now.getTime() - TREND_DAYS * 24 * 60 * 60 * 1000);
-  const trendStartUsecs = Number(usecsFromDate(trendStart));
-  const trendEndUsecs = Number(usecsFromDate(now));
-
   const activeScopeStart = new Date(now.getTime() - ACTIVE_SCOPE_HOURS * 60 * 60 * 1000);
-  const activeScopeStartUsecs = Number(usecsFromDate(activeScopeStart));
+  const activeScopeStartUsecs = usecsFromDate(activeScopeStart);
 
-  // ==============================
-  // 4) Clusters
-  // ==============================
+  // ==========================================================
+  // 4) GET CLUSTERS
+  // ==========================================================
+  const errors = [];
   const commonHeaders = { accept: "application/json", apiKey };
 
-  const cluUrl = `${baseUrl}/v2/mcm/cluster-mgmt/info`;
-  const cluData = await getJson(cluUrl, commonHeaders, { scope: "clusters" });
-  const clusters = arr(cluData && cluData.cohesityClusters);
+  const cluUrl = baseUrl + "/v2/mcm/cluster-mgmt/info";
+  const cluResp = await getJsonSafe(cluUrl, commonHeaders);
+  const clusters = toArrayMaybe(cluResp.ok && cluResp.data && cluResp.data.cohesityClusters);
 
-  if (!clusters.length) {
-    return { authMode, totalClusters: 0, markdownEmail: "⚠️ No clusters returned from Helios.", errors };
+  if (!cluResp.ok || !clusters.length) {
+    return {
+      authMode,
+      totalClusters: 0,
+      markdownEmail: "⚠️ No clusters returned from Helios or API call failed.",
+      errors: cluResp.ok ? [] : [{ scope: "clusters", httpStatus: cluResp.status, url: cluResp.url, body: cluResp.bodyText }]
+    };
   }
 
-  // ==============================
-  // 5) GET-only API helpers (NO POST)
-  // ==============================
-  async function fetchPGs(clusterHeaders, clusterMeta) {
-    const url =
-      `${baseUrl}/v2/data-protect/protection-groups` +
-      `?environments=${encodeURIComponent(ENV)}` +
-      `&isDeleted=false&isPaused=false&isActive=true`;
+  // ==========================================================
+  // 5) API HELPERS
+  // ==========================================================
+  async function fetchAllAHVActivePGs(clusterId) {
+    const headers = { accept: "application/json", apiKey, accessClusterId: clusterId };
 
-    const d = await getJson(url, clusterHeaders, { ...clusterMeta, scope: "protection-groups" });
-    return arr(d && d.protectionGroups);
-  }
+    const pgs = [];
+    let pageToken = "";
+    let safety = 0;
 
-  async function fetchRuns(clusterHeaders, pgId, meta) {
-    const url =
-      `${baseUrl}/v2/data-protect/protection-groups/${encodeURIComponent(pgId)}/runs` +
-      `?numRuns=${encodeURIComponent(String(RUNS_LOOKBACK))}` +
-      `&excludeNonRestorableRuns=false&includeObjectDetails=true`;
+    while (safety < 200) {
+      safety++;
+      let url = baseUrl + "/v2/data-protect/protection-groups?environments=kAcropolis&isDeleted=false&isActive=true&isPaused=false";
+      if (pageToken) url += "&pageToken=" + encodeURIComponent(pageToken);
 
-    const d = await getJson(url, clusterHeaders, { ...meta, scope: "pg-runs", protectionGroupId: pgId });
-    return arr(d && d.runs);
-  }
+      const resp = await getJsonSafe(url, headers);
+      if (!resp.ok) return { ok: false, pgs: [], err: resp };
 
-  async function fetchObjectsForRun(clusterHeaders, pgId, runId, meta) {
-    const url =
-      `${baseUrl}/v2/data-protect/protection-groups/${encodeURIComponent(pgId)}` +
-      `/runs/${encodeURIComponent(runId)}/objects?includeDetails=true`;
+      const data = resp.data || {};
+      const batch = toArrayMaybe(data.protectionGroups);
+      for (let i = 0; i < batch.length; i++) pgs.push(batch[i]);
 
-    const d = await getJson(url, clusterHeaders, { ...meta, scope: "run-objects", protectionGroupId: pgId, runId });
-    const objs =
-      arr(d && d.objects).length ? arr(d.objects) :
-      arr(d && d.runObjects).length ? arr(d.runObjects) :
-      arr(d && d.objectRuns).length ? arr(d.objectRuns) :
-      arr(d && d.protectedObjects).length ? arr(d.protectedObjects) :
-      [];
-    return objs;
-  }
+      const next =
+        norm(data.nextPageToken) ||
+        norm(data.pageToken) ||
+        norm(data.nextToken) ||
+        norm(data.pagination && (data.pagination.nextPageToken || data.pagination.nextToken));
 
-  function extractObjectsInline(run) {
-    const o =
-      arr(run && run.objects).length ? arr(run.objects) :
-      arr(run && run.runObjects).length ? arr(run.runObjects) :
-      arr(run && run.objectRuns).length ? arr(run.objectRuns) :
-      [];
-    return o.length ? o : null;
-  }
-
-  // ==============================
-  // 6) Compute
-  // ==============================
-  const clusterAgg = {};      // cluster -> { activePGs,totalVMs,added,removed,net }
-  const pgRows = [];
-  const issuesRows = [];
-
-  const clustersSorted = clusters
-    .map((c) => ({
-      clusterId: norm(c.clusterId),
-      clusterName: norm(c.name) || norm(c.clusterName) || norm(c.displayName) || `Unknown-${norm(c.clusterId)}`
-    }))
-    .filter((c) => c.clusterId)
-    .sort((a, b) => a.clusterName.localeCompare(b.clusterName));
-
-  for (let ci = 0; ci < clustersSorted.length; ci++) {
-    const { clusterId, clusterName } = clustersSorted[ci];
-
-    const clusterHeaders = { accept: "application/json", apiKey, accessClusterId: clusterId };
-
-    if (!clusterAgg[clusterName]) {
-      clusterAgg[clusterName] = { activePGs: 0, totalVMs: 0, added: 0, removed: 0, net: 0 };
+      if (!next || next === pageToken) break;
+      pageToken = next;
     }
 
-    const pgs = await fetchPGs(clusterHeaders, { clusterName, clusterId });
-    if (!pgs.length) continue;
+    return { ok: true, pgs, err: null };
+  }
 
-    for (let pi = 0; pi < pgs.length; pi++) {
-      const pg = pgs[pi] || {};
+  async function fetchRunsWithObjects(clusterHeaders, pgId, numRuns) {
+    const id = encodeURIComponent(pgId);
+    const url = `${baseUrl}/v2/data-protect/protection-groups/${id}/runs?numRuns=${encodeURIComponent(String(numRuns))}&includeObjectDetails=true`;
+    const r = await getJsonSafe(url, clusterHeaders);
+    if (!r.ok) return { ok: false, runs: [], err: r, usedUrl: url };
+    const d = r.data || {};
+    return { ok: true, runs: toArrayMaybe(d.runs), usedUrl: url };
+  }
+
+  // ==========================================================
+  // 6) COMPUTE DRIFT + TABLES
+  // Facts:
+  // - “–” means: No completed snapshot for that ET day (No Run / No Evidence)
+  // - First snapshot day in-window is “0” (baseline established), not “–”
+  // - Section 3 removed (you said not needed)
+  // ==========================================================
+  const pgRows = [];
+  const issuesRows = [];
+  const clusterSummary = {}; // per cluster: Active_PGs, TotalVMs, Added7d, Removed7d, NetDrift7d
+
+  let grandTotalVMsActiveScope = 0;
+  let totalActivePGs = 0;
+  let globalLatestInventoryUsecs = 0;
+
+  for (let c = 0; c < clusters.length; c++) {
+    const cl = clusters[c] || {};
+    const clusterName = norm(cl.clusterName) || `Cluster-${c + 1}`;
+    const clusterId = norm(cl.clusterId);
+    if (!clusterId) continue;
+
+    const headers = { accept: "application/json", apiKey, accessClusterId: clusterId };
+
+    const pgRes = await fetchAllAHVActivePGs(clusterId);
+    if (!pgRes.ok) {
+      errors.push({
+        scope: "protection-groups",
+        clusterName,
+        clusterId,
+        httpStatus: pgRes.err.status,
+        url: pgRes.err.url,
+        body: pgRes.err.bodyText
+      });
+      continue;
+    }
+
+    if (!clusterSummary[clusterName]) {
+      clusterSummary[clusterName] = { Active_PGs: 0, TotalVMs: 0, Added7d: 0, Removed7d: 0, NetDrift7d: 0 };
+    }
+
+    const pgs = toArrayMaybe(pgRes.pgs);
+
+    for (let p = 0; p < pgs.length; p++) {
+      const pg = pgs[p] || {};
       const pgName = norm(pg.name);
-      const pgId = norm(pg.id) || norm(pg.protectionGroupId) || norm(pg.groupId);
-      if (!pgName || !pgId) continue;
+      if (!pgName) continue;
 
-      const runsRaw = await fetchRuns(clusterHeaders, pgId, { clusterName, clusterId, protectionGroup: pgName });
-      if (!runsRaw.length) continue;
+      const pgId = norm(pg.id) || norm(pg.protectionGroupId) || norm(pg.groupId) || norm(pg.protectionJobId);
+      if (!pgId) continue;
 
-      const runs = runsRaw
-        .filter((r) => isCompletedRun(r))
-        .map((r) => ({
-          raw: r,
-          endUsecs: Number(runEndUsecs(r)),
-          startUsecs: Number(runStartUsecs(r)),
-          status: runStatus(r),
-          runType: runType(r)
-        }))
-        .filter((x) => Number.isFinite(x.endUsecs) && x.endUsecs > 0)
-        .sort((a, b) => b.endUsecs - a.endUsecs);
-
-      if (!runs.length) continue;
-
-      // ET-day -> latest completed run in trend window
-      const dayToRun = {};
-      for (let i = 0; i < runs.length; i++) {
-        if (runs[i].endUsecs < trendStartUsecs || runs[i].endUsecs > trendEndUsecs) continue;
-        const key = dateKeyET(new Date(Math.floor(runs[i].endUsecs / 1000)));
-        if (!dayToRun[key] || runs[i].endUsecs > dayToRun[key].endUsecs) dayToRun[key] = runs[i];
+      const runRes = await fetchRunsWithObjects(headers, pgId, RUNS_TO_PULL);
+      if (!runRes.ok) {
+        errors.push({
+          scope: "pg-runs",
+          clusterName,
+          clusterId,
+          protectionGroup: pgName,
+          protectionGroupId: pgId,
+          httpStatus: runRes.err.status,
+          url: runRes.err.url || runRes.usedUrl,
+          body: runRes.err.bodyText
+        });
+        continue;
       }
 
-      // Per-day VM sets
+      const finishedRuns = runRes.runs
+        .map((r) => ({
+          raw: r,
+          runId: pickRunId(r),
+          endUsecs: pickRunEndUsecs(r),
+          finished: isRunFinished(r),
+          ok: isRunOK(r),
+          statusRaw: pickRunStatus(r),
+          objects: extractObjectsFromRun(r)
+        }))
+        .filter((x) => x.runId && x.endUsecs && x.finished && x.objects && x.objects.length)
+        .sort((a, b) => Number(b.endUsecs) - Number(a.endUsecs));
+
+      if (!finishedRuns.length) continue;
+
+      // Map ET day -> latest completed run for that ET day
+      const dayToRun = {};
+      for (let i = 0; i < finishedRuns.length; i++) {
+        const endMs = Math.floor(Number(finishedRuns[i].endUsecs) / 1000);
+        if (!Number.isFinite(endMs)) continue;
+        const key = dateKeyET(new Date(endMs));
+        if (!dayToRun[key] || Number(finishedRuns[i].endUsecs) > Number(dayToRun[key].endUsecs)) {
+          dayToRun[key] = finishedRuns[i];
+        }
+      }
+
+      // Build day -> VM set (null means truly "No Run")
       const dayVmSets = {};
       for (let i = 0; i < etKeys.length; i++) dayVmSets[etKeys[i]] = null;
 
-      for (let di = 0; di < etKeys.length; di++) {
-        const k = etKeys[di];
-        const pick = dayToRun[k];
-        if (!pick) continue;
+      for (let i = 0; i < etKeys.length; i++) {
+        const k = etKeys[i];
+        const sel = dayToRun[k];
+        if (!sel) continue;
 
-        let objs = extractObjectsInline(pick.raw);
-        if (!objs) {
-          const runId = norm(pick.raw && (pick.raw.id || pick.raw.runId || pick.raw.protectionGroupRunId || pick.raw.instanceId));
-          if (runId) objs = await fetchObjectsForRun(clusterHeaders, pgId, runId, { clusterName, clusterId, protectionGroup: pgName });
-          else objs = [];
+        const set = new Set();
+        const objs = sel.objects;
+        for (let o = 0; o < objs.length; o++) {
+          if (!isAhvVm(objs[o])) continue;
+          const nm = extractVmName(objs[o]);
+          if (nm) set.add(nm);
         }
+        dayVmSets[k] = set;
+      }
 
-        const vmSet = new Set();
-        for (let oi = 0; oi < objs.length; oi++) {
-          const o = objs[oi];
-          if (!isVmObject(o)) continue;
-          vmSet.add(vmName(o));
+      // Active Scope snapshot = latest completed run ending within last ACTIVE_SCOPE_HOURS
+      let activeScopeRun = null;
+      for (let i = 0; i < finishedRuns.length; i++) {
+        if (Number(finishedRuns[i].endUsecs) >= Number(activeScopeStartUsecs)) {
+          activeScopeRun = finishedRuns[i];
+          break;
         }
-        dayVmSets[k] = vmSet;
       }
+      if (!activeScopeRun) continue; // no evidence-backed "today" for this PG
 
-      // Active Scope snapshot: latest completed run within last 48h
-      let activeRun = null;
-      for (let i = 0; i < runs.length; i++) {
-        if (runs[i].endUsecs >= activeScopeStartUsecs) { activeRun = runs[i]; break; }
-      }
-      if (!activeRun) continue;
+      // VMs Today (Active Scope)
+      const activeSet = new Set();
+      const activeObjs = activeScopeRun.objects;
 
-      let activeObjs = extractObjectsInline(activeRun.raw);
-      if (!activeObjs) {
-        const runId = norm(activeRun.raw && (activeRun.raw.id || activeRun.raw.runId || activeRun.raw.protectionGroupRunId || activeRun.raw.instanceId));
-        if (runId) activeObjs = await fetchObjectsForRun(clusterHeaders, pgId, runId, { clusterName, clusterId, protectionGroup: pgName });
-        else activeObjs = [];
-      }
+      let objFailCount = 0;
+      for (let o = 0; o < activeObjs.length; o++) {
+        if (!isAhvVm(activeObjs[o])) continue;
+        const nm = extractVmName(activeObjs[o]);
+        if (nm) activeSet.add(nm);
 
-      // Today counts from ALL VM objects
-      const todayVmSet = new Set();
-      let todayFailed = 0;
-
-      for (let oi = 0; oi < activeObjs.length; oi++) {
-        const o = activeObjs[oi];
-        if (!isVmObject(o)) continue;
-
-        const name = vmName(o);
-        todayVmSet.add(name);
-
-        const fa = failedAttempts(o);
-        if (fa.length) {
-          todayFailed += 1;
-          const msgs = failureMessages(o);
-          const msg = msgs.length ? msgs[0] : "Failed (no failedAttempts message)";
-          issuesRows.push({ Cluster: clusterName, ProtectionGroup: pgName, VMName: name, FailedMessage: msg });
+        const fa = failedAttempts(activeObjs[o]);
+        if (fa.length > 0) {
+          objFailCount++;
+          issuesRows.push({
+            Cluster: clusterName,
+            ProtectionGroup: pgName,
+            VMName: nm,
+            IssueType: "Failed",
+            Notes: objectErrorBestEffort(activeObjs[o]) || "Failed attempt(s) observed in completed snapshot"
+          });
         }
       }
 
-      const todayTotal = todayVmSet.size;
-      const todaySuccess = Math.max(0, todayTotal - todayFailed);
+      const activeScopeVmCount = activeSet.size;
 
-      // Day delta cells (vs previous available snapshot)
-      const dayCells = {};
+      if (Number(activeScopeRun.endUsecs) > globalLatestInventoryUsecs) {
+        globalLatestInventoryUsecs = Number(activeScopeRun.endUsecs);
+      }
+
+      // Trend deltas:
+      // - “–” only when there is truly no completed snapshot for that ET day
+      // - First snapshot day in-window is “0” (baseline established)
+      const dayDelta = {};
+      for (let i = 0; i < etKeys.length; i++) dayDelta[etKeys[i]] = "–";
+
       let prevSet = null;
 
-      for (let di = 0; di < etKeys.length; di++) {
-        const k = etKeys[di];
-        const curSet = dayVmSets[k];
+      let pgAdds = 0;
+      let pgRems = 0;
 
-        if (curSet === null) {
-          dayCells[k] = "No run";
-          continue;
-        }
+      for (let i = 0; i < etKeys.length; i++) {
+        const k = etKeys[i];
+        const cur = dayVmSets[k];
+
+        if (cur === null) { dayDelta[k] = "–"; continue; }
 
         if (prevSet === null) {
-          dayCells[k] = "0";
-          prevSet = curSet;
+          dayDelta[k] = "0";   // baseline day (has snapshot), not “No Run”
+          prevSet = cur;
           continue;
         }
 
         let adds = 0, rems = 0;
-        for (const x of curSet) if (!prevSet.has(x)) adds++;
-        for (const x of prevSet) if (!curSet.has(x)) rems++;
+        for (const x of cur) if (!prevSet.has(x)) adds++;
+        for (const x of prevSet) if (!cur.has(x)) rems++;
 
-        if (adds === 0 && rems === 0) dayCells[k] = "0";
-        else if (adds > 0 && rems === 0) dayCells[k] = `🟢 +${adds}`;
-        else if (rems > 0 && adds === 0) dayCells[k] = `🔴 -${rems}`;
-        else dayCells[k] = `🟢 +${adds} / 🔴 -${rems}`;
+        pgAdds += adds;
+        pgRems += rems;
 
-        prevSet = curSet;
+        if (adds === 0 && rems === 0) dayDelta[k] = "0";
+        else if (adds > 0 && rems === 0) dayDelta[k] = `🟢 +${adds}`;
+        else if (rems > 0 && adds === 0) dayDelta[k] = `🔴 -${rems}`;
+        else dayDelta[k] = `🟢 +${adds} / 🔴 -${rems}`;
+
+        prevSet = cur;
       }
 
-      // Added/Removed/Net for summary: first vs last available snapshot in 7-day display
-      let firstSnap = null;
-      let lastSnap = null;
-
-      for (let di = 0; di < etKeys.length; di++) {
-        const k = etKeys[di];
-        if (dayVmSets[k] !== null) { firstSnap = dayVmSets[k]; break; }
-      }
-      for (let di = etKeys.length - 1; di >= 0; di--) {
-        const k = etKeys[di];
-        if (dayVmSets[k] !== null) { lastSnap = dayVmSets[k]; break; }
+      // last day with a computed delta/baseline
+      let lastKnownDelta = "–";
+      for (let i = etKeys.length - 1; i >= 0; i--) {
+        const k = etKeys[i];
+        if (dayDelta[k] !== "–") { lastKnownDelta = `${dayDelta[k]} (${k})`; break; }
       }
 
-      let pgAdded = 0, pgRemoved = 0, pgNet = 0;
-      if (firstSnap && lastSnap) {
-        for (const x of lastSnap) if (!firstSnap.has(x)) pgAdded++;
-        for (const x of firstSnap) if (!lastSnap.has(x)) pgRemoved++;
-        pgNet = lastSnap.size - firstSnap.size;
-      }
+      // Cluster summary accumulators (7-day adds/removes derived from day comparisons)
+      clusterSummary[clusterName].Added7d += pgAdds;
+      clusterSummary[clusterName].Removed7d += pgRems;
 
-      // Cluster aggregates
-      clusterAgg[clusterName].activePGs += 1;
-      clusterAgg[clusterName].totalVMs += todayTotal;
-      clusterAgg[clusterName].added += pgAdded;
-      clusterAgg[clusterName].removed += pgRemoved;
-      clusterAgg[clusterName].net += pgNet;
+      // Successful/Failed run label (management)
+      const runLabel = activeScopeRun.ok ? "Successful" : "Failed";
 
-      // Section 2 row
-      const row = {
+      // Add to cluster "Active scope today"
+      clusterSummary[clusterName].Active_PGs += 1;
+      clusterSummary[clusterName].TotalVMs += activeScopeVmCount;
+
+      totalActivePGs += 1;
+      grandTotalVMsActiveScope += activeScopeVmCount;
+
+      // PG row
+      const r = {
         Cluster: clusterName,
         ProtectionGroup: pgName,
-        VMsToday: String(todayTotal),
-        SuccessfulToday: String(todaySuccess),
-        FailedToday: String(todayFailed)
+        TotalVMsToday: String(activeScopeVmCount),
+        LastKnownDelta: lastKnownDelta,
+        PGState: "Active",
+        LastCompletedJob: runLabel
       };
-      for (let di = 0; di < etKeys.length; di++) row[dayLabels[di]] = dayCells[etKeys[di]];
-      pgRows.push(row);
+      for (let i = 0; i < etKeys.length; i++) r[dayLabels[i]] = dayDelta[etKeys[i]];
+      pgRows.push(r);
     }
   }
 
-  // ==============================
-  // 7) Markdown output
-  // ==============================
+  // Finalize per-cluster NetDrift7d as Added7d - Removed7d (factual, consistent)
+  const clusterNames = Object.keys(clusterSummary);
+  for (let i = 0; i < clusterNames.length; i++) {
+    const cn = clusterNames[i];
+    const s = clusterSummary[cn];
+    s.NetDrift7d = (s.Added7d - s.Removed7d);
+  }
+
+  // ==========================================================
+  // 7) MARKDOWN OUTPUT (email-ready)
+  // ==========================================================
   function mdTable(headers, rows) {
     const head = "| " + headers.join(" | ") + " |";
     const sep = "| " + headers.map(() => "---").join(" | ") + " |";
@@ -477,102 +524,120 @@ export default async function () {
     return [head, sep].concat(body).join("\n");
   }
 
-  const s1Headers = ["Cluster", "Active_PGs", "TotalVMsToday", "Added(7d)", "Removed(7d)", "Net(7d)"];
+  const clustersSorted = Object.keys(clusterSummary).sort();
+
+  let inventoryAsOfET = asOfEt;
+  if (globalLatestInventoryUsecs && Number.isFinite(globalLatestInventoryUsecs)) {
+    inventoryAsOfET = usecsToEtString(globalLatestInventoryUsecs) || asOfEt;
+  }
+
+  // Section 1 rows (Added/Removed/Net Drift)
   const s1Rows = [];
-  let gActive = 0, gTotal = 0, gAdd = 0, gRem = 0, gNet = 0;
+  let sumAdded = 0;
+  let sumRemoved = 0;
+  let sumNet = 0;
 
-  const clusterNames = Object.keys(clusterAgg).sort();
-  for (let i = 0; i < clusterNames.length; i++) {
-    const cn = clusterNames[i];
-    const x = clusterAgg[cn];
-    if (!x.activePGs) continue;
+  for (let i = 0; i < clustersSorted.length; i++) {
+    const cn = clustersSorted[i];
+    const s = clusterSummary[cn];
 
-    gActive += x.activePGs;
-    gTotal += x.totalVMs;
-    gAdd += x.added;
-    gRem += x.removed;
-    gNet += x.net;
+    sumAdded += s.Added7d;
+    sumRemoved += s.Removed7d;
+    sumNet += s.NetDrift7d;
 
-    const netStr = x.net > 0 ? `🟢 +${x.net}` : x.net < 0 ? `🔴 ${x.net}` : "0";
+    const netStr = (s.NetDrift7d > 0) ? `🟢 +${s.NetDrift7d}` : (s.NetDrift7d < 0) ? `🔴 ${s.NetDrift7d}` : "0";
+
     s1Rows.push({
       Cluster: cn,
-      Active_PGs: String(x.activePGs),
-      TotalVMsToday: String(x.totalVMs),
-      "Added(7d)": `+${x.added}`,
-      "Removed(7d)": `-${x.removed}`,
-      "Net(7d)": netStr
+      Active_PGs: String(s.Active_PGs),
+      TotalVMs: String(s.TotalVMs),
+      "Added (7d)": `+${s.Added7d}`,
+      "Removed (7d)": `-${s.Removed7d}`,
+      "Net Drift (7d)": netStr
     });
   }
 
-  const gNetStr = gNet > 0 ? `🟢 +${gNet}` : gNet < 0 ? `🔴 ${gNet}` : "0";
+  const sumNetStr = (sumNet > 0) ? `🟢 +${sumNet}` : (sumNet < 0) ? `🔴 ${sumNet}` : "0";
   s1Rows.push({
     Cluster: "⭐ TOTAL",
-    Active_PGs: String(gActive),
-    TotalVMsToday: String(gTotal),
-    "Added(7d)": `+${gAdd}`,
-    "Removed(7d)": `-${gRem}`,
-    "Net(7d)": gNetStr
+    Active_PGs: String(totalActivePGs),
+    TotalVMs: String(grandTotalVMsActiveScope),
+    "Added (7d)": `+${sumAdded}`,
+    "Removed (7d)": `-${sumRemoved}`,
+    "Net Drift (7d)": sumNetStr
   });
 
-  const s2Headers = ["Cluster", "ProtectionGroup", "VMsToday", "SuccessfulToday", "FailedToday"].concat(dayLabels);
+  // Section 2 headers + rows
+  const s2Headers = ["Cluster", "ProtectionGroup", "TotalVMsToday"]
+    .concat(dayLabels)
+    .concat(["LastKnownDelta", "PGState", "LastCompletedJob"]);
+
   const s2Rows = pgRows
-    .sort((a, b) => a.Cluster.localeCompare(b.Cluster) || a.ProtectionGroup.localeCompare(b.ProtectionGroup))
+    .sort((a, b) => (a.Cluster.localeCompare(b.Cluster) || a.ProtectionGroup.localeCompare(b.ProtectionGroup)))
     .map((r) => {
-      const o = {
-        Cluster: r.Cluster,
-        ProtectionGroup: r.ProtectionGroup,
-        VMsToday: r.VMsToday,
-        SuccessfulToday: r.SuccessfulToday,
-        FailedToday: r.FailedToday
-      };
-      for (let i = 0; i < dayLabels.length; i++) o[dayLabels[i]] = r[dayLabels[i]];
-      return o;
+      const out = { Cluster: r.Cluster, ProtectionGroup: r.ProtectionGroup, TotalVMsToday: r.TotalVMsToday };
+      for (let i = 0; i < dayLabels.length; i++) out[dayLabels[i]] = r[dayLabels[i]];
+      out.LastKnownDelta = r.LastKnownDelta;
+      out.PGState = r.PGState;
+      out.LastCompletedJob = r.LastCompletedJob;
+      return out;
     });
 
-  const s3Headers = ["Cluster", "ProtectionGroup", "VMName", "FailedMessage"];
-  const s3Rows = issuesRows
-    .slice(0, EMAIL_ISSUES_CAP)
+  const grandRow = { Cluster: "⭐ GRAND TOTAL", ProtectionGroup: "—", TotalVMsToday: String(grandTotalVMsActiveScope) };
+  for (let i = 0; i < dayLabels.length; i++) grandRow[dayLabels[i]] = "";
+  grandRow.LastKnownDelta = "";
+  grandRow.PGState = "";
+  grandRow.LastCompletedJob = "";
+  s2Rows.push(grandRow);
+
+  // Section 4 issues (with error detail in Notes)
+  const s4Headers = ["Cluster", "ProtectionGroup", "VMName", "IssueType", "Notes"];
+  const s4Rows = issuesRows
     .map((r) => ({
       Cluster: r.Cluster,
       ProtectionGroup: r.ProtectionGroup,
       VMName: r.VMName,
-      FailedMessage: r.FailedMessage
-    }));
+      IssueType: r.IssueType,
+      Notes: r.Notes
+    }))
+    .slice(0, EMAIL_ISSUES_CAP);
 
   const markdownEmail = [
-    `### Cohesity ${ENV} Inventory Drift (VM-level)`,
+    "### Cohesity AHV Inventory Drift — 7-Day (Retention-Aware)",
     "",
-    `**Inventory As Of (ET):** ${asOfEt}`,
-    `**Drift Window:** Last ${TREND_DAYS} days (ET display)`,
-    `**Evidence Source:** Completed backup snapshots only`,
-    `**Today Definition (Active Scope):** Latest completed run per PG within last ${ACTIVE_SCOPE_HOURS} hours`,
+    `**Inventory As Of (ET):** ${inventoryAsOfET}`,
+    `**Drift Window:** Last ${TREND_DAYS} days (ET)`,
+    "**Retention Context:** Policy-based (7 / 14 / 35 / 6mo; used for validation only)",
+    "**Evidence Source:** Completed backup jobs only",
     "",
-    "## 1) Active Scope (Today) — Management Summary",
-    mdTable(s1Headers, s1Rows),
+    "## 1) Active Scope (Today)",
+    mdTable(["Cluster", "Active_PGs", "TotalVMs", "Added (7d)", "Removed (7d)", "Net Drift (7d)"], s1Rows),
     "",
-    "## 2) Protection Group Drift (7-Day Display) + Today State",
-    "_Legend: 0 = no add/remove between snapshots | No run = no completed snapshot selected for that ET day_",
+    "## 2) Protection Group Drift (7-Day) + Current State",
+    "_Legend: 🟢 added | 🔴 removed | 0 baseline/no-change | – No Run (no completed snapshot that ET day)_",
     mdTable(s2Headers, s2Rows),
     "",
-    "## 3) Failed VMs (from Today snapshots)",
-    (s3Rows.length ? mdTable(s3Headers, s3Rows) : "No failed VMs detected in the Active Scope snapshots."),
+    "## 3) Virtual Machines With Observed Issues (Completed Snapshots Only)",
+    (s4Rows.length ? mdTable(s4Headers, s4Rows) : "No VM issues detected in completed snapshots within the report scope."),
     "",
-    "_Notes:_",
-    "- _VM counts are computed from **all VM objects** in the selected snapshot (not from failures only)._",
-    "- _Added/Removed/Net are computed by comparing the first vs last available completed snapshots **within the 7-day display window** (no baseline inference beyond the window)._"
+    "_Audit note: “–” is strictly No Run/No Evidence for that ET day. “0” means a completed snapshot exists (baseline or no-change)._"
   ].join("\n");
 
   return {
     authMode,
-    environment: ENV,
-    totalClusters: clustersSorted.length,
-    inventoryAsOfET: asOfEt,
+    totalClusters: clusters.length,
+    inventoryAsOfET: inventoryAsOfET,
     trendWindowDays: TREND_DAYS,
     activeScopeHours: ACTIVE_SCOPE_HOURS,
     dayLabels,
+    grandTotalVMsActiveScope,
     markdownEmail,
     markdownTable: markdownEmail,
-    rows: { section1: s1Rows, section2: s2Rows, failedVMs: s3Rows },
+    rows: {
+      section1: s1Rows,
+      section2: s2Rows,
+      section3: s4Rows // kept as section3 in JSON only to avoid breaking downstream; it is the Issues table
+    },
     errors
   };
 }
