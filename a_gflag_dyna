@@ -1,1 +1,231 @@
 
+import { credentialVaultClient } from "@dynatrace-sdk/client-classic-environment-v2";
+
+/**
+ * Cohesity Helios GFlags — Flat Table (Cluster | Service | GFlag | Value | Reason)
+ * - Pull clusters from /v2/mcm/cluster-mgmt/info
+ * - For each cluster: GET /v2/clusters/gflag with accessClusterId header
+ * - Flatten: serviceName + gflags[] -> rows
+ * - Truncate Value for email readability
+ */
+export default async function () {
+  const baseUrl = "https://helios.cohesity.com";
+
+  // ======================
+  // CONFIG
+  // ======================
+  const VALUE_MAX_LEN = 120;
+  const MAX_ROWS = 5000; // safety for email/workflow size
+
+  // ==============================
+  // 1) Auth (vault name -> id -> manual)
+  // ==============================
+  const vaultName = "Cohesity_API_Key";
+  const vaultId = "credentials_vault-312312";
+
+  let apiKey = null;
+  let authMode = "vault-name";
+
+  async function getKeyByName(name) {
+    const all = await credentialVaultClient.getCredentials();
+    const creds = all?.credentials || [];
+    const found = creds.find((c) => c?.name === name);
+    if (!found) return null;
+    const detail = await credentialVaultClient.getCredentialsDetails({ id: found.id });
+    return detail?.token || detail?.password || null;
+  }
+
+  try {
+    apiKey = await getKeyByName(vaultName);
+    if (!apiKey) throw new Error("not-found");
+  } catch (_) {
+    try {
+      const d2 = await credentialVaultClient.getCredentialsDetails({ id: vaultId });
+      apiKey = d2?.token || d2?.password || null;
+      authMode = "vault-id";
+    } catch (_) {
+      authMode = "manual";
+      apiKey = "PASTE_YOUR_API_KEY_HERE";
+    }
+  }
+
+  if (!apiKey) throw new Error("No Helios API key available.");
+  const commonHeaders = { accept: "application/json", apiKey };
+
+  // ======================
+  // 2) Helpers (same style)
+  // ======================
+  const norm = (v) => (v === null || v === undefined ? "" : String(v).trim());
+  const toArray = (v) => (!v ? [] : Array.isArray(v) ? v : [v]);
+  const safeCell = (v) => (v === null || v === undefined ? "" : String(v).replace(/\|/g, " "));
+  const trunc = (s, n) => (s.length > n ? s.slice(0, n) + "…" : s);
+
+  function nowEtString() {
+    const parts = new Intl.DateTimeFormat("en-US", {
+      timeZone: "America/New_York",
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+      hour12: false
+    }).formatToParts(new Date());
+    const m = {};
+    for (const p of parts) m[p.type] = p.value;
+    return `${m.year}-${m.month}-${m.day} ${m.hour}:${m.minute}`;
+  }
+
+  async function getJson(url, headers) {
+    const resp = await fetch(url, { method: "GET", headers });
+    if (!resp.ok) {
+      let txt = "";
+      try { txt = await resp.text(); } catch (_) {}
+      const err = new Error(`GET ${url} -> HTTP ${resp.status} ${txt}`);
+      err.httpStatus = resp.status;
+      err.bodyText = txt;
+      err.url = url;
+      throw err;
+    }
+    return resp.json();
+  }
+
+  async function getJsonSafe(url, headers) {
+    try {
+      const data = await getJson(url, headers);
+      return { ok: true, data, status: 200, bodyText: "", url };
+    } catch (e) {
+      return {
+        ok: false,
+        data: null,
+        status: e?.httpStatus || 0,
+        bodyText: e?.bodyText || String(e || ""),
+        url: e?.url || url
+      };
+    }
+  }
+
+  function mdTable(headers, rows) {
+    const head = "| " + headers.join(" | ") + " |";
+    const sep = "| " + headers.map(() => "---").join(" | ") + " |";
+    const body = rows.map((r) => "| " + headers.map((h) => safeCell(r[h])).join(" | ") + " |");
+    return [head, sep].concat(body).join("\n");
+  }
+
+  // ======================
+  // 3) Clusters
+  // ======================
+  const errors = [];
+  const cluUrl = `${baseUrl}/v2/mcm/cluster-mgmt/info`;
+  const cluResp = await getJsonSafe(cluUrl, commonHeaders);
+  const clusters = toArray(cluResp?.data?.cohesityClusters);
+
+  if (!cluResp.ok || !clusters.length) {
+    return {
+      authMode,
+      totalClusters: 0,
+      markdownEmail: "⚠️ No clusters returned from Helios or API call failed.",
+      errors: cluResp.ok ? [] : [{ scope: "clusters", httpStatus: cluResp.status, url: cluResp.url, body: cluResp.bodyText }]
+    };
+  }
+
+  // ======================
+  // 4) Per-cluster gflags
+  // ======================
+  const rows = [];
+
+  function normalizeGflagItem(f) {
+    const flagName = norm(f?.name) || norm(f?.flagName) || norm(f?.key) || "";
+    let value = f?.value ?? f?.flagValue ?? f?.val ?? "";
+    // value can be non-string (object/array/number/bool)
+    let valueStr = "";
+    try {
+      valueStr = typeof value === "string" ? value : JSON.stringify(value);
+    } catch (_) {
+      valueStr = String(value);
+    }
+    const reason = norm(f?.reason) || norm(f?.description) || norm(f?.notes) || "default / unknown";
+    return { flagName, valueStr, reason };
+  }
+
+  for (const cl of clusters) {
+    const clusterId = norm(cl?.clusterId);
+    if (!clusterId) continue;
+
+    const clusterName =
+      norm(cl?.clusterName) ||
+      norm(cl?.name) ||
+      `Cluster-${clusterId}`;
+
+    const headers = { accept: "application/json", apiKey, accessClusterId: clusterId };
+
+    const gUrl = `${baseUrl}/v2/clusters/gflag`;
+    const gResp = await getJsonSafe(gUrl, headers);
+    if (!gResp.ok) {
+      errors.push({
+        scope: "gflags",
+        clusterName,
+        clusterId,
+        httpStatus: gResp.status,
+        url: gResp.url,
+        body: gResp.bodyText
+      });
+      continue;
+    }
+
+    // Expected shape: array of { serviceName, gflags }
+    const data = gResp.data;
+    const services = Array.isArray(data)
+      ? data
+      : (toArray(data?.items).length ? toArray(data.items) : toArray(data?.services));
+
+    for (const s of services) {
+      const serviceName = norm(s?.serviceName) || norm(s?.service) || "UNKNOWN_SERVICE";
+      const gflags = toArray(s?.gflags);
+
+      for (const f of gflags) {
+        const nf = normalizeGflagItem(f);
+        if (!nf.flagName) continue;
+
+        rows.push({
+          Cluster: clusterName,
+          Service: serviceName,
+          GFlag: nf.flagName,
+          Value: trunc(nf.valueStr, VALUE_MAX_LEN),
+          Reason: nf.reason
+        });
+
+        if (rows.length >= MAX_ROWS) break;
+      }
+      if (rows.length >= MAX_ROWS) break;
+    }
+    if (rows.length >= MAX_ROWS) break;
+  }
+
+  // ======================
+  // 5) Markdown output
+  // ======================
+  const asOfEt = nowEtString();
+
+  const headers = ["Cluster", "Service", "GFlag", "Value", "Reason"];
+  const markdownEmail = [
+    "### Cohesity GFlags — Cluster / Service View",
+    "",
+    `**Inventory As Of (ET):** ${asOfEt}`,
+    `**Rows:** ${rows.length}`,
+    "",
+    rows.length ? mdTable(headers, rows) : "No gflags returned.",
+    "",
+    `_Note: Value is truncated to ${VALUE_MAX_LEN} characters for email readability._`
+  ].join("\n");
+
+  return {
+    authMode,
+    totalClusters: clusters.length,
+    inventoryAsOfET: asOfEt,
+    valueTruncateChars: VALUE_MAX_LEN,
+    rowCount: rows.length,
+    markdownEmail,
+    rows,
+    errors
+  };
+}
