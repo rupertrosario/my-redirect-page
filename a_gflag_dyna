@@ -1,12 +1,19 @@
-
 import { credentialVaultClient } from "@dynatrace-sdk/client-classic-environment-v2";
 
 /**
- * Cohesity Helios GFlags — Flat Table (Cluster | Service | GFlag | Value | Reason)
- * - Pull clusters from /v2/mcm/cluster-mgmt/info
- * - For each cluster: GET /v2/clusters/gflag with accessClusterId header
- * - Flatten: serviceName + gflags[] -> rows
- * - Truncate Value for email readability
+ * Cohesity Helios GFlags — Flat, Readable Report
+ * Columns (FINAL):
+ * Cluster | Service | GFlag | Value | Reason | AppliedAtET
+ *
+ * Facts locked from screenshot:
+ * - Timestamp field name: `timestamp`
+ * - Unit: epoch SECONDS
+ * - Meaning: when the gflag was applied
+ *
+ * Behavior:
+ * - GET-only
+ * - No truncation
+ * - Sorted by Cluster → Service → GFlag
  */
 export default async function () {
   const baseUrl = "https://helios.cohesity.com";
@@ -14,8 +21,7 @@ export default async function () {
   // ======================
   // CONFIG
   // ======================
-  const VALUE_MAX_LEN = 120;
-  const MAX_ROWS = 5000; // safety for email/workflow size
+  const MAX_ROWS = 20000; // guardrail for workflow/email limits
 
   // ==============================
   // 1) Auth (vault name -> id -> manual)
@@ -53,12 +59,31 @@ export default async function () {
   const commonHeaders = { accept: "application/json", apiKey };
 
   // ======================
-  // 2) Helpers (same style)
+  // 2) Helpers
   // ======================
   const norm = (v) => (v === null || v === undefined ? "" : String(v).trim());
   const toArray = (v) => (!v ? [] : Array.isArray(v) ? v : [v]);
-  const safeCell = (v) => (v === null || v === undefined ? "" : String(v).replace(/\|/g, " "));
-  const trunc = (s, n) => (s.length > n ? s.slice(0, n) + "…" : s);
+
+  const safeCell = (v) =>
+    v === null || v === undefined
+      ? ""
+      : String(v).replace(/\|/g, " ").replace(/[\r\n]+/g, " ");
+
+  function epochSecondsToEt(sec) {
+    if (!sec) return "";
+    const ms = Number(sec) * 1000;
+    if (!Number.isFinite(ms)) return "";
+    return new Date(ms).toLocaleString("en-US", {
+      timeZone: "America/New_York",
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+      hour12: false
+    });
+  }
 
   function nowEtString() {
     const parts = new Intl.DateTimeFormat("en-US", {
@@ -111,8 +136,18 @@ export default async function () {
     return [head, sep].concat(body).join("\n");
   }
 
+  function normalizeGflagItem(f) {
+    const flagName = norm(f?.name);
+    const valueStr =
+      typeof f?.value === "string" ? f.value : JSON.stringify(f?.value ?? "");
+    const reason = norm(f?.reason) || "default / unknown";
+    const appliedAtET = epochSecondsToEt(f?.timestamp); // confirmed from screenshot
+
+    return { flagName, valueStr, reason, appliedAtET };
+  }
+
   // ======================
-  // 3) Clusters
+  // 3) Fetch clusters
   // ======================
   const errors = [];
   const cluUrl = `${baseUrl}/v2/mcm/cluster-mgmt/info`;
@@ -129,57 +164,32 @@ export default async function () {
   }
 
   // ======================
-  // 4) Per-cluster gflags
+  // 4) Per-cluster gflags → rows
   // ======================
   const rows = [];
-
-  function normalizeGflagItem(f) {
-    const flagName = norm(f?.name) || norm(f?.flagName) || norm(f?.key) || "";
-    let value = f?.value ?? f?.flagValue ?? f?.val ?? "";
-    // value can be non-string (object/array/number/bool)
-    let valueStr = "";
-    try {
-      valueStr = typeof value === "string" ? value : JSON.stringify(value);
-    } catch (_) {
-      valueStr = String(value);
-    }
-    const reason = norm(f?.reason) || norm(f?.description) || norm(f?.notes) || "default / unknown";
-    return { flagName, valueStr, reason };
-  }
 
   for (const cl of clusters) {
     const clusterId = norm(cl?.clusterId);
     if (!clusterId) continue;
 
-    const clusterName =
-      norm(cl?.clusterName) ||
-      norm(cl?.name) ||
-      `Cluster-${clusterId}`;
-
+    const clusterName = norm(cl?.clusterName) || norm(cl?.name) || `Cluster-${clusterId}`;
     const headers = { accept: "application/json", apiKey, accessClusterId: clusterId };
 
     const gUrl = `${baseUrl}/v2/clusters/gflag`;
     const gResp = await getJsonSafe(gUrl, headers);
+
     if (!gResp.ok) {
-      errors.push({
-        scope: "gflags",
-        clusterName,
-        clusterId,
-        httpStatus: gResp.status,
-        url: gResp.url,
-        body: gResp.bodyText
-      });
+      errors.push({ scope: "gflags", clusterName, clusterId, httpStatus: gResp.status, url: gResp.url, body: gResp.bodyText });
       continue;
     }
 
-    // Expected shape: array of { serviceName, gflags }
-    const data = gResp.data;
-    const services = Array.isArray(data)
-      ? data
-      : (toArray(data?.items).length ? toArray(data.items) : toArray(data?.services));
+    // Expected shape: [{ serviceName, gflags: [...] }]
+    const services = Array.isArray(gResp.data)
+      ? gResp.data
+      : toArray(gResp.data?.items || gResp.data?.services);
 
     for (const s of services) {
-      const serviceName = norm(s?.serviceName) || norm(s?.service) || "UNKNOWN_SERVICE";
+      const serviceName = norm(s?.serviceName) || "UNKNOWN_SERVICE";
       const gflags = toArray(s?.gflags);
 
       for (const f of gflags) {
@@ -190,8 +200,9 @@ export default async function () {
           Cluster: clusterName,
           Service: serviceName,
           GFlag: nf.flagName,
-          Value: trunc(nf.valueStr, VALUE_MAX_LEN),
-          Reason: nf.reason
+          Value: nf.valueStr,
+          Reason: nf.reason,
+          AppliedAtET: nf.appliedAtET
         });
 
         if (rows.length >= MAX_ROWS) break;
@@ -202,27 +213,33 @@ export default async function () {
   }
 
   // ======================
-  // 5) Markdown output
+  // 5) Sort (Cluster → Service → GFlag)
+  // ======================
+  rows.sort((a, b) =>
+    a.Cluster.localeCompare(b.Cluster) ||
+    a.Service.localeCompare(b.Service) ||
+    a.GFlag.localeCompare(b.GFlag)
+  );
+
+  // ======================
+  // 6) Markdown output
   // ======================
   const asOfEt = nowEtString();
+  const headers = ["Cluster", "Service", "GFlag", "Value", "Reason", "AppliedAtET"];
 
-  const headers = ["Cluster", "Service", "GFlag", "Value", "Reason"];
   const markdownEmail = [
     "### Cohesity GFlags — Cluster / Service View",
     "",
     `**Inventory As Of (ET):** ${asOfEt}`,
     `**Rows:** ${rows.length}`,
     "",
-    rows.length ? mdTable(headers, rows) : "No gflags returned.",
-    "",
-    `_Note: Value is truncated to ${VALUE_MAX_LEN} characters for email readability._`
+    rows.length ? mdTable(headers, rows) : "No gflags returned."
   ].join("\n");
 
   return {
     authMode,
     totalClusters: clusters.length,
     inventoryAsOfET: asOfEt,
-    valueTruncateChars: VALUE_MAX_LEN,
     rowCount: rows.length,
     markdownEmail,
     rows,
