@@ -1,16 +1,26 @@
 import { credentialVaultClient } from "@dynatrace-sdk/client-classic-environment-v2";
 
 /**
- * Cohesity Helios GFlags — Defaults vs Overrides
- * SAFE / READ-ONLY / HUMAN-READABLE TIME
+ * Cohesity Helios GFlags — Flat View (Stable Baseline)
+ * Columns: Cluster | Service | GFlag | Value | Reason
+ *
+ * - GET-only
+ * - No truncation (long values wrap naturally in markdown)
+ * - 502-safe (per-cluster)
+ * - Sorted: Cluster → Service → GFlag
  */
 
 export default async function () {
   const baseUrl = "https://helios.cohesity.com";
 
-  // ====================================================
+  // ======================
+  // SAFETY
+  // ======================
+  const MAX_ROWS = 6000; // only guardrail left (email size)
+
+  // ======================
   // AUTH (READ-ONLY)
-  // ====================================================
+  // ======================
   const vaultName = "Cohesity_API_Key";
   const vaultId = "credentials_vault-312312";
   let apiKey = null;
@@ -32,42 +42,23 @@ export default async function () {
     apiKey = d?.token || d?.password || null;
   }
 
-  if (!apiKey) {
-    return { error: "No Cohesity API key available" };
-  }
+  if (!apiKey) return { error: "No Cohesity API key available" };
 
   const commonHeaders = { accept: "application/json", apiKey };
 
-  // ====================================================
+  // ======================
   // HELPERS
-  // ====================================================
+  // ======================
   const norm = v => (v === null || v === undefined ? "" : String(v).trim());
   const toArray = v => (!v ? [] : Array.isArray(v) ? v : [v]);
 
+  // IMPORTANT: do NOT truncate; only sanitize pipes/newlines
   const safeCell = v =>
     v === null || v === undefined
       ? ""
-      : String(v).replace(/\|/g, " ").replace(/[\r\n]+/g, " ");
-
-  function toHumanTime(v) {
-    if (!v) return "";
-    if (typeof v === "string" && isNaN(Number(v))) return v;
-
-    const n = Number(v);
-    if (!Number.isFinite(n)) return "";
-
-    const ms = n > 1e12 ? n : n * 1000; // sec or ms
-    return new Date(ms).toLocaleString("en-US", {
-      timeZone: "America/New_York",
-      year: "numeric",
-      month: "2-digit",
-      day: "2-digit",
-      hour: "2-digit",
-      minute: "2-digit",
-      second: "2-digit",
-      hour12: false
-    });
-  }
+      : String(v)
+          .replace(/\|/g, " ")        // prevent column breaks
+          .replace(/\r?\n/g, " ");    // wrap-friendly, single cell
 
   function mdTable(headers, rows) {
     const head = "| " + headers.join(" | ") + " |";
@@ -78,31 +69,23 @@ export default async function () {
     return [head, sep, ...body].join("\n");
   }
 
-  function isDefaultReason(reason) {
-    const r = (reason || "").toLowerCase();
-    return r.includes("auto set by cohesity") || r.includes("default");
-  }
-
-  // ====================================================
-  // SAFE GET (NEVER THROWS)
-  // ====================================================
   async function getJsonSafe(url, headers) {
     try {
       const resp = await fetch(url, { method: "GET", headers });
       if (!resp.ok) {
         let txt = "";
         try { txt = await resp.text(); } catch {}
-        return { ok: false, status: resp.status, body: txt, data: null };
+        return { ok: false, status: resp.status, error: txt, data: null };
       }
-      return { ok: true, status: 200, body: "", data: await resp.json() };
+      return { ok: true, status: 200, data: await resp.json() };
     } catch (e) {
-      return { ok: false, status: 0, body: String(e), data: null };
+      return { ok: false, status: 0, error: String(e), data: null };
     }
   }
 
-  // ====================================================
+  // ======================
   // FETCH CLUSTERS
-  // ====================================================
+  // ======================
   const cluRes = await getJsonSafe(
     `${baseUrl}/v2/mcm/cluster-mgmt/info`,
     commonHeaders
@@ -112,25 +95,17 @@ export default async function () {
     return {
       error: "Failed to fetch clusters",
       status: cluRes.status,
-      details: cluRes.body
+      details: cluRes.error
     };
   }
 
   const clusters = toArray(cluRes.data?.cohesityClusters);
-  const clusterCount = clusters.length;
 
-  // ====================================================
+  // ======================
   // COLLECT GFLAGS
-  // ====================================================
-  const allRows = [];
-  const globalIndex = {};
+  // ======================
+  const rows = [];
   const errors = [];
-
-  function indexGlobal(row) {
-    const k = `${row.Service}||${row.GFlag}||${row.Value}`;
-    if (!globalIndex[k]) globalIndex[k] = { clusters: new Set(), row };
-    globalIndex[k].clusters.add(row.Cluster);
-  }
 
   for (const cl of clusters) {
     const clusterId = norm(cl?.clusterId);
@@ -149,9 +124,9 @@ export default async function () {
         scope: "gflags",
         cluster: clusterName,
         status: gRes.status,
-        error: gRes.body
+        error: gRes.error
       });
-      continue;
+      continue; // DO NOT break whole workflow
     }
 
     const services = Array.isArray(gRes.data)
@@ -168,99 +143,55 @@ export default async function () {
 
         let valueStr;
         try {
-          valueStr = typeof f?.value === "string"
-            ? f.value
-            : JSON.stringify(f?.value ?? "");
+          valueStr =
+            typeof f?.value === "string"
+              ? f.value
+              : JSON.stringify(f?.value ?? "");
         } catch {
           valueStr = String(f?.value ?? "");
         }
 
-        const reason = norm(f?.reason) || "default";
-        const appliedAt = toHumanTime(f?.timestamp);
-
-        const row = {
+        rows.push({
           Cluster: clusterName,
           Service: serviceName,
           GFlag: flagName,
           Value: valueStr,
-          Reason: reason,
-          AppliedAt: appliedAt
-        };
+          Reason: norm(f?.reason)
+        });
 
-        indexGlobal(row);
-        allRows.push(row);
+        if (rows.length >= MAX_ROWS) break;
       }
+      if (rows.length >= MAX_ROWS) break;
     }
+    if (rows.length >= MAX_ROWS) break;
   }
 
-  // ====================================================
-  // DEFAULTS VS OVERRIDES
-  // ====================================================
-  const globalDefaults = [];
-  const globalKeys = new Set();
-
-  for (const entry of Object.values(globalIndex)) {
-    if (
-      isDefaultReason(entry.row.Reason) &&
-      entry.clusters.size === clusterCount
-    ) {
-      const k = `${entry.row.Service}||${entry.row.GFlag}||${entry.row.Value}`;
-      globalKeys.add(k);
-      globalDefaults.push({
-        Service: entry.row.Service,
-        GFlag: entry.row.GFlag,
-        Value: entry.row.Value,
-        Reason: entry.row.Reason
-      });
-    }
-  }
-
-  const overrides = allRows.filter(r => {
-    const k = `${r.Service}||${r.GFlag}||${r.Value}`;
-    return !globalKeys.has(k);
-  });
-
-  // ====================================================
-  // SORT
-  // ====================================================
-  globalDefaults.sort((a,b)=>
-    a.Service.localeCompare(b.Service) ||
-    a.GFlag.localeCompare(b.GFlag)
-  );
-
-  overrides.sort((a,b)=>
+  // ======================
+  // SORT (READABILITY)
+  // ======================
+  rows.sort((a, b) =>
     a.Cluster.localeCompare(b.Cluster) ||
     a.Service.localeCompare(b.Service) ||
     a.GFlag.localeCompare(b.GFlag)
   );
 
-  // ====================================================
+  // ======================
   // MARKDOWN OUTPUT
-  // ====================================================
+  // ======================
   const markdownEmail = [
-    "### Cohesity GFlags — Defaults vs Overrides",
+    "### Cohesity GFlags — Flat View",
     "",
-    "## 1) Global Defaults (Applied to All Clusters)",
-    globalDefaults.length
-      ? mdTable(["Service","GFlag","Value","Reason"], globalDefaults)
-      : "_None_",
+    mdTable(
+      ["Cluster", "Service", "GFlag", "Value", "Reason"],
+      rows
+    ),
     "",
-    "## 2) Cluster-Specific Overrides",
-    overrides.length
-      ? mdTable(
-          ["Cluster","Service","GFlag","Value","Reason","AppliedAt"],
-          overrides
-        )
-      : "_None_",
-    "",
-    "_GET-only. Read-only evidence collection. No configuration changes performed._"
+    "_GET-only. Read-only evidence collection. Long values wrap naturally inside table cells._"
   ].join("\n");
 
   return {
-    clusterCount,
-    totalFlags: allRows.length,
-    defaultCount: globalDefaults.length,
-    overrideCount: overrides.length,
+    clusterCount: clusters.length,
+    rowCount: rows.length,
     errors,
     markdownEmail
   };
