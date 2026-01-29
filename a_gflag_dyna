@@ -1,20 +1,26 @@
 import { credentialVaultClient } from "@dynatrace-sdk/client-classic-environment-v2";
 
 /**
- * Cohesity Helios GFlags — Per Cluster (Split Tables, No Date)
- *
- * Per cluster:
- * 1) Meta table  : Service | GFlag | Reason
- * 2) Value table : Service | GFlag | Value   (long values wrap safely)
+ * Cohesity Helios GFlags — Cluster Sections (NO Cluster column)
+ * Layout per cluster:
+ *   [Centered, numbered cluster name]
+ *   | Service | GFlag | Value | Reason |
  *
  * - GET-only
- * - Markdown only
- * - No truncation
- * - Email renderer safe
+ * - Per-cluster table (single email body)
+ * - Value NOT truncated (wraps)
+ * - Reason compacted to fit email
+ * - 502-safe (continues to next cluster)
+ * - Clusters sorted alphabetically + numbered
  */
 
 export default async function () {
   const baseUrl = "https://helios.cohesity.com";
+
+  // ======================
+  // SAFETY (email size)
+  // ======================
+  const MAX_ROWS_TOTAL = 6000;
 
   // ======================
   // AUTH (READ-ONLY)
@@ -26,7 +32,7 @@ export default async function () {
   async function getKeyByName(name) {
     const all = await credentialVaultClient.getCredentials();
     const creds = all?.credentials || [];
-    const found = creds.find(c => c?.name === name);
+    const found = creds.find((c) => c?.name === name);
     if (!found) return null;
     const d = await credentialVaultClient.getCredentialsDetails({ id: found.id });
     return d?.token || d?.password || null;
@@ -40,41 +46,39 @@ export default async function () {
     apiKey = d?.token || d?.password || null;
   }
 
-  if (!apiKey) {
-    return { error: "No Cohesity API key available" };
-  }
+  if (!apiKey) return { error: "No Cohesity API key available" };
 
   const commonHeaders = { accept: "application/json", apiKey };
 
   // ======================
   // HELPERS
   // ======================
-  const norm = v => (v === null || v === undefined ? "" : String(v).trim());
-  const toArray = v => (!v ? [] : Array.isArray(v) ? v : [v]);
+  const norm = (v) => (v === null || v === undefined ? "" : String(v).trim());
+  const toArray = (v) => (!v ? [] : Array.isArray(v) ? v : [v]);
 
-  // Markdown-safe cell (no truncation)
-  const safeCell = v =>
+  // Don’t truncate Value; just make markdown-safe
+  const safeCell = (v) =>
     v === null || v === undefined
       ? ""
       : String(v).replace(/\|/g, " ").replace(/\r?\n/g, " ");
 
   function mdTable(headers, rows) {
     const head = "| " + headers.join(" | ") + " |";
-    const sep  = "| " + headers.map(() => "---").join(" | ") + " |";
-    const body = rows.map(r =>
-      "| " + headers.map(h => safeCell(r[h])).join(" | ") + " |"
+    const sep = "| " + headers.map(() => "---").join(" | ") + " |";
+    const body = rows.map(
+      (r) => "| " + headers.map((h) => safeCell(r[h])).join(" | ") + " |"
     );
     return [head, sep, ...body].join("\n");
   }
 
-  // Compact reason so it never dominates width
+  // Compact Reason so last column fits better in email
   function normalizeReason(reason) {
     const raw = norm(reason);
     if (!raw) return "";
 
     const s = raw.toLowerCase();
     if (s.includes("auto set by cohesity")) return "Auto (Cohesity)";
-    if (s.includes("do not update")) return "System Managed";
+    if (s.includes("don't update manually") || s.includes("do not update")) return "System Managed";
     if (s.includes("default")) return "Default";
 
     const m = raw.match(/case#\s*\d+/i);
@@ -100,26 +104,19 @@ export default async function () {
   // ======================
   // FETCH CLUSTERS
   // ======================
-  const cluRes = await getJsonSafe(
-    `${baseUrl}/v2/mcm/cluster-mgmt/info`,
-    commonHeaders
-  );
-
+  const cluRes = await getJsonSafe(`${baseUrl}/v2/mcm/cluster-mgmt/info`, commonHeaders);
   if (!cluRes.ok) {
-    return {
-      error: "Failed to fetch clusters",
-      status: cluRes.status,
-      details: cluRes.error
-    };
+    return { error: "Failed to fetch clusters", status: cluRes.status, details: cluRes.error };
   }
 
   const clusters = toArray(cluRes.data?.cohesityClusters);
 
   // ======================
-  // BUILD MARKDOWN
+  // COLLECT PER-CLUSTER
   // ======================
-  const sections = [];
+  const byCluster = {}; // clusterName -> row[]
   const errors = [];
+  let totalRows = 0;
 
   for (const cl of clusters) {
     const clusterId = norm(cl?.clusterId);
@@ -128,27 +125,14 @@ export default async function () {
     const clusterName = norm(cl?.clusterName) || `Cluster-${clusterId}`;
     const headers = { ...commonHeaders, accessClusterId: clusterId };
 
-    const gRes = await getJsonSafe(
-      `${baseUrl}/v2/clusters/gflag`,
-      headers
-    );
-
+    const gRes = await getJsonSafe(`${baseUrl}/v2/clusters/gflag`, headers);
     if (!gRes.ok) {
-      errors.push({
-        scope: "gflags",
-        cluster: clusterName,
-        status: gRes.status,
-        error: gRes.error
-      });
+      errors.push({ scope: "gflags", cluster: clusterName, status: gRes.status, error: gRes.error });
       continue;
     }
 
-    const services = Array.isArray(gRes.data)
-      ? gRes.data
-      : toArray(gRes.data?.items);
-
-    const metaRows = [];
-    const valueRows = [];
+    const services = Array.isArray(gRes.data) ? gRes.data : toArray(gRes.data?.items);
+    const rows = [];
 
     for (const s of services) {
       const serviceName = norm(s?.serviceName) || "UNKNOWN_SERVICE";
@@ -160,63 +144,68 @@ export default async function () {
 
         let valueStr;
         try {
-          valueStr =
-            typeof f?.value === "string"
-              ? f.value
-              : JSON.stringify(f?.value ?? "");
+          valueStr = typeof f?.value === "string" ? f.value : JSON.stringify(f?.value ?? "");
         } catch {
           valueStr = String(f?.value ?? "");
         }
 
-        metaRows.push({
+        rows.push({
           Service: serviceName,
           GFlag: flagName,
+          Value: valueStr,
           Reason: normalizeReason(f?.reason)
         });
 
-        valueRows.push({
-          Service: serviceName,
-          GFlag: flagName,
-          Value: valueStr
-        });
+        totalRows++;
+        if (totalRows >= MAX_ROWS_TOTAL) break;
       }
+      if (totalRows >= MAX_ROWS_TOTAL) break;
     }
 
-    metaRows.sort((a, b) =>
-      a.Service.localeCompare(b.Service) ||
-      a.GFlag.localeCompare(b.GFlag)
-    );
-    valueRows.sort((a, b) =>
-      a.Service.localeCompare(b.Service) ||
-      a.GFlag.localeCompare(b.GFlag)
-    );
+    // Sort within cluster: Service -> GFlag
+    rows.sort((a, b) => a.Service.localeCompare(b.Service) || a.GFlag.localeCompare(b.GFlag));
+    byCluster[clusterName] = rows;
 
-    sections.push(`**${clusterName}**`);
+    if (totalRows >= MAX_ROWS_TOTAL) break;
+  }
+
+  // ======================
+  // MARKDOWN (cluster heading centered, sorted, numbered)
+  // ======================
+  const tableHeaders = ["Service", "GFlag", "Value", "Reason"];
+
+  const clusterNames = Object.keys(byCluster)
+    .sort((a, b) => a.localeCompare(b, undefined, { sensitivity: "base" }));
+
+  const sections = [];
+  let idx = 1;
+
+  for (const cn of clusterNames) {
+    const r = byCluster[cn] || [];
+
+    // Centered, numbered cluster header (simple, email-friendly)
+    sections.push(`<div align="center"><b>${idx}. ${safeCell(cn)}</b></div>`);
+    idx++;
+
     sections.push("");
-    sections.push(
-      metaRows.length
-        ? mdTable(["Service", "GFlag", "Reason"], metaRows)
-        : "_No gflags returned._"
-    );
-    sections.push("");
-    sections.push("_Value details_");
-    sections.push("");
-    sections.push(
-      valueRows.length
-        ? mdTable(["Service", "GFlag", "Value"], valueRows)
-        : "_No values returned._"
-    );
+    sections.push(r.length ? mdTable(tableHeaders, r) : "_No gflags returned._");
     sections.push("\n---\n");
   }
 
   const markdownEmail = [
     "### Cohesity GFlags — Per Cluster",
     "",
-    ...sections
-  ].join("\n");
+    ...sections,
+    totalRows >= MAX_ROWS_TOTAL ? `_Note: Capped at ${MAX_ROWS_TOTAL} rows to fit email._` : "",
+    errors.length ? `_Errors captured for some clusters (see returned errors[])._` : ""
+  ]
+    .filter(Boolean)
+    .join("\n");
 
   return {
     clusterCount: clusters.length,
+    renderedClusters: clusterNames.length,
+    rowCount: totalRows,
     errors,
     markdownEmail
   };
