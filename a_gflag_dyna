@@ -1,26 +1,18 @@
 import { credentialVaultClient } from "@dynatrace-sdk/client-classic-environment-v2";
 
 /**
- * Cohesity Helios GFlags — Defaults vs Overrides (Single Message)
- *
- * Output:
- * 1) Global Defaults (applied to all clusters)
- * 2) Cluster-Specific Overrides
- *
- * Columns:
- * - Defaults: Service | GFlag | Value | Reason
- * - Overrides: Cluster | Service | GFlag | Value | Reason | AppliedAtET
+ * Cohesity Helios GFlags — Defaults vs Overrides
+ * SAFE / READ-ONLY / HUMAN-READABLE TIME
  */
 
 export default async function () {
   const baseUrl = "https://helios.cohesity.com";
 
-  // ======================
-  // AUTH (same pattern)
-  // ======================
+  // ====================================================
+  // AUTH (READ-ONLY)
+  // ====================================================
   const vaultName = "Cohesity_API_Key";
   const vaultId = "credentials_vault-312312";
-
   let apiKey = null;
 
   async function getKeyByName(name) {
@@ -28,25 +20,27 @@ export default async function () {
     const creds = all?.credentials || [];
     const found = creds.find(c => c?.name === name);
     if (!found) return null;
-    const detail = await credentialVaultClient.getCredentialsDetails({ id: found.id });
-    return detail?.token || detail?.password || null;
+    const d = await credentialVaultClient.getCredentialsDetails({ id: found.id });
+    return d?.token || d?.password || null;
   }
 
   try {
     apiKey = await getKeyByName(vaultName);
     if (!apiKey) throw new Error();
   } catch {
-    const d2 = await credentialVaultClient.getCredentialsDetails({ id: vaultId });
-    apiKey = d2?.token || d2?.password || null;
+    const d = await credentialVaultClient.getCredentialsDetails({ id: vaultId });
+    apiKey = d?.token || d?.password || null;
   }
 
-  if (!apiKey) throw new Error("No Cohesity API key available");
+  if (!apiKey) {
+    return { error: "No Cohesity API key available" };
+  }
 
   const commonHeaders = { accept: "application/json", apiKey };
 
-  // ======================
+  // ====================================================
   // HELPERS
-  // ======================
+  // ====================================================
   const norm = v => (v === null || v === undefined ? "" : String(v).trim());
   const toArray = v => (!v ? [] : Array.isArray(v) ? v : [v]);
 
@@ -55,10 +49,14 @@ export default async function () {
       ? ""
       : String(v).replace(/\|/g, " ").replace(/[\r\n]+/g, " ");
 
-  function epochSecToET(sec) {
-    if (!sec) return "";
-    const ms = Number(sec) * 1000;
-    if (!Number.isFinite(ms)) return "";
+  function toHumanTime(v) {
+    if (!v) return "";
+    if (typeof v === "string" && isNaN(Number(v))) return v;
+
+    const n = Number(v);
+    if (!Number.isFinite(n)) return "";
+
+    const ms = n > 1e12 ? n : n * 1000; // sec or ms
     return new Date(ms).toLocaleString("en-US", {
       timeZone: "America/New_York",
       year: "numeric",
@@ -73,7 +71,7 @@ export default async function () {
 
   function mdTable(headers, rows) {
     const head = "| " + headers.join(" | ") + " |";
-    const sep = "| " + headers.map(() => "---").join(" | ") + " |";
+    const sep  = "| " + headers.map(() => "---").join(" | ") + " |";
     const body = rows.map(r =>
       "| " + headers.map(h => safeCell(r[h])).join(" | ") + " |"
     );
@@ -85,35 +83,53 @@ export default async function () {
     return r.includes("auto set by cohesity") || r.includes("default");
   }
 
-  async function getJson(url, headers) {
-    const resp = await fetch(url, { method: "GET", headers });
-    if (!resp.ok) {
-      const txt = await resp.text();
-      throw new Error(`GET ${url} -> ${resp.status} ${txt}`);
+  // ====================================================
+  // SAFE GET (NEVER THROWS)
+  // ====================================================
+  async function getJsonSafe(url, headers) {
+    try {
+      const resp = await fetch(url, { method: "GET", headers });
+      if (!resp.ok) {
+        let txt = "";
+        try { txt = await resp.text(); } catch {}
+        return { ok: false, status: resp.status, body: txt, data: null };
+      }
+      return { ok: true, status: 200, body: "", data: await resp.json() };
+    } catch (e) {
+      return { ok: false, status: 0, body: String(e), data: null };
     }
-    return resp.json();
   }
 
-  // ======================
-  // CLUSTERS
-  // ======================
-  const cluUrl = `${baseUrl}/v2/mcm/cluster-mgmt/info`;
-  const cluData = await getJson(cluUrl, commonHeaders);
-  const clusters = toArray(cluData?.cohesityClusters);
+  // ====================================================
+  // FETCH CLUSTERS
+  // ====================================================
+  const cluRes = await getJsonSafe(
+    `${baseUrl}/v2/mcm/cluster-mgmt/info`,
+    commonHeaders
+  );
+
+  if (!cluRes.ok) {
+    return {
+      error: "Failed to fetch clusters",
+      status: cluRes.status,
+      details: cluRes.body
+    };
+  }
+
+  const clusters = toArray(cluRes.data?.cohesityClusters);
   const clusterCount = clusters.length;
 
-  // ======================
-  // COLLECT ALL FLAGS
-  // ======================
+  // ====================================================
+  // COLLECT GFLAGS
+  // ====================================================
   const allRows = [];
-  const globalIndex = {}; // key -> { clusters:Set, row }
+  const globalIndex = {};
+  const errors = [];
 
   function indexGlobal(row) {
-    const key = `${row.Service}||${row.GFlag}||${row.Value}`;
-    if (!globalIndex[key]) {
-      globalIndex[key] = { clusters: new Set(), row };
-    }
-    globalIndex[key].clusters.add(row.Cluster);
+    const k = `${row.Service}||${row.GFlag}||${row.Value}`;
+    if (!globalIndex[k]) globalIndex[k] = { clusters: new Set(), row };
+    globalIndex[k].clusters.add(row.Cluster);
   }
 
   for (const cl of clusters) {
@@ -123,10 +139,24 @@ export default async function () {
     const clusterName = norm(cl?.clusterName) || `Cluster-${clusterId}`;
     const headers = { ...commonHeaders, accessClusterId: clusterId };
 
-    const gUrl = `${baseUrl}/v2/clusters/gflag`;
-    const data = await getJson(gUrl, headers);
+    const gRes = await getJsonSafe(
+      `${baseUrl}/v2/clusters/gflag`,
+      headers
+    );
 
-    const services = Array.isArray(data) ? data : toArray(data?.items);
+    if (!gRes.ok) {
+      errors.push({
+        scope: "gflags",
+        cluster: clusterName,
+        status: gRes.status,
+        error: gRes.body
+      });
+      continue;
+    }
+
+    const services = Array.isArray(gRes.data)
+      ? gRes.data
+      : toArray(gRes.data?.items);
 
     for (const s of services) {
       const serviceName = norm(s?.serviceName) || "UNKNOWN_SERVICE";
@@ -146,7 +176,7 @@ export default async function () {
         }
 
         const reason = norm(f?.reason) || "default";
-        const appliedAtET = epochSecToET(f?.timestamp);
+        const appliedAt = toHumanTime(f?.timestamp);
 
         const row = {
           Cluster: clusterName,
@@ -154,7 +184,7 @@ export default async function () {
           GFlag: flagName,
           Value: valueStr,
           Reason: reason,
-          AppliedAtET: appliedAtET
+          AppliedAt: appliedAt
         };
 
         indexGlobal(row);
@@ -163,9 +193,9 @@ export default async function () {
     }
   }
 
-  // ======================
-  // SPLIT DEFAULTS vs OVERRIDES
-  // ======================
+  // ====================================================
+  // DEFAULTS VS OVERRIDES
+  // ====================================================
   const globalDefaults = [];
   const globalKeys = new Set();
 
@@ -190,9 +220,9 @@ export default async function () {
     return !globalKeys.has(k);
   });
 
-  // ======================
+  // ====================================================
   // SORT
-  // ======================
+  // ====================================================
   globalDefaults.sort((a,b)=>
     a.Service.localeCompare(b.Service) ||
     a.GFlag.localeCompare(b.GFlag)
@@ -204,29 +234,26 @@ export default async function () {
     a.GFlag.localeCompare(b.GFlag)
   );
 
-  // ======================
-  // MARKDOWN
-  // ======================
+  // ====================================================
+  // MARKDOWN OUTPUT
+  // ====================================================
   const markdownEmail = [
     "### Cohesity GFlags — Defaults vs Overrides",
     "",
     "## 1) Global Defaults (Applied to All Clusters)",
     globalDefaults.length
-      ? mdTable(
-          ["Service", "GFlag", "Value", "Reason"],
-          globalDefaults
-        )
+      ? mdTable(["Service","GFlag","Value","Reason"], globalDefaults)
       : "_None_",
     "",
     "## 2) Cluster-Specific Overrides",
     overrides.length
       ? mdTable(
-          ["Cluster", "Service", "GFlag", "Value", "Reason", "AppliedAtET"],
+          ["Cluster","Service","GFlag","Value","Reason","AppliedAt"],
           overrides
         )
       : "_None_",
     "",
-    "_Note: Defaults are auto-set and identical across all clusters. Overrides represent intentional or case-driven changes._"
+    "_GET-only. Read-only evidence collection. No configuration changes performed._"
   ].join("\n");
 
   return {
@@ -234,6 +261,7 @@ export default async function () {
     totalFlags: allRows.length,
     defaultCount: globalDefaults.length,
     overrideCount: overrides.length,
+    errors,
     markdownEmail
   };
 }
