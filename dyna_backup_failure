@@ -1,51 +1,225 @@
-// ===============================
-// Script #2 — Pass-through / Normalizer (NO SNOW)
-// ===============================
-// Reads Script #1 output via automation-utils result()
-// Keeps your exact return shape (as in your picture)
+// Cohesity Helios – Backup Failures (Phase 1: Candidates)
+// GET-only | FAST (no objectDetails) | returns PG+RunType candidates needing object-level check
 
-import { result } from "@dynatrace-sdk/automation-utils";
+import { credentialVaultClient } from "@dynatrace-sdk/client-classic-environment-v2";
 
 export default async function () {
-  // IMPORTANT: this string must match the workflow action id/name of Script #1
-  const p = await result("run_javascript_1");
+  const baseUrl = "https://helios.cohesity.com";
 
-  const authMode = p?.authMode ?? "unknown";
-  const failures = Array.isArray(p?.failures) ? p.failures : [];
-  const count = typeof p?.count === "number" ? p.count : failures.length;
+  // Tunables
+  const NUM_RUNS = 10;
+  const CLUSTER_CONCURRENCY = 2;
+  const PG_CONCURRENCY = 6;
 
-  const incidentText_create =
-    typeof p?.incidentText_create === "string"
-      ? p.incidentText_create
-      : (count === 0 ? "✅ No failures." : `Count: ${count}`);
+  // AUTH
+  const vaultName = "Cohesity_API_Key";
+  const vaultId = "credentials_vault-312312";
+  let apiKey = null;
+  let authMode = "vault-name";
 
-  const incidentText_update =
-    typeof p?.incidentText_update === "string"
-      ? p.incidentText_update
-      : incidentText_create;
+  async function getKeyByName(name) {
+    const all = await credentialVaultClient.getCredentials();
+    const found = all.credentials.find((c) => c.name === name);
+    if (!found) return null;
+    const detail = await credentialVaultClient.getCredentialsDetails({ id: found.id });
+    return (detail && (detail.token || detail.password)) || null;
+  }
 
-  const markdownTable =
-    typeof p?.markdownTable === "string"
-      ? p.markdownTable
-      : (count === 0 ? "✅ No failures." : "");
+  try {
+    apiKey = await getKeyByName(vaultName);
+    if (!apiKey) throw new Error("not-found");
+  } catch {
+    try {
+      const detail = await credentialVaultClient.getCredentialsDetails({ id: vaultId });
+      apiKey = (detail && (detail.token || detail.password)) || null;
+      authMode = "vault-id";
+    } catch {
+      authMode = "manual";
+      apiKey = "PASTE_YOUR_API_KEY_HERE";
+    }
+  }
+  if (!apiKey) throw new Error("No Helios API key available (vault + manual failed).");
 
-  // Keep snow fields present (blank) to match your required output signature
-  const snow_query = typeof p?.snow_query === "string" ? p.snow_query : "";
-  const snow_short_description = typeof p?.snow_short_description === "string" ? p.snow_short_description : "";
-  const snow_description_create = typeof p?.snow_description_create === "string" ? p.snow_description_create : "";
-  const snow_description_update = typeof p?.snow_description_update === "string" ? p.snow_description_update : "";
+  function buildQuery(params) {
+    const usp = new URLSearchParams();
+    Object.keys(params || {}).forEach((k) => {
+      const v = params[k];
+      if (v === undefined || v === null) return;
+      if (Array.isArray(v)) v.forEach((x) => usp.append(k, String(x)));
+      else usp.append(k, String(v));
+    });
+    return usp.toString();
+  }
+
+  function toInfoArray(localBackupInfo) {
+    if (!localBackupInfo) return [];
+    return Array.isArray(localBackupInfo) ? localBackupInfo : [localBackupInfo];
+  }
+
+  function isSuccessStatus(status) {
+    return status === "Succeeded" || status === "SucceededWithWarning";
+  }
+
+  async function sleep(ms) {
+    return new Promise((r) => setTimeout(r, ms));
+  }
+
+  async function getJson(url, headers, attempt = 0) {
+    const resp = await fetch(url, { method: "GET", headers });
+    if (resp.ok) return resp.json();
+    const status = resp.status;
+    let txt = "";
+    try { txt = await resp.text(); } catch {}
+    if ((status === 429 || status === 502 || status === 503 || status === 504) && attempt < 2) {
+      await sleep(250 * (attempt + 1));
+      return getJson(url, headers, attempt + 1);
+    }
+    throw new Error(`GET ${url} -> HTTP ${status} ${txt}`);
+  }
+
+  async function mapLimit(items, limit, fn) {
+    const out = [];
+    let idx = 0;
+    const workers = new Array(Math.min(limit, items.length)).fill(0).map(async () => {
+      while (idx < items.length) {
+        const i = idx++;
+        try { out[i] = await fn(items[i], i); } catch { out[i] = null; }
+      }
+    });
+    await Promise.all(workers);
+    return out;
+  }
+
+  // Env mapping (keep)
+  const ENV_LABELS = {
+    kOracle: "Oracle",
+    kSQL: "SQL",
+    kPhysical: "Physical",
+    kGenericNas: "NAS",
+    kIsilon: "NAS",
+    kHyperV: "HyperV",
+    kAcropolis: "Acropolis",
+    kRemoteAdapter: "RemoteAdapter"
+  };
+
+  function getEnvCode(pg) {
+    let envRaw = pg.environment;
+    if (!envRaw && Array.isArray(pg.environmentTypes) && pg.environmentTypes.length > 0) {
+      envRaw = pg.environmentTypes[0];
+    }
+    return envRaw || null;
+  }
+
+  function mapEnvironmentLabel(envCode) {
+    if (!envCode) return "Unknown";
+    return ENV_LABELS[envCode] || envCode;
+  }
+
+  // Per-PG: list-only runs => determine RunTypes that have "latest failure with no later success"
+  async function collectPgCandidates(clusterName, headers, pg) {
+    const pgId = pg.id;
+    const pgName = pg.name || "Unknown PG";
+    const envCode = getEnvCode(pg);
+    const envLbl = mapEnvironmentLabel(envCode);
+
+    const runQueryListOnly = buildQuery({
+      numRuns: NUM_RUNS,
+      excludeNonRestorableRuns: false,
+      includeObjectDetails: false
+    });
+
+    let runData;
+    try {
+      runData = await getJson(
+        `${baseUrl}/v2/data-protect/protection-groups/${encodeURIComponent(pgId)}/runs?${runQueryListOnly}`,
+        headers
+      );
+    } catch {
+      return null;
+    }
+
+    const runs = runData && runData.runs ? runData.runs : [];
+    if (!runs.length) return null;
+
+    // group by RunType (use localBackupInfo[0])
+    const byType = {};
+    for (let i = 0; i < runs.length; i++) {
+      const infos = toInfoArray(runs[i].localBackupInfo);
+      if (!infos.length) continue;
+      const rt = infos[0]?.runType ? infos[0].runType : "UNKNOWN";
+      if (!byType[rt]) byType[rt] = [];
+      byType[rt].push({
+        runType: rt,
+        status: infos[0]?.status || "Unknown",
+        startUsecs: infos[0]?.startTimeUsecs || 0,
+        endUsecs: infos[0]?.endTimeUsecs || 0
+      });
+    }
+
+    const runTypesNeedingDetails = [];
+    for (const rt of Object.keys(byType)) {
+      const arr = byType[rt].slice().sort((a, b) => (b.endUsecs || 0) - (a.endUsecs || 0));
+      const latestFailed = arr.find((x) => x.status === "Failed");
+      if (!latestFailed) continue;
+
+      const hasLaterSuccess = arr.some(
+        (x) => isSuccessStatus(x.status) && (x.startUsecs || 0) > (latestFailed.endUsecs || 0)
+      );
+      if (!hasLaterSuccess) runTypesNeedingDetails.push(rt);
+    }
+
+    if (!runTypesNeedingDetails.length) return null;
+
+    return {
+      Cluster: clusterName,
+      clusterId: headers.accessClusterId,
+      pgId,
+      pgName,
+      envCode,
+      envLbl,
+      runTypes: runTypesNeedingDetails
+    };
+  }
+
+  async function collectClusterCandidates(cluster) {
+    const clusterName =
+      cluster.name || cluster.clusterName || cluster.displayName || `Unknown-${cluster.clusterId}`;
+
+    const headers = {
+      accept: "application/json",
+      apiKey,
+      accessClusterId: String(cluster.clusterId)
+    };
+
+    // Active PGs only
+    let pgData;
+    try {
+      pgData = await getJson(
+        `${baseUrl}/v2/data-protect/protection-groups?${buildQuery({ isDeleted: false, isPaused: false, isActive: true })}`,
+        headers
+      );
+    } catch {
+      return [];
+    }
+
+    const pgs = pgData?.protectionGroups || [];
+    if (!pgs.length) return [];
+
+    const pgCand = await mapLimit(pgs, PG_CONCURRENCY, async (pg) => collectPgCandidates(clusterName, headers, pg));
+    return pgCand.filter(Boolean);
+  }
+
+  // Clusters
+  const clustersResp = await getJson(`${baseUrl}/v2/mcm/cluster-mgmt/info`, { accept: "application/json", apiKey });
+  const clusters = clustersResp?.cohesityClusters || [];
+
+  const clusterResults = await mapLimit(clusters, CLUSTER_CONCURRENCY, async (c) => collectClusterCandidates(c));
+  const candidates = clusterResults.flat().filter(Boolean);
 
   return {
     authMode,
-    count,
-    failures,
-    incidentText_create,
-    incidentText_update,
-    markdownTable,
-    markdownEmail: markdownTable,
-    snow_query,
-    snow_short_description,
-    snow_description_create,
-    snow_description_update
+    NUM_RUNS,
+    candidatesCount: candidates.length,
+    candidates
   };
 }
