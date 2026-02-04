@@ -1,41 +1,31 @@
 // ================================
-// Script 2 (Run JavaScript #2)
-// Cohesity Helios – Backup Failures (Latest Uncleared Only) — SPLIT + FASTER
-// GET-only | NO SNOW calls | 502/429 safe (best-effort)
-//
-// Faster changes:
-// - objectDetails fetch limited to NUM_RUNS_OBJECT = 7
-// - removed Oracle/SQL host-map pre-scan (big CPU/JSON walk)
-// - host lookup done per-run (cheap)
-//
-// FINAL RETURN SHAPE (matches your picture):
-// {
-//   authMode,
-//   count,
-//   failures,
-//   incidentText_create,
-//   incidentText_update,
-//   markdownTable,
-//   markdownEmail
-// }
+// Script 1 (Run JavaScript #1)
+// Cohesity Helios – Backup Failures (Object-level, Latest Uncleared Only)
+// Partition: 0 (even split by cluster hash)
+// GET-only | 502/429 safe | Output includes failures[] only (merged by Script 2)
 // ================================
 
 import { credentialVaultClient } from "@dynatrace-sdk/client-classic-environment-v2";
-import { result } from "@dynatrace-sdk/automation-utils";
 
 export default async function () {
   const baseUrl = "https://helios.cohesity.com";
 
-  // Phase 1 input
-  const phase1 = await result("run_javascript_1");
-  const candidates = (phase1 && Array.isArray(phase1.candidates)) ? phase1.candidates : [];
+  // ======================
+  // Split control (EVEN)
+  // ======================
+  const PART_ID = 0; // Script 1 = 0, Script 2 = 1
 
+  // ======================
   // Tunables
-  const NUM_RUNS_OBJECT = 7;     // objectDetails fetch scope (was 10)
-  const MAX_ROWS_TOTAL = 6000;
-  const CANDIDATE_CONCURRENCY = 3;
+  // ======================
+  const NUM_RUNS_OBJECT = 7;      // objectDetails scope
+  const MAX_ROWS_TOTAL = 6000;    // hard cap
+  const CLUSTER_CONCURRENCY = 2;
+  const PG_CONCURRENCY = 4;
 
-  // AUTH
+  // ======================
+  // AUTH (READ-ONLY)
+  // ======================
   const vaultName = "Cohesity_API_Key";
   const vaultId = "credentials_vault-312312";
 
@@ -65,6 +55,9 @@ export default async function () {
   }
   if (!apiKey) throw new Error("No Helios API key available (vault + manual failed).");
 
+  // ======================
+  // Helpers
+  // ======================
   function buildQuery(params) {
     const usp = new URLSearchParams();
     Object.keys(params || {}).forEach((k) => {
@@ -136,7 +129,6 @@ export default async function () {
     return !hasFailedAttempts(ob);
   }
 
-  // Oracle/SQL: cheap host lookup per-run (no pre-scan)
   function findHostNameInRun(objects, sourceId) {
     if (!sourceId || !objects || !objects.length) return null;
     const sid = String(sourceId);
@@ -146,6 +138,13 @@ export default async function () {
       if (String(o.id) === sid) return o.name || null;
     }
     return null;
+  }
+
+  function part(clusterName) {
+    const s = String(clusterName || "");
+    let sum = 0;
+    for (let i = 0; i < s.length; i++) sum = (sum + s.charCodeAt(i)) % 2;
+    return sum; // 0 or 1
   }
 
   async function sleep(ms) {
@@ -180,6 +179,9 @@ export default async function () {
     return out;
   }
 
+  // ======================
+  // Environment maps
+  // ======================
   const ENV_LABELS = {
     kOracle: "Oracle",
     kSQL: "SQL",
@@ -212,6 +214,14 @@ export default async function () {
     kAcropolis: ["kAcropolis"],
     kRemoteAdapter: ["kRemoteAdapter"]
   };
+
+  function getEnvCode(pg) {
+    let envRaw = pg.environment;
+    if (!envRaw && Array.isArray(pg.environmentTypes) && pg.environmentTypes.length > 0) {
+      envRaw = pg.environmentTypes[0];
+    }
+    return envRaw || null;
+  }
 
   function mapEnvironmentLabel(envCode) {
     if (!envCode) return "Unknown";
@@ -249,7 +259,7 @@ export default async function () {
     return { raHost, raDB };
   }
 
-  async function collectRemoteAdapterPg(clusterName, headers, pg, envLbl, onlyRunTypesSet) {
+  async function collectRemoteAdapterPg(clusterName, headers, pg, envLbl) {
     const pgId = pg.id;
     const pgName = pg.name || "Unknown PG";
 
@@ -281,11 +291,8 @@ export default async function () {
       const infos = toInfoArray(runs[i].localBackupInfo);
       for (let j = 0; j < infos.length; j++) {
         const info = infos[j] || {};
-        const rt = info.runType || "UNKNOWN";
-        if (onlyRunTypesSet && !onlyRunTypesSet.has(rt)) continue;
-
         flat.push({
-          RunType: rt,
+          RunType: info.runType || "UNKNOWN",
           Status: info.status || "Unknown",
           Message: cleanMessage(info.messages),
           StartUsecs: info.startTimeUsecs || 0,
@@ -332,14 +339,14 @@ export default async function () {
     return out;
   }
 
-  async function collectPgLatestUncleared(clusterName, headers, pg, onlyRunTypesSet) {
+  async function collectPgLatestUncleared(clusterName, headers, pg) {
     const pgId = pg.id;
     const pgName = pg.name || "Unknown PG";
-    const envCode = pg.environment || null;
+    const envCode = getEnvCode(pg);
     const envLbl = mapEnvironmentLabel(envCode);
 
     if (envCode === "kRemoteAdapter") {
-      return collectRemoteAdapterPg(clusterName, headers, pg, envLbl, onlyRunTypesSet);
+      return collectRemoteAdapterPg(clusterName, headers, pg, envLbl);
     }
 
     const targetType = ENV_OBJECT_TYPES[envCode] || null;
@@ -370,7 +377,6 @@ export default async function () {
       const infos = toInfoArray(runs[i].localBackupInfo);
       if (!infos.length) continue;
       const rType = infos[0]?.runType ? infos[0].runType : "UNKNOWN";
-      if (onlyRunTypesSet && !onlyRunTypesSet.has(rType)) continue;
       if (!byType[rType]) byType[rType] = [];
       byType[rType].push(runs[i]);
     }
@@ -385,8 +391,6 @@ export default async function () {
             ((b.localBackupInfo?.[0]?.endTimeUsecs) || 0) -
             ((a.localBackupInfo?.[0]?.endTimeUsecs) || 0)
         );
-
-      if (!runsForType.length) continue;
 
       const cleared = new Set();
       const latestFailByKey = new Map();
@@ -405,7 +409,7 @@ export default async function () {
         const objects = run.objects || [];
         if (!objects.length) continue;
 
-        // (1) mark clears (object present + no failedAttempts)
+        // clears
         for (let oi = 0; oi < objects.length; oi++) {
           const ob = objects[oi];
           if (!ob?.object || !ob.localSnapshotInfo) continue;
@@ -415,7 +419,7 @@ export default async function () {
           }
         }
 
-        // (2) Oracle/SQL host-level failures (discovery failures)
+        // Oracle/SQL host-level failures
         if (parentHostNeeded) {
           for (let oi = 0; oi < objects.length; oi++) {
             const ob = objects[oi];
@@ -452,7 +456,7 @@ export default async function () {
           }
         }
 
-        // (3) target object failures
+        // target object failures
         for (let oi = 0; oi < objects.length; oi++) {
           const ob = objects[oi];
           const obj = ob?.object || null;
@@ -535,129 +539,72 @@ export default async function () {
     return out;
   }
 
-  async function collectAllFailures() {
-    if (!candidates.length) return [];
+  async function collectClusterFailures(cluster) {
+    const clusterId = cluster.clusterId;
+    const clusterName =
+      cluster.name || cluster.clusterName || cluster.displayName || `Unknown-${clusterId}`;
 
-    const all = [];
-    await mapLimit(candidates, CANDIDATE_CONCURRENCY, async (cand) => {
-      const headers = {
-        accept: "application/json",
-        apiKey: apiKey,
-        accessClusterId: String(cand.clusterId)
-      };
+    if (part(clusterName) !== PART_ID) return [];
 
-      const pg = {
-        id: String(cand.pgId),
-        name: cand.pgName || "Unknown PG",
-        environment: cand.envCode || null,
-        remoteAdapterParams: cand.remoteAdapterParams || null
-      };
+    const headers = {
+      accept: "application/json",
+      apiKey,
+      accessClusterId: String(clusterId)
+    };
 
-      const onlyRunTypesSet = new Set(cand.runTypes || []);
-      const rows = await collectPgLatestUncleared(cand.clusterName || "Unknown Cluster", headers, pg, onlyRunTypesSet);
-      if (rows && rows.length) all.push(...rows);
+    let pgData;
+    try {
+      pgData = await getJson(
+        `${baseUrl}/v2/data-protect/protection-groups?${buildQuery({
+          isDeleted: false,
+          isPaused: false,
+          isActive: true
+        })}`,
+        headers
+      );
+    } catch {
+      return [];
+    }
+
+    const pgs = pgData && pgData.protectionGroups ? pgData.protectionGroups : [];
+    if (!pgs.length) return [];
+
+    const pgResults = await mapLimit(pgs, PG_CONCURRENCY, async (pg) => {
+      return collectPgLatestUncleared(clusterName, headers, pg);
     });
 
-    if (all.length > MAX_ROWS_TOTAL) all.length = MAX_ROWS_TOTAL;
-    all.sort((a, b) => (b.EndTimeUsecs || 0) - (a.EndTimeUsecs || 0));
-    return all;
+    const rows = [];
+    for (let i = 0; i < pgResults.length; i++) {
+      const r = pgResults[i];
+      if (r && r.length) rows.push(...r);
+      if (rows.length >= MAX_ROWS_TOTAL) break;
+    }
+    return rows;
   }
 
-  function toIncidentTextCreate(rows) {
-    if (!rows || rows.length === 0) return "✅ No FAILED backup objects without a later successful run (last 10 runs scope).";
-    const lines = [];
-    lines.push("=== Backup Failures (Latest Uncleared Only) ===");
-    lines.push(`Count: ${rows.length}`);
-    lines.push("");
-    for (let i = 0; i < rows.length; i++) {
-      const r = rows[i];
-      const obj = r.DatabaseName || r.ObjectName || "-";
-      lines.push(
-        `#${i + 1} [${r.Environment}] Cluster=${r.Cluster} | PG=${r.ProtectionGroup} | RunType=${r.RunType} | ` +
-        `Host=${r.Host || "-"} | Obj=${obj} | End(ET)=${r.EndTime || "-"}`
-      );
-    }
-    return lines.join("\n");
+  // clusters
+  const clustersResp = await getJson(
+    `${baseUrl}/v2/mcm/cluster-mgmt/info`,
+    { accept: "application/json", apiKey }
+  );
+  const clusters = clustersResp && clustersResp.cohesityClusters ? clustersResp.cohesityClusters : [];
+
+  const clusterResults = await mapLimit(clusters, CLUSTER_CONCURRENCY, async (c) => {
+    return collectClusterFailures(c);
+  });
+
+  const failures = [];
+  for (let i = 0; i < clusterResults.length; i++) {
+    const r = clusterResults[i];
+    if (r && r.length) failures.push(...r);
+    if (failures.length >= MAX_ROWS_TOTAL) break;
   }
 
-  function toIncidentTextUpdate(rows) {
-    if (!rows || rows.length === 0) return "✅ No FAILED backup objects without a later successful run (last 10 runs scope).";
-    const lines = [];
-    lines.push("=== Backup Failures (Latest Uncleared Only) ===");
-    lines.push(`Count: ${rows.length}`);
-    lines.push("");
-    for (let i = 0; i < rows.length; i++) {
-      const r = rows[i];
-      const obj = r.DatabaseName || r.ObjectName || "-";
-      lines.push(
-        `#${i + 1} [${r.Environment}] Cluster=${r.Cluster} | PG=${r.ProtectionGroup} | RunType=${r.RunType} | ` +
-        `Host=${r.Host || "-"} | Obj=${obj} | End(ET)=${r.EndTime || "-"}`
-      );
-      if (r.FailedMessage) lines.push(`    Message: ${String(r.FailedMessage)}`);
-      lines.push("");
-    }
-    return lines.join("\n");
-  }
-
-  function toMarkdownTable(rows) {
-    if (!rows || rows.length === 0) {
-      return "✅ No FAILED backup objects without a later successful run (last 10 runs scope).";
-    }
-
-    function safeCell(v) {
-      if (v == null) return "";
-      return String(v).replace(/\|/g, " ").replace(/[\r\n]+/g, " ").trim();
-    }
-
-    const headerLabels = [
-      "Cluster",
-      "ProtectionGroup",
-      "Host",
-      "ObjectName",
-      "RunType",
-      "StartTime",
-      "EndTime",
-      "FailedMessage"
-    ];
-
-    const headerRow = "| " + headerLabels.join(" | ") + " |";
-    const separator = "| " + headerLabels.map(() => "---").join(" | ") + " |";
-
-    const bodyRows = rows.map((r) => {
-      const obj = r.DatabaseName || r.ObjectName || "";
-      const vals = [
-        safeCell(r.Cluster),
-        safeCell(r.ProtectionGroup),
-        safeCell(r.Host),
-        safeCell(obj),
-        safeCell(r.RunType),
-        safeCell(r.StartTime),
-        safeCell(r.EndTime),
-        safeCell(r.FailedMessage)
-      ];
-      return "| " + vals.join(" | ") + " |";
-    });
-
-    const introLines = [
-      "### Backup failures without a latest successful run",
-      "",
-      ""
-    ];
-
-    return introLines.join("\n") + "\n" + [headerRow, separator].concat(bodyRows).join("\n");
-  }
-
-  // 8) Run + return (matches your picture)
-  const failures = await collectAllFailures();
-  const markdownTable = toMarkdownTable(failures);
+  failures.sort((a, b) => (b.EndTimeUsecs || 0) - (a.EndTimeUsecs || 0));
 
   return {
     authMode: authMode,
     count: failures.length,
-    failures: failures,
-    incidentText_create: toIncidentTextCreate(failures),
-    incidentText_update: toIncidentTextUpdate(failures),
-    markdownTable: markdownTable,
-    markdownEmail: markdownTable
+    failures: failures
   };
 }
