@@ -1,46 +1,30 @@
 import { credentialVaultClient } from "@dynatrace-sdk/client-classic-environment-v2";
 
 /**
- * Cohesity Helios — Active Alert Tiles (Cluster-scoped via accessClusterId)
- * - Uses /v2/mcm/alerts
- * - GET-only
- * - ONLY clusters that currently have Active (kOpen) alerts are shown (short output)
- * - Time filter: last 7 days (rolling) via startTimeUsecs/endTimeUsecs (epoch microseconds)
- * - Sections: Hardware / Maintenance / Data Service
- * - Columns: EXACT alertCategory enums (alphabetical)
- * - Cell: ✅ if healthy, else ⛔<n> ⚠️<n> ℹ️<n> ❓<n>
- * - NO dedupe (raw per-cluster counts)
- *
- * Returns:
- *  - note
- *  - markdownHardware
- *  - markdownMaintenance
- *  - markdownDataService
- *  - startTimeUsecs, endTimeUsecs (for validation)
+ * Helios Active Alert Tiles (GET-only)
+ * - Per-cluster accuracy: uses accessClusterId header for every call
+ * - 7-day window via startTimeUsecs/endTimeUsecs (epoch microseconds)
+ * - Symbols: ✅ healthy, else ⛔ ⚠️ ℹ️ ❓
+ * - Returns section markdown separately so you can pick which to email
  */
 
 export default async function () {
   const baseUrl = "https://helios.cohesity.com";
 
-  // ==============================
-  // 1) Auth (ID-only; validated)
-  // ==============================
+  // ===== Auth (vault id only) =====
   const vaultId = "credentials_vault-312312";
   const d2 = await credentialVaultClient.getCredentialsDetails({ id: vaultId });
   const apiKey = (d2?.token || d2?.password || "").trim();
   if (!apiKey) throw new Error("No Helios API key available (empty token/password).");
+
   const commonHeaders = { accept: "application/json", apiKey };
 
-  // ==============================
-  // 2) TIME WINDOW (last 7 days rolling)
-  // ==============================
+  // ===== Time window: last 7 days (rolling) in usecs =====
   const LOOKBACK_DAYS = 7;
   const endTimeUsecs = String(Date.now() * 1000);
   const startTimeUsecs = String((Date.now() - LOOKBACK_DAYS * 24 * 60 * 60 * 1000) * 1000);
 
-  // ==============================
-  // 3) CATEGORY COLUMNS (EXACT ENUMS)
-  // ==============================
+  // ===== Categories (exact enums) =====
   const HW_Cats = [
     "kCPU","kChassis","kCluster","kDisk","kFan","kFirmware","kMemory","kNIC",
     "kNode","kNodeHealth","kOperatingSystem","kPowerSupply","kStorageDevice",
@@ -59,24 +43,19 @@ export default async function () {
     "kNetBackup","kQuota","kRemoteReplication","kViewFailover"
   ].sort();
 
-  // ==============================
-  // 4) SYMBOLS
-  // ==============================
-  const SYM_HEALTHY = "✅";
+  // ===== Symbols =====
+  const SYM_OK = "✅";
   const SYM_C = "⛔";
   const SYM_W = "⚠️";
   const SYM_I = "ℹ️";
   const SYM_U = "❓";
 
-  // ==============================
-  // 5) HELPERS
-  // ==============================
   function sevBucket(sev) {
     switch (sev) {
       case "kCritical": return "C";
-      case "kWarning":  return "W";
-      case "kInfo":     return "I";
-      default:          return "U";
+      case "kWarning": return "W";
+      case "kInfo": return "I";
+      default: return "U";
     }
   }
 
@@ -88,141 +67,130 @@ export default async function () {
   }
 
   async function getJson(url, headers) {
-    const resp = await fetch(url, { method: "GET", headers });
-    if (!resp.ok) {
-      let txt = "";
-      try { txt = await resp.text(); } catch (_) {}
-      const err = new Error(`GET ${url} -> HTTP ${resp.status} ${txt}`);
-      err.httpStatus = resp.status;
-      err.bodyText = txt;
-      err.url = url;
-      throw err;
+    const r = await fetch(url, { method: "GET", headers });
+    if (!r.ok) {
+      const txt = await r.text().catch(() => "");
+      const e = new Error(`GET ${url} -> HTTP ${r.status} ${txt}`);
+      e.status = r.status;
+      e.body = txt;
+      throw e;
     }
-    return resp.json();
+    return r.json();
   }
 
-  async function getJsonSafe(url, headers) {
-    try {
-      const data = await getJson(url, headers);
-      return { ok: true, data, status: 200, bodyText: "", url };
-    } catch (e) {
-      return { ok: false, data: null, status: e?.httpStatus || 0, bodyText: e?.bodyText || String(e || ""), url: e?.url || url };
+  async function tryAlertsEndpoint(paths, qs, headers) {
+    let lastErr = null;
+    for (const p of paths) {
+      const url = `${baseUrl}${p}?${qs.toString()}`;
+      try {
+        const data = await getJson(url, headers);
+        return { ok: true, data, urlUsed: url };
+      } catch (e) {
+        lastErr = e;
+      }
     }
+    return { ok: false, data: null, err: lastErr };
   }
 
-  // ==============================
-  // 6) Fetch clusters
-  // ==============================
-  const cluUrl = `${baseUrl}/v2/mcm/cluster-mgmt/info`;
-  const cluResp = await getJsonSafe(cluUrl, { ...commonHeaders, Accept: "application/json" });
-  const clusters = Array.isArray(cluResp?.data?.cohesityClusters) ? cluResp.data.cohesityClusters : [];
-  if (!cluResp.ok || !clusters.length) throw new Error(cluResp.ok ? "No clusters returned from Helios." : `Cluster list failed: ${cluResp.status} ${cluResp.bodyText || ""}`);
+  // ===== Clusters =====
+  const clu = await getJson(`${baseUrl}/v2/mcm/cluster-mgmt/info`, { ...commonHeaders, Accept: "application/json" });
+  const clusters = Array.isArray(clu?.cohesityClusters) ? clu.cohesityClusters : [];
+  if (!clusters.length) throw new Error("No clusters returned from /v2/mcm/cluster-mgmt/info");
 
-  // ==============================
-  // 7) Cluster-scoped alerts pull (v2 endpoint + time filter)
-  // ==============================
-  async function getActiveAlertsByBucketForCluster(bucketEnum, clusterId) {
-    const qs = new URLSearchParams({
+  // ===== Query builder (shared) =====
+  function qsFor(bucketEnum) {
+    return new URLSearchParams({
       alertStateList: "kOpen",
       alertTypeBucketList: bucketEnum,
       startTimeUsecs,
       endTimeUsecs
     });
-
-    const url = `${baseUrl}/v2/mcm/alerts?${qs.toString()}`;
-    const headers = { ...commonHeaders, Accept: "application/json", accessClusterId: String(clusterId) };
-
-    const r = await getJsonSafe(url, headers);
-    if (!r.ok) return { ok: false, alerts: [], err: r };
-    return { ok: true, alerts: normalizeAlerts(r.data), err: null };
   }
 
-  // ==============================
-  // 8) Build tables
-  // ==============================
-  function cellValue(C, W, I, U) {
-    if (C === 0 && W === 0 && I === 0 && U === 0) return SYM_HEALTHY;
+  const ALERT_PATHS = ["/v2/alerts", "/v2/mcm/alerts"]; // try /v2/alerts first, fallback to documented Helios route
+
+  async function getClusterBucketAlerts(clusterId, bucketEnum) {
+    const headers = { ...commonHeaders, Accept: "application/json", accessClusterId: String(clusterId) };
+    const qs = qsFor(bucketEnum);
+    const res = await tryAlertsEndpoint(ALERT_PATHS, qs, headers);
+    if (!res.ok) return { ok: false, alerts: [], urlUsed: "", err: res.err };
+    return { ok: true, alerts: normalizeAlerts(res.data), urlUsed: res.urlUsed, err: null };
+  }
+
+  function cell(C, W, I, U) {
+    if (C === 0 && W === 0 && I === 0 && U === 0) return SYM_OK;
     return `${SYM_C}${C} ${SYM_W}${W} ${SYM_I}${I} ${SYM_U}${U}`;
   }
 
-  function buildMarkdownTable(rows, categories) {
-    if (!rows?.length) return "No Active alerts (no clusters to display).";
-    const header = ["ClusterName", ...categories];
+  function mdTable(rows, cats) {
+    if (!rows.length) return "No Active alerts (no clusters to display).";
+    const header = ["ClusterName", ...cats];
     const sep = header.map(() => "---");
     const lines = [`| ${header.join(" | ")} |`, `| ${sep.join(" | ")} |`];
-    for (const row of rows) {
-      const vals = [row.ClusterName, ...categories.map((c) => row[c] ?? SYM_HEALTHY)];
-      lines.push(`| ${vals.join(" | ")} |`);
+    for (const r of rows) {
+      lines.push(`| ${[r.ClusterName, ...cats.map((c) => r[c] ?? SYM_OK)].join(" | ")} |`);
     }
     return lines.join("\n");
   }
 
-  async function buildWideTileTableSeverityShort(bucketEnum, categories) {
-    const counts = new Map();          // "clusterName||category" -> {C,W,I,U}
-    const clustersWithAny = new Set(); // clusters that have at least 1 alert in this bucket
+  async function buildSection(bucketEnum, cats) {
+    const counts = new Map();          // key cluster||cat -> {C,W,I,U}
+    const clustersWithAny = new Set(); // only clusters with any active alerts in this bucket
 
     for (const cl of clusters) {
       const clusterId = cl?.clusterId;
       const clusterName = String(cl?.clusterName || "").trim();
       if (!clusterId || !clusterName) continue;
 
-      const res = await getActiveAlertsByBucketForCluster(bucketEnum, clusterId);
+      const res = await getClusterBucketAlerts(clusterId, bucketEnum);
       const alerts = res.alerts || [];
 
       for (const a of alerts) {
         const cat = String(a?.alertCategory ?? "").trim();
-        if (!cat) continue;
-        if (!categories.includes(cat)) continue;
+        if (!cat || !cats.includes(cat)) continue;
 
-        const sevKey = sevBucket(String(a?.severity ?? ""));
+        const sev = sevBucket(String(a?.severity ?? ""));
         const key = `${clusterName}||${cat}`;
-
         if (!counts.has(key)) counts.set(key, { C: 0, W: 0, I: 0, U: 0 });
-        counts.get(key)[sevKey] += 1;
+        counts.get(key)[sev] += 1;
+
         clustersWithAny.add(clusterName);
       }
     }
 
-    const clusterList = Array.from(clustersWithAny).sort((a, b) => a.localeCompare(b));
-    if (!clusterList.length) return { markdown: "" };
-
-    const rows = clusterList.map((cn) => {
+    const list = Array.from(clustersWithAny).sort((a, b) => a.localeCompare(b));
+    const rows = list.map((cn) => {
       const row = { ClusterName: cn };
-      for (const cat of categories) {
+      for (const cat of cats) {
         const key = `${cn}||${cat}`;
-        if (!counts.has(key)) row[cat] = SYM_HEALTHY;
+        if (!counts.has(key)) row[cat] = SYM_OK;
         else {
           const { C, W, I, U } = counts.get(key);
-          row[cat] = cellValue(C, W, I, U);
+          row[cat] = cell(C, W, I, U);
         }
       }
       return row;
     });
 
-    return { markdown: buildMarkdownTable(rows, categories) };
+    return mdTable(rows, cats);
   }
 
-  // ==============================
-  // 9) Output sections separately
-  // ==============================
   const note =
     `**NOTE:** This mimics the **System → Health → Components** page of the cluster.\n` +
-    `- Shows ONLY clusters that currently have Active (kOpen) alerts for the selected section.\n` +
-    `- Clusters not displayed have no Active alerts for that section (healthy for these tiles).\n` +
-    `- Cells show "${SYM_HEALTHY}" or "${SYM_C}<n> ${SYM_W}<n> ${SYM_I}<n> ${SYM_U}<n>".\n` +
-    `- Filter: last ${LOOKBACK_DAYS} days via startTimeUsecs/endTimeUsecs.\n` +
-    `- Data source: per-cluster pull using accessClusterId (no dedupe).`;
+    `- Shows ONLY clusters that have Active (kOpen) alerts in each section.\n` +
+    `- Filter: last ${LOOKBACK_DAYS} days (startTimeUsecs/endTimeUsecs).\n` +
+    `- Data is pulled per-cluster using accessClusterId (no dedupe).`;
 
-  const hw  = await buildWideTileTableSeverityShort("kHardware", HW_Cats);
-  const mnt = await buildWideTileTableSeverityShort("kMaintenance", MAINT_Cats);
-  const ds  = await buildWideTileTableSeverityShort("kDataService", DS_Cats);
+  const markdownHardware = `**Hardware**\n${await buildSection("kHardware", HW_Cats)}`;
+  const markdownMaintenance = `**Maintenance**\n${await buildSection("kMaintenance", MAINT_Cats)}`;
+  const markdownDataService = `**Data Service**\n${await buildSection("kDataService", DS_Cats)}`;
 
   return {
     startTimeUsecs,
     endTimeUsecs,
     note,
-    markdownHardware: `**Hardware**\n${hw.markdown || "No Active alerts (no clusters to display)."}`,
-    markdownMaintenance: `**Maintenance**\n${mnt.markdown || "No Active alerts (no clusters to display)."}`,
-    markdownDataService: `**Data Service**\n${ds.markdown || "No Active alerts (no clusters to display)."}`
+    markdownHardware,
+    markdownMaintenance,
+    markdownDataService
   };
 }
