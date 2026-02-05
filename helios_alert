@@ -1,17 +1,14 @@
 # -------------------------------------------------------------
-# Cohesity Helios — Active Alert Tiles (Wide Tables, Severity Split)
+# Cohesity Helios — Active Alert Tiles (Dynamic Columns + Cluster Menu)
 #   - GET-only
-#   - ONLY clusters that currently have Active (kOpen) alerts are shown (short output)
+#   - Menu: [0] All clusters seen in alerts OR [1..N] single cluster
 #   - Sections: Hardware / Maintenance / Data Service (header line only)
-#   - Columns: EXACT alertCategory enums (alphabetical)
+#   - Columns: UNIQUE alertCategory values returned by API per bucket (sorted)
 #   - Cell:
 #       - "Healthy" if no active alerts for that category on that cluster
-#       - else "C:<n> W:<n> I:<n>"
+#       - else "C:<n> W:<n> I:<n> U:<n>" (U = unknown severity)
 #   - NOTE:
-#       Clusters not shown have no Active alerts for that section (healthy for these tiles).
-#   - DISPLAY:
-#       Uses Format-Table * + Out-String -Width 5000 to avoid column truncation in console.
-#       CSV exports always contain all columns.
+#       Only clusters that have at least one Active (kOpen) alert in that bucket are listed.
 # -------------------------------------------------------------
 $ErrorActionPreference = "Stop"
 $FormatEnumerationLimit = -1
@@ -25,27 +22,7 @@ if (-not (Test-Path $outDir))     { New-Item -ItemType Directory -Path $outDir |
 
 $apiKey  = (Get-Content -Path $apiKeyPath -Raw).Trim()
 $headers = @{ apiKey = $apiKey }
-
 $uriAlerts = "https://helios.cohesity.com/mcm/alerts"
-
-# ---------- CATEGORY COLUMNS (EXACT ENUMS) ----------
-$HW_Cats = @(
-  "kCPU","kChassis","kCluster","kDisk","kFan","kFirmware","kMemory","kNIC",
-  "kNode","kNodeHealth","kOperatingSystem","kPowerSupply","kStorageDevice",
-  "kStoragePool","kTemperature"
-) | Sort-Object
-
-$MAINT_Cats = @(
-  "kAuditLog","kClusterManagement","kConfiguration","kFaultTolerance",
-  "kGeneralSoftwareFailure","kHelios","kLicense","kNetworking","kSecurity",
-  "kStorageUsage","kSystemService","kUpgrade"
-) | Sort-Object
-
-$DS_Cats = @(
-  "kAgent","kAppMarketPlace","kArchivalRestore","kBackupRestore","kCDP",
-  "kDataPath","kDataSourceConnector","kDisasterRecovery","kIndexing","kMetadata",
-  "kNetBackup","kQuota","kRemoteReplication","kViewFailover"
-) | Sort-Object
 
 # ---------- HELPERS ----------
 function SeverityKey {
@@ -54,124 +31,166 @@ function SeverityKey {
     "kCritical" { "C" }
     "kWarning"  { "W" }
     "kInfo"     { "I" }
-    default     { "I" } # treat unknown as Info
+    default     { "U" }  # Unknown (do NOT treat as Info)
   }
 }
 
 function Get-ActiveAlertsByBucket {
   param([string]$bucketEnum) # kHardware / kMaintenance / kDataService
-
   $body = @{
     alertStateList      = "kOpen"       # Active only
     alertTypeBucketList = $bucketEnum
   }
-
   return (Invoke-RestMethod -Method Get -Uri $uriAlerts -Headers $headers -Body $body)
 }
 
-function Build-WideTileTableSeverity_Short {
+function Build-Section {
   param(
+    [string]$title,
     [string]$bucketEnum,
-    [string[]]$Categories
+    [string]$stamp
   )
 
   $alerts = Get-ActiveAlertsByBucket -bucketEnum $bucketEnum
 
-  # Cluster list ONLY from alerts (short output)
+  # Determine clusters and categories exactly from API output
   $clusters = $alerts | ForEach-Object { [string]$_.clusterName } |
     Where-Object { $_ -and $_.Trim() -ne "" } | Sort-Object -Unique
 
-  if (-not $clusters -or $clusters.Count -eq 0) {
-    return @() # no active alerts for this bucket
+  $categories = $alerts | ForEach-Object { [string]$_.alertCategory } |
+    Where-Object { $_ -and $_.Trim() -ne "" } | Sort-Object -Unique
+
+  # If nothing, return empty
+  if (-not $clusters -or $clusters.Count -eq 0 -or -not $categories -or $categories.Count -eq 0) {
+    return @{
+      Title = $title
+      Alerts = $alerts
+      Clusters = @()
+      Categories = @()
+      Rows = @()
+    }
   }
 
-  # counts["cluster||category"] = @{C=n;W=n;I=n}
-  $counts = @{}
+  # --------------------------
+  # Cluster selection menu
+  # --------------------------
+  Write-Host "`n$title — Cluster Selection (from Active alerts only)"
+  Write-Host "[0] All clusters"
+  for ($i=0; $i -lt $clusters.Count; $i++) {
+    $n = $i + 1
+    Write-Host ("[{0}] {1}" -f $n, $clusters[$i])
+  }
 
+  $choice = Read-Host "Select (0..$($clusters.Count))"
+  [int]$choiceInt = 0
+  if (-not [int]::TryParse($choice, [ref]$choiceInt)) { $choiceInt = 0 }
+
+  $selectedClusters =
+    if ($choiceInt -le 0 -or $choiceInt -gt $clusters.Count) { $clusters }
+    else { @($clusters[$choiceInt - 1]) }
+
+  # counts["cluster||category"] = @{C=n;W=n;I=n;U=n}
+  $counts = @{}
   foreach ($a in $alerts) {
-    $cluster = [string]$a.clusterName
-    $cat     = [string]$a.alertCategory
-    if (-not $cluster -or -not $cat) { continue }
-    if ($Categories -notcontains $cat) { continue }
+    $c = [string]$a.clusterName
+    if ($selectedClusters -notcontains $c) { continue }
+
+    $cat = [string]$a.alertCategory
+    if (-not $cat) { continue }
+
+    $k = "$c||$cat"
+    if (-not $counts.ContainsKey($k)) {
+      $counts[$k] = @{ C=0; W=0; I=0; U=0 }
+    }
 
     $sevKey = SeverityKey ([string]$a.severity)
-    $k = "$cluster||$cat"
-
-    if (-not $counts.ContainsKey($k)) {
-      $counts[$k] = @{ C = 0; W = 0; I = 0 }
-    }
     $counts[$k][$sevKey]++
   }
 
-  $rows = foreach ($c in $clusters) {
+  # Build rows
+  $rows = foreach ($c in $selectedClusters) {
     $row = [ordered]@{ ClusterName = $c }
 
-    foreach ($cat in $Categories) {
+    foreach ($cat in $categories) {
       $k = "$c||$cat"
       if (-not $counts.ContainsKey($k)) {
         $row[$cat] = "Healthy"
         continue
       }
 
-      $cN = [int]$counts[$k]["C"]
-      $wN = [int]$counts[$k]["W"]
-      $iN = [int]$counts[$k]["I"]
+      $C = [int]$counts[$k]["C"]
+      $W = [int]$counts[$k]["W"]
+      $I = [int]$counts[$k]["I"]
+      $U = [int]$counts[$k]["U"]
 
-      if ($cN -eq 0 -and $wN -eq 0 -and $iN -eq 0) {
+      if ($C -eq 0 -and $W -eq 0 -and $I -eq 0 -and $U -eq 0) {
         $row[$cat] = "Healthy"
       } else {
-        $row[$cat] = "C:$cN W:$wN I:$iN"
+        $row[$cat] = "C:$C W:$W I:$I U:$U"
       }
     }
 
     [PSCustomObject]$row
   }
 
-  return $rows
+  return @{
+    Title      = $title
+    Alerts     = $alerts
+    Clusters   = $clusters
+    Categories = $categories
+    Rows       = $rows
+  }
 }
 
 function Write-WideTable {
-  param(
-    [string]$title,
-    $rows
-  )
+  param([string]$title, $rows)
+
   "`n$title"
   if (-not $rows -or $rows.Count -eq 0) {
     "No Active alerts (no clusters to display)."
     return
   }
-
-  # Forces all properties (columns) to be rendered; Width avoids truncation
   $rows | Format-Table * | Out-String -Width 5000 | Write-Host
 }
 
-# ---------- NOTE ----------
+function Export-SectionCsv {
+  param(
+    [string]$titleSlug,
+    $rows,
+    [string]$stamp
+  )
+
+  $csv = Join-Path $outDir "Helios_Tiles_${titleSlug}_Active_$stamp.csv"
+  if ($rows -and $rows.Count -gt 0) {
+    $rows | Export-Csv -NoTypeInformation -Encoding UTF8 -Path $csv
+  } else {
+    "" | Set-Content -Path $csv -Encoding UTF8
+  }
+  return $csv
+}
+
+# ---------- RUN ----------
+$stamp = Get-Date -Format "yyyy-MM-dd_HHmm"
+
 $note = @"
 NOTE:
-- This report shows ONLY clusters that currently have Active (kOpen) alerts in each section.
-- Clusters not displayed have no Active alerts for that section (healthy for these tiles).
-- Cells show "Healthy" or "C:<n> W:<n> I:<n>".
+- This report shows ONLY Active (kOpen) alerts.
+- Only clusters present in the Active alert output for a section are offered in that section’s menu.
+- Columns are derived from the API output (unique alertCategory values per section).
+- Cells show "Healthy" or "C:<n> W:<n> I:<n> U:<n>" (U = unknown severity).
 "@
 "`n$note"
 
-# ---------- BUILD TABLES ----------
-$hw  = Build-WideTileTableSeverity_Short -bucketEnum "kHardware"    -Categories $HW_Cats
-$mnt = Build-WideTileTableSeverity_Short -bucketEnum "kMaintenance" -Categories $MAINT_Cats
-$ds  = Build-WideTileTableSeverity_Short -bucketEnum "kDataService" -Categories $DS_Cats
+$secHW  = Build-Section -title "Hardware"     -bucketEnum "kHardware"    -stamp $stamp
+$secMNT = Build-Section -title "Maintenance"  -bucketEnum "kMaintenance" -stamp $stamp
+$secDS  = Build-Section -title "Data Service" -bucketEnum "kDataService" -stamp $stamp
 
-# ---------- CONSOLE OUTPUT (full columns) ----------
-Write-WideTable -title "Hardware"    -rows $hw
-Write-WideTable -title "Maintenance" -rows $mnt
-Write-WideTable -title "Data Service" -rows $ds
+Write-WideTable -title "Hardware"     -rows $secHW.Rows
+Write-WideTable -title "Maintenance"  -rows $secMNT.Rows
+Write-WideTable -title "Data Service" -rows $secDS.Rows
 
-# ---------- EXPORT CSV ----------
-$stamp  = Get-Date -Format "yyyy-MM-dd_HHmm"
-$hwCsv  = Join-Path $outDir "Helios_Tiles_Hardware_Active_SHORT_$stamp.csv"
-$mntCsv = Join-Path $outDir "Helios_Tiles_Maintenance_Active_SHORT_$stamp.csv"
-$dsCsv  = Join-Path $outDir "Helios_Tiles_DataService_Active_SHORT_$stamp.csv"
-
-if ($hw  -and $hw.Count  -gt 0) { $hw  | Export-Csv -NoTypeInformation -Encoding UTF8 -Path $hwCsv }  else { "" | Set-Content -Path $hwCsv -Encoding UTF8 }
-if ($mnt -and $mnt.Count -gt 0) { $mnt | Export-Csv -NoTypeInformation -Encoding UTF8 -Path $mntCsv } else { "" | Set-Content -Path $mntCsv -Encoding UTF8 }
-if ($ds  -and $ds.Count  -gt 0) { $ds  | Export-Csv -NoTypeInformation -Encoding UTF8 -Path $dsCsv }  else { "" | Set-Content -Path $dsCsv -Encoding UTF8 }
+$hwCsv  = Export-SectionCsv -titleSlug "Hardware"    -rows $secHW.Rows  -stamp $stamp
+$mntCsv = Export-SectionCsv -titleSlug "Maintenance" -rows $secMNT.Rows -stamp $stamp
+$dsCsv  = Export-SectionCsv -titleSlug "DataService" -rows $secDS.Rows  -stamp $stamp
 
 Write-Host "`nSaved:`n$hwCsv`n$mntCsv`n$dsCsv"
