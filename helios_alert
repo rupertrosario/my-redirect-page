@@ -1,15 +1,15 @@
 # -------------------------------------------------------------
-# Cohesity Helios — Active Alert Tiles (Dynamic Columns, All Clusters in Alerts)
+# Cohesity Helios — Active/Note Alert Tiles (USING /v2/alerts-summary)
+#   Endpoint: https://helios.cohesity.com/v2/alerts-summary
 #   - GET-only
-#   - NO cluster selection (shows ALL clusters returned by alerts, per section)
+#   - States: kOpen + kNote (per your curl)
 #   - NO CSV export
+#   - NO cluster selection (shows only clusters present in summary output per section)
 #   - Sections: Hardware / Maintenance / Data Service (header line only)
-#   - Columns: UNIQUE alertCategory values returned by API per bucket (sorted)
+#   - Columns: UNIQUE category values returned by API per section (sorted)
 #   - Cell:
-#       - "Healthy" if no active alerts for that category on that cluster
+#       - "Healthy" if no alerts for that category on that cluster
 #       - else "C:<n> W:<n> I:<n> U:<n>" (U = unknown severity)
-#   - NOTE:
-#       Only clusters that have at least one Active (kOpen) alert in that bucket will appear.
 # -------------------------------------------------------------
 $ErrorActionPreference = "Stop"
 $FormatEnumerationLimit = -1
@@ -19,8 +19,12 @@ $apiKeyPath = "X:\PowerShell\Cohesity_API_Scripts\DO_NOT_Delete\apikey.txt"
 if (-not (Test-Path $apiKeyPath)) { throw "API key file not found at $apiKeyPath" }
 
 $apiKey  = (Get-Content -Path $apiKeyPath -Raw).Trim()
-$headers = @{ apiKey = $apiKey }
-$uriAlerts = "https://helios.cohesity.com/mcm/alerts"
+$headers = @{ apiKey = $apiKey; Accept = "application/json" }
+
+$uriSummary = "https://helios.cohesity.com/v2/alerts-summary"
+
+# States per your curl
+$states = @("kOpen","kNote")
 
 # ---------- HELPERS ----------
 function SeverityKey {
@@ -33,53 +37,148 @@ function SeverityKey {
   }
 }
 
-function Get-ActiveAlertsByBucket {
-  param([string]$bucketEnum) # kHardware / kMaintenance / kDataService
-  $body = @{
-    alertStateList      = "kOpen"       # Active only
-    alertTypeBucketList = $bucketEnum
+function Build-QueryString {
+  param([string[]]$statesList, [int]$mode)
+
+  # mode 1: repeated param => ?statesList=kOpen&statesList=kNote
+  if ($mode -eq 1) {
+    return ($statesList | ForEach-Object { "statesList=$_" }) -join "&"
   }
-  return (Invoke-RestMethod -Method Get -Uri $uriAlerts -Headers $headers -Body $body)
+
+  # mode 2: indexed => ?statesList[0]=kOpen&statesList[1]=kNote
+  $i = 0
+  $parts = @()
+  foreach ($s in $statesList) {
+    $parts += ("statesList[{0}]={1}" -f $i, $s)
+    $i++
+  }
+  return ($parts -join "&")
 }
 
-function Build-WideTiles {
-  param([string]$bucketEnum)
+function Invoke-AlertsSummary {
+  param([string[]]$statesList)
 
-  $alerts = Get-ActiveAlertsByBucket -bucketEnum $bucketEnum
+  # Try both query styles to match server expectations
+  $qs1 = Build-QueryString -statesList $statesList -mode 1
+  $qs2 = Build-QueryString -statesList $statesList -mode 2
 
-  $clusters = $alerts | ForEach-Object { [string]$_.clusterName } |
-    Where-Object { $_ -and $_.Trim() -ne "" } | Sort-Object -Unique
-
-  $categories = $alerts | ForEach-Object { [string]$_.alertCategory } |
-    Where-Object { $_ -and $_.Trim() -ne "" } | Sort-Object -Unique
-
-  if (-not $clusters -or $clusters.Count -eq 0 -or -not $categories -or $categories.Count -eq 0) {
-    return @()
+  foreach ($qs in @($qs1,$qs2)) {
+    $u = "$uriSummary`?$qs"
+    try {
+      return (Invoke-RestMethod -Method Get -Uri $u -Headers $headers)
+    } catch {
+      # try next
+    }
   }
+
+  throw "Failed calling /v2/alerts-summary with statesList. Verify API key + endpoint availability."
+}
+
+function Get-Prop {
+  param($obj, [string[]]$names)
+  foreach ($n in $names) {
+    $p = $obj.PSObject.Properties[$n]
+    if ($p -and $null -ne $p.Value -and $p.Value.ToString().Trim() -ne "") { return $p.Value }
+  }
+  return $null
+}
+
+function Normalize-Records {
+  param($summaryResp)
+
+  # Attempt to locate an array of records (common shapes)
+  $records =
+    if ($summaryResp.items) { $summaryResp.items }
+    elseif ($summaryResp.alertsSummary) { $summaryResp.alertsSummary }
+    elseif ($summaryResp.alertSummary) { $summaryResp.alertSummary }
+    elseif ($summaryResp.summary) { $summaryResp.summary }
+    elseif ($summaryResp -is [System.Array]) { $summaryResp }
+    else { @() }
+
+  if (-not $records -or $records.Count -eq 0) { return @() }
+
+  # Normalize each record to fields we need:
+  # clusterName, category, typeBucket, severity, count
+  $norm = @()
+  foreach ($r in $records) {
+    $cluster = Get-Prop $r @("clusterName","cluster","cluster_name","clusterInfoName","clusterDisplayName","sourceClusterName")
+    $cat     = Get-Prop $r @("category","alertCategory","alert_category","categoryType")
+    $bucket  = Get-Prop $r @("typeBucket","alertTypeBucket","bucket","alert_type_bucket","type")
+    $sev     = Get-Prop $r @("severity","alertSeverity","alert_severity","level")
+    $cnt     = Get-Prop $r @("count","totalCount","alertsCount","numAlerts","value")
+
+    # Some APIs embed dimensions under a "groupBy"/"group" object
+    if (-not $cluster -or -not $cat -or -not $bucket -or -not $sev) {
+      $g = Get-Prop $r @("group","groupBy","dimensions","key")
+      if ($g) {
+        if (-not $cluster) { $cluster = Get-Prop $g @("clusterName","cluster") }
+        if (-not $cat)     { $cat     = Get-Prop $g @("category","alertCategory") }
+        if (-not $bucket)  { $bucket  = Get-Prop $g @("typeBucket","alertTypeBucket") }
+        if (-not $sev)     { $sev     = Get-Prop $g @("severity","alertSeverity") }
+      }
+    }
+
+    if (-not $cnt) { $cnt = 0 }
+    $cnt = [int]$cnt
+
+    # If the endpoint does NOT return clusterName, we cannot build tiles per cluster.
+    if (-not $cluster) { continue }
+    if (-not $cat)     { continue }
+    if (-not $bucket)  { continue }
+    if (-not $sev)     { $sev = "Unknown" }
+
+    $norm += [PSCustomObject]@{
+      ClusterName = [string]$cluster
+      Category    = [string]$cat
+      TypeBucket  = [string]$bucket
+      Severity    = [string]$sev
+      Count       = $cnt
+    }
+  }
+
+  return $norm
+}
+
+function BucketTitle {
+  param([string]$bucket)
+  switch ($bucket) {
+    "kHardware"     { "Hardware" }
+    "kMaintenance"  { "Maintenance" }
+    "kDataService"  { "Data Service" }
+    default {
+      # If API returns non-k* values, keep as-is
+      $bucket
+    }
+  }
+}
+
+function Build-WideTilesFromNorm {
+  param(
+    $normRecords,
+    [string]$bucketEnum
+  )
+
+  $rec = $normRecords | Where-Object { $_.TypeBucket -eq $bucketEnum }
+  if (-not $rec -or $rec.Count -eq 0) { return @() }
+
+  $clusters = $rec | Select-Object -ExpandProperty ClusterName | Sort-Object -Unique
+  $cats     = $rec | Select-Object -ExpandProperty Category    | Sort-Object -Unique
 
   # counts["cluster||category"] = @{C=n;W=n;I=n;U=n}
   $counts = @{}
-  foreach ($a in $alerts) {
-    $c = [string]$a.clusterName
-    $cat = [string]$a.alertCategory
-    if (-not $c -or -not $cat) { continue }
-
-    $k = "$c||$cat"
+  foreach ($r in $rec) {
+    $k = "$($r.ClusterName)||$($r.Category)"
     if (-not $counts.ContainsKey($k)) { $counts[$k] = @{ C=0; W=0; I=0; U=0 } }
 
-    $sevKey = SeverityKey ([string]$a.severity)
-    $counts[$k][$sevKey]++
+    $sKey = SeverityKey $r.Severity
+    $counts[$k][$sKey] += [int]$r.Count
   }
 
   $rows = foreach ($c in $clusters) {
     $row = [ordered]@{ ClusterName = $c }
-
-    foreach ($cat in $categories) {
+    foreach ($cat in $cats) {
       $k = "$c||$cat"
-      if (-not $counts.ContainsKey($k)) {
-        $row[$cat] = "Healthy"
-        continue
-      }
+      if (-not $counts.ContainsKey($k)) { $row[$cat] = "Healthy"; continue }
 
       $C = [int]$counts[$k]["C"]
       $W = [int]$counts[$k]["W"]
@@ -92,7 +191,6 @@ function Build-WideTiles {
         $row[$cat] = "C:$C W:$W I:$I U:$U"
       }
     }
-
     [PSCustomObject]$row
   }
 
@@ -104,7 +202,7 @@ function Write-WideTable {
 
   "`n$title"
   if (-not $rows -or $rows.Count -eq 0) {
-    "No Active alerts (no clusters to display)."
+    "No alerts in summary output for this section."
     return
   }
 
@@ -112,21 +210,34 @@ function Write-WideTable {
   $rows | Format-Table * | Out-String -Width 5000 | Write-Host
 }
 
-# ---------- NOTE ----------
+# ---------- RUN ----------
 $note = @"
 NOTE:
-- This report shows ONLY Active (kOpen) alerts.
-- Only clusters present in the Active alert output for a section are displayed.
-- Columns are derived from the API output (unique alertCategory values per section).
+- Using /v2/alerts-summary with statesList = kOpen, kNote.
+- Sections show ONLY clusters present in the summary output for that bucket.
+- Columns are derived from the API output (unique category values per section).
 - Cells show "Healthy" or "C:<n> W:<n> I:<n> U:<n>" (U = unknown severity).
 "@
 "`n$note"
 
-# ---------- BUILD + PRINT ----------
-$hw  = Build-WideTiles -bucketEnum "kHardware"
-$mnt = Build-WideTiles -bucketEnum "kMaintenance"
-$ds  = Build-WideTiles -bucketEnum "kDataService"
+$summaryRaw = Invoke-AlertsSummary -statesList $states
+$norm = Normalize-Records -summaryResp $summaryRaw
 
-Write-WideTable -title "Hardware"     -rows $hw
-Write-WideTable -title "Maintenance"  -rows $mnt
-Write-WideTable -title "Data Service" -rows $ds
+if (-not $norm -or $norm.Count -eq 0) {
+  throw "No usable records returned from /v2/alerts-summary (or response lacks clusterName/category/typeBucket)."
+}
+
+# Determine which buckets actually appear
+$buckets = $norm | Select-Object -ExpandProperty TypeBucket | Sort-Object -Unique
+
+# Prefer these three buckets if present
+$preferred = @("kHardware","kMaintenance","kDataService")
+$orderedBuckets = @()
+foreach ($b in $preferred) { if ($buckets -contains $b) { $orderedBuckets += $b } }
+foreach ($b in $buckets)   { if ($orderedBuckets -notcontains $b) { $orderedBuckets += $b } }
+
+foreach ($b in $orderedBuckets) {
+  $title = BucketTitle $b
+  $rows  = Build-WideTilesFromNorm -normRecords $norm -bucketEnum $b
+  Write-WideTable -title $title -rows $rows
+}
