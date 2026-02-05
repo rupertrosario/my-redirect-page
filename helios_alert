@@ -1,0 +1,178 @@
+# -------------------------------------------------------------
+# Cohesity Helios — Active Alert "Tiles" (Wide Health Tables)
+#   - Rows: Cluster
+#   - Columns: Categories (alphabetical)
+#   - Cell: "Healthy" if 0 active alerts else count
+# Buckets:
+#   1) Hardware
+#   2) Maintenance
+#   3) Data Service
+# -------------------------------------------------------------
+$ErrorActionPreference = "Stop"
+
+# ---------- CONFIG ----------
+$apiKeyPath = "X:\PowerShell\Cohesity_API_Scripts\DO_NOT_Delete\apikey.txt"
+$outDir     = "X:\PowerShell\Data\Cohesity\Alerts"
+# Optional: include clusters that have ZERO alerts (one cluster name per line)
+# $clusterListPath = "X:\PowerShell\Cohesity_API_Scripts\clusters.txt"
+$clusterListPath = $null
+
+if (-not (Test-Path $apiKeyPath)) { throw "API key file not found at $apiKeyPath" }
+if (-not (Test-Path $outDir))     { New-Item -ItemType Directory -Path $outDir | Out-Null }
+
+$apiKey  = (Get-Content -Path $apiKeyPath -Raw).Trim()
+$headers = @{ apiKey = $apiKey }
+
+$uriAlerts = "https://helios.cohesity.com/mcm/alerts"
+
+# ---------- CATEGORY DEFINITIONS (your required columns) ----------
+# Map DisplayName -> regex patterns to match (alertCategory + description)
+$HW_Map = [ordered]@{
+  "Chassis"      = @("chassis","enclosure","backplane")
+  "Cluster"      = @("cluster")
+  "CPU"          = @("cpu","processor")
+  "Disk"         = @("disk","drive","ssd","hdd","media error","storage device")
+  "Fan"          = @("fan")
+  "Firmware"     = @("firmware","bios","bmc","ipmi","upgrade firmware")
+  "Memory"       = @("memory","dimm","ram","ecc")
+  "NIC"          = @("nic","network","interface","link down","ethernet")
+  "Node"         = @("node","host","appliance")
+  "PowerSupply"  = @("psu","power supply","power-supply","\bpower\b")
+  "Temperature"  = @("temp","temperature","thermal","overheat")
+}
+
+$MAINT_Map = [ordered]@{
+  "ClusterManagement" = @("cluster management","cluster mgmt","management")
+  "Configuration"     = @("configuration","config","misconfig")
+  "FaultTolerance"    = @("fault tolerance","fault-tolerance","redundancy","replica","erasure")
+  "License"           = @("license","licensing","entitlement")
+  "Networking"        = @("networking","network","dns","ntp","gateway","route","interface")
+  "Security"          = @("security","auth","authentication","authorization","certificate","tls","ssh","rbac")
+  "StorageUsage"      = @("storage usage","capacity","full","space","utilization","usage","threshold")
+  "Upgrade"           = @("upgrade","update","patch","version","rolling")
+}
+
+$DS_Map = [ordered]@{
+  "ArchivalAndRestore"        = @("archival and restore","archive restore","archival","archive")
+  "BackupAndRestore"          = @("backup and restore","backup","restore")
+  "ContinuousDataProtection"  = @("continuous data protection","cdp","journal")
+  "DataSourceConnector"       = @("data source connector","connector","agent","plugin","registration")
+  "DisasterRecovery"          = @("disaster recovery","dr","failover","failback","runbook")
+  "Quota"                     = @("quota","limit","throttle")
+  "RemoteReplication"         = @("remote replication","replication","replicate")
+  "ViewFailover"              = @("view failover","view","mount","instant volume","failover view")
+}
+
+# ---------- HELPERS ----------
+function Normalize-Text {
+  param([string]$s)
+  if (-not $s) { return "" }
+  return $s.ToLowerInvariant()
+}
+
+function Resolve-Category {
+  param(
+    $alert,
+    [hashtable]$Map
+  )
+  $cat  = Normalize-Text ([string]$alert.alertCategory)
+  $desc = Normalize-Text ([string]$alert.alertDocument.alertDescription)
+  $t = "$cat $desc"
+
+  foreach ($display in $Map.Keys) {
+    foreach ($pat in $Map[$display]) {
+      if ($t -match $pat) { return $display }
+    }
+  }
+  return "Other"
+}
+
+function Get-ActiveAlertsByBucket {
+  param([string]$bucketEnum) # e.g. kHardware / kMaintenance / kDataService
+
+  $body = @{
+    alertStateList      = "kOpen"       # UI: Active
+    alertTypeBucketList = $bucketEnum
+  }
+
+  $resp = Invoke-RestMethod -Method Get -Uri $uriAlerts -Headers $headers -Body $body
+  return $resp
+}
+
+function Build-WideTileTable {
+  param(
+    [string]$bucketLabel,
+    [string]$bucketEnum,
+    [hashtable]$CategoryMap
+  )
+
+  $alerts = Get-ActiveAlertsByBucket -bucketEnum $bucketEnum
+
+  $norm = foreach ($a in $alerts) {
+    [PSCustomObject]@{
+      ClusterName = [string]$a.clusterName
+      Category    = Resolve-Category -alert $a -Map $CategoryMap
+    }
+  }
+
+  # Cluster list
+  $clusters = @()
+  if ($clusterListPath -and (Test-Path $clusterListPath)) {
+    $clusters = Get-Content $clusterListPath | Where-Object { $_ -and $_.Trim() -ne "" } | Sort-Object -Unique
+  } else {
+    $clusters = $norm.ClusterName | Where-Object { $_ -and $_.Trim() -ne "" } | Sort-Object -Unique
+  }
+
+  # Categories (alphabetical by display name)
+  $cats = $CategoryMap.Keys | Sort-Object
+
+  # Pre-count: Cluster|Category -> count
+  $counts = @{}
+  foreach ($n in $norm) {
+    if ($n.Category -eq "Other") { continue } # ignore unmapped for quick-look tiles
+    $k = "$($n.ClusterName)||$($n.Category)"
+    if (-not $counts.ContainsKey($k)) { $counts[$k] = 0 }
+    $counts[$k]++
+  }
+
+  # Build wide rows (ordered)
+  $rows = foreach ($c in $clusters) {
+    $row = [ordered]@{
+      ClusterName = $c
+      Status      = "Active"   # constant label; cells are Healthy/count
+      Bucket      = $bucketLabel
+    }
+
+    foreach ($cat in $cats) {
+      $k = "$c||$cat"
+      $v = if ($counts.ContainsKey($k)) { [string]$counts[$k] } else { "Healthy" }
+      $row[$cat] = $v
+    }
+
+    [PSCustomObject]$row
+  }
+
+  return $rows
+}
+
+# ---------- BUILD TABLES ----------
+$hw   = Build-WideTileTable -bucketLabel "Hardware"     -bucketEnum "kHardware"     -CategoryMap $HW_Map
+$mnt  = Build-WideTileTable -bucketLabel "Maintenance"  -bucketEnum "kMaintenance"  -CategoryMap $MAINT_Map
+$ds   = Build-WideTileTable -bucketLabel "DataService"  -bucketEnum "kDataService"  -CategoryMap $DS_Map
+
+# ---------- CONSOLE (quick look) ----------
+$hw  | Format-Table -AutoSize
+$mnt | Format-Table -AutoSize
+$ds  | Format-Table -AutoSize
+
+# ---------- EXPORT ----------
+$stamp = Get-Date -Format "yyyy-MM-dd_HHmm"
+$hwCsv  = Join-Path $outDir "Helios_Tiles_Hardware_Active_$stamp.csv"
+$mntCsv = Join-Path $outDir "Helios_Tiles_Maintenance_Active_$stamp.csv"
+$dsCsv  = Join-Path $outDir "Helios_Tiles_DataService_Active_$stamp.csv"
+
+$hw  | Export-Csv -NoTypeInformation -Encoding UTF8 -Path $hwCsv
+$mnt | Export-Csv -NoTypeInformation -Encoding UTF8 -Path $mntCsv
+$ds  | Export-Csv -NoTypeInformation -Encoding UTF8 -Path $dsCsv
+
+Write-Host "Saved:`n$hwCsv`n$mntCsv`n$dsCsv"
