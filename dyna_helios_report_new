@@ -2,9 +2,10 @@ import { credentialVaultClient } from "@dynatrace-sdk/client-classic-environment
 
 /**
  * Cohesity Helios — Active Alert Tiles (Cluster-scoped via accessClusterId)
- * - Uses /v2/mcm/alerts (as requested)
+ * - Uses /v2/mcm/alerts
  * - GET-only
  * - ONLY clusters that currently have Active (kOpen) alerts are shown (short output)
+ * - Time filter: TODAY (00:00:00 → now) in US Eastern (ET), expressed as startTimeUsecs/endTimeUsecs
  * - Sections: Hardware / Maintenance / Data Service
  * - Columns: EXACT alertCategory enums (alphabetical)
  * - Cell: ✅ if healthy, else ⛔<n> ⚠️<n> ℹ️<n> ❓<n>
@@ -15,6 +16,7 @@ import { credentialVaultClient } from "@dynatrace-sdk/client-classic-environment
  *  - markdownHardware
  *  - markdownMaintenance
  *  - markdownDataService
+ *  - startTimeUsecs, endTimeUsecs (so you can verify)
  */
 
 export default async function () {
@@ -31,7 +33,72 @@ export default async function () {
   const commonHeaders = { accept: "application/json", apiKey };
 
   // ==============================
-  // 2) CATEGORY COLUMNS (EXACT ENUMS)
+  // 2) TIME WINDOW (TODAY in ET)
+  //    startTimeUsecs = ET midnight today
+  //    endTimeUsecs   = now
+  // ==============================
+  function epochUsecsNow() {
+    return BigInt(Date.now()) * 1000n;
+  }
+
+  function tzOffsetMinutesAt(date, timeZone) {
+    // returns offset minutes: UTC - TZ (e.g., ET winter => 300)
+    const dtf = new Intl.DateTimeFormat("en-US", {
+      timeZone,
+      year: "numeric", month: "2-digit", day: "2-digit",
+      hour: "2-digit", minute: "2-digit", second: "2-digit",
+      hour12: false
+    });
+    const parts = dtf.formatToParts(date);
+    const m = {};
+    for (const p of parts) m[p.type] = p.value;
+
+    const asUTC = Date.UTC(
+      Number(m.year),
+      Number(m.month) - 1,
+      Number(m.day),
+      Number(m.hour),
+      Number(m.minute),
+      Number(m.second)
+    );
+    // if `date` is the real instant, then date.getTime() - asUTC = offset in ms (TZ relative to UTC)
+    return Math.round((date.getTime() - asUTC) / 60000);
+  }
+
+  function startOfTodayUsecsInTZ(timeZone) {
+    // Build "today" calendar date in target TZ
+    const now = new Date();
+    const dtf = new Intl.DateTimeFormat("en-US", {
+      timeZone,
+      year: "numeric", month: "2-digit", day: "2-digit",
+      hour12: false
+    });
+    const parts = dtf.formatToParts(now);
+    const m = {};
+    for (const p of parts) m[p.type] = p.value;
+
+    // Midnight UTC for that Y-M-D
+    const utcMidnightMs = Date.UTC(
+      Number(m.year),
+      Number(m.month) - 1,
+      Number(m.day),
+      0, 0, 0
+    );
+
+    // Convert that wall-clock midnight in TZ to real UTC instant by subtracting TZ offset at that moment
+    const approx = new Date(utcMidnightMs);
+    const offMin = tzOffsetMinutesAt(approx, timeZone);
+    const realMs = utcMidnightMs + offMin * 60 * 1000;
+
+    return BigInt(realMs) * 1000n;
+  }
+
+  const TZ = "America/New_York"; // ET/EDT depending on date
+  const startTimeUsecs = startOfTodayUsecsInTZ(TZ).toString();
+  const endTimeUsecs = epochUsecsNow().toString();
+
+  // ==============================
+  // 3) CATEGORY COLUMNS (EXACT ENUMS)
   // ==============================
   const HW_Cats = [
     "kCPU","kChassis","kCluster","kDisk","kFan","kFirmware","kMemory","kNIC",
@@ -52,7 +119,7 @@ export default async function () {
   ].sort();
 
   // ==============================
-  // 3) SYMBOLS
+  // 4) SYMBOLS
   // ==============================
   const SYM_HEALTHY = "✅";
   const SYM_C = "⛔";
@@ -61,7 +128,7 @@ export default async function () {
   const SYM_U = "❓";
 
   // ==============================
-  // 4) HELPERS
+  // 5) HELPERS
   // ==============================
   function sevBucket(sev) {
     switch (sev) {
@@ -109,7 +176,7 @@ export default async function () {
   }
 
   // ==============================
-  // 5) Fetch clusters
+  // 6) Fetch clusters
   // ==============================
   const cluUrl = `${baseUrl}/v2/mcm/cluster-mgmt/info`;
   const cluResp = await getJsonSafe(cluUrl, { ...commonHeaders, Accept: "application/json" });
@@ -121,12 +188,14 @@ export default async function () {
   }
 
   // ==============================
-  // 6) Cluster-scoped alerts pull (v2 endpoint)
+  // 7) Cluster-scoped alerts pull (v2 endpoint + time filter)
   // ==============================
   async function getActiveAlertsByBucketForCluster(bucketEnum, clusterId) {
     const qs = new URLSearchParams({
       alertStateList: "kOpen",
-      alertTypeBucketList: bucketEnum
+      alertTypeBucketList: bucketEnum,
+      startTimeUsecs,
+      endTimeUsecs
       // maxAlerts: "500"
     });
 
@@ -143,7 +212,7 @@ export default async function () {
   }
 
   // ==============================
-  // 7) Build tables
+  // 8) Build tables (short output)
   // ==============================
   function cellValue(C, W, I, U) {
     if (C === 0 && W === 0 && I === 0 && U === 0) return SYM_HEALTHY;
@@ -214,13 +283,14 @@ export default async function () {
   }
 
   // ==============================
-  // 8) Output sections separately
+  // 9) Output sections separately
   // ==============================
   const note =
     `**NOTE:** This mimics the **System → Health → Components** page of the cluster.\n` +
     `- Shows ONLY clusters that currently have Active (kOpen) alerts for the selected section.\n` +
     `- Clusters not displayed have no Active alerts for that section (healthy for these tiles).\n` +
     `- Cells show "${SYM_HEALTHY}" or "${SYM_C}<n> ${SYM_W}<n> ${SYM_I}<n> ${SYM_U}<n>".\n` +
+    `- Filter: TODAY in ET via startTimeUsecs/endTimeUsecs.\n` +
     `- Data source: per-cluster pull using accessClusterId (no dedupe).`;
 
   const hw  = await buildWideTileTableSeverityShort("kHardware", HW_Cats);
@@ -237,6 +307,8 @@ export default async function () {
     `**Data Service**\n${ds.markdown || "No Active alerts (no clusters to display)."}`;
 
   return {
+    startTimeUsecs,
+    endTimeUsecs,
     note,
     markdownHardware,
     markdownMaintenance,
