@@ -1,0 +1,245 @@
+import { credentialVaultClient } from "@dynatrace-sdk/client-classic-environment-v2";
+
+/**
+ * Cohesity Helios — Active Alert Tiles (Markdown-only, Severity Symbols)
+ * - GET-only
+ * - ONLY clusters that currently have Active (kOpen) alerts are shown (short output)
+ * - Sections: Hardware / Maintenance / Data Service (header line only)
+ * - Columns: EXACT alertCategory enums (alphabetical)
+ * - Cell:
+ *     - "✅" if no active alerts for that category on that cluster
+ *     - else "⛔<n> ⚠️<n> ℹ️<n>"
+ */
+
+export default async function () {
+  const baseUrl = "https://helios.cohesity.com";
+  const alertsPath = "/mcm/alerts";
+
+  // ----------------------------
+  // AUTH (Credential Vault)
+  // ----------------------------
+  const vaultName = "Cohesity_API_Key";
+  const vaultId = "credentials_vault-312312"; // keep your existing ID if you have one
+
+  async function getKeyByName(name) {
+    const all = await credentialVaultClient.getCredentials();
+    const hit = (all?.credentials ?? []).find((c) => c.name === name);
+    if (!hit?.id) return null;
+    const sec = await credentialVaultClient.getCredentialById({ id: hit.id });
+    return sec?.token ?? sec?.password ?? sec?.value ?? null;
+  }
+
+  async function getKeyById(id) {
+    if (!id) return null;
+    const sec = await credentialVaultClient.getCredentialById({ id });
+    return sec?.token ?? sec?.password ?? sec?.value ?? null;
+  }
+
+  const apiKey = (await getKeyByName(vaultName)) || (await getKeyById(vaultId));
+  if (!apiKey) {
+    throw new Error(
+      `Cohesity API key not found in Credential Vault (name="${vaultName}" or id="${vaultId}").`
+    );
+  }
+
+  const headers = { apiKey, Accept: "application/json" };
+
+  // ----------------------------
+  // CATEGORY COLUMNS (EXACT ENUMS)
+  // ----------------------------
+  const HW_Cats = [
+    "kCPU",
+    "kChassis",
+    "kCluster",
+    "kDisk",
+    "kFan",
+    "kFirmware",
+    "kMemory",
+    "kNIC",
+    "kNode",
+    "kNodeHealth",
+    "kOperatingSystem",
+    "kPowerSupply",
+    "kStorageDevice",
+    "kStoragePool",
+    "kTemperature",
+  ].sort();
+
+  const MAINT_Cats = [
+    "kAuditLog",
+    "kClusterManagement",
+    "kConfiguration",
+    "kFaultTolerance",
+    "kGeneralSoftwareFailure",
+    "kHelios",
+    "kLicense",
+    "kNetworking",
+    "kSecurity",
+    "kStorageUsage",
+    "kSystemService",
+    "kUpgrade",
+  ].sort();
+
+  const DS_Cats = [
+    "kAgent",
+    "kAppMarketPlace",
+    "kArchivalRestore",
+    "kBackupRestore",
+    "kCDP",
+    "kDataPath",
+    "kDataSourceConnector",
+    "kDisasterRecovery",
+    "kIndexing",
+    "kMetadata",
+    "kNetBackup",
+    "kQuota",
+    "kRemoteReplication",
+    "kViewFailover",
+  ].sort();
+
+  // ----------------------------
+  // SYMBOLS
+  // ----------------------------
+  const SYM_HEALTHY = "✅";
+  const SYM_C = "⛔"; // Critical
+  const SYM_W = "⚠️"; // Warning
+  const SYM_I = "ℹ️"; // Info
+
+  // ----------------------------
+  // HELPERS
+  // ----------------------------
+  function sevBucket(sev) {
+    switch (sev) {
+      case "kCritical":
+        return "C";
+      case "kWarning":
+        return "W";
+      case "kInfo":
+        return "I";
+      default:
+        return "I";
+    }
+  }
+
+  function normalizeAlerts(resp) {
+    if (Array.isArray(resp)) return resp;
+    if (Array.isArray(resp?.alerts)) return resp.alerts;
+    if (Array.isArray(resp?.items)) return resp.items;
+    return [];
+  }
+
+  async function getActiveAlertsByBucket(bucketEnum) {
+    // GET with query params (avoid GET body issues)
+    const qs = new URLSearchParams({
+      alertStateList: "kOpen",
+      alertTypeBucketList: bucketEnum,
+    });
+
+    const url = `${baseUrl}${alertsPath}?${qs.toString()}`;
+    const r = await fetch(url, { method: "GET", headers });
+
+    if (!r.ok) {
+      const t = await r.text().catch(() => "");
+      throw new Error(`Helios alerts GET failed (${r.status}): ${t || r.statusText}`);
+    }
+
+    const j = await r.json().catch(() => ({}));
+    return normalizeAlerts(j);
+  }
+
+  function cellValue(C, W, I) {
+    if (C === 0 && W === 0 && I === 0) return SYM_HEALTHY;
+    return `${SYM_C}${C} ${SYM_W}${W} ${SYM_I}${I}`;
+  }
+
+  function buildMarkdownTable(rows, categories) {
+    if (!rows?.length) return "No Active alerts (no clusters to display).";
+
+    const header = ["ClusterName", ...categories];
+    const sep = header.map(() => "---");
+
+    const lines = [];
+    lines.push(`| ${header.join(" | ")} |`);
+    lines.push(`| ${sep.join(" | ")} |`);
+
+    for (const row of rows) {
+      const vals = [row.ClusterName, ...categories.map((c) => row[c] ?? SYM_HEALTHY)];
+      lines.push(`| ${vals.join(" | ")} |`);
+    }
+    return lines.join("\n");
+  }
+
+  async function buildWideTileTableSeverityShort(bucketEnum, categories) {
+    const alerts = await getActiveAlertsByBucket(bucketEnum);
+
+    // Cluster list ONLY from alerts (short output)
+    const clusters = Array.from(
+      new Set(
+        alerts
+          .map((a) => String(a?.clusterName ?? "").trim())
+          .filter((x) => x.length > 0)
+      )
+    ).sort((a, b) => a.localeCompare(b));
+
+    if (!clusters.length) return { rows: [], markdown: "" };
+
+    // counts["cluster||category"] = {C:n, W:n, I:n}
+    const counts = new Map();
+
+    for (const a of alerts) {
+      const cluster = String(a?.clusterName ?? "").trim();
+      const cat = String(a?.alertCategory ?? "").trim();
+      if (!cluster || !cat) continue;
+      if (!categories.includes(cat)) continue;
+
+      const k = `${cluster}||${cat}`;
+      if (!counts.has(k)) counts.set(k, { C: 0, W: 0, I: 0 });
+
+      const bucket = sevBucket(String(a?.severity ?? ""));
+      counts.get(k)[bucket] += 1;
+    }
+
+    const rows = clusters.map((c) => {
+      const row = { ClusterName: c };
+      for (const cat of categories) {
+        const k = `${c}||${cat}`;
+        if (!counts.has(k)) {
+          row[cat] = SYM_HEALTHY;
+          continue;
+        }
+        const { C, W, I } = counts.get(k);
+        row[cat] = cellValue(C, W, I);
+      }
+      return row;
+    });
+
+    return { rows, markdown: buildMarkdownTable(rows, categories) };
+  }
+
+  // ----------------------------
+  // NOTE
+  // ----------------------------
+  const note =
+    `NOTE:\n` +
+    `- This report shows ONLY clusters that currently have Active (kOpen) alerts in each section.\n` +
+    `- Clusters not displayed have no Active alerts for that section (healthy for these tiles).\n` +
+    `- Cells show "${SYM_HEALTHY}" or "${SYM_C}<n> ${SYM_W}<n> ${SYM_I}<n>".`;
+
+  // ----------------------------
+  // BUILD TABLES
+  // ----------------------------
+  const hw = await buildWideTileTableSeverityShort("kHardware", HW_Cats);
+  const mnt = await buildWideTileTableSeverityShort("kMaintenance", MAINT_Cats);
+  const ds = await buildWideTileTableSeverityShort("kDataService", DS_Cats);
+
+  // ----------------------------
+  // MARKDOWN-ONLY BODY
+  // ----------------------------
+  const markdown =
+    `${note}\n\n` +
+    `Hardware\n${hw.markdown || "No Active alerts (no clusters to display)."}\n\n` +
+    `Maintenance\n${mnt.markdown || "No Active alerts (no clusters to display)."}\n\n` +
+    `Data Service\n${ds.markdown || "No Active alerts (no clusters to display)."}`;
+
+  return { markdown };
+}
