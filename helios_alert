@@ -1,6 +1,7 @@
 # -------------------------------------------------------------
 # Cohesity Helios — Active Alert "Tiles" (Wide Health Tables)
-#   - Rows: Cluster
+#   - GET-only
+#   - Rows: ALL clusters (from /mcm/clusters)
 #   - Columns: Categories (alphabetical)
 #   - Cell: "Healthy" if 0 active alerts else count
 # Buckets:
@@ -13,9 +14,6 @@ $ErrorActionPreference = "Stop"
 # ---------- CONFIG ----------
 $apiKeyPath = "X:\PowerShell\Cohesity_API_Scripts\DO_NOT_Delete\apikey.txt"
 $outDir     = "X:\PowerShell\Data\Cohesity\Alerts"
-# Optional: include clusters that have ZERO alerts (one cluster name per line)
-# $clusterListPath = "X:\PowerShell\Cohesity_API_Scripts\clusters.txt"
-$clusterListPath = $null
 
 if (-not (Test-Path $apiKeyPath)) { throw "API key file not found at $apiKeyPath" }
 if (-not (Test-Path $outDir))     { New-Item -ItemType Directory -Path $outDir | Out-Null }
@@ -25,7 +23,7 @@ $headers = @{ apiKey = $apiKey }
 
 $uriAlerts = "https://helios.cohesity.com/mcm/alerts"
 
-# ---------- CATEGORY DEFINITIONS (your required columns) ----------
+# ---------- CATEGORY DEFINITIONS ----------
 # Map DisplayName -> regex patterns to match (alertCategory + description)
 $HW_Map = [ordered]@{
   "Chassis"      = @("chassis","enclosure","backplane")
@@ -95,15 +93,43 @@ function Get-ActiveAlertsByBucket {
     alertTypeBucketList = $bucketEnum
   }
 
-  $resp = Invoke-RestMethod -Method Get -Uri $uriAlerts -Headers $headers -Body $body
-  return $resp
+  return (Invoke-RestMethod -Method Get -Uri $uriAlerts -Headers $headers -Body $body)
+}
+
+function Get-AllHeliosClusters {
+  $endpoints = @(
+    "https://helios.cohesity.com/mcm/clusters",
+    "https://helios.cohesity.com/v2/mcm/clusters"
+  )
+
+  foreach ($u in $endpoints) {
+    try {
+      $resp = Invoke-RestMethod -Method Get -Uri $u -Headers $headers
+      if (-not $resp) { continue }
+
+      $items =
+        if ($resp.clusters) { $resp.clusters }
+        elseif ($resp.items) { $resp.items }
+        elseif ($resp -is [System.Array]) { $resp }
+        else { @($resp) }
+
+      $names = $items | ForEach-Object {
+        $_.name ?? $_.clusterName ?? $_.cluster ?? $_.clusterInfo.name
+      } | Where-Object { $_ -and $_.ToString().Trim() -ne "" } | Sort-Object -Unique
+
+      if ($names.Count -gt 0) { return $names }
+    } catch { }
+  }
+
+  throw "Could not fetch cluster list from /mcm/clusters. If your tenant uses a different endpoint, adjust Get-AllHeliosClusters()."
 }
 
 function Build-WideTileTable {
   param(
     [string]$bucketLabel,
     [string]$bucketEnum,
-    [hashtable]$CategoryMap
+    [hashtable]$CategoryMap,
+    [string[]]$AllClusters
   )
 
   $alerts = Get-ActiveAlertsByBucket -bucketEnum $bucketEnum
@@ -115,38 +141,29 @@ function Build-WideTileTable {
     }
   }
 
-  # Cluster list
-  $clusters = @()
-  if ($clusterListPath -and (Test-Path $clusterListPath)) {
-    $clusters = Get-Content $clusterListPath | Where-Object { $_ -and $_.Trim() -ne "" } | Sort-Object -Unique
-  } else {
-    $clusters = $norm.ClusterName | Where-Object { $_ -and $_.Trim() -ne "" } | Sort-Object -Unique
-  }
+  $clusters = $AllClusters | Where-Object { $_ -and $_.Trim() -ne "" } | Sort-Object -Unique
+  $cats     = $CategoryMap.Keys | Sort-Object
 
-  # Categories (alphabetical by display name)
-  $cats = $CategoryMap.Keys | Sort-Object
-
-  # Pre-count: Cluster|Category -> count
+  # Cluster|Category -> count
   $counts = @{}
   foreach ($n in $norm) {
-    if ($n.Category -eq "Other") { continue } # ignore unmapped for quick-look tiles
+    if ($n.Category -eq "Other") { continue }  # unmapped ignored for quick-look
+    if (-not $n.ClusterName) { continue }
     $k = "$($n.ClusterName)||$($n.Category)"
     if (-not $counts.ContainsKey($k)) { $counts[$k] = 0 }
     $counts[$k]++
   }
 
-  # Build wide rows (ordered)
   $rows = foreach ($c in $clusters) {
     $row = [ordered]@{
       ClusterName = $c
-      Status      = "Active"   # constant label; cells are Healthy/count
+      Status      = "Active"
       Bucket      = $bucketLabel
     }
 
     foreach ($cat in $cats) {
       $k = "$c||$cat"
-      $v = if ($counts.ContainsKey($k)) { [string]$counts[$k] } else { "Healthy" }
-      $row[$cat] = $v
+      $row[$cat] = if ($counts.ContainsKey($k)) { [string]$counts[$k] } else { "Healthy" }
     }
 
     [PSCustomObject]$row
@@ -155,10 +172,13 @@ function Build-WideTileTable {
   return $rows
 }
 
+# ---------- ALL CLUSTERS ----------
+$allClusters = Get-AllHeliosClusters
+
 # ---------- BUILD TABLES ----------
-$hw   = Build-WideTileTable -bucketLabel "Hardware"     -bucketEnum "kHardware"     -CategoryMap $HW_Map
-$mnt  = Build-WideTileTable -bucketLabel "Maintenance"  -bucketEnum "kMaintenance"  -CategoryMap $MAINT_Map
-$ds   = Build-WideTileTable -bucketLabel "DataService"  -bucketEnum "kDataService"  -CategoryMap $DS_Map
+$hw  = Build-WideTileTable -bucketLabel "Hardware"    -bucketEnum "kHardware"    -CategoryMap $HW_Map    -AllClusters $allClusters
+$mnt = Build-WideTileTable -bucketLabel "Maintenance" -bucketEnum "kMaintenance" -CategoryMap $MAINT_Map -AllClusters $allClusters
+$ds  = Build-WideTileTable -bucketLabel "DataService" -bucketEnum "kDataService" -CategoryMap $DS_Map    -AllClusters $allClusters
 
 # ---------- CONSOLE (quick look) ----------
 $hw  | Format-Table -AutoSize
@@ -166,7 +186,7 @@ $mnt | Format-Table -AutoSize
 $ds  | Format-Table -AutoSize
 
 # ---------- EXPORT ----------
-$stamp = Get-Date -Format "yyyy-MM-dd_HHmm"
+$stamp  = Get-Date -Format "yyyy-MM-dd_HHmm"
 $hwCsv  = Join-Path $outDir "Helios_Tiles_Hardware_Active_$stamp.csv"
 $mntCsv = Join-Path $outDir "Helios_Tiles_Maintenance_Active_$stamp.csv"
 $dsCsv  = Join-Path $outDir "Helios_Tiles_DataService_Active_$stamp.csv"
