@@ -1,216 +1,179 @@
-# -------------------------------------------------------------
-# Cohesity Helios - Cluster GFlags (GET Only) - Picture Script
-# -------------------------------------------------------------
-# ✅ Menu: [0] All clusters OR [1..N] single cluster
-# ✅ GET only (no set/clear/import/restart)
-# ✅ CSV output fixed: no System.Object[]
-# ✅ Node/cluster targeting via accessClusterId header
-# -------------------------------------------------------------
+import { credentialVaultClient } from "@dynatrace-sdk/client-classic-environment-v2";
 
-$ErrorActionPreference = "Stop"
+/**
+ * Cohesity Helios — Active Alert Tiles (Markdown-only, Symbols)
+ * - GET-only
+ * - ONLY clusters that currently have Active (kOpen) alerts are shown (short output)
+ * - Sections: Hardware / Maintenance / Data Service
+ * - Columns: EXACT alertCategory enums (alphabetical)
+ * - Cell: ✅ if healthy, else ⛔<n> ⚠️<n> ℹ️<n>
+ */
 
-# ==============================
-# 0) API key from your path
-# ==============================
-$apikeypath = "X:\PowerShell\Cohesity_API_Scripts\DO_NOT_Delete\apikey.txt"
-if (-not (Test-Path $apikeypath)) { throw "API key file not found at $apikeypath" }
+export default async function () {
+  const baseUrl = "https://helios.cohesity.com";
+  const alertsPath = "/mcm/alerts";
 
-$apiKey = (Get-Content -Path $apikeypath -Raw).Trim()
-$commonHeaders = @{ "apiKey" = $apiKey }
+  // ===== Vault (REFERENCE-STYLE: "read key once") =====
+  const vaultId = "credentials_vault-312312"; // <-- set to your working secret ID
 
-# -------------------------------------------------------------
-# CSV helper: Converts arrays -> strings (prevents System.Object[])
-# -------------------------------------------------------------
-function To-CsvList {
-    param([object]$v)
-    if ($null -eq $v) { return "" }
-    if ($v -isnot [System.Array]) { return "$v" }
-
-    $arr = @($v | ForEach-Object { "$_" } | Where-Object { $_ -ne "" })
-    if ($arr.Count -eq 0) { return "" }
-    if ($arr.Count -eq 1) { return $arr[0] }
-
-    $uniq = @($arr | Select-Object -Unique)
-    if ($uniq.Count -eq 1) { return $uniq[0] }
-
-    return "{" + ($arr -join ",") + "}"
-}
-
-# -------------------------------------------------------------
-# Timestamp helper (best-effort; empty if missing/0)
-# Note: gflag timestamp units may vary by backend; this normalizes safely.
-# -------------------------------------------------------------
-function Convert-CohesityTimestampToDateString {
-    param([double]$ts)
-    if (-not $ts -or $ts -eq 0) { return "" }
-
-    # seconds ~1e9, millis ~1e12, micros ~1e15
+  async function readApiKeyFromVaultById(id) {
     try {
-        if ($ts -lt 1e11) {
-            return ([DateTimeOffset]::FromUnixTimeSeconds([int64]$ts)).UtcDateTime.ToString("yyyy-MM-dd")
-        } elseif ($ts -lt 1e14) {
-            return ([DateTimeOffset]::FromUnixTimeMilliseconds([int64]$ts)).UtcDateTime.ToString("yyyy-MM-dd")
-        } else {
-            # micros -> ms
-            $ms = [int64]($ts / 1000)
-            return ([DateTimeOffset]::FromUnixTimeMilliseconds($ms)).UtcDateTime.ToString("yyyy-MM-dd")
+      const sec = await credentialVaultClient.getCredentialById({ id });
+      const key = sec?.token ?? sec?.password ?? sec?.value ?? null;
+      if (!key || String(key).trim() === "") throw new Error("Empty secret value.");
+      return String(key).trim();
+    } catch (e) {
+      const msg = e?.message ? String(e.message) : String(e);
+      throw new Error(
+        `CredentialVault read failed for id="${id}". Ensure the workflow has Credential vault READ permission. Raw: ${msg}`
+      );
+    }
+  }
+
+  const apiKey = await readApiKeyFromVaultById(vaultId);
+  const headers = { apiKey, Accept: "application/json" };
+
+  // ===== Category columns (exact enums) =====
+  const HW_Cats = [
+    "kCPU","kChassis","kCluster","kDisk","kFan","kFirmware","kMemory","kNIC",
+    "kNode","kNodeHealth","kOperatingSystem","kPowerSupply","kStorageDevice",
+    "kStoragePool","kTemperature",
+  ].sort();
+
+  const MAINT_Cats = [
+    "kAuditLog","kClusterManagement","kConfiguration","kFaultTolerance",
+    "kGeneralSoftwareFailure","kHelios","kLicense","kNetworking","kSecurity",
+    "kStorageUsage","kSystemService","kUpgrade",
+  ].sort();
+
+  const DS_Cats = [
+    "kAgent","kAppMarketPlace","kArchivalRestore","kBackupRestore","kCDP",
+    "kDataPath","kDataSourceConnector","kDisasterRecovery","kIndexing","kMetadata",
+    "kNetBackup","kQuota","kRemoteReplication","kViewFailover",
+  ].sort();
+
+  // ===== Symbols =====
+  const SYM_HEALTHY = "✅";
+  const SYM_C = "⛔";
+  const SYM_W = "⚠️";
+  const SYM_I = "ℹ️";
+
+  function sevBucket(sev) {
+    switch (sev) {
+      case "kCritical": return "C";
+      case "kWarning":  return "W";
+      case "kInfo":     return "I";
+      default:          return "I";
+    }
+  }
+
+  function normalizeAlerts(resp) {
+    if (Array.isArray(resp)) return resp;
+    if (Array.isArray(resp?.alerts)) return resp.alerts;
+    if (Array.isArray(resp?.items)) return resp.items;
+    return [];
+  }
+
+  async function getActiveAlertsByBucket(bucketEnum) {
+    // GET with query params (avoid GET body issues)
+    const qs = new URLSearchParams({
+      alertStateList: "kOpen",
+      alertTypeBucketList: bucketEnum,
+    });
+
+    const url = `${baseUrl}${alertsPath}?${qs.toString()}`;
+    const r = await fetch(url, { method: "GET", headers });
+    if (!r.ok) {
+      const t = await r.text().catch(() => "");
+      throw new Error(`Helios alerts GET failed (${r.status}): ${t || r.statusText}`);
+    }
+    const j = await r.json().catch(() => ({}));
+    return normalizeAlerts(j);
+  }
+
+  function cellValue(C, W, I) {
+    if (C === 0 && W === 0 && I === 0) return SYM_HEALTHY;
+    return `${SYM_C}${C} ${SYM_W}${W} ${SYM_I}${I}`;
+  }
+
+  function buildMarkdownTable(rows, categories) {
+    if (!rows?.length) return "No Active alerts (no clusters to display).";
+
+    const header = ["ClusterName", ...categories];
+    const sep = header.map(() => "---");
+
+    const lines = [];
+    lines.push(`| ${header.join(" | ")} |`);
+    lines.push(`| ${sep.join(" | ")} |`);
+
+    for (const row of rows) {
+      const vals = [row.ClusterName, ...categories.map((c) => row[c] ?? SYM_HEALTHY)];
+      lines.push(`| ${vals.join(" | ")} |`);
+    }
+    return lines.join("\n");
+  }
+
+  async function buildWideTileTableSeverityShort(bucketEnum, categories) {
+    const alerts = await getActiveAlertsByBucket(bucketEnum);
+
+    // Cluster list ONLY from alerts (short output)
+    const clusters = Array.from(
+      new Set(
+        alerts
+          .map((a) => String(a?.clusterName ?? "").trim())
+          .filter((x) => x.length > 0)
+      )
+    ).sort((a, b) => a.localeCompare(b));
+
+    if (!clusters.length) return { markdown: "" };
+
+    // counts["cluster||category"] = {C:n, W:n, I:n}
+    const counts = new Map();
+
+    for (const a of alerts) {
+      const cluster = String(a?.clusterName ?? "").trim();
+      const cat = String(a?.alertCategory ?? "").trim();
+      if (!cluster || !cat) continue;
+      if (!categories.includes(cat)) continue;
+
+      const k = `${cluster}||${cat}`;
+      if (!counts.has(k)) counts.set(k, { C: 0, W: 0, I: 0 });
+
+      const b = sevBucket(String(a?.severity ?? ""));
+      counts.get(k)[b] += 1;
+    }
+
+    const rows = clusters.map((c) => {
+      const row = { ClusterName: c };
+      for (const cat of categories) {
+        const k = `${c}||${cat}`;
+        if (!counts.has(k)) row[cat] = SYM_HEALTHY;
+        else {
+          const { C, W, I } = counts.get(k);
+          row[cat] = cellValue(C, W, I);
         }
-    } catch {
-        return ""
-    }
+      }
+      return row;
+    });
+
+    return { markdown: buildMarkdownTable(rows, categories) };
+  }
+
+  const note =
+    `NOTE:\n` +
+    `- This report shows ONLY clusters that currently have Active (kOpen) alerts in each section.\n` +
+    `- Clusters not displayed have no Active alerts for that section (healthy for these tiles).\n` +
+    `- Cells show "${SYM_HEALTHY}" or "${SYM_C}<n> ${SYM_W}<n> ${SYM_I}<n>".`;
+
+  const hw  = await buildWideTileTableSeverityShort("kHardware", HW_Cats);
+  const mnt = await buildWideTileTableSeverityShort("kMaintenance", MAINT_Cats);
+  const ds  = await buildWideTileTableSeverityShort("kDataService", DS_Cats);
+
+  const markdown =
+    `${note}\n\n` +
+    `Hardware\n${hw.markdown || "No Active alerts (no clusters to display)."}\n\n` +
+    `Maintenance\n${mnt.markdown || "No Active alerts (no clusters to display)."}\n\n` +
+    `Data Service\n${ds.markdown || "No Active alerts (no clusters to display)."}`;
+
+  return { markdown };
 }
-
-# ==========================================
-# 1) Get Clusters (ClusterName + ClusterId)
-# ==========================================
-$url      = "https://helios.cohesity.com/v2/mcm/cluster-mgmt/info"
-$response = Invoke-WebRequest -Method Get -Uri $url -Headers $commonHeaders
-$json     = $response.Content | ConvertFrom-Json
-$json_clu = $json.cohesityClusters
-
-if (-not $json_clu -or $json_clu.Count -eq 0) {
-    throw "No clusters returned from Helios."
-}
-
-# ==========================================
-# 2) Build menu + pick ALL or SINGLE
-# ==========================================
-$sorted = $json_clu | Sort-Object -Property clusterName
-
-$clusters = for ($i = 0; $i -lt $sorted.Count; $i++) {
-    [pscustomobject]@{
-        Index       = $i + 1
-        ClusterName = $sorted[$i].clusterName
-        ClusterId   = $sorted[$i].clusterId
-    }
-}
-
-Write-Host ""
-Write-Host "Available Helios Clusters (sorted by name):" -ForegroundColor Cyan
-$clusters | Format-Table -AutoSize
-
-Write-Host ""
-Write-Host "[0] All clusters" -ForegroundColor Yellow
-Write-Host "[X] Exit without selecting" -ForegroundColor Yellow
-Write-Host ""
-
-while ($true) {
-    $inputVal = Read-Host "Enter 0 for ALL, 1-$($clusters.Count) for single, or X to exit"
-
-    if ($inputVal -match '^(x|X|q|Q)$') {
-        Write-Host "Exit selected. No clusters chosen." -ForegroundColor Cyan
-        return
-    }
-
-    [int]$num = 0
-    if (-not [int]::TryParse($inputVal, [ref]$num)) {
-        Write-Host "Please enter a valid number or X to exit." -ForegroundColor Red
-        continue
-    }
-
-    if ($num -lt 0 -or $num -gt $clusters.Count) {
-        Write-Host "Please enter 0, 1-$($clusters.Count), or X to exit." -ForegroundColor Red
-        continue
-    }
-
-    $selection = $num
-    break
-}
-
-if ($selection -eq 0) {
-    $SelectedClusters   = $clusters
-    $SelectedClusterIds = $clusters.ClusterId
-    Write-Host ""
-    Write-Host "You selected: ALL clusters" -ForegroundColor Green
-}
-else {
-    $selectedCluster    = $clusters | Where-Object { $_.Index -eq $selection }
-    $SelectedClusters   = @($selectedCluster)
-    $SelectedClusterIds = @($selectedCluster.ClusterId)
-
-    Write-Host ""
-    Write-Host "You selected cluster:" -ForegroundColor Green
-    Write-Host "  Name: $($selectedCluster.ClusterName)"
-    Write-Host "  Id:   $($selectedCluster.ClusterId)"
-    Write-Host ""
-}
-
-# ==========================================
-# 3) For each selected cluster, GET gflags
-# ==========================================
-$AllRows = @()
-
-foreach ($cid in $SelectedClusterIds) {
-
-    $clus = $SelectedClusters | Where-Object { $_.ClusterId -eq $cid } | Select-Object -First 1
-    $cluster_name = $clus.ClusterName
-    $cluster_id   = $clus.ClusterId
-
-    $urlG = "https://helios.cohesity.com/irisservices/api/v1/public/clusters/gflag"
-    $headers = @{ "apiKey" = $apiKey; "accessClusterId" = $cluster_id }
-
-    try {
-        $respG = Invoke-WebRequest -Method Get -Uri $urlG -Headers $headers
-        $jsonG = $respG.Content | ConvertFrom-Json
-    }
-    catch {
-        Write-Host "Failed to get gflags for cluster '$cluster_name' (Id: $cluster_id): $_" -ForegroundColor Red
-        continue
-    }
-
-    if (-not $jsonG) {
-        Write-Host "No gflags returned for cluster '$cluster_name' (Id: $cluster_id)." -ForegroundColor Yellow
-        continue
-    }
-
-    foreach ($svc in $jsonG) {
-        $svcName = $svc.serviceName
-        Write-Host "`n$cluster_name :: $svcName" -ForegroundColor Cyan
-
-        foreach ($gf in ($svc.gflags | Where-Object { $_ })) {
-            $dateStr = Convert-CohesityTimestampToDateString -ts $gf.timestamp
-            Write-Host ("    {0}: {1} ({2}) ({3})" -f $gf.name, $gf.value, $gf.reason, $dateStr)
-
-            $AllRows += [pscustomobject]@{
-                Cluster     = $cluster_name
-                ClusterId   = "$cluster_id"
-                ServiceName = $svcName
-                FlagName    = $gf.name
-                FlagValue   = $gf.value
-                Reason      = $gf.reason
-                Date        = $dateStr
-            }
-        }
-    }
-}
-
-if (-not $AllRows -or $AllRows.Count -eq 0) {
-    Write-Host "No rows collected from gflag API." -ForegroundColor Yellow
-    return
-}
-
-# =======================
-# 4) Export to CSV
-# =======================
-$reportdate = Get-Date -Format "yyyy-MM-dd_HHmm"
-
-$csvDir = "X:\PowerShell\Data\Cohesity\Alerts"
-if (-not (Test-Path $csvDir)) { New-Item -ItemType Directory -Path $csvDir | Out-Null }
-
-$excelFile = Join-Path $csvDir "All_Cluster_GFlags_$reportdate.csv"
-
-$csvRows = $AllRows | Select-Object `
-    Cluster,
-    ClusterId,
-    ServiceName,
-    FlagName,
-    @{n="FlagValue"; e={ To-CsvList $_.FlagValue }},
-    @{n="Reason"; e={ To-CsvList $_.Reason }},
-    Date
-
-$csvRows |
-    Sort-Object Cluster, ServiceName, FlagName |
-    Export-Csv -Path $excelFile -NoTypeInformation -Encoding UTF8
-
-Write-Host ""
-Write-Host "Saved CSV report at: $excelFile" -ForegroundColor Green
