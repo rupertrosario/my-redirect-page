@@ -4,14 +4,7 @@ import { credentialVaultClient } from "@dynatrace-sdk/client-classic-environment
  * Cohesity PROD Failures (Policy DaysToKeep >= 35) — Multi-Cluster (Helios)
  * READ-ONLY (GET-only) — Markdown table output only (NO CSV)
  *
- * Logic:
- * 1) ALL clusters from /v2/mcm/cluster-mgmt/info
- * 2) PG prefilter: policy.daysToKeep >= 35 (v1 policy lookup cached per cluster)
- * 3) Two-stage runs:
- *    - LIGHT includeObjectDetails=false (numRuns=10)
- *    - HEAVY includeObjectDetails=true ONLY if latest per runType status != "Succeeded"
- * 4) Failure rule (per runType):
- *    - Latest failure per object that has NO later success (within last 10 runs)
+ * Vaulting: uses the EXACT vault section style from your alerts script.
  */
 
 export default async function () {
@@ -19,35 +12,32 @@ export default async function () {
   const DAYS_TO_KEEP_MIN = 35;
   const NUM_RUNS = 10;
 
-  // ===== Dynatrace Credential Vault =====
-  // Update these to match your env (same pattern you already use in other scripts)
-  const vaultName = "Cohesity_API_Key";
+  // ==============================
+  // AUTH (vault id)  ✅ same as your alerts script
+  // ==============================
   const vaultId = "credentials_vault-312312";
+  const d2 = await credentialVaultClient.getCredentialsDetails({ id: vaultId });
+  const apiKey = (d2?.token || d2?.password || "").trim();
+  if (!apiKey) throw new Error("No Helios API key available (empty token/password).");
 
-  async function getApiKey() {
-    const creds = await credentialVaultClient.getCredentialsDetails({ id: vaultId });
-    const items = creds?.credentials || creds?.items || [];
-    const hit = items.find((x) => (x.name || x.label) === vaultName) || items[0];
-    const key = hit?.password || hit?.secret || hit?.token || hit?.value;
-    if (!key) throw new Error("API key not found in Credential Vault (check vaultId/vaultName mapping).");
-    return String(key).trim();
-  }
+  const commonHeaders = { accept: "application/json", apiKey };
 
-  const apiKey = await getApiKey();
-
-  // ===== Fetch helpers =====
-  async function heliosGetJson(path, headers) {
-    const res = await fetch(`${baseUrl}${path}`, {
-      method: "GET",
-      headers: { accept: "application/json", ...headers },
-    });
-    if (!res.ok) {
-      const txt = await res.text().catch(() => "");
-      throw new Error(`GET ${path} failed: ${res.status} ${res.statusText}${txt ? ` :: ${txt}` : ""}`);
+  // ==============================
+  // GET helper
+  // ==============================
+  async function getJson(url, headers) {
+    const resp = await fetch(url, { method: "GET", headers });
+    if (!resp.ok) {
+      let txt = "";
+      try { txt = await resp.text(); } catch (_) {}
+      throw new Error(`GET ${url} -> HTTP ${resp.status} ${txt}`);
     }
-    return await res.json();
+    return resp.json();
   }
 
+  // ==============================
+  // Helpers
+  // ==============================
   function cleanMsg(s) {
     if (!s) return "";
     return String(s)
@@ -59,11 +49,9 @@ export default async function () {
 
   function fmtETFromUsecs(usecs) {
     if (!usecs) return "";
-    // usecs -> ms
     const ms = Math.floor(Number(usecs) / 1000);
     const d = new Date(ms);
     try {
-      // ET display (DST-safe via Intl)
       return new Intl.DateTimeFormat("en-US", {
         timeZone: "America/New_York",
         year: "numeric",
@@ -92,7 +80,6 @@ export default async function () {
   }
 
   function isSuccessForClear(ob) {
-    // success = no failedAttempts
     return ob?.localSnapshotInfo && !hasFailedAttempts(ob);
   }
 
@@ -102,36 +89,36 @@ export default async function () {
     return msgs.join(" | ");
   }
 
-  // ===== 1) Clusters =====
-  const clusterInfo = await heliosGetJson("/v2/mcm/cluster-mgmt/info", {
-    apiKey,
-  });
-  const clusters = clusterInfo?.cohesityClusters || [];
-  if (!clusters.length) throw new Error("No clusters returned from Helios.");
+  // ==============================
+  // CLUSTERS
+  // ==============================
+  const clu = await getJson(`${baseUrl}/v2/mcm/cluster-mgmt/info`, { ...commonHeaders, Accept: "application/json" });
+  const clusters = Array.isArray(clu?.cohesityClusters) ? clu.cohesityClusters : [];
+  if (!clusters.length) throw new Error("No clusters returned from /v2/mcm/cluster-mgmt/info");
 
   const allFailures = [];
 
-  for (const cluster of clusters) {
-    const clusterId = cluster.clusterId;
-    const clusterName =
-      (cluster.name || cluster.clusterName || cluster.displayName || "").trim() || `Unknown-${clusterId}`;
+  for (const cl of clusters) {
+    const clusterId = cl?.clusterId;
+    const clusterName = String(cl?.name || cl?.clusterName || cl?.displayName || "").trim() || `Unknown-${clusterId}`;
+    if (!clusterId) continue;
 
-    const headers = { apiKey, accessClusterId: String(clusterId) };
+    const headers = { ...commonHeaders, Accept: "application/json", accessClusterId: String(clusterId) };
 
-    // ===== 2) PG list (active only) =====
+    // 1) PG list (active only)
     let pgs = [];
     try {
-      const pgJson = await heliosGetJson(
-        "/v2/data-protect/protection-groups?isDeleted=false&isPaused=false&isActive=true",
+      const pgJson = await getJson(
+        `${baseUrl}/v2/data-protect/protection-groups?isDeleted=false&isPaused=false&isActive=true`,
         headers
       );
       pgs = Array.isArray(pgJson?.protectionGroups) ? pgJson.protectionGroups : [];
       if (!pgs.length) continue;
-    } catch {
-      continue; // 502-safe: skip cluster
+    } catch (_) {
+      continue; // fail-open per cluster
     }
 
-    // ===== 2b) Policy cache + PG prefilter daysToKeep >= 35 =====
+    // 2) Policy cache + PG prefilter
     const policyCache = new Map(); // policyId -> { daysToKeep, name }
 
     async function getPolicy(policyId) {
@@ -139,15 +126,15 @@ export default async function () {
       if (policyCache.has(policyId)) return policyCache.get(policyId);
 
       const enc = encodeURIComponent(String(policyId));
-      const path = `/irisservices/api/v1/public/protectionPolicies/${enc}`;
+      const url = `${baseUrl}/irisservices/api/v1/public/protectionPolicies/${enc}`;
       try {
-        const p = await heliosGetJson(path, headers);
+        const p = await getJson(url, headers);
         const obj = { daysToKeep: p?.daysToKeep ?? null, name: p?.name ?? "" };
-        policyCache.set(policyId, obj);
+        policyCache.set(String(policyId), obj);
         return obj;
-      } catch {
+      } catch (_) {
         const obj = { daysToKeep: null, name: "PolicyLookupFailed" };
-        policyCache.set(policyId, obj);
+        policyCache.set(String(policyId), obj);
         return obj;
       }
     }
@@ -162,7 +149,7 @@ export default async function () {
     }
     if (!pgs35.length) continue;
 
-    // ===== 3/4) For each PG: LIGHT -> decide HEAVY -> failure extraction =====
+    // 3) Two-stage runs per PG
     for (const pg of pgs35) {
       const pgId = pg?.id;
       const pgName = pg?.name || "";
@@ -177,17 +164,16 @@ export default async function () {
       // LIGHT
       let runsLight = null;
       try {
-        runsLight = await heliosGetJson(
-          `/v2/data-protect/protection-groups/${encodeURIComponent(String(pgId))}/runs?numRuns=${NUM_RUNS}&excludeNonRestorableRuns=false&includeObjectDetails=false`,
+        runsLight = await getJson(
+          `${baseUrl}/v2/data-protect/protection-groups/${encodeURIComponent(String(pgId))}/runs?numRuns=${NUM_RUNS}&excludeNonRestorableRuns=false&includeObjectDetails=false`,
           headers
         );
-      } catch {
+      } catch (_) {
         continue;
       }
       const runsArr = Array.isArray(runsLight?.runs) ? runsLight.runs : [];
       if (!runsArr.length) continue;
 
-      // determine if heavy needed: any runType latest status != Succeeded
       const runTypes = Array.from(
         new Set(
           runsArr
@@ -203,21 +189,18 @@ export default async function () {
           .filter((r) => String(r?.localBackupInfo?.[0]?.runType || "") === rt)
           .sort((a, b) => Number(b?.localBackupInfo?.[0]?.endTimeUsecs || 0) - Number(a?.localBackupInfo?.[0]?.endTimeUsecs || 0))[0];
         const st = latest?.localBackupInfo?.[0]?.status;
-        if (st !== "Succeeded") {
-          needHeavy = true;
-          break;
-        }
+        if (st !== "Succeeded") { needHeavy = true; break; }
       }
       if (!needHeavy) continue;
 
       // HEAVY
       let runsHeavy = null;
       try {
-        runsHeavy = await heliosGetJson(
-          `/v2/data-protect/protection-groups/${encodeURIComponent(String(pgId))}/runs?numRuns=${NUM_RUNS}&excludeNonRestorableRuns=false&includeObjectDetails=true`,
+        runsHeavy = await getJson(
+          `${baseUrl}/v2/data-protect/protection-groups/${encodeURIComponent(String(pgId))}/runs?numRuns=${NUM_RUNS}&excludeNonRestorableRuns=false&includeObjectDetails=true`,
           headers
         );
-      } catch {
+      } catch (_) {
         continue;
       }
       const runs = Array.isArray(runsHeavy?.runs) ? runsHeavy.runs : [];
@@ -238,7 +221,7 @@ export default async function () {
           .sort((a, b) => Number(b?.localBackupInfo?.[0]?.endTimeUsecs || 0) - Number(a?.localBackupInfo?.[0]?.endTimeUsecs || 0));
         if (!runsForType.length) continue;
 
-        // best-effort host map for sourceId -> name
+        // best-effort host map for sourceId -> name (DB)
         const idToName = new Map();
         for (const rr of runsForType) {
           const objs = Array.isArray(rr?.objects) ? rr.objects : [];
@@ -259,7 +242,6 @@ export default async function () {
             .filter((x) => x?.object && x?.localSnapshotInfo);
 
           if (!objsAll.length) {
-            // run-level fallback only if status is Failed
             if (info.status === "Failed") {
               const rk = `RUNLEVEL|${pgId}|${rType}`;
               if (!latestFailByKey.has(rk)) {
@@ -280,7 +262,7 @@ export default async function () {
             continue;
           }
 
-          // mark successes first (newer clears older failures)
+          // clear successes first (newer runs clear older failures)
           for (const ob of objsAll) {
             if (isSuccessForClear(ob)) {
               const k = getObjKey(ob);
@@ -288,7 +270,7 @@ export default async function () {
             }
           }
 
-          // capture latest uncleared failures per object
+          // capture latest uncleared failures
           for (const ob of objsAll) {
             const k = getObjKey(ob);
             if (!k) continue;
@@ -322,10 +304,12 @@ export default async function () {
     }
   }
 
-  // ===== Markdown table output =====
+  // ==============================
+  // Markdown output only
+  // ==============================
   if (!allFailures.length) {
     return {
-      markdownTable: "✅ No failures found for Policy DaysToKeep >= 35 across all clusters.",
+      markdownTable: `✅ No failures found for Policy DaysToKeep >= ${DAYS_TO_KEEP_MIN} across all clusters.`,
       failures: [],
       count: 0,
     };
