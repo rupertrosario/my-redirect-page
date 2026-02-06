@@ -1,0 +1,393 @@
+import { credentialVaultClient } from "@dynatrace-sdk/client-classic-environment-v2";
+
+/**
+ * Cohesity PROD Failures (Policy DaysToKeep >= 35) — Multi-Cluster (Helios)
+ * READ-ONLY (GET-only) — Markdown table output only (NO CSV)
+ *
+ * Logic:
+ * 1) ALL clusters from /v2/mcm/cluster-mgmt/info
+ * 2) PG prefilter: policy.daysToKeep >= 35 (v1 policy lookup cached per cluster)
+ * 3) Two-stage runs:
+ *    - LIGHT includeObjectDetails=false (numRuns=10)
+ *    - HEAVY includeObjectDetails=true ONLY if latest per runType status != "Succeeded"
+ * 4) Failure rule (per runType):
+ *    - Latest failure per object that has NO later success (within last 10 runs)
+ */
+
+export default async function () {
+  const baseUrl = "https://helios.cohesity.com";
+  const DAYS_TO_KEEP_MIN = 35;
+  const NUM_RUNS = 10;
+
+  // ===== Dynatrace Credential Vault =====
+  // Update these to match your env (same pattern you already use in other scripts)
+  const vaultName = "Cohesity_API_Key";
+  const vaultId = "credentials_vault-312312";
+
+  async function getApiKey() {
+    const creds = await credentialVaultClient.getCredentialsDetails({ id: vaultId });
+    const items = creds?.credentials || creds?.items || [];
+    const hit = items.find((x) => (x.name || x.label) === vaultName) || items[0];
+    const key = hit?.password || hit?.secret || hit?.token || hit?.value;
+    if (!key) throw new Error("API key not found in Credential Vault (check vaultId/vaultName mapping).");
+    return String(key).trim();
+  }
+
+  const apiKey = await getApiKey();
+
+  // ===== Fetch helpers =====
+  async function heliosGetJson(path, headers) {
+    const res = await fetch(`${baseUrl}${path}`, {
+      method: "GET",
+      headers: { accept: "application/json", ...headers },
+    });
+    if (!res.ok) {
+      const txt = await res.text().catch(() => "");
+      throw new Error(`GET ${path} failed: ${res.status} ${res.statusText}${txt ? ` :: ${txt}` : ""}`);
+    }
+    return await res.json();
+  }
+
+  function cleanMsg(s) {
+    if (!s) return "";
+    return String(s)
+      .replace(/[\r\n]+/g, " ")
+      .replace(/,/g, " ")
+      .replace(/"/g, "'")
+      .trim();
+  }
+
+  function fmtETFromUsecs(usecs) {
+    if (!usecs) return "";
+    // usecs -> ms
+    const ms = Math.floor(Number(usecs) / 1000);
+    const d = new Date(ms);
+    try {
+      // ET display (DST-safe via Intl)
+      return new Intl.DateTimeFormat("en-US", {
+        timeZone: "America/New_York",
+        year: "numeric",
+        month: "2-digit",
+        day: "2-digit",
+        hour: "2-digit",
+        minute: "2-digit",
+        hour12: false,
+      }).format(d);
+    } catch {
+      return d.toISOString();
+    }
+  }
+
+  function getObjKey(ob) {
+    const o = ob?.object;
+    if (!o) return "";
+    if (o.id) return String(o.id);
+    const sid = o.sourceId ? String(o.sourceId) : "";
+    return `${o.environment || ""}|${o.objectType || ""}|${o.name || ""}|${sid}`;
+  }
+
+  function hasFailedAttempts(ob) {
+    const fa = ob?.localSnapshotInfo?.failedAttempts;
+    return Array.isArray(fa) && fa.length > 0;
+  }
+
+  function isSuccessForClear(ob) {
+    // success = no failedAttempts
+    return ob?.localSnapshotInfo && !hasFailedAttempts(ob);
+  }
+
+  function combineFailedAttempts(attempts) {
+    if (!Array.isArray(attempts) || attempts.length === 0) return "";
+    const msgs = attempts.map((a) => cleanMsg(a?.message)).filter(Boolean);
+    return msgs.join(" | ");
+  }
+
+  // ===== 1) Clusters =====
+  const clusterInfo = await heliosGetJson("/v2/mcm/cluster-mgmt/info", {
+    apiKey,
+  });
+  const clusters = clusterInfo?.cohesityClusters || [];
+  if (!clusters.length) throw new Error("No clusters returned from Helios.");
+
+  const allFailures = [];
+
+  for (const cluster of clusters) {
+    const clusterId = cluster.clusterId;
+    const clusterName =
+      (cluster.name || cluster.clusterName || cluster.displayName || "").trim() || `Unknown-${clusterId}`;
+
+    const headers = { apiKey, accessClusterId: String(clusterId) };
+
+    // ===== 2) PG list (active only) =====
+    let pgs = [];
+    try {
+      const pgJson = await heliosGetJson(
+        "/v2/data-protect/protection-groups?isDeleted=false&isPaused=false&isActive=true",
+        headers
+      );
+      pgs = Array.isArray(pgJson?.protectionGroups) ? pgJson.protectionGroups : [];
+      if (!pgs.length) continue;
+    } catch {
+      continue; // 502-safe: skip cluster
+    }
+
+    // ===== 2b) Policy cache + PG prefilter daysToKeep >= 35 =====
+    const policyCache = new Map(); // policyId -> { daysToKeep, name }
+
+    async function getPolicy(policyId) {
+      if (!policyId) return null;
+      if (policyCache.has(policyId)) return policyCache.get(policyId);
+
+      const enc = encodeURIComponent(String(policyId));
+      const path = `/irisservices/api/v1/public/protectionPolicies/${enc}`;
+      try {
+        const p = await heliosGetJson(path, headers);
+        const obj = { daysToKeep: p?.daysToKeep ?? null, name: p?.name ?? "" };
+        policyCache.set(policyId, obj);
+        return obj;
+      } catch {
+        const obj = { daysToKeep: null, name: "PolicyLookupFailed" };
+        policyCache.set(policyId, obj);
+        return obj;
+      }
+    }
+
+    const pgs35 = [];
+    for (const pg of pgs) {
+      const polid = pg?.policyId ? String(pg.policyId) : "";
+      if (!polid) continue;
+      const pol = await getPolicy(polid);
+      const days = pol?.daysToKeep;
+      if (days !== null && Number(days) >= DAYS_TO_KEEP_MIN) pgs35.push(pg);
+    }
+    if (!pgs35.length) continue;
+
+    // ===== 3/4) For each PG: LIGHT -> decide HEAVY -> failure extraction =====
+    for (const pg of pgs35) {
+      const pgId = pg?.id;
+      const pgName = pg?.name || "";
+      if (!pgId) continue;
+
+      const pgEnv =
+        (pg.environment && String(pg.environment)) ||
+        (pg.environments && String(pg.environments)) ||
+        (Array.isArray(pg.environmentTypes) ? pg.environmentTypes.join(",") : "") ||
+        "UnknownEnv";
+
+      // LIGHT
+      let runsLight = null;
+      try {
+        runsLight = await heliosGetJson(
+          `/v2/data-protect/protection-groups/${encodeURIComponent(String(pgId))}/runs?numRuns=${NUM_RUNS}&excludeNonRestorableRuns=false&includeObjectDetails=false`,
+          headers
+        );
+      } catch {
+        continue;
+      }
+      const runsArr = Array.isArray(runsLight?.runs) ? runsLight.runs : [];
+      if (!runsArr.length) continue;
+
+      // determine if heavy needed: any runType latest status != Succeeded
+      const runTypes = Array.from(
+        new Set(
+          runsArr
+            .map((r) => r?.localBackupInfo?.[0]?.runType)
+            .filter(Boolean)
+            .map(String)
+        )
+      );
+
+      let needHeavy = false;
+      for (const rt of runTypes) {
+        const latest = runsArr
+          .filter((r) => String(r?.localBackupInfo?.[0]?.runType || "") === rt)
+          .sort((a, b) => Number(b?.localBackupInfo?.[0]?.endTimeUsecs || 0) - Number(a?.localBackupInfo?.[0]?.endTimeUsecs || 0))[0];
+        const st = latest?.localBackupInfo?.[0]?.status;
+        if (st !== "Succeeded") {
+          needHeavy = true;
+          break;
+        }
+      }
+      if (!needHeavy) continue;
+
+      // HEAVY
+      let runsHeavy = null;
+      try {
+        runsHeavy = await heliosGetJson(
+          `/v2/data-protect/protection-groups/${encodeURIComponent(String(pgId))}/runs?numRuns=${NUM_RUNS}&excludeNonRestorableRuns=false&includeObjectDetails=true`,
+          headers
+        );
+      } catch {
+        continue;
+      }
+      const runs = Array.isArray(runsHeavy?.runs) ? runsHeavy.runs : [];
+      if (!runs.length) continue;
+
+      const heavyRunTypes = Array.from(
+        new Set(
+          runs
+            .map((r) => r?.localBackupInfo?.[0]?.runType)
+            .filter(Boolean)
+            .map(String)
+        )
+      );
+
+      for (const rType of heavyRunTypes) {
+        const runsForType = runs
+          .filter((r) => String(r?.localBackupInfo?.[0]?.runType || "") === rType)
+          .sort((a, b) => Number(b?.localBackupInfo?.[0]?.endTimeUsecs || 0) - Number(a?.localBackupInfo?.[0]?.endTimeUsecs || 0));
+        if (!runsForType.length) continue;
+
+        // best-effort host map for sourceId -> name
+        const idToName = new Map();
+        for (const rr of runsForType) {
+          const objs = Array.isArray(rr?.objects) ? rr.objects : [];
+          for (const ob of objs) {
+            const o = ob?.object;
+            if (o?.id && o?.name && !idToName.has(String(o.id))) idToName.set(String(o.id), String(o.name));
+          }
+        }
+
+        const cleared = new Set();
+        const latestFailByKey = new Map();
+
+        for (const run of runsForType) {
+          const info = run?.localBackupInfo?.[0] || {};
+          const endTime = fmtETFromUsecs(info.endTimeUsecs);
+
+          const objsAll = (Array.isArray(run?.objects) ? run.objects : [])
+            .filter((x) => x?.object && x?.localSnapshotInfo);
+
+          if (!objsAll.length) {
+            // run-level fallback only if status is Failed
+            if (info.status === "Failed") {
+              const rk = `RUNLEVEL|${pgId}|${rType}`;
+              if (!latestFailByKey.has(rk)) {
+                const msg = Array.isArray(info.messages) ? info.messages.join(" | ") : info.messages;
+                latestFailByKey.set(rk, {
+                  Environment: pgEnv,
+                  Cluster: clusterName,
+                  ProtectionGroup: pgName,
+                  Host: "",
+                  ObjectType: "RunLevel",
+                  ObjectName: "(Run-level)",
+                  RunType: rType,
+                  EndTimeET: endTime,
+                  FailedMessage: cleanMsg(msg),
+                });
+              }
+            }
+            continue;
+          }
+
+          // mark successes first (newer clears older failures)
+          for (const ob of objsAll) {
+            if (isSuccessForClear(ob)) {
+              const k = getObjKey(ob);
+              if (k) cleared.add(k);
+            }
+          }
+
+          // capture latest uncleared failures per object
+          for (const ob of objsAll) {
+            const k = getObjKey(ob);
+            if (!k) continue;
+            if (cleared.has(k)) continue;
+            if (latestFailByKey.has(k)) continue;
+            if (!hasFailedAttempts(ob)) continue;
+
+            const msg = combineFailedAttempts(ob?.localSnapshotInfo?.failedAttempts);
+            if (!msg) continue;
+
+            const o = ob.object || {};
+            let hostName = "";
+            if (o.sourceId && idToName.has(String(o.sourceId))) hostName = idToName.get(String(o.sourceId));
+
+            latestFailByKey.set(k, {
+              Environment: o.environment ? String(o.environment) : pgEnv,
+              Cluster: clusterName,
+              ProtectionGroup: pgName,
+              Host: hostName,
+              ObjectType: o.objectType ? String(o.objectType) : "UnknownType",
+              ObjectName: o.name ? String(o.name) : "",
+              RunType: rType,
+              EndTimeET: endTime,
+              FailedMessage: msg,
+            });
+          }
+        }
+
+        for (const v of latestFailByKey.values()) allFailures.push(v);
+      }
+    }
+  }
+
+  // ===== Markdown table output =====
+  if (!allFailures.length) {
+    return {
+      markdownTable: "✅ No failures found for Policy DaysToKeep >= 35 across all clusters.",
+      failures: [],
+      count: 0,
+    };
+  }
+
+  // final dedup safety
+  const dedup = new Map();
+  for (const r of allFailures) {
+    const key = `${r.Environment}|${r.Cluster}|${r.ProtectionGroup}|${r.RunType}|${r.Host}|${r.ObjectType}|${r.ObjectName}`;
+    const prev = dedup.get(key);
+    if (!prev || String(r.EndTimeET) > String(prev.EndTimeET)) dedup.set(key, r);
+  }
+
+  const final = Array.from(dedup.values()).sort((a, b) => {
+    const c = String(a.Cluster).localeCompare(String(b.Cluster));
+    if (c) return c;
+    const p = String(a.ProtectionGroup).localeCompare(String(b.ProtectionGroup));
+    if (p) return p;
+    const e = String(a.Environment).localeCompare(String(b.Environment));
+    if (e) return e;
+    const rt = String(a.RunType).localeCompare(String(b.RunType));
+    if (rt) return rt;
+    return String(b.EndTimeET).localeCompare(String(a.EndTimeET));
+  });
+
+  const headers = [
+    "Environment",
+    "Cluster",
+    "ProtectionGroup",
+    "Host",
+    "ObjectType",
+    "ObjectName",
+    "RunType",
+    "EndTimeET",
+    "FailedMessage",
+  ];
+
+  const lines = [];
+  lines.push(`### Cohesity PROD Failures (Policy DaysToKeep >= ${DAYS_TO_KEEP_MIN}) — All Clusters`);
+  lines.push(`Total failures: **${final.length}**`);
+  lines.push("");
+  lines.push(`| ${headers.join(" | ")} |`);
+  lines.push(`| ${headers.map(() => "---").join(" | ")} |`);
+
+  for (const r of final) {
+    const row = [
+      r.Environment,
+      r.Cluster,
+      r.ProtectionGroup,
+      r.Host || "",
+      r.ObjectType,
+      r.ObjectName,
+      r.RunType,
+      r.EndTimeET,
+      cleanMsg(r.FailedMessage),
+    ].map((x) => cleanMsg(x));
+    lines.push(`| ${row.join(" | ")} |`);
+  }
+
+  return {
+    markdownTable: lines.join("\n"),
+    failures: final,
+    count: final.length,
+  };
+}
