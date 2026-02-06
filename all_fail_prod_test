@@ -4,22 +4,25 @@
 # STRICTLY READ-ONLY (GET-only)
 #
 # Logic:
-# - Pre-filter PGs by Policy daysToKeep >= 35 (cached per cluster)
-# - Fetch last N runs (default 20) with includeObjectDetails=true
-# - For each RunType present in those N runs:
-#     - Track LATEST failure per object that has NO later object-level success
-# - Single consolidated CSV only if failures exist
+# 1) For EACH cluster (Helios mcm info)
+# 2) List active PGs ONLY for envs: kOracle,kSQL,kRemoteAdapter
+# 3) Pre-filter those PGs by Policy daysToKeep >= 35 (v1 policy endpoint; cached per cluster)
+# 4) For each remaining PG:
+#    - GET last N runs (default 20) with includeObjectDetails=true (required for partial rerun logic)
+#    - For each RunType present:
+#       - Scan runs newest->oldest
+#       - Mark object-level success (object present + no failedAttempts) as "cleared"
+#       - Capture LATEST failure per object that is NOT later cleared (within those N runs)
+# 5) Output ONE consolidated CSV only if failures exist
 # =====================================================================
 
 $ErrorActionPreference = "Stop"
 
 # -------------------------------
-# Tunables (time vs coverage)
+# Tunables
 # -------------------------------
 $NUM_RUNS = 20
 $MIN_DAYS_TO_KEEP = 35
-
-# Only these environments
 $ENV_FILTER = "kOracle,kSQL,kRemoteAdapter"
 
 # -------------------------------
@@ -30,19 +33,25 @@ if (-not (Test-Path -Path $logDirectory -PathType Container)) {
     New-Item -Path $logDirectory -ItemType Directory | Out-Null
 }
 
-# Hygiene: keep at most 50 newest files + delete >30 days
+# Hygiene: keep at most 50 newest files
 try {
     $files = Get-ChildItem -Path $logDirectory -File -ErrorAction Stop
     if ($files.Count -gt 50) {
         $toDelete = $files | Sort-Object CreationTime | Select-Object -First ($files.Count - 50)
         $toDelete | Remove-Item -Force -ErrorAction SilentlyContinue
+        Write-Host "🧹 Trimmed old files to keep last 50." -ForegroundColor DarkGray
     }
 } catch {}
+
+# Hygiene: delete anything older than 30 days
 try {
     $threshold = (Get-Date).AddDays(-30)
-    Get-ChildItem -Path $logDirectory -File -ErrorAction SilentlyContinue |
-        Where-Object { $_.LastWriteTime -lt $threshold } |
-        Remove-Item -Force -ErrorAction SilentlyContinue
+    $older = Get-ChildItem -Path $logDirectory -File -ErrorAction SilentlyContinue |
+             Where-Object { $_.LastWriteTime -lt $threshold }
+    if ($older) {
+        $older | Remove-Item -Force -ErrorAction SilentlyContinue
+        Write-Host "🧽 Deleted files older than 30 days." -ForegroundColor DarkGray
+    }
 } catch {}
 
 $apikeypath = "X:\PowerShell\Cohesity_API_Scripts\DO_NOT_Delete\apikey.txt"
@@ -113,6 +122,7 @@ function Has-FailedAttempts($ob){
     } catch { return $false }
 }
 function Is-ObjectSuccess($ob){
+    # Object present in run + no failedAttempts => treat as success for clearing older failures
     if ($null -eq $ob -or $null -eq $ob.localSnapshotInfo) { return $false }
     return (-not (Has-FailedAttempts $ob))
 }
@@ -125,7 +135,7 @@ $json_clu = $cluJson.cohesityClusters
 if (-not $json_clu -or $json_clu.Count -eq 0) { throw "No clusters returned from Helios." }
 
 # -------------------------------
-# Consolidated failures
+# Consolidated results
 # -------------------------------
 $allFailures = @()
 
@@ -137,7 +147,7 @@ foreach ($cluster in $json_clu) {
     Write-Host "`n🔹 Processing cluster: $cluster_name" -ForegroundColor Cyan
     $headers = @{ apiKey=$apiKey; accessClusterId=$cluster.clusterId; accept="application/json" }
 
-    # 1) List active PGs (Oracle/SQL/RemoteAdapter only)
+    # 1) PGs: Oracle/SQL/RemoteAdapter only
     $pgs = @()
     try {
         $pgUri  = "$baseUrl/v2/data-protect/protection-groups?environments=$ENV_FILTER&isDeleted=false&isPaused=false&isActive=true"
@@ -149,7 +159,7 @@ foreach ($cluster in $json_clu) {
     }
     if (-not $pgs -or $pgs.Count -eq 0) { continue }
 
-    # 2) Policy cache + prefilter PGs by daysToKeep >= 35
+    # 2) Policy cache + prefilter daysToKeep >= 35
     $policyCache = @{}  # policyId -> @{ daysToKeep=...; name=... }
 
     function Get-PolicyLocal {
@@ -171,7 +181,7 @@ foreach ($cluster in $json_clu) {
     $pgs35 = @()
 
     foreach ($pg in $pgs) {
-        $polid = $pg.policyId  # NOTE: polid (NOT $pid)
+        $polid = $pg.policyId   # NOTE: polid (NOT $pid)
         if ([string]::IsNullOrWhiteSpace($polid)) { continue }
         $pol = Get-PolicyLocal -PolicyId $polid
         if ($null -eq $pol) { continue }
@@ -195,7 +205,7 @@ foreach ($cluster in $json_clu) {
         elseif ($pg.PSObject.Properties["environmentTypes"]) { $pgEnv = (@($pg.environmentTypes) -join ",") }
         if ([string]::IsNullOrWhiteSpace($pgEnv)) { $pgEnv = "UnknownEnv" }
 
-        # Runs (HEAVY) – required for correct partial-rerun clearing logic
+        # 3) Runs (HEAVY) – required for partial rerun clearing logic
         $jsonRuns = $null
         try {
             $runsUri  = "$baseUrl/v2/data-protect/protection-groups/$pgId/runs?numRuns=$NUM_RUNS&excludeNonRestorableRuns=false&includeObjectDetails=true"
@@ -217,7 +227,7 @@ foreach ($cluster in $json_clu) {
             )
             if (-not $runsForType -or $runsForType.Count -eq 0) { continue }
 
-            # Build id->name map (host mapping via sourceId best-effort)
+            # Build id->name map for DB host mapping via sourceId (best-effort)
             $idToName = @{}
             foreach ($rr in $runsForType) {
                 foreach ($ob in @($rr.objects)) {
@@ -236,7 +246,7 @@ foreach ($cluster in $json_clu) {
                 $info    = $run.localBackupInfo[0]
                 $endTime = Convert-ToLocalFromUsecs $info.endTimeUsecs $tz
 
-                # If no objects returned, record run-level failures
+                # If no objects returned, record run-level failures only
                 if (-not $run.objects -or @($run.objects).Count -eq 0) {
                     if ($info.status -eq "Failed") {
                         $rk = "RUNLEVEL|$pgId|$rType"
@@ -313,7 +323,7 @@ foreach ($cluster in $json_clu) {
 }
 
 # -------------------------------
-# Output (single CSV only if failures exist)
+# Output (one CSV only if failures exist)
 # -------------------------------
 if ($allFailures -and $allFailures.Count -gt 0) {
 
