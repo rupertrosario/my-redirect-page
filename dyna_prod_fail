@@ -1,13 +1,30 @@
-// Cohesity Helios — SIMPLE Policy List (All Clusters)
-// GET-only | Fast | 502/429 safe
-// Output: { authMode, count, policies: [ { Cluster, PolicyId, PolicyName } ] }
+// Cohesity Helios — Active Protection Groups with Policy daysToKeep >= 35 (All Clusters)
+// GET-only | Fast inventory | 502/429 safe
+//
+// What it does:
+// 1) For each cluster: list active PGs (v2)
+// 2) For each PG: fetch policy details via irisservices (daysToKeep)
+// 3) Keep only PGs where daysToKeep >= 35
+//
+// Output:
+// {
+//   authMode,
+//   count,
+//   protectionGroups: [
+//     { Cluster, ClusterId, ProtectionGroup, PgId, Environment, PolicyId, PolicyName, DaysToKeep }
+//   ]
+// }
 
 import { credentialVaultClient } from "@dynatrace-sdk/client-classic-environment-v2";
 
 export default async function () {
   const baseUrl = "https://helios.cohesity.com";
-  const CLUSTER_CONCURRENCY = 4;
-  const MAX_ROWS_TOTAL = 50000;
+
+  const MIN_DAYS = 35;
+  const CLUSTER_CONCURRENCY = 2;
+  const PG_CONCURRENCY = 6;
+  const POLICY_CONCURRENCY = 10;
+  const MAX_ROWS_TOTAL = 20000;
 
   // ======================
   // AUTH (READ-ONLY)
@@ -44,6 +61,49 @@ export default async function () {
   // ======================
   // Helpers
   // ======================
+  function buildQuery(params) {
+    const usp = new URLSearchParams();
+    Object.keys(params || {}).forEach((k) => {
+      const v = params[k];
+      if (v === undefined || v === null) return;
+      if (Array.isArray(v)) v.forEach((x) => usp.append(k, String(x)));
+      else usp.append(k, String(v));
+    });
+    return usp.toString();
+  }
+
+  function envLabel(pg) {
+    const ENV_LABELS = {
+      kOracle: "Oracle",
+      kSQL: "SQL",
+      kPhysical: "Physical",
+      kGenericNas: "NAS",
+      kIsilon: "NAS",
+      kHyperV: "HyperV",
+      kAcropolis: "Acropolis",
+      kRemoteAdapter: "RemoteAdapter"
+    };
+    const env = pg?.environment || (Array.isArray(pg?.environmentTypes) ? pg.environmentTypes[0] : null);
+    return ENV_LABELS[env] || env || "Unknown";
+  }
+
+  function pickPolicyId(pg) {
+    if (pg?.policyId != null) return String(pg.policyId);
+    if (Array.isArray(pg?.policyIds) && pg.policyIds.length) return String(pg.policyIds[0]);
+    if (Array.isArray(pg?.policies) && pg.policies.length) {
+      const p = pg.policies[0];
+      if (p?.id != null) return String(p.id);
+      if (p?.policyId != null) return String(p.policyId);
+    }
+    return null;
+  }
+
+  function policyDetailUrl(baseUrl, policyId) {
+    // keep ":" intact (avoid %3A in path)
+    const safeId = encodeURIComponent(String(policyId)).replace(/%3A/gi, ":");
+    return `${baseUrl}/irisservices/api/v1/public/protectionPolicies/${safeId}`;
+  }
+
   async function sleep(ms) {
     return new Promise((r) => setTimeout(r, ms));
   }
@@ -86,7 +146,7 @@ export default async function () {
   const clusters = clustersResp?.cohesityClusters || [];
 
   // ======================
-  // Policies per cluster
+  // Collect PGs + policies
   // ======================
   const perCluster = await mapLimit(clusters, CLUSTER_CONCURRENCY, async (c) => {
     const clusterId = c.clusterId;
@@ -98,54 +158,98 @@ export default async function () {
       accessClusterId: String(clusterId)
     };
 
-    let policiesData = null;
+    // active PGs only
+    let pgData;
     try {
-      policiesData = await getJson(`${baseUrl}/v1/protectionPolicies`, headers);
+      pgData = await getJson(
+        `${baseUrl}/v2/data-protect/protection-groups?${buildQuery({
+          isDeleted: false,
+          isPaused: false,
+          isActive: true
+        })}`,
+        headers
+      );
     } catch {
+      return [];
+    }
+
+    const pgs = pgData?.protectionGroups || [];
+    if (!pgs.length) return [];
+
+    // Dedup policy lookups per cluster
+    const policyCache = new Map(); // policyId -> { daysToKeep, name }
+    async function getPolicy(policyId) {
+      if (!policyId) return null;
+      if (policyCache.has(policyId)) return policyCache.get(policyId);
+
+      let p = null;
       try {
-        policiesData = await getJson(`${baseUrl}/protectionPolicies`, headers);
+        p = await getJson(policyDetailUrl(baseUrl, policyId), headers);
       } catch {
-        return [];
+        p = null;
       }
+
+      const policyObj = p?.protectionPolicy || p; // handle wrapper
+      const daysToKeep = policyObj?.daysToKeep ?? null;
+      const name = policyObj?.name ?? policyObj?.policyName ?? null;
+
+      const rec = { daysToKeep, name };
+      policyCache.set(policyId, rec);
+      return rec;
     }
 
-    const policiesArr =
-      policiesData?.protectionPolicies ||
-      policiesData?.policies ||
-      policiesData?.items ||
-      policiesData ||
-      [];
-
-    if (!Array.isArray(policiesArr) || !policiesArr.length) return [];
-
-    const rows = [];
-    for (let i = 0; i < policiesArr.length; i++) {
-      const p = policiesArr[i];
-      const id = p?.id ?? p?.policyId ?? p?._id ?? null;
-      const name = p?.name ?? p?.policyName ?? "UnknownPolicy";
-      rows.push({
+    // First collect PG skeletons
+    const pgSkeletons = [];
+    for (let i = 0; i < pgs.length; i++) {
+      const pg = pgs[i];
+      const policyId = pickPolicyId(pg);
+      if (!policyId) continue;
+      pgSkeletons.push({
         Cluster: clusterName,
-        PolicyId: id != null ? String(id) : null,
-        PolicyName: String(name)
+        ClusterId: String(clusterId),
+        ProtectionGroup: pg.name || "Unknown PG",
+        PgId: String(pg.id),
+        Environment: envLabel(pg),
+        PolicyId: policyId
       });
-      if (rows.length >= MAX_ROWS_TOTAL) break;
     }
-    return rows;
+
+    // Fetch policy details in parallel (bounded)
+    const enriched = await mapLimit(pgSkeletons, POLICY_CONCURRENCY, async (x) => {
+      const pol = await getPolicy(x.PolicyId);
+      const days = (pol && pol.daysToKeep != null) ? Number(pol.daysToKeep) : null;
+      if (!Number.isFinite(days)) return null;
+      if (days < MIN_DAYS) return null;
+
+      return {
+        ...x,
+        PolicyName: pol?.name || "",
+        DaysToKeep: days
+      };
+    });
+
+    return enriched.filter(Boolean);
   });
 
-  const policies = [];
+  const protectionGroups = [];
   for (let i = 0; i < perCluster.length; i++) {
     const r = perCluster[i];
-    if (r && r.length) policies.push(...r);
-    if (policies.length >= MAX_ROWS_TOTAL) break;
+    if (r && r.length) protectionGroups.push(...r);
+    if (protectionGroups.length >= MAX_ROWS_TOTAL) break;
   }
 
   // Sort
-  policies.sort((a, b) => {
+  protectionGroups.sort((a, b) => {
     const c = String(a.Cluster).localeCompare(String(b.Cluster));
     if (c !== 0) return c;
-    return String(a.PolicyName).localeCompare(String(b.PolicyName));
+    const d = (b.DaysToKeep || 0) - (a.DaysToKeep || 0);
+    if (d !== 0) return d;
+    return String(a.ProtectionGroup).localeCompare(String(b.ProtectionGroup));
   });
 
-  return { authMode, count: policies.length, policies };
+  return {
+    authMode,
+    count: protectionGroups.length,
+    protectionGroups
+  };
 }
