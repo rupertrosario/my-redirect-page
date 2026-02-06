@@ -1,22 +1,15 @@
 import { credentialVaultClient } from "@dynatrace-sdk/client-classic-environment-v2";
 
 /**
- * Cohesity Helios — Alert Tiles (FAST: alerts-summary per cluster)
+ * Cohesity Hardware Health Check — System → Health → Components (GET-only)
  * - Endpoints:
  *   - GET https://helios.cohesity.com/v2/mcm/cluster-mgmt/info
  *   - GET https://helios.cohesity.com/v2/alerts-summary   (with accessClusterId per cluster)
- * - GET-only
  * - 1 call per cluster
- * - Includes ALL clusters (healthy clusters show ✅)
- * - Symbols: ✅ healthy, else ⛔<n> ⚠️<n> ℹ️<n>
- * - NOTE: Unknown counts are ignored (no ❓)
- *
- * Returns:
- *  - note
- *  - markdownHardware
- *  - markdownMaintenance
- *  - markdownDataService
- *  - markdown (all sections combined)
+ * - Includes ALL clusters
+ * - Adds "NO_DATA" column to flag clusters whose /alerts-summary call failed (cluster down/unreachable)
+ * - Symbols: ✅ healthy, ⛔ critical, ⚠️ warning, ℹ️ info
+ * - Unknown counts are ignored (no ❓)
  */
 
 export default async function () {
@@ -38,7 +31,7 @@ export default async function () {
   const CONCURRENCY = 8;
 
   // ==============================
-  // CATEGORY LISTS (as per your confirmed list)
+  // CATEGORY LISTS
   // ==============================
   const HW_Cats = [
     "kDisk","kNode","kCluster","kChassis","kPowerSupply","kCPU","kMemory","kTemperature",
@@ -55,6 +48,12 @@ export default async function () {
     "kDataPath","kDataSourceConnector","kMetadata","kIndexing","kBackupRestore","kArchivalRestore",
     "kRemoteReplication","kQuota","kCDP","kViewFailover","kDisasterRecovery","kAgent","kNetBackup"
   ].sort();
+
+  // Add NO_DATA as first column for every section (always visible)
+  const NO_DATA_COL = "NO_DATA";
+  const HW_Cols = [NO_DATA_COL, ...HW_Cats];
+  const MAINT_Cols = [NO_DATA_COL, ...MAINT_Cats];
+  const DS_Cols = [NO_DATA_COL, ...DS_Cats];
 
   // ==============================
   // SYMBOLS
@@ -168,10 +167,15 @@ export default async function () {
           });
         }
 
-        return { ok: true, clusterName: cl.clusterName, byType };
-      } catch (_) {
-        // fail-open: include cluster with all-healthy cells
-        return { ok: false, clusterName: cl.clusterName, byType: { kHardware: new Map(), kMaintenance: new Map(), kDataService: new Map() } };
+        return { ok: true, clusterName: cl.clusterName, byType, fetchError: "" };
+      } catch (e) {
+        // FAIL-CLOSED: cluster down/unreachable -> NO_DATA flags it (prevents "all green")
+        return {
+          ok: false,
+          clusterName: cl.clusterName,
+          byType: { kHardware: new Map(), kMaintenance: new Map(), kDataService: new Map() },
+          fetchError: String(e?.message || e || "alerts-summary failed")
+        };
       }
     },
     CONCURRENCY
@@ -180,36 +184,56 @@ export default async function () {
   // ==============================
   // 3) Build section tables (ALL clusters)
   // ==============================
-  function buildSection(typeKey, cats) {
+  function buildSection(typeKey, cols) {
+    const cats = cols.filter((c) => c !== NO_DATA_COL);
     const rows = [];
 
     for (const c of perCluster) {
       const m = c.byType?.[typeKey] || new Map();
       const row = { ClusterName: c.clusterName };
 
+      // NO_DATA column first
+      row[NO_DATA_COL] = c.ok ? SYM_OK : `${SYM_W}NO_DATA`;
+
       for (const cat of cats) {
+        if (!c.ok) {
+          // Keep categories ✅ when no data; NO_DATA column is the flag
+          row[cat] = SYM_OK;
+          continue;
+        }
         const v = m.get(cat) || { criticalCount: 0, warningCount: 0, infoCount: 0, totalCount: 0 };
         row[cat] = cellFromCounts(v.criticalCount, v.warningCount, v.infoCount, v.totalCount);
       }
+
       rows.push(row);
     }
 
-    // default: alphabetical (stable + predictable)
     rows.sort((a, b) => String(a.ClusterName).localeCompare(String(b.ClusterName)));
-    return mdTable(["ClusterName", ...cats], rows);
+    return mdTable(["ClusterName", ...cols], rows);
   }
 
+  // ==============================
+  // 4) NOTE (rephrased as requested)
+  // ==============================
   const note =
-    `**NOTE:** This mimics the **System → Health → Components** page of the cluster.\n` +
-    `- Source: **/v2/alerts-summary** per cluster (header **accessClusterId**).\n` +
-    `- Includes ALL clusters; healthy clusters show **${SYM_OK}**.\n` +
-    `- Cell format: "${SYM_OK}" or "${SYM_C}<n> ${SYM_W}<n> ${SYM_I}<n>".`;
+    `### Cohesity Hardware Health Check\n\n` +
+    `This report mimics the **System → Health → Components** view for each Cohesity cluster.\n\n` +
+    `**Legend (symbols used in the tables):**\n` +
+    `- ✅ = Healthy (no active alerts)\n` +
+    `- ⛔<N> = Critical alerts count\n` +
+    `- ⚠️<N> = Warning alerts count\n` +
+    `- ℹ️<N> = Info alerts count\n` +
+    `- ⚠️NO_DATA = Cluster health data could not be fetched (cluster down/unreachable)\n`;
 
-  const markdownHardware = `**Hardware**\n${buildSection("kHardware", HW_Cats)}`;
-  const markdownMaintenance = `**Maintenance**\n${buildSection("kMaintenance", MAINT_Cats)}`;
-  const markdownDataService = `**Data Service**\n${buildSection("kDataService", DS_Cats)}`;
+  // ==============================
+  // 5) MARKDOWN SECTIONS (independent)
+  // ==============================
+  const markdownHardware = `**Hardware**\n${buildSection("kHardware", HW_Cols)}`;
+  const markdownMaintenance = `**Maintenance**\n${buildSection("kMaintenance", MAINT_Cols)}`;
+  const markdownDataService = `**Data Service**\n${buildSection("kDataService", DS_Cols)}`;
 
-  const markdown = [note, "", markdownHardware, "", markdownMaintenance, "", markdownDataService].join("\n");
+  // Combined (easy for email body)
+  const markdown = [note, markdownHardware, "", markdownMaintenance, "", markdownDataService].join("\n");
 
   return {
     note,
