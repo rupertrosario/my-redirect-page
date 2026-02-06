@@ -1,0 +1,86 @@
+# -------------------------------------------------------------
+# Cohesity PG Inventory (All Environments) + Policy (DaysToKeep>=35)
+# READ-ONLY (GET-only) | Multi-Cluster (Helios)
+# -------------------------------------------------------------
+
+$ErrorActionPreference = "Stop"
+$apikeypath = "X:\PowerShell\Cohesity_API_Scripts\DO_NOT_Delete\apikey.txt"
+if (-not (Test-Path $apikeypath)) { throw "API key file not found at $apikeypath" }
+$apiKey = (Get-Content -Path $apikeypath -Raw).Trim()
+
+$baseUrl = "https://helios.cohesity.com"
+$commonHeaders = @{ "apiKey" = $apiKey }
+
+# 1) Clusters
+$cluUrl = "$baseUrl/v2/mcm/cluster-mgmt/info"
+$clu = (Invoke-RestMethod -Method Get -Uri $cluUrl -Headers $commonHeaders).cohesityClusters
+if (-not $clu) { throw "No clusters returned from Helios." }
+
+# 2) Policy cache
+$policyCache = @{}  # policyId -> @{ name=...; daysToKeep=... }
+
+function Get-PolicyDetails {
+  param([string]$PolicyId, [hashtable]$Headers, [string]$BaseUrl)
+
+  if ([string]::IsNullOrWhiteSpace($PolicyId)) { return $null }
+  if ($policyCache.ContainsKey($PolicyId)) { return $policyCache[$PolicyId] }
+
+  $enc = [uri]::EscapeDataString($PolicyId)
+  $u = "$BaseUrl/irisservices/api/v1/public/protectionPolicies/$enc"
+
+  try {
+    $p = Invoke-RestMethod -Method Get -Uri $u -Headers $Headers
+    $val = @{ name = $p.name; daysToKeep = $p.daysToKeep }
+  } catch {
+    $val = @{ name = "PolicyLookupFailed"; daysToKeep = $null }
+  }
+
+  $policyCache[$PolicyId] = $val
+  return $val
+}
+
+# 3) Collect PG rows
+$out = New-Object System.Collections.Generic.List[object]
+
+foreach ($c in $clu) {
+  $clusterName = $c.name
+  if ([string]::IsNullOrWhiteSpace($clusterName)) { $clusterName = $c.clusterName }
+  if ([string]::IsNullOrWhiteSpace($clusterName)) { $clusterName = $c.displayName }
+  if ([string]::IsNullOrWhiteSpace($clusterName)) { $clusterName = "Unknown-$($c.clusterId)" }
+
+  $headers = @{ apiKey = $apiKey; accessClusterId = $c.clusterId }
+
+  # PG list: all environments, active-ish only (tweak if you want deleted/paused included)
+  $pgUrl = "$baseUrl/v2/data-protect/protection-groups?isDeleted=false&isPaused=false&isActive=true"
+  $pgs = (Invoke-RestMethod -Method Get -Uri $pgUrl -Headers $headers).protectionGroups
+  if (-not $pgs) { continue }
+
+  foreach ($pg in $pgs) {
+    $policyId = $pg.policyId
+    $pol = Get-PolicyDetails -PolicyId $policyId -Headers $headers -BaseUrl $baseUrl
+    $days = if ($pol) { $pol.daysToKeep } else { $null }
+
+    if ($null -eq $days -or [int]$days -lt 35) { continue }
+
+    $env = $pg.environment
+    if (-not $env -and $pg.environments -and $pg.environments.Count -gt 0) { $env = $pg.environments[0] }
+
+    $out.Add([pscustomobject]@{
+      Cluster         = $clusterName
+      Environment     = $env
+      ProtectionGroup = $pg.name
+      PgId            = $pg.id
+      PolicyName      = $pol.name
+      DaysToKeep      = $days
+      PolicyId        = $policyId
+    })
+  }
+}
+
+# 4) Output
+if ($out.Count -eq 0) {
+  Write-Host "No active protection groups found with policy DaysToKeep >= 35." -ForegroundColor Yellow
+} else {
+  $out | Sort-Object Cluster, Environment, ProtectionGroup |
+    Format-Table Cluster, Environment, ProtectionGroup, PolicyName, DaysToKeep, PolicyId -AutoSize
+}
