@@ -1,18 +1,26 @@
 # =====================================================================
 # Cohesity PROD Failures (Policy DaysToKeep >= 35) – Multi-Cluster (Helios)
+# SCOPE: Oracle + SQL + RemoteAdapter only
 # STRICTLY READ-ONLY (GET-only)
 #
-# REQUIRED LOGIC (your original / correct for partial reruns):
-# - Look back last 10 runs per PG per RunType (includeObjectDetails=true)
-# - Track LATEST failure per object that has NO later object-level success (within those 10 runs)
-# - DO NOT skip just because "latest run succeeded" (can be partial)
-#
-# PERF:
-# - Pre-filter PGs by Policy daysToKeep >= 35 using v1 protectionPolicies (cached per cluster)
+# Logic:
+# - Pre-filter PGs by Policy daysToKeep >= 35 (cached per cluster)
+# - Fetch last N runs (default 20) with includeObjectDetails=true
+# - For each RunType present in those N runs:
+#     - Track LATEST failure per object that has NO later object-level success
 # - Single consolidated CSV only if failures exist
 # =====================================================================
 
 $ErrorActionPreference = "Stop"
+
+# -------------------------------
+# Tunables (time vs coverage)
+# -------------------------------
+$NUM_RUNS = 20
+$MIN_DAYS_TO_KEEP = 35
+
+# Only these environments
+$ENV_FILTER = "kOracle,kSQL,kRemoteAdapter"
 
 # -------------------------------
 # Output folder + API key
@@ -105,7 +113,6 @@ function Has-FailedAttempts($ob){
     } catch { return $false }
 }
 function Is-ObjectSuccess($ob){
-    # Object present in run + no failedAttempts => success for clearing older failures
     if ($null -eq $ob -or $null -eq $ob.localSnapshotInfo) { return $false }
     return (-not (Has-FailedAttempts $ob))
 }
@@ -130,10 +137,10 @@ foreach ($cluster in $json_clu) {
     Write-Host "`n🔹 Processing cluster: $cluster_name" -ForegroundColor Cyan
     $headers = @{ apiKey=$apiKey; accessClusterId=$cluster.clusterId; accept="application/json" }
 
-    # 1) List active PGs (all envs)
+    # 1) List active PGs (Oracle/SQL/RemoteAdapter only)
     $pgs = @()
     try {
-        $pgUri  = "$baseUrl/v2/data-protect/protection-groups?isDeleted=false&isPaused=false&isActive=true"
+        $pgUri  = "$baseUrl/v2/data-protect/protection-groups?environments=$ENV_FILTER&isDeleted=false&isPaused=false&isActive=true"
         $pgJson = Invoke-HeliosGetJson -Uri $pgUri -Headers $headers
         $pgs    = @($pgJson.protectionGroups)
     } catch {
@@ -164,12 +171,12 @@ foreach ($cluster in $json_clu) {
     $pgs35 = @()
 
     foreach ($pg in $pgs) {
-        $polid = $pg.policyId   # NOTE: polid (NOT $pid)
+        $polid = $pg.policyId  # NOTE: polid (NOT $pid)
         if ([string]::IsNullOrWhiteSpace($polid)) { continue }
         $pol = Get-PolicyLocal -PolicyId $polid
         if ($null -eq $pol) { continue }
         $days = $pol.daysToKeep
-        if ($null -ne $days -and [int]$days -ge 35) { $pgs35 += $pg }
+        if ($null -ne $days -and [int]$days -ge $MIN_DAYS_TO_KEEP) { $pgs35 += $pg }
     }
 
     $pgs = $pgs35
@@ -188,10 +195,10 @@ foreach ($cluster in $json_clu) {
         elseif ($pg.PSObject.Properties["environmentTypes"]) { $pgEnv = (@($pg.environmentTypes) -join ",") }
         if ([string]::IsNullOrWhiteSpace($pgEnv)) { $pgEnv = "UnknownEnv" }
 
-        # 3) HEAVY runs (object details) ALWAYS for correct uncleared logic
+        # Runs (HEAVY) – required for correct partial-rerun clearing logic
         $jsonRuns = $null
         try {
-            $runsUri  = "$baseUrl/v2/data-protect/protection-groups/$pgId/runs?numRuns=10&excludeNonRestorableRuns=false&includeObjectDetails=true"
+            $runsUri  = "$baseUrl/v2/data-protect/protection-groups/$pgId/runs?numRuns=$NUM_RUNS&excludeNonRestorableRuns=false&includeObjectDetails=true"
             $jsonRuns = Invoke-HeliosGetJson -Uri $runsUri -Headers $headers
         } catch {
             continue
@@ -203,14 +210,14 @@ foreach ($cluster in $json_clu) {
 
         foreach ($rType in $runTypes) {
 
-            # newest -> oldest
+            # newest -> oldest for this runType
             $runsForType = @(
                 $runs | Where-Object { $_.localBackupInfo -and $_.localBackupInfo[0] -and $_.localBackupInfo[0].runType -eq $rType } |
                 Sort-Object { $_.localBackupInfo[0].endTimeUsecs } -Descending
             )
             if (-not $runsForType -or $runsForType.Count -eq 0) { continue }
 
-            # Host-name map for DB sourceId resolution (best-effort)
+            # Build id->name map (host mapping via sourceId best-effort)
             $idToName = @{}
             foreach ($rr in $runsForType) {
                 foreach ($ob in @($rr.objects)) {
@@ -229,7 +236,7 @@ foreach ($cluster in $json_clu) {
                 $info    = $run.localBackupInfo[0]
                 $endTime = Convert-ToLocalFromUsecs $info.endTimeUsecs $tz
 
-                # If no objects returned, record run-level failures only
+                # If no objects returned, record run-level failures
                 if (-not $run.objects -or @($run.objects).Count -eq 0) {
                     if ($info.status -eq "Failed") {
                         $rk = "RUNLEVEL|$pgId|$rType"
@@ -254,7 +261,7 @@ foreach ($cluster in $json_clu) {
 
                 $objsAll = @($run.objects) | Where-Object { $_ -and $_.object -and $_.localSnapshotInfo }
 
-                # 1) Mark object successes (in newer runs) to clear older failures
+                # 1) Mark object successes (newer runs clear older failures)
                 foreach ($ob in $objsAll) {
                     if (Is-ObjectSuccess $ob) {
                         $k = Get-ObjKey $ob
@@ -278,7 +285,6 @@ foreach ($cluster in $json_clu) {
                     $objEnv  = $ob.object.environment
                     $objName = $ob.object.name
 
-                    # DB host mapping (best-effort via sourceId)
                     $hostName = $null
                     if ($ob.object.PSObject.Properties["sourceId"]) {
                         $sid = [string]$ob.object.sourceId
@@ -317,7 +323,7 @@ if ($allFailures -and $allFailures.Count -gt 0) {
         Sort-Object Cluster,ProtectionGroup,Environment,RunType,EndTime -Descending
 
     $timestamp = Get-Date -Format "yyyyMMdd_HHmm"
-    $csvPath   = Join-Path $logDirectory "PROD_Failures_35dPlus_$timestamp.csv"
+    $csvPath   = Join-Path $logDirectory "PROD_Failures_35dPlus_Oracle_SQL_RA_$timestamp.csv"
 
     $final | Select-Object Environment,Cluster,ProtectionGroup,Host,ObjectType,ObjectName,RunType,EndTime,FailedMessage |
         Export-Csv -Path $csvPath -NoTypeInformation -Encoding utf8
@@ -326,5 +332,5 @@ if ($allFailures -and $allFailures.Count -gt 0) {
     Write-Host "`n📂 CSV saved: $csvPath" -ForegroundColor Gray
 }
 else {
-    Write-Host "`n✅ No failures found for Policy DaysToKeep >= 35 across all clusters (no CSV created)." -ForegroundColor Green
+    Write-Host "`n✅ No failures found for Policy DaysToKeep >= $MIN_DAYS_TO_KEEP (Oracle/SQL/RemoteAdapter) across all clusters (no CSV created)." -ForegroundColor Green
 }
