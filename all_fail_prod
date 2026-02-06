@@ -1,35 +1,71 @@
 # -------------------------------------------------------------
-# Cohesity PG Inventory (All Environments) + Policy (DaysToKeep>=35)
-# READ-ONLY (GET-only) | Multi-Cluster (Helios)
+# Cohesity PG + Policy (DaysToKeep >= 35) — Menu Cluster Selection
+# Helios | READ-ONLY (GET-only)
+# Output: Cluster | Environment | ProtectionGroup | PolicyName | DaysToKeep | PolicyId | PgId
 # -------------------------------------------------------------
 
 $ErrorActionPreference = "Stop"
+
+# 0) API key
 $apikeypath = "X:\PowerShell\Cohesity_API_Scripts\DO_NOT_Delete\apikey.txt"
 if (-not (Test-Path $apikeypath)) { throw "API key file not found at $apikeypath" }
 $apiKey = (Get-Content -Path $apikeypath -Raw).Trim()
 
 $baseUrl = "https://helios.cohesity.com"
-$commonHeaders = @{ "apiKey" = $apiKey }
+$commonHeaders = @{ apiKey = $apiKey }
 
-# 1) Clusters
+# 1) Get clusters
 $cluUrl = "$baseUrl/v2/mcm/cluster-mgmt/info"
-$clu = (Invoke-RestMethod -Method Get -Uri $cluUrl -Headers $commonHeaders).cohesityClusters
+$clusters = (Invoke-WebRequest -Method Get -Uri $cluUrl -Headers $commonHeaders).Content | ConvertFrom-Json
+$clu = $clusters.cohesityClusters
 if (-not $clu) { throw "No clusters returned from Helios." }
 
-# 2) Policy cache
+# Normalize cluster names
+$clusterList = foreach ($c in $clu) {
+  $name = $c.name
+  if ([string]::IsNullOrWhiteSpace($name)) { $name = $c.clusterName }
+  if ([string]::IsNullOrWhiteSpace($name)) { $name = $c.displayName }
+  if ([string]::IsNullOrWhiteSpace($name)) { $name = "Unknown-$($c.clusterId)" }
+
+  [pscustomobject]@{
+    ClusterName = $name
+    ClusterId   = $c.clusterId
+  }
+} | Sort-Object ClusterName
+
+# 2) Menu selection
+Write-Host ""
+Write-Host "Select cluster:" -ForegroundColor Cyan
+Write-Host "[0] All clusters" -ForegroundColor Yellow
+for ($i=0; $i -lt $clusterList.Count; $i++) {
+  "{0,2}. {1}" -f ($i+1), $clusterList[$i].ClusterName | Write-Host
+}
+$choice = Read-Host "`nEnter selection (0..$($clusterList.Count))"
+if ($choice -notmatch '^\d+$') { throw "Invalid selection." }
+$choice = [int]$choice
+if ($choice -lt 0 -or $choice -gt $clusterList.Count) { throw "Selection out of range." }
+
+$selectedClusters =
+  if ($choice -eq 0) { $clusterList }
+  else { @($clusterList[$choice-1]) }
+
+# 3) Policy cache (per run)
 $policyCache = @{}  # policyId -> @{ name=...; daysToKeep=... }
 
 function Get-PolicyDetails {
-  param([string]$PolicyId, [hashtable]$Headers, [string]$BaseUrl)
+  param(
+    [Parameter(Mandatory=$true)][string]$PolicyId,
+    [Parameter(Mandatory=$true)][hashtable]$Headers
+  )
 
   if ([string]::IsNullOrWhiteSpace($PolicyId)) { return $null }
   if ($policyCache.ContainsKey($PolicyId)) { return $policyCache[$PolicyId] }
 
   $enc = [uri]::EscapeDataString($PolicyId)
-  $u = "$BaseUrl/irisservices/api/v1/public/protectionPolicies/$enc"
+  $u = "$baseUrl/irisservices/api/v1/public/protectionPolicies/$enc"
 
   try {
-    $p = Invoke-RestMethod -Method Get -Uri $u -Headers $Headers
+    $p = (Invoke-WebRequest -Method Get -Uri $u -Headers $Headers).Content | ConvertFrom-Json
     $val = @{ name = $p.name; daysToKeep = $p.daysToKeep }
   } catch {
     $val = @{ name = "PolicyLookupFailed"; daysToKeep = $null }
@@ -39,48 +75,56 @@ function Get-PolicyDetails {
   return $val
 }
 
-# 3) Collect PG rows
-$out = New-Object System.Collections.Generic.List[object]
+# 4) Collect PGs + join policy + filter DaysToKeep >= 35
+$results = New-Object System.Collections.Generic.List[object]
 
-foreach ($c in $clu) {
-  $clusterName = $c.name
-  if ([string]::IsNullOrWhiteSpace($clusterName)) { $clusterName = $c.clusterName }
-  if ([string]::IsNullOrWhiteSpace($clusterName)) { $clusterName = $c.displayName }
-  if ([string]::IsNullOrWhiteSpace($clusterName)) { $clusterName = "Unknown-$($c.clusterId)" }
+foreach ($sc in $selectedClusters) {
+  Write-Host "`n🔹 Processing: $($sc.ClusterName)" -ForegroundColor Cyan
 
-  $headers = @{ apiKey = $apiKey; accessClusterId = $c.clusterId }
+  $headers = @{ apiKey = $apiKey; accessClusterId = $sc.ClusterId }
 
-  # PG list: all environments, active-ish only (tweak if you want deleted/paused included)
-  $pgUrl = "$baseUrl/v2/data-protect/protection-groups?isDeleted=false&isPaused=false&isActive=true"
-  $pgs = (Invoke-RestMethod -Method Get -Uri $pgUrl -Headers $headers).protectionGroups
+  # All environments, active, not paused, not deleted
+  # (keeping your GET + Body pattern)
+  $pgResp = Invoke-WebRequest -Method Get -Uri "$baseUrl/v2/data-protect/protection-groups" -Headers $headers -Body @{
+    isDeleted = "False"
+    isPaused  = "False"
+    isActive  = "True"
+  }
+
+  $pgs = ($pgResp.Content | ConvertFrom-Json).protectionGroups
   if (-not $pgs) { continue }
 
   foreach ($pg in $pgs) {
     $policyId = $pg.policyId
-    $pol = Get-PolicyDetails -PolicyId $policyId -Headers $headers -BaseUrl $baseUrl
-    $days = if ($pol) { $pol.daysToKeep } else { $null }
+    $pol = Get-PolicyDetails -PolicyId $policyId -Headers $headers
+    if (-not $pol) { continue }
 
-    if ($null -eq $days -or [int]$days -lt 35) { continue }
+    $days = $pol.daysToKeep
+    if ($null -eq $days) { continue }
+    if ([int]$days -lt 35) { continue }
 
     $env = $pg.environment
     if (-not $env -and $pg.environments -and $pg.environments.Count -gt 0) { $env = $pg.environments[0] }
+    if (-not $env) { $env = "Unknown" }
 
-    $out.Add([pscustomobject]@{
-      Cluster         = $clusterName
+    $results.Add([pscustomobject]@{
+      Cluster         = $sc.ClusterName
       Environment     = $env
       ProtectionGroup = $pg.name
-      PgId            = $pg.id
       PolicyName      = $pol.name
       DaysToKeep      = $days
       PolicyId        = $policyId
+      PgId            = $pg.id
     })
   }
 }
 
-# 4) Output
-if ($out.Count -eq 0) {
-  Write-Host "No active protection groups found with policy DaysToKeep >= 35." -ForegroundColor Yellow
+# 5) Output
+if ($results.Count -eq 0) {
+  Write-Host "`nNo protection groups found with policy DaysToKeep >= 35." -ForegroundColor Yellow
 } else {
-  $out | Sort-Object Cluster, Environment, ProtectionGroup |
-    Format-Table Cluster, Environment, ProtectionGroup, PolicyName, DaysToKeep, PolicyId -AutoSize
+  Write-Host "`n✅ Protection Groups with Policy DaysToKeep >= 35:`n" -ForegroundColor Green
+  $results |
+    Sort-Object Cluster, Environment, ProtectionGroup |
+    Format-Table Cluster, Environment, ProtectionGroup, PolicyName, DaysToKeep, PolicyId, PgId -AutoSize
 }
