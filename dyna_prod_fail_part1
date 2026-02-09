@@ -1,32 +1,21 @@
 import { credentialVaultClient } from "@dynatrace-sdk/client-classic-environment-v2";
 
 /**
- * PART 1 — Cohesity PROD Failures (Policy DaysToKeep >= 35) — Multi-Cluster (Helios)
- * READ-ONLY (GET-only)
- *
- * Output of Part 1 (used by Part 2):
+ * PART 1 (FAST): Clusters + Active PG Index (NO policy calls, NO runs calls)
+ * Output -> Part 2:
  * {
- *   baseUrl,
- *   apiKey,
- *   commonHeaders,
- *   daysToKeepMin,
- *   numRuns,
- *   clusters,          // from /v2/mcm/cluster-mgmt/info
- *   pgWorkItems        // array of PGs that REQUIRE HEAVY runs (part 2), already filtered by:
- *                      // - active PG
- *                      // - policy daysToKeep >= 35
- *                      // - LIGHT latest per runType status != Succeeded
+ *   baseUrl, apiKey, commonHeaders,
+ *   daysToKeepMin, numRuns,
+ *   clusters,
+ *   pgIndex: [{ clusterId, clusterName, pgId, pgName, pgEnv, policyId }]
  * }
  */
-
 export default async function () {
   const baseUrl = "https://helios.cohesity.com";
   const daysToKeepMin = 35;
   const numRuns = 5;
 
-  // ==============================
-  // AUTH (vault id) — same as your alerts script
-  // ==============================
+  // AUTH (same as your alerts script)
   const vaultId = "credentials_vault-312312";
   const d2 = await credentialVaultClient.getCredentialsDetails({ id: vaultId });
   const apiKey = (d2?.token || d2?.password || "").trim();
@@ -34,9 +23,6 @@ export default async function () {
 
   const commonHeaders = { accept: "application/json", apiKey };
 
-  // ==============================
-  // GET helper
-  // ==============================
   async function getJson(url, headers) {
     const resp = await fetch(url, { method: "GET", headers });
     if (!resp.ok) {
@@ -47,24 +33,13 @@ export default async function () {
     return resp.json();
   }
 
-  // ==============================
-  // 1) CLUSTERS
-  // ==============================
+  // 1) clusters
   const clu = await getJson(`${baseUrl}/v2/mcm/cluster-mgmt/info`, { ...commonHeaders, Accept: "application/json" });
   const clusters = Array.isArray(clu?.cohesityClusters) ? clu.cohesityClusters : [];
   if (!clusters.length) throw new Error("No clusters returned from /v2/mcm/cluster-mgmt/info");
 
-  // ==============================
-  // 2) BUILD worklist for Part 2
-  // ==============================
-  const pgWorkItems = []; // Part-2 input
-  // shape:
-  // {
-  //   clusterId, clusterName,
-  //   pgId, pgName, pgEnv,
-  //   policyId, policyName, daysToKeep,
-  //   runTypesNeedingHeavy: [ "kFull", "kLog", ... ]   // optional hint for Part 2
-  // }
+  // 2) active PG index (per cluster) — minimal fields only
+  const pgIndex = [];
 
   for (const cl of clusters) {
     const clusterId = cl?.clusterId;
@@ -74,60 +49,24 @@ export default async function () {
 
     const headers = { ...commonHeaders, Accept: "application/json", accessClusterId: String(clusterId) };
 
-    // 2a) Active PGs
-    let pgs = [];
+    let pgJson;
     try {
-      const pgJson = await getJson(
+      pgJson = await getJson(
         `${baseUrl}/v2/data-protect/protection-groups?isDeleted=false&isPaused=false&isActive=true`,
         headers
       );
-      pgs = Array.isArray(pgJson?.protectionGroups) ? pgJson.protectionGroups : [];
-      if (!pgs.length) continue;
     } catch (_) {
       continue; // fail-open per cluster
     }
 
-    // 2b) Policy cache (per cluster)
-    const policyCache = new Map(); // policyId -> { daysToKeep, name }
+    const pgs = Array.isArray(pgJson?.protectionGroups) ? pgJson.protectionGroups : [];
+    if (!pgs.length) continue;
 
-    async function getPolicy(policyId) {
-      if (!policyId) return null;
-      const pid = String(policyId);
-      if (policyCache.has(pid)) return policyCache.get(pid);
-
-      const enc = encodeURIComponent(pid);
-      const url = `${baseUrl}/irisservices/api/v1/public/protectionPolicies/${enc}`;
-      try {
-        const p = await getJson(url, headers);
-        const obj = { daysToKeep: p?.daysToKeep ?? null, name: p?.name ?? "" };
-        policyCache.set(pid, obj);
-        return obj;
-      } catch (_) {
-        const obj = { daysToKeep: null, name: "PolicyLookupFailed" };
-        policyCache.set(pid, obj);
-        return obj;
-      }
-    }
-
-    // 2c) Prefilter PGs by policy daysToKeep >= 35
-    const pgs35 = [];
     for (const pg of pgs) {
-      const policyId = pg?.policyId ? String(pg.policyId) : "";
-      if (!policyId) continue;
-      const pol = await getPolicy(policyId);
-      const days = pol?.daysToKeep;
-      if (days !== null && Number(days) >= daysToKeepMin) {
-        pgs35.push({ pg, policyId, policyName: pol?.name || "", daysToKeep: Number(days) });
-      }
-    }
-    if (!pgs35.length) continue;
-
-    // 2d) LIGHT runs decision: only PGs needing HEAVY are pushed to worklist
-    for (const item of pgs35) {
-      const pg = item.pg;
       const pgId = pg?.id;
       const pgName = pg?.name || "";
-      if (!pgId) continue;
+      const policyId = pg?.policyId ? String(pg.policyId) : "";
+      if (!pgId || !policyId) continue;
 
       const pgEnv =
         (pg.environment && String(pg.environment)) ||
@@ -135,68 +74,16 @@ export default async function () {
         (Array.isArray(pg.environmentTypes) ? pg.environmentTypes.join(",") : "") ||
         "UnknownEnv";
 
-      let runsLight;
-      try {
-        runsLight = await getJson(
-          `${baseUrl}/v2/data-protect/protection-groups/${encodeURIComponent(String(pgId))}/runs?numRuns=${numRuns}&excludeNonRestorableRuns=false&includeObjectDetails=false`,
-          headers
-        );
-      } catch (_) {
-        continue;
-      }
-
-      const runsArr = Array.isArray(runsLight?.runs) ? runsLight.runs : [];
-      if (!runsArr.length) continue;
-
-      const runTypes = Array.from(
-        new Set(
-          runsArr
-            .map((r) => r?.localBackupInfo?.[0]?.runType)
-            .filter(Boolean)
-            .map(String)
-        )
-      );
-
-      const runTypesNeedingHeavy = [];
-
-      for (const rt of runTypes) {
-        const latest = runsArr
-          .filter((r) => String(r?.localBackupInfo?.[0]?.runType || "") === rt)
-          .sort(
-            (a, b) =>
-              Number(b?.localBackupInfo?.[0]?.endTimeUsecs || 0) - Number(a?.localBackupInfo?.[0]?.endTimeUsecs || 0)
-          )[0];
-
-        const st = latest?.localBackupInfo?.[0]?.status;
-        if (st !== "Succeeded") runTypesNeedingHeavy.push(rt);
-      }
-
-      if (runTypesNeedingHeavy.length === 0) continue; // time saver
-
-      pgWorkItems.push({
+      pgIndex.push({
         clusterId: String(clusterId),
         clusterName,
         pgId: String(pgId),
         pgName,
         pgEnv,
-        policyId: item.policyId,
-        policyName: item.policyName,
-        daysToKeep: item.daysToKeep,
-        runTypesNeedingHeavy, // optional optimization hint for Part 2
+        policyId,
       });
     }
   }
 
-  // ==============================
-  // Part 1 output -> Part 2 input
-  // ==============================
-  return {
-    baseUrl,
-    apiKey,
-    commonHeaders,
-    daysToKeepMin,
-    numRuns,
-    clusters,
-    pgWorkItems,
-  };
+  return { baseUrl, apiKey, commonHeaders, daysToKeepMin, numRuns, clusters, pgIndex };
 }
