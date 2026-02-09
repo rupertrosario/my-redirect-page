@@ -1,0 +1,282 @@
+import { credentialVaultClient } from "@dynatrace-sdk/client-classic-environment-v2";
+
+/**
+ * Cohesity Cluster Health Tiles — Email-safe Markdown (GET-only)
+ *
+ * Returns:
+ *  - note
+ *  - markdownHardware
+ *  - markdownMaintenance
+ *  - markdownDataService
+ *  - markdown (all sections combined)
+ */
+
+export default async function () {
+  const baseUrl = "https://helios.cohesity.com";
+
+  // ==============================
+  // AUTH (vault id)
+  // ==============================
+  const vaultId = "credentials_vault-312312";
+  const d2 = await credentialVaultClient.getCredentialsDetails({ id: vaultId });
+  const apiKey = (d2?.token || d2?.password || "").trim();
+  if (!apiKey) throw new Error("No Helios API key available (empty token/password).");
+
+  // Dynatrace/Helios headers (use lowercase keys consistently)
+  const commonHeaders = {
+    accept: "application/json",
+    apiKey,
+  };
+
+  // ==============================
+  // PERF
+  // ==============================
+  const CONCURRENCY = 8;
+
+  // ==============================
+  // CATEGORY LISTS (sorted alphabetically)
+  // ==============================
+  const HW_Cats = [
+    "kDisk",
+    "kNode",
+    "kCluster",
+    "kChassis",
+    "kPowerSupply",
+    "kCPU",
+    "kMemory",
+    "kTemperature",
+    "kFan",
+    "kNIC",
+    "kFirmware",
+    "kNodeHealth",
+    "kOperatingSystem",
+    "kStorageDevice",
+    "kStoragePool",
+  ].sort();
+
+  const MAINT_Cats = [
+    "kHelios",
+    "kAppMarketPlace",
+    "kSystemService",
+    "kLicense",
+    "kSecurity",
+    "kUpgrade",
+    "kClusterManagement",
+    "kAuditLog",
+    "kNetworking",
+    "kConfiguration",
+    "kStorageUsage",
+    "kFaultTolerance",
+    "kGeneralSoftwareFailure",
+  ].sort();
+
+  const DS_Cats = [
+    "kDataPath",
+    "kDataSourceConnector",
+    "kMetadata",
+    "kIndexing",
+    "kBackupRestore",
+    "kArchivalRestore",
+    "kRemoteReplication",
+    "kQuota",
+    "kCDP",
+    "kViewFailover",
+    "kDisasterRecovery",
+    "kAgent",
+    "kNetBackup",
+  ].sort();
+
+  // ==============================
+  // SYMBOLS
+  // ==============================
+  const SYM_OK = "✅";
+  const SYM_C = "⛔";
+  const SYM_W = "⚠️";
+  const SYM_I = "ℹ️";
+  const SYM_NO_DATA = `${SYM_W}NO_DATA`;
+
+  // ==============================
+  // HELPERS
+  // ==============================
+  const norm = (v) => (v === null || v === undefined ? "" : String(v).trim());
+  const toArray = (v) => (!v ? [] : Array.isArray(v) ? v : [v]);
+  const safeCell = (v) => (v === null || v === undefined ? "" : String(v).replace(/\|/g, " "));
+
+  async function getJson(url, headers) {
+    const resp = await fetch(url, { method: "GET", headers });
+    if (!resp.ok) {
+      let txt = "";
+      try {
+        txt = await resp.text();
+      } catch (_) {}
+      const e = new Error(`GET ${url} -> HTTP ${resp.status} ${txt}`.trim());
+      e.status = resp.status;
+      e.body = txt;
+      throw e;
+    }
+    return resp.json();
+  }
+
+  function mdTable(headers, rows) {
+    if (!rows.length) return "No clusters returned.";
+    const head = `| ${headers.join(" | ")} |`;
+    const sep = `| ${headers.map(() => "---").join(" | ")} |`;
+    const body = rows.map((r) => `| ${headers.map((h) => safeCell(r[h] ?? "")).join(" | ")} |`);
+    return [head, sep, ...body].join("\n");
+  }
+
+  function cellFromCounts(criticalCount, warningCount, infoCount, totalCount) {
+    const c = Number(criticalCount || 0);
+    const w = Number(warningCount || 0);
+    const i = Number(infoCount || 0);
+    const t = Number(totalCount || 0);
+
+    // Healthy if no active alerts
+    if (t === 0 || (c === 0 && w === 0 && i === 0)) return SYM_OK;
+
+    return `${SYM_C}${c} ${SYM_W}${w} ${SYM_I}${i}`;
+  }
+
+  function normalizeAlertsSummaryPayload(payload) {
+    // Be tolerant to minor schema variations
+    if (Array.isArray(payload?.alertsSummary)) return payload.alertsSummary;
+    if (Array.isArray(payload?.summary)) return payload.summary;
+    if (Array.isArray(payload)) return payload;
+    return [];
+  }
+
+  async function poolMap(items, worker, concurrency) {
+    const results = new Array(items.length);
+    let idx = 0;
+
+    const runners = new Array(Math.min(concurrency, items.length)).fill(0).map(async () => {
+      while (idx < items.length) {
+        const cur = idx++;
+        results[cur] = await worker(items[cur], cur);
+      }
+    });
+
+    await Promise.all(runners);
+    return results;
+  }
+
+  // ==============================
+  // 1) CLUSTERS (name + id)
+  // ==============================
+  const clu = await getJson(`${baseUrl}/v2/mcm/cluster-mgmt/info`, commonHeaders);
+
+  const clusters = toArray(clu?.cohesityClusters)
+    .map((c) => ({ clusterName: norm(c?.clusterName), clusterId: norm(c?.clusterId) }))
+    .filter((c) => c.clusterName && c.clusterId)
+    .sort((a, b) => a.clusterName.localeCompare(b.clusterName));
+
+  if (!clusters.length) throw new Error("No clusters returned from /v2/mcm/cluster-mgmt/info");
+
+  // ==============================
+  // 2) PER-CLUSTER alerts-summary (1 call per cluster)
+  // ==============================
+  async function fetchAlertsSummaryForCluster(clusterId) {
+    const headers = {
+      ...commonHeaders,
+      accessClusterId: String(clusterId),
+    };
+    const url = `${baseUrl}/v2/alerts-summary`;
+    const data = await getJson(url, headers);
+    return normalizeAlertsSummaryPayload(data);
+  }
+
+  const perCluster = await poolMap(
+    clusters,
+    async (cl) => {
+      try {
+        const rows = await fetchAlertsSummaryForCluster(cl.clusterId);
+
+        const byType = {
+          kHardware: new Map(),
+          kMaintenance: new Map(),
+          kDataService: new Map(),
+        };
+
+        for (const r of rows) {
+          const type = norm(r?.type);
+          const category = norm(r?.category);
+          if (!type || !category) continue;
+          if (!byType[type]) continue;
+
+          byType[type].set(category, {
+            criticalCount: Number(r?.criticalCount || 0),
+            warningCount: Number(r?.warningCount || 0),
+            infoCount: Number(r?.infoCount || 0),
+            totalCount: Number(r?.totalCount || 0),
+          });
+        }
+
+        return { ok: true, clusterName: cl.clusterName, byType };
+      } catch (_) {
+        // FAIL-CLOSED: any error => all cells become ⚠️NO_DATA
+        return {
+          ok: false,
+          clusterName: cl.clusterName,
+          byType: { kHardware: new Map(), kMaintenance: new Map(), kDataService: new Map() },
+        };
+      }
+    },
+    CONCURRENCY
+  );
+
+  // ==============================
+  // 3) Build section tables (ALL clusters; FAIL => ⚠️NO_DATA for all categories)
+  // ==============================
+  function buildSection(typeKey, cats) {
+    const rows = [];
+
+    for (const c of perCluster) {
+      const row = { ClusterName: c.clusterName };
+
+      if (!c.ok) {
+        for (const cat of cats) row[cat] = SYM_NO_DATA;
+        rows.push(row);
+        continue;
+      }
+
+      const m = c.byType?.[typeKey] || new Map();
+      for (const cat of cats) {
+        const v = m.get(cat) || { criticalCount: 0, warningCount: 0, infoCount: 0, totalCount: 0 };
+        row[cat] = cellFromCounts(v.criticalCount, v.warningCount, v.infoCount, v.totalCount);
+      }
+
+      rows.push(row);
+    }
+
+    // Alphabetical sort (explicit, even though clusters were sorted)
+    rows.sort((a, b) => String(a.ClusterName).localeCompare(String(b.ClusterName)));
+    return mdTable(["ClusterName", ...cats], rows);
+  }
+
+  // ==============================
+  // 4) NOTE / HEADER (exact wording)
+  // ==============================
+  const note = [
+    "### Cohesity Hardware Health Check",
+    "This report mimics the System → Health → Components view for each Cohesity cluster.",
+    "**Legend:** ✅ Healthy | ⛔<N> Critical | ⚠️<N> Warning | ℹ️<N> Info | ⚠️NO_DATA Unreachable",
+  ].join("\n\n");
+
+  // ==============================
+  // 5) MARKDOWN SECTIONS (independent)
+  // ==============================
+  const markdownHardware = `\n**Hardware**\n${buildSection("kHardware", HW_Cats)}`;
+  const markdownMaintenance = `\n**Maintenance**\n${buildSection("kMaintenance", MAINT_Cats)}`;
+  const markdownDataService = `\n**Data Service**\n${buildSection("kDataService", DS_Cats)}`;
+
+  // Combined for email body (double newlines between sections)
+  const markdown = [note, markdownHardware, markdownMaintenance, markdownDataService].join("\n\n");
+
+  return {
+    note,
+    markdownHardware,
+    markdownMaintenance,
+    markdownDataService,
+    markdown,
+  };
+}
