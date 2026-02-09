@@ -2,31 +2,22 @@ import { credentialVaultClient } from "@dynatrace-sdk/client-classic-environment
 import { result } from "@dynatrace-sdk/automation-utils";
 
 /**
- * PART 3 (HEAVY): Runs logic + failure rule + ONE markdown table
+ * PART 3 (HEAVY): Runs + failure rule + markdown table
  * READ-ONLY (GET-only)
  *
  * Reads Part 2 output via: await result("run_javascript_2")
  *
  * Failure rule (per runType, per object) within last numRuns:
  * - Latest failure per object that has NO later success (within window)
- *
- * Returns:
- *  - markdownTable
- *  - count
- *  - failures
  */
 
 export default async function () {
-  // ---------- pull Part 2 output (NO workflow input mapping required) ----------
-  const p2 = await result("run_javascript_2"); // must match your task name exactly
-  if (!p2 || !Array.isArray(p2.pgWorkItems)) {
-    throw new Error("Part 3: could not read Part 2 output (missing pgWorkItems). Check task name run_javascript_2.");
-  }
-
-  const baseUrl = p2.baseUrl || "https://helios.cohesity.com";
-  const DAYS_TO_KEEP_MIN = Number(p2.daysToKeepMin ?? 35);
-  const NUM_RUNS = Number(p2.numRuns ?? 5);
-  const pgWorkItems = p2.pgWorkItems;
+  // ----- pull Part 2 output -----
+  const p2 = await result("run_javascript_2");
+  const pgWorkItems = Array.isArray(p2?.pgWorkItems) ? p2.pgWorkItems : [];
+  const baseUrl = p2?.baseUrl || "https://helios.cohesity.com";
+  const DAYS_TO_KEEP_MIN = Number(p2?.daysToKeepMin ?? 35);
+  const NUM_RUNS = Number(p2?.numRuns ?? 5);
 
   if (!pgWorkItems.length) {
     return {
@@ -36,7 +27,7 @@ export default async function () {
     };
   }
 
-  // ---------- AUTH (vault) ----------
+  // ----- AUTH (vault) -----
   const vaultId = "credentials_vault-312312";
   const d2 = await credentialVaultClient.getCredentialsDetails({ id: vaultId });
   const apiKey = (d2?.token || d2?.password || "").trim();
@@ -44,7 +35,6 @@ export default async function () {
 
   const commonHeaders = { accept: "application/json", apiKey };
 
-  // ---------- fetch helper ----------
   async function getJson(url, headers) {
     const resp = await fetch(url, { method: "GET", headers });
     if (!resp.ok) {
@@ -55,14 +45,40 @@ export default async function () {
     return resp.json();
   }
 
-  // ---------- utils ----------
+  // ----- helpers -----
   function cleanMsg(s) {
     if (!s) return "";
-    return String(s)
-      .replace(/[\r\n]+/g, " ")
-      .replace(/,/g, " ")
-      .replace(/"/g, "'")
-      .trim();
+    return String(s).replace(/[\r\n]+/g, " ").replace(/,/g, " ").replace(/"/g, "'").trim();
+  }
+
+  // localBackupInfo can be OBJECT or ARRAY
+  function infoOf(run) {
+    const lbi = run?.localBackupInfo;
+    if (Array.isArray(lbi)) return lbi[0] || {};
+    if (lbi && typeof lbi === "object") return lbi;
+    return {};
+  }
+
+  function runTypeOf(run) {
+    return String(infoOf(run)?.runType || "").trim();
+  }
+
+  function statusOf(run) {
+    return String(infoOf(run)?.status || "").trim();
+  }
+
+  function endUsecsOf(run) {
+    return Number(infoOf(run)?.endTimeUsecs || 0);
+  }
+
+  // counts are present even when objects are null in some responses
+  function failedCountOf(run) {
+    const i = infoOf(run);
+    const fo = Number(i?.failedObjectsCount || 0);
+    const fao = Number(i?.failedAppObjectsCount || 0);
+    const co = Number(i?.cancelledObjectsCount || 0);
+    const cao = Number(i?.cancelledAppObjectsCount || 0);
+    return fo + fao + co + cao;
   }
 
   function fmtETFromUsecs(usecs) {
@@ -107,16 +123,6 @@ export default async function () {
     return msgs.join(" | ");
   }
 
-  // ---------- group PGs by cluster (so headers are correct + optional parallelism) ----------
-  const byCluster = new Map(); // clusterId -> { clusterName, items: [...] }
-  for (const it of pgWorkItems) {
-    const cid = String(it?.clusterId || "");
-    if (!cid) continue;
-    if (!byCluster.has(cid)) byCluster.set(cid, { clusterName: it?.clusterName || `Unknown-${cid}`, items: [] });
-    byCluster.get(cid).items.push(it);
-  }
-
-  // ---------- small concurrency pool (keeps runtime down without hammering Helios) ----------
   async function mapLimit(arr, limit, fn) {
     const out = [];
     let i = 0;
@@ -131,91 +137,89 @@ export default async function () {
     return out;
   }
 
+  // ----- group PGs by cluster -----
+  const byCluster = new Map();
+  for (const it of pgWorkItems) {
+    const cid = String(it?.clusterId || "");
+    if (!cid) continue;
+    if (!byCluster.has(cid)) byCluster.set(cid, { clusterName: it?.clusterName || `Unknown-${cid}`, items: [] });
+    byCluster.get(cid).items.push(it);
+  }
+
   const CONCURRENCY_PER_CLUSTER = 3;
   const allFailures = [];
 
   for (const [clusterId, group] of byCluster.entries()) {
-    const headers = {
-      ...commonHeaders,
-      Accept: "application/json",
-      accessClusterId: String(clusterId),
-    };
+    const headers = { ...commonHeaders, Accept: "application/json", accessClusterId: String(clusterId) };
 
     async function processPg(pgItem) {
       const pgId = String(pgItem.pgId || "");
-      const pgName = pgItem.pgName || "";
-      const pgEnv = pgItem.pgEnv || "UnknownEnv";
-      const clusterName = pgItem.clusterName || group.clusterName;
-
       if (!pgId) return;
 
-      // 1) LIGHT runs
+      const clusterName = pgItem.clusterName || group.clusterName;
+      const pgName = pgItem.pgName || "";
+      const pgEnv = pgItem.pgEnv || "UnknownEnv";
+
+      // 1) LIGHT
       let runsLight;
       try {
         runsLight = await getJson(
           `${baseUrl}/v2/data-protect/protection-groups/${encodeURIComponent(pgId)}/runs?numRuns=${NUM_RUNS}&excludeNonRestorableRuns=false&includeObjectDetails=false`,
           headers
         );
-      } catch (_) {
-        return; // fail-open per PG
+      } catch {
+        return;
       }
 
       const runsArr = Array.isArray(runsLight?.runs) ? runsLight.runs : [];
       if (!runsArr.length) return;
 
-      const runTypes = Array.from(
-        new Set(
-          runsArr
-            .map((r) => r?.localBackupInfo?.[0]?.runType)
-            .filter(Boolean)
-            .map(String)
-        )
-      );
+      // derive runTypes safely
+      const runTypes = Array.from(new Set(runsArr.map(runTypeOf).filter(Boolean)));
 
+      // IMPORTANT: decide HEAVY using status OR failed counts (even if status "Succeeded")
       let needHeavy = false;
-      for (const rt of runTypes) {
-        const latest = runsArr
-          .filter((r) => String(r?.localBackupInfo?.[0]?.runType || "") === rt)
-          .sort(
-            (a, b) => Number(b?.localBackupInfo?.[0]?.endTimeUsecs || 0) - Number(a?.localBackupInfo?.[0]?.endTimeUsecs || 0)
-          )[0];
-        const st = latest?.localBackupInfo?.[0]?.status;
-        if (st !== "Succeeded") { needHeavy = true; break; }
+      if (runTypes.length === 0) {
+        needHeavy = true; // can't infer safely
+      } else {
+        for (const rt of runTypes) {
+          const latest = runsArr
+            .filter((r) => runTypeOf(r) === rt)
+            .sort((a, b) => endUsecsOf(b) - endUsecsOf(a))[0];
+
+          if (!latest) continue;
+          if (statusOf(latest) !== "Succeeded" || failedCountOf(latest) > 0) { needHeavy = true; break; }
+        }
       }
       if (!needHeavy) return;
 
-      // 2) HEAVY runs
+      // 2) HEAVY
       let runsHeavy;
       try {
         runsHeavy = await getJson(
           `${baseUrl}/v2/data-protect/protection-groups/${encodeURIComponent(pgId)}/runs?numRuns=${NUM_RUNS}&excludeNonRestorableRuns=false&includeObjectDetails=true`,
           headers
         );
-      } catch (_) {
+      } catch {
         return;
       }
 
       const runs = Array.isArray(runsHeavy?.runs) ? runsHeavy.runs : [];
       if (!runs.length) return;
 
-      const heavyRunTypes = Array.from(
-        new Set(
-          runs
-            .map((r) => r?.localBackupInfo?.[0]?.runType)
-            .filter(Boolean)
-            .map(String)
-        )
-      );
+      const heavyRunTypes = Array.from(new Set(runs.map(runTypeOf).filter(Boolean)));
+      const typesToProcess = heavyRunTypes.length ? heavyRunTypes : ["__UNKNOWN__"];
 
-      for (const rType of heavyRunTypes) {
-        const runsForType = runs
-          .filter((r) => String(r?.localBackupInfo?.[0]?.runType || "") === rType)
-          .sort(
-            (a, b) => Number(b?.localBackupInfo?.[0]?.endTimeUsecs || 0) - Number(a?.localBackupInfo?.[0]?.endTimeUsecs || 0)
-          );
+      for (const rType of typesToProcess) {
+        const runsForType = (rType === "__UNKNOWN__")
+          ? runs.slice().sort((a, b) => endUsecsOf(b) - endUsecsOf(a))
+          : runs
+              .filter((r) => runTypeOf(r) === rType)
+              .sort((a, b) => endUsecsOf(b) - endUsecsOf(a));
+
         if (!runsForType.length) continue;
 
-        // DB host map (best-effort)
+        // host map best-effort
         const idToName = new Map();
         for (const rr of runsForType) {
           const objs = Array.isArray(rr?.objects) ? rr.objects : [];
@@ -229,18 +233,17 @@ export default async function () {
         const latestFailByKey = new Map();
 
         for (const run of runsForType) {
-          const info = run?.localBackupInfo?.[0] || {};
-          const endTimeET = fmtETFromUsecs(info.endTimeUsecs);
+          const endTimeET = fmtETFromUsecs(endUsecsOf(run));
+          const info = infoOf(run);
 
-          const objsAll = (Array.isArray(run?.objects) ? run.objects : [])
-            .filter((x) => x?.object && x?.localSnapshotInfo);
+          const objsAll = (Array.isArray(run?.objects) ? run.objects : []).filter((x) => x?.object && x?.localSnapshotInfo);
 
-          // Run-level fallback only if objects missing and run Failed
+          // run-level fallback if objects missing and run failed/has failed counts
           if (!objsAll.length) {
-            if (info.status === "Failed") {
+            if (String(info?.status || "") === "Failed" || failedCountOf(run) > 0) {
               const rk = `RUNLEVEL|${pgId}|${rType}`;
               if (!latestFailByKey.has(rk)) {
-                const msg = Array.isArray(info.messages) ? info.messages.join(" | ") : info.messages;
+                const msg = Array.isArray(info?.messages) ? info.messages.join(" | ") : info?.messages;
                 latestFailByKey.set(rk, {
                   Environment: pgEnv,
                   Cluster: clusterName,
@@ -248,16 +251,16 @@ export default async function () {
                   Host: "",
                   ObjectType: "RunLevel",
                   ObjectName: "(Run-level)",
-                  RunType: rType,
+                  RunType: rType === "__UNKNOWN__" ? (runTypeOf(run) || "UnknownRunType") : rType,
                   EndTimeET: endTimeET,
-                  FailedMessage: cleanMsg(msg),
+                  FailedMessage: cleanMsg(msg) || "Run indicates failed objects but object list not returned.",
                 });
               }
             }
             continue;
           }
 
-          // Pass 1: clear successes (newer clears older failures)
+          // clear successes
           for (const ob of objsAll) {
             if (isSuccessForClear(ob)) {
               const k = getObjKey(ob);
@@ -265,7 +268,7 @@ export default async function () {
             }
           }
 
-          // Pass 2: capture latest uncleared failures
+          // capture latest uncleared failures
           for (const ob of objsAll) {
             const k = getObjKey(ob);
             if (!k) continue;
@@ -287,7 +290,7 @@ export default async function () {
               Host: hostName,
               ObjectType: o.objectType ? String(o.objectType) : "UnknownType",
               ObjectName: o.name ? String(o.name) : "",
-              RunType: rType,
+              RunType: rType === "__UNKNOWN__" ? (runTypeOf(run) || "UnknownRunType") : rType,
               EndTimeET: endTimeET,
               FailedMessage: msg,
             });
@@ -298,11 +301,10 @@ export default async function () {
       }
     }
 
-    // process PGs with small concurrency per cluster
     await mapLimit(group.items, CONCURRENCY_PER_CLUSTER, processPg);
   }
 
-  // ---------- output ----------
+  // ----- output -----
   if (!allFailures.length) {
     return {
       markdownTable: `✅ No failures found for Policy DaysToKeep >= ${DAYS_TO_KEEP_MIN} across all clusters (last ${NUM_RUNS} runs).`,
@@ -311,7 +313,6 @@ export default async function () {
     };
   }
 
-  // final dedup safety
   const dedup = new Map();
   for (const r of allFailures) {
     const key = `${r.Environment}|${r.Cluster}|${r.ProtectionGroup}|${r.RunType}|${r.Host}|${r.ObjectType}|${r.ObjectName}`;
@@ -355,9 +356,5 @@ export default async function () {
     lines.push(`| ${row.join(" | ")} |`);
   }
 
-  return {
-    markdownTable: lines.join("\n"),
-    count: final.length,
-    failures: final,
-  };
+  return { markdownTable: lines.join("\n"), count: final.length, failures: final };
 }
