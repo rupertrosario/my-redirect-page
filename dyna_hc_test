@@ -3,20 +3,22 @@ import { credentialVaultClient } from "@dynatrace-sdk/client-classic-environment
 /**
  * Cohesity Health Tiles — Email-safe Markdown (GET-only)
  *
- * Source (single call):
- *   - GET https://helios.cohesity.com/v2/mcm/alerts
+ * Source:
+ *   - GET https://helios.cohesity.com/v2/mcm/alerts  (single call)
  *
- * Logic (your requirement):
- * - Fetch alerts once.
- * - For EACH cluster, for EACH bucket (Hardware/Maintenance/DataService), for EACH category+severity:
- *     count UNIQUE alertCode values (dedupe key = clusterId|bucket|category|severity|alertCode)
- * - Cell output:
- *     ✅ if no unique codes
- *     else ⛔<N> ⚠️<N> ℹ️<N> (N = unique alertCodes)
+ * Clean 3-phase logic (correctness first):
+ *   Phase 1: Partition alerts by clusterId
+ *   Phase 2: Within each clusterId, dedupe by alertCode (keep ONE representative)
+ *   Phase 3: Classify each unique alertCode into (bucket, category, severity) and count tiles
  *
- * IMPORTANT LIMITATION (because we do NOT call cluster-mgmt/info):
- * - Clusters with zero active alerts (kOpen/kNote) will not appear at all.
- * - “⚠️NO_DATA Unreachable” cannot be determined without a cluster baseline endpoint.
+ * Cell meaning:
+ *   ⛔<N> ⚠️<N> ℹ️<N> where N = number of UNIQUE alertCodes (per cluster) in that severity for that category
+ *   ✅ when all 3 counts are zero
+ *
+ * Notes / limitations (because no cluster-mgmt baseline):
+ * - Clusters with zero active alerts (kOpen/kNote) will not appear.
+ * - No ⚠️NO_DATA unreachable handling (needs baseline list to detect missing clusters).
+ * - No time window and no maxAlerts param (API default cap applies).
  *
  * Returns:
  *  - note
@@ -64,6 +66,8 @@ export default async function () {
     { key: "kDataService", label: "Data Service", cats: DS_Cats }
   ];
 
+  const catsByBucket = new Map(BUCKETS.map((b) => [b.key, new Set(b.cats)]));
+
   // ==============================
   // SYMBOLS
   // ==============================
@@ -84,10 +88,7 @@ export default async function () {
     if (!resp.ok) {
       let txt = "";
       try { txt = await resp.text(); } catch (_) {}
-      const e = new Error(`GET ${url} -> HTTP ${resp.status} ${txt}`.trim());
-      e.status = resp.status;
-      e.body = txt;
-      throw e;
+      throw new Error(`GET ${url} -> HTTP ${resp.status} ${txt}`.trim());
     }
     return resp.json();
   }
@@ -100,36 +101,35 @@ export default async function () {
     return [head, sep, ...body].join("\n");
   }
 
-  function cellFromSets(setC, setW, setI) {
-    const c = setC ? setC.size : 0;
-    const w = setW ? setW.size : 0;
-    const i = setI ? setI.size : 0;
-    if (c === 0 && w === 0 && i === 0) return SYM_OK;
-    return `${SYM_C}${c} ${SYM_W}${w} ${SYM_I}${i}`;
+  function cellFromCounts(c, w, i) {
+    const cc = Number(c || 0);
+    const ww = Number(w || 0);
+    const ii = Number(i || 0);
+    if (cc === 0 && ww === 0 && ii === 0) return SYM_OK;
+    return `${SYM_C}${cc} ${SYM_W}${ww} ${SYM_I}${ii}`;
   }
 
-  // store[bucketKey][clusterName][category] = { C:Set, W:Set, I:Set }
+  // store[bucketKey][clusterName][category] = { c:int, w:int, i:int }
   const store = new Map();
 
-  function ensureCell(bucketKey, clusterName, category) {
+  function ensureCounts(bucketKey, clusterName, category) {
     if (!store.has(bucketKey)) store.set(bucketKey, new Map());
     const b = store.get(bucketKey);
     if (!b.has(clusterName)) b.set(clusterName, new Map());
     const c = b.get(clusterName);
-    if (!c.has(category)) c.set(category, { C: new Set(), W: new Set(), I: new Set() });
+    if (!c.has(category)) c.set(category, { c: 0, w: 0, i: 0 });
     return c.get(category);
   }
 
   // ==============================
-  // 1) Fetch alerts (single global call; no maxAlerts; no time window)
+  // 1) Fetch alerts (single global call)
   // ==============================
   function buildAlertsUrl() {
     const u = new URL(`${baseUrl}/v2/mcm/alerts`);
-
-    // array params => repeated params
     ["kOpen", "kNote"].forEach((s) => u.searchParams.append("alertStateList", s));
-    ["kHardware", "kMaintenance", "kDataService"].forEach((b) => u.searchParams.append("alertTypeBucketList", b));
-
+    ["kHardware", "kMaintenance", "kDataService"].forEach((b) =>
+      u.searchParams.append("alertTypeBucketList", b)
+    );
     return u.toString();
   }
 
@@ -137,43 +137,67 @@ export default async function () {
   const alerts = toArray(payload?.alertsList);
 
   // ==============================
-  // 2) Per-cluster dedupe on alertCode (scoped properly)
-  //    key = clusterId|bucket|category|severity|alertCode
+  // PHASE 1: Partition by clusterId
+  // clusterId -> { clusterName, alerts: [] }
   // ==============================
-  const seen = new Set();
-
-  // quick lookup for valid categories per bucket
-  const catsByBucket = new Map(BUCKETS.map((b) => [b.key, new Set(b.cats)]));
+  const byCluster = new Map();
 
   for (const a of alerts) {
     const state = norm(a?.alertState);
     if (state !== "kOpen" && state !== "kNote") continue;
 
     const clusterId = String(a?.clusterId ?? "");
+    if (!clusterId) continue;
+
     const clusterName = norm(a?.clusterName) || clusterId;
 
-    const bucket = norm(a?.alertTypeBucket);
-    const category = norm(a?.alertCategory);
-    const severity = norm(a?.severity);
-    const code = norm(a?.alertCode);
-
-    if (!clusterId || !clusterName || !bucket || !category || !severity || !code) continue;
-    if (!catsByBucket.has(bucket)) continue;
-    if (!catsByBucket.get(bucket).has(category)) continue;
-    if (severity !== "kCritical" && severity !== "kWarning" && severity !== "kInfo") continue;
-
-    const dedupeKey = `${clusterId}|${bucket}|${category}|${severity}|${code}`;
-    if (seen.has(dedupeKey)) continue;
-    seen.add(dedupeKey);
-
-    const cell = ensureCell(bucket, clusterName, category);
-    if (severity === "kCritical") cell.C.add(code);
-    else if (severity === "kWarning") cell.W.add(code);
-    else cell.I.add(code);
+    if (!byCluster.has(clusterId)) byCluster.set(clusterId, { clusterName, alerts: [] });
+    byCluster.get(clusterId).alerts.push(a);
   }
 
   // ==============================
-  // 3) Build section tables
+  // PHASE 2: Dedupe per cluster by alertCode (keep ONE representative per code)
+  // clusterId -> Map(alertCode -> representativeAlert)
+  // ==============================
+  const uniqByCluster = new Map();
+
+  for (const [clusterId, obj] of byCluster.entries()) {
+    const repByCode = new Map();
+
+    for (const a of obj.alerts) {
+      const code = norm(a?.alertCode);
+      if (!code) continue;
+
+      // keep first; (optional) you could prefer kCritical over others, but not requested
+      if (!repByCode.has(code)) repByCode.set(code, a);
+    }
+
+    uniqByCluster.set(clusterId, { clusterName: obj.clusterName, repByCode });
+  }
+
+  // ==============================
+  // PHASE 3: Classify each unique alertCode into tiles
+  // ==============================
+  for (const { clusterName, repByCode } of uniqByCluster.values()) {
+    for (const a of repByCode.values()) {
+      const bucket = norm(a?.alertTypeBucket);
+      const category = norm(a?.alertCategory);
+      const severity = norm(a?.severity);
+
+      if (!bucket || !category || !severity) continue;
+      if (!catsByBucket.has(bucket)) continue;
+      if (!catsByBucket.get(bucket).has(category)) continue;
+      if (severity !== "kCritical" && severity !== "kWarning" && severity !== "kInfo") continue;
+
+      const cell = ensureCounts(bucket, clusterName, category);
+      if (severity === "kCritical") cell.c += 1;
+      else if (severity === "kWarning") cell.w += 1;
+      else cell.i += 1;
+    }
+  }
+
+  // ==============================
+  // Build section tables
   // ==============================
   function buildSection(bucketKey, cats) {
     const b = store.get(bucketKey) || new Map();
@@ -185,8 +209,8 @@ export default async function () {
       const catMap = b.get(name) || new Map();
 
       for (const cat of cats) {
-        const v = catMap.get(cat) || { C: new Set(), W: new Set(), I: new Set() };
-        row[cat] = cellFromSets(v.C, v.W, v.I);
+        const v = catMap.get(cat) || { c: 0, w: 0, i: 0 };
+        row[cat] = cellFromCounts(v.c, v.w, v.i);
       }
       rows.push(row);
     }
@@ -195,7 +219,7 @@ export default async function () {
   }
 
   // ==============================
-  // 4) NOTE / HEADER (exact wording)
+  // NOTE / HEADER (exact wording)
   // ==============================
   const note =
     `### Cohesity Hardware Health Check\n\n` +
@@ -203,7 +227,7 @@ export default async function () {
     `**Legend:** ✅ Healthy | ⛔<N> Critical | ⚠️<N> Warning | ℹ️<N> Info | ⚠️NO_DATA Unreachable\n`;
 
   // ==============================
-  // 5) MARKDOWN SECTIONS (independent)
+  // MARKDOWN SECTIONS (independent)
   // ==============================
   const markdownHardware = `\n**Hardware**\n${buildSection("kHardware", HW_Cats)}`;
   const markdownMaintenance = `\n**Maintenance**\n${buildSection("kMaintenance", MAINT_Cats)}`;
@@ -217,8 +241,9 @@ export default async function () {
     markdownMaintenance,
     markdownDataService,
     markdown,
-    // minimal debug to verify behavior
+    // Debug (remove later)
     debug_alertsReturned: alerts.length,
-    debug_uniqueKeys: seen.size
+    debug_clustersWithAlerts: byCluster.size,
+    debug_uniqueCodesTotal: Array.from(uniqByCluster.values()).reduce((n, x) => n + x.repByCode.size, 0),
   };
 }
