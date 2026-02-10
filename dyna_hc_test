@@ -1,14 +1,22 @@
 import { credentialVaultClient } from "@dynatrace-sdk/client-classic-environment-v2";
 
 /**
- * Cohesity Health Tiles (GET-only) — Alerts-only (NO cluster-mgmt baseline)
- * - GET /v2/mcm/alerts (single call)
- * - Filter: alertState in (kOpen, kNote)
- * - Hardware table ONLY counts UNIQUE alertCode per CLUSTER for kHardware
- * - Cell shows: ⛔<N> ⚠️<N> ℹ️<N> where N = unique alertCodes in that severity for that category on that cluster
+ * Cohesity Health Tiles — Email-safe Markdown (GET-only)
  *
- * LIMITATION:
- * - Clusters with zero active alerts will not appear (no baseline endpoint).
+ * Source (single call):
+ *   - GET https://helios.cohesity.com/v2/mcm/alerts
+ *
+ * Logic (your requirement):
+ * - Fetch alerts once.
+ * - For EACH cluster, for EACH bucket (Hardware/Maintenance/DataService), for EACH category+severity:
+ *     count UNIQUE alertCode values (dedupe key = clusterId|bucket|category|severity|alertCode)
+ * - Cell output:
+ *     ✅ if no unique codes
+ *     else ⛔<N> ⚠️<N> ℹ️<N> (N = unique alertCodes)
+ *
+ * IMPORTANT LIMITATION (because we do NOT call cluster-mgmt/info):
+ * - Clusters with zero active alerts (kOpen/kNote) will not appear at all.
+ * - “⚠️NO_DATA Unreachable” cannot be determined without a cluster baseline endpoint.
  *
  * Returns:
  *  - note
@@ -50,6 +58,12 @@ export default async function () {
     "kRemoteReplication","kQuota","kCDP","kViewFailover","kDisasterRecovery","kAgent","kNetBackup"
   ].sort();
 
+  const BUCKETS = [
+    { key: "kHardware", label: "Hardware", cats: HW_Cats },
+    { key: "kMaintenance", label: "Maintenance", cats: MAINT_Cats },
+    { key: "kDataService", label: "Data Service", cats: DS_Cats }
+  ];
+
   // ==============================
   // SYMBOLS
   // ==============================
@@ -70,7 +84,10 @@ export default async function () {
     if (!resp.ok) {
       let txt = "";
       try { txt = await resp.text(); } catch (_) {}
-      throw new Error(`GET ${url} -> HTTP ${resp.status} ${txt}`.trim());
+      const e = new Error(`GET ${url} -> HTTP ${resp.status} ${txt}`.trim());
+      e.status = resp.status;
+      e.body = txt;
+      throw e;
     }
     return resp.json();
   }
@@ -91,13 +108,28 @@ export default async function () {
     return `${SYM_C}${c} ${SYM_W}${w} ${SYM_I}${i}`;
   }
 
+  // store[bucketKey][clusterName][category] = { C:Set, W:Set, I:Set }
+  const store = new Map();
+
+  function ensureCell(bucketKey, clusterName, category) {
+    if (!store.has(bucketKey)) store.set(bucketKey, new Map());
+    const b = store.get(bucketKey);
+    if (!b.has(clusterName)) b.set(clusterName, new Map());
+    const c = b.get(clusterName);
+    if (!c.has(category)) c.set(category, { C: new Set(), W: new Set(), I: new Set() });
+    return c.get(category);
+  }
+
   // ==============================
-  // 1) Fetch alerts (single global call)
+  // 1) Fetch alerts (single global call; no maxAlerts; no time window)
   // ==============================
   function buildAlertsUrl() {
     const u = new URL(`${baseUrl}/v2/mcm/alerts`);
+
+    // array params => repeated params
     ["kOpen", "kNote"].forEach((s) => u.searchParams.append("alertStateList", s));
     ["kHardware", "kMaintenance", "kDataService"].forEach((b) => u.searchParams.append("alertTypeBucketList", b));
+
     return u.toString();
   }
 
@@ -105,47 +137,46 @@ export default async function () {
   const alerts = toArray(payload?.alertsList);
 
   // ==============================
-  // 2) Build per-cluster unique alertCode sets (per bucket/category/severity)
-  // store[bucket][clusterName][category] = { C:Set, W:Set, I:Set }
+  // 2) Per-cluster dedupe on alertCode (scoped properly)
+  //    key = clusterId|bucket|category|severity|alertCode
   // ==============================
-  const store = new Map();
+  const seen = new Set();
 
-  function ensureCell(bucket, clusterName, category) {
-    if (!store.has(bucket)) store.set(bucket, new Map());
-    const b = store.get(bucket);
-    if (!b.has(clusterName)) b.set(clusterName, new Map());
-    const c = b.get(clusterName);
-    if (!c.has(category)) c.set(category, { C: new Set(), W: new Set(), I: new Set() });
-    return c.get(category);
-  }
+  // quick lookup for valid categories per bucket
+  const catsByBucket = new Map(BUCKETS.map((b) => [b.key, new Set(b.cats)]));
 
   for (const a of alerts) {
     const state = norm(a?.alertState);
     if (state !== "kOpen" && state !== "kNote") continue;
+
+    const clusterId = String(a?.clusterId ?? "");
+    const clusterName = norm(a?.clusterName) || clusterId;
 
     const bucket = norm(a?.alertTypeBucket);
     const category = norm(a?.alertCategory);
     const severity = norm(a?.severity);
     const code = norm(a?.alertCode);
 
-    // per your ask: “unique codes for hardware type”
-    if (bucket !== "kHardware") continue;
+    if (!clusterId || !clusterName || !bucket || !category || !severity || !code) continue;
+    if (!catsByBucket.has(bucket)) continue;
+    if (!catsByBucket.get(bucket).has(category)) continue;
+    if (severity !== "kCritical" && severity !== "kWarning" && severity !== "kInfo") continue;
 
-    const clusterName = norm(a?.clusterName) || String(a?.clusterId ?? "");
-    if (!clusterName || !category || !code) continue;
-    if (!HW_Cats.includes(category)) continue;
+    const dedupeKey = `${clusterId}|${bucket}|${category}|${severity}|${code}`;
+    if (seen.has(dedupeKey)) continue;
+    seen.add(dedupeKey);
 
     const cell = ensureCell(bucket, clusterName, category);
     if (severity === "kCritical") cell.C.add(code);
     else if (severity === "kWarning") cell.W.add(code);
-    else if (severity === "kInfo") cell.I.add(code);
+    else cell.I.add(code);
   }
 
   // ==============================
-  // 3) Build Hardware table (clusters with at least one hardware alert)
+  // 3) Build section tables
   // ==============================
-  function buildHardware() {
-    const b = store.get("kHardware") || new Map();
+  function buildSection(bucketKey, cats) {
+    const b = store.get(bucketKey) || new Map();
     const clusterNames = Array.from(b.keys()).sort((x, y) => x.localeCompare(y));
 
     const rows = [];
@@ -153,26 +184,30 @@ export default async function () {
       const row = { ClusterName: name };
       const catMap = b.get(name) || new Map();
 
-      for (const cat of HW_Cats) {
+      for (const cat of cats) {
         const v = catMap.get(cat) || { C: new Set(), W: new Set(), I: new Set() };
         row[cat] = cellFromSets(v.C, v.W, v.I);
       }
       rows.push(row);
     }
-    return mdTable(["ClusterName", ...HW_Cats], rows);
+
+    return mdTable(["ClusterName", ...cats], rows);
   }
 
-  const note = [
-    "### Cohesity Hardware Health Check",
-    "This report mimics the System → Health → Components view for each Cohesity cluster.",
-    "**Legend:** ✅ Healthy | ⛔<N> Critical | ⚠️<N> Warning | ℹ️<N> Info | ⚠️NO_DATA Unreachable",
-  ].join("\n\n");
+  // ==============================
+  // 4) NOTE / HEADER (exact wording)
+  // ==============================
+  const note =
+    `### Cohesity Hardware Health Check\n\n` +
+    `This report mimics the System → Health → Components view for each Cohesity cluster.\n\n` +
+    `**Legend:** ✅ Healthy | ⛔<N> Critical | ⚠️<N> Warning | ℹ️<N> Info | ⚠️NO_DATA Unreachable\n`;
 
-  const markdownHardware = `\n**Hardware**\n${buildHardware()}`;
-
-  // Placeholders (not populated in this version since you asked hardware only)
-  const markdownMaintenance = `\n**Maintenance**\nNo data (hardware-only unique alertCode mode).`;
-  const markdownDataService = `\n**Data Service**\nNo data (hardware-only unique alertCode mode).`;
+  // ==============================
+  // 5) MARKDOWN SECTIONS (independent)
+  // ==============================
+  const markdownHardware = `\n**Hardware**\n${buildSection("kHardware", HW_Cats)}`;
+  const markdownMaintenance = `\n**Maintenance**\n${buildSection("kMaintenance", MAINT_Cats)}`;
+  const markdownDataService = `\n**Data Service**\n${buildSection("kDataService", DS_Cats)}`;
 
   const markdown = [note, markdownHardware, markdownMaintenance, markdownDataService].join("\n\n");
 
@@ -182,6 +217,8 @@ export default async function () {
     markdownMaintenance,
     markdownDataService,
     markdown,
+    // minimal debug to verify behavior
     debug_alertsReturned: alerts.length,
+    debug_uniqueKeys: seen.size
   };
 }
