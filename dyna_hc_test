@@ -1,13 +1,18 @@
 import { credentialVaultClient } from "@dynatrace-sdk/client-classic-environment-v2";
 
 /**
- * Cohesity Cluster Health Tiles — System → Health → Components (GET-only)
- * - ALL clusters from /v2/mcm/cluster-mgmt/info
- * - Alerts from /v2/mcm/alerts (dedupe by alertsList[].id, ignore dedupCount)
- * - Email-safe markdown tables (Hardware / Maintenance / Data Service + combined)
- * - FAIL-CLOSED:
- *    - isConnectedToHelios === false  -> ⚠️NO_DATA (all cells, all sections)
- *    - /mcm/alerts batch call fails   -> ⚠️NO_DATA for clusters in that batch (that section)
+ * Cohesity Cluster Health Tiles — Email-safe Markdown (GET-only)
+ * Source: GET /v2/mcm/alerts (single call, capped ~1000)
+ *
+ * IMPORTANT LIMITATION:
+ * - Clusters with NO alerts (kOpen/kNote) will NOT appear in output (cannot show ✅ for them without cluster-mgmt/info).
+ *
+ * Returns:
+ *  - note
+ *  - markdownHardware
+ *  - markdownMaintenance
+ *  - markdownDataService
+ *  - markdown
  */
 
 export default async function () {
@@ -26,16 +31,11 @@ export default async function () {
   // ==============================
   // PERF / LIMITS
   // ==============================
-  const CONCURRENCY = 8;
-  const CLUSTER_BATCH_SIZE = 25;
-  const MAX_ALERTS_PER_CALL = 5000;
-  const MAX_PAGES_PER_BATCH = 50;
-
-  // Rolling window to avoid 10k+ active alerts
-  const WINDOW_HOURS = 24;
+  const MAX_ALERTS = 1000; // your observed cap
+  const WINDOW_HOURS = 24; // keep bounded; set 0 to omit time filter
 
   // ==============================
-  // CATEGORY LISTS (sorted)
+  // CATEGORY ENUMS (sorted)
   // ==============================
   const HW_Cats = [
     "kDisk","kNode","kCluster","kChassis","kPowerSupply","kCPU","kMemory","kTemperature",
@@ -60,7 +60,6 @@ export default async function () {
   const SYM_C = "⛔";
   const SYM_W = "⚠️";
   const SYM_I = "ℹ️";
-  const SYM_NO_DATA = `${SYM_W}NO_DATA`;
 
   // ==============================
   // HELPERS
@@ -74,7 +73,10 @@ export default async function () {
     if (!resp.ok) {
       let txt = "";
       try { txt = await resp.text(); } catch (_) {}
-      throw new Error(`GET ${url} -> HTTP ${resp.status} ${txt}`.trim());
+      const e = new Error(`GET ${url} -> HTTP ${resp.status} ${txt}`.trim());
+      e.status = resp.status;
+      e.body = txt;
+      throw e;
     }
     return resp.json();
   }
@@ -85,25 +87,6 @@ export default async function () {
     const sep = `| ${headers.map(() => "---").join(" | ")} |`;
     const body = rows.map((r) => `| ${headers.map((h) => safeCell(r[h] ?? "")).join(" | ")} |`);
     return [head, sep, ...body].join("\n");
-  }
-
-  function chunk(arr, n) {
-    const out = [];
-    for (let i = 0; i < arr.length; i += n) out.push(arr.slice(i, i + n));
-    return out;
-  }
-
-  async function poolMap(items, worker, concurrency) {
-    const results = new Array(items.length);
-    let idx = 0;
-    const runners = new Array(Math.min(concurrency, items.length)).fill(0).map(async () => {
-      while (idx < items.length) {
-        const cur = idx++;
-        results[cur] = await worker(items[cur], cur);
-      }
-    });
-    await Promise.all(runners);
-    return results;
   }
 
   function cellFromCounts(c, w, i) {
@@ -124,186 +107,92 @@ export default async function () {
     return { startTimeUsecs: Math.floor(start), endTimeUsecs: Math.floor(end) };
   }
 
-  function normalizeMcmAlertsPayload(payload) {
-    const alertsList = toArray(payload?.alertsList);
-    const nextCursor =
-      payload?.nextCursor ?? payload?.cursor ?? payload?.next_cursor ?? payload?.next ?? null;
-    const nextPageToken =
-      payload?.nextPageToken ?? payload?.pageToken ?? payload?.next_page_token ?? payload?.continuationToken ?? null;
-    const hasMore = Boolean(payload?.hasMore || payload?.has_more);
-    return { alertsList, nextCursor, nextPageToken, hasMore };
-  }
-
   // ==============================
-  // 1) CLUSTERS
+  // 1) Fetch alerts (single global call)
   // ==============================
-  const clu = await getJson(`${baseUrl}/v2/mcm/cluster-mgmt/info`, commonHeaders);
-
-  const clusters = toArray(clu?.cohesityClusters)
-    .map((c) => ({
-      clusterName: norm(c?.clusterName),
-      clusterId: norm(c?.clusterId),
-      // IMPORTANT: treat missing as connected; only explicit false is disconnected
-      isConnectedToHelios: c?.isConnectedToHelios !== false,
-    }))
-    .filter((c) => c.clusterName && c.clusterId)
-    .sort((a, b) => a.clusterName.localeCompare(b.clusterName));
-
-  if (!clusters.length) throw new Error("No clusters returned from /v2/mcm/cluster-mgmt/info");
-
-  const clusterIdToName = new Map(clusters.map((c) => [String(c.clusterId), c.clusterName]));
-  const connectedClusterIds = clusters.filter((c) => c.isConnectedToHelios).map((c) => String(c.clusterId));
-  const disconnectedClusterIds = new Set(clusters.filter((c) => !c.isConnectedToHelios).map((c) => String(c.clusterId)));
-
-  // ==============================
-  // 2) /v2/mcm/alerts (DEDUP + AGG)
-  // ==============================
-  const { startTimeUsecs, endTimeUsecs } = buildWindowUsecs(WINDOW_HOURS);
-
-  // IMPORTANT: arrays must be encoded as repeated query params (per docs)
-  function buildAlertsUrl({ bucket, clusterIds, cursor, pageToken }) {
+  function buildAlertsUrl() {
     const u = new URL(`${baseUrl}/v2/mcm/alerts`);
 
-    u.searchParams.set("alertIdList", "");
-
-    // alertStateList: array-of-strings => repeat param
+    // array params => repeated params (NOT comma-joined)
     ["kOpen", "kNote"].forEach((s) => u.searchParams.append("alertStateList", s));
+    ["kHardware", "kMaintenance", "kDataService"].forEach((b) => u.searchParams.append("alertTypeBucketList", b));
 
-    // clusterIdentifiers: array-of-strings => repeat param
-    clusterIds.forEach((id) => u.searchParams.append("clusterIdentifiers", String(id)));
+    u.searchParams.set("maxAlerts", String(MAX_ALERTS));
 
-    // alertTypeBucketList: array-of-strings => repeat param
-    u.searchParams.append("alertTypeBucketList", bucket);
-
-    // time window + cap
-    u.searchParams.set("startTimeUsecs", String(startTimeUsecs));
-    u.searchParams.set("endTimeUsecs", String(endTimeUsecs));
-    u.searchParams.set("maxAlerts", String(MAX_ALERTS_PER_CALL));
-
-    if (cursor) u.searchParams.set("cursor", String(cursor));
-    if (pageToken) u.searchParams.set("pageToken", String(pageToken));
+    if (WINDOW_HOURS > 0) {
+      const { startTimeUsecs, endTimeUsecs } = buildWindowUsecs(WINDOW_HOURS);
+      u.searchParams.set("startTimeUsecs", String(startTimeUsecs));
+      u.searchParams.set("endTimeUsecs", String(endTimeUsecs));
+    }
 
     return u.toString();
   }
 
-  // Aggregation store: bucket -> clusterId -> category -> {c,w,i}
-  function ensureAgg(agg, bucket, clusterId, category) {
-    if (!agg.has(bucket)) agg.set(bucket, new Map());
-    const b = agg.get(bucket);
-    if (!b.has(clusterId)) b.set(clusterId, new Map());
-    const c = b.get(clusterId);
+  const payload = await getJson(buildAlertsUrl(), commonHeaders);
+  const alerts = toArray(payload?.alertsList);
+
+  // ==============================
+  // 2) Dedupe by id + aggregate to tiles
+  // bucket -> clusterName -> category -> {c,w,i}
+  // ==============================
+  const store = new Map();
+  const seen = new Set();
+
+  function ensure(bucket, clusterName, category) {
+    if (!store.has(bucket)) store.set(bucket, new Map());
+    const b = store.get(bucket);
+    if (!b.has(clusterName)) b.set(clusterName, new Map());
+    const c = b.get(clusterName);
     if (!c.has(category)) c.set(category, { c: 0, w: 0, i: 0 });
     return c.get(category);
   }
 
-  async function fetchBucketAggregates(bucket) {
-    const agg = new Map(); // bucket -> ...
-    const failedClusterIds = new Set();
+  for (const a of alerts) {
+    const id = norm(a?.id);
+    if (!id || seen.has(id)) continue;
+    seen.add(id);
 
-    const batches = chunk(connectedClusterIds, CLUSTER_BATCH_SIZE);
+    const state = norm(a?.alertState);
+    if (state !== "kOpen" && state !== "kNote") continue;
 
-    await poolMap(
-      batches,
-      async (clusterIdBatch) => {
-        try {
-          let pages = 0;
-          let cursor = null;
-          let pageToken = null;
+    const bucket = norm(a?.alertTypeBucket);
+    const category = norm(a?.alertCategory);
+    const severity = norm(a?.severity);
+    const clusterName = norm(a?.clusterName) || String(a?.clusterId ?? "");
 
-          // DEDUP within this batch+bucket
-          const seen = new Set();
+    if (!bucket || !category || !clusterName) continue;
+    if (bucket !== "kHardware" && bucket !== "kMaintenance" && bucket !== "kDataService") continue;
 
-          while (pages < MAX_PAGES_PER_BATCH) {
-            pages += 1;
-
-            const url = buildAlertsUrl({ bucket, clusterIds: clusterIdBatch, cursor, pageToken });
-            const payload = await getJson(url, commonHeaders);
-            const { alertsList, nextCursor, nextPageToken, hasMore } = normalizeMcmAlertsPayload(payload);
-
-            for (const a of alertsList) {
-              const id = norm(a?.id);
-              if (!id || seen.has(id)) continue;
-              seen.add(id);
-
-              const clusterId = String(a?.clusterId ?? "");
-              const alertBucket = norm(a?.alertTypeBucket);
-              const category = norm(a?.alertCategory);
-              const severity = norm(a?.severity);
-
-              if (!clusterId || !clusterIdToName.has(clusterId)) continue;
-              if (alertBucket !== bucket) continue;
-              if (!category) continue;
-
-              const cell = ensureAgg(agg, bucket, clusterId, category);
-              if (severity === "kCritical") cell.c += 1;
-              else if (severity === "kWarning") cell.w += 1;
-              else if (severity === "kInfo") cell.i += 1;
-            }
-
-            if (nextCursor) { cursor = nextCursor; pageToken = null; continue; }
-            if (nextPageToken) { pageToken = nextPageToken; cursor = null; continue; }
-            if (hasMore) break; // hasMore without token -> stop
-            break;
-          }
-        } catch (_) {
-          // FAIL-CLOSED for this bucket on this batch
-          for (const cid of clusterIdBatch) failedClusterIds.add(String(cid));
-        }
-      },
-      CONCURRENCY
-    );
-
-    return { agg, failedClusterIds };
-  }
-
-  const bucketResults = {
-    kHardware: await fetchBucketAggregates("kHardware"),
-    kMaintenance: await fetchBucketAggregates("kMaintenance"),
-    kDataService: await fetchBucketAggregates("kDataService"),
-  };
-
-  function getCounts(bucket, clusterId, category) {
-    const { agg } = bucketResults[bucket] || {};
-    const b = agg?.get(bucket);
-    const c = b?.get(String(clusterId));
-    const v = c?.get(category);
-    return v || { c: 0, w: 0, i: 0 };
-  }
-
-  function clusterIsNoDataForBucket(bucket, clusterId) {
-    const failed = bucketResults[bucket]?.failedClusterIds;
-    return disconnectedClusterIds.has(String(clusterId)) || (failed && failed.has(String(clusterId)));
+    const cell = ensure(bucket, clusterName, category);
+    if (severity === "kCritical") cell.c += 1;
+    else if (severity === "kWarning") cell.w += 1;
+    else if (severity === "kInfo") cell.i += 1;
   }
 
   // ==============================
-  // 3) Build markdown sections
+  // 3) Build section tables (clusters with alerts only)
   // ==============================
   function buildSection(bucket, cats) {
+    const b = store.get(bucket) || new Map();
+    const clusterNames = Array.from(b.keys()).sort((x, y) => x.localeCompare(y));
+
     const rows = [];
-
-    for (const cl of clusters) {
-      const row = { ClusterName: cl.clusterName };
-
-      if (clusterIsNoDataForBucket(bucket, cl.clusterId)) {
-        for (const cat of cats) row[cat] = SYM_NO_DATA;
-        rows.push(row);
-        continue;
-      }
+    for (const name of clusterNames) {
+      const row = { ClusterName: name };
+      const catMap = b.get(name) || new Map();
 
       for (const cat of cats) {
-        const { c, w, i } = getCounts(bucket, cl.clusterId, cat);
-        row[cat] = cellFromCounts(c, w, i);
+        const v = catMap.get(cat) || { c: 0, w: 0, i: 0 };
+        row[cat] = cellFromCounts(v.c, v.w, v.i);
       }
-
       rows.push(row);
     }
 
-    rows.sort((a, b) => String(a.ClusterName).localeCompare(String(b.ClusterName)));
     return mdTable(["ClusterName", ...cats], rows);
   }
 
   // ==============================
-  // NOTE / HEADER (exact wording)
+  // 4) NOTE / HEADER (exact wording)
   // ==============================
   const note = [
     "### Cohesity Hardware Health Check",
@@ -311,6 +200,9 @@ export default async function () {
     "**Legend:** ✅ Healthy | ⛔<N> Critical | ⚠️<N> Warning | ℹ️<N> Info | ⚠️NO_DATA Unreachable",
   ].join("\n\n");
 
+  // ==============================
+  // 5) MARKDOWN SECTIONS
+  // ==============================
   const markdownHardware = `\n**Hardware**\n${buildSection("kHardware", HW_Cats)}`;
   const markdownMaintenance = `\n**Maintenance**\n${buildSection("kMaintenance", MAINT_Cats)}`;
   const markdownDataService = `\n**Data Service**\n${buildSection("kDataService", DS_Cats)}`;
