@@ -2,22 +2,12 @@ import { credentialVaultClient } from "@dynatrace-sdk/client-classic-environment
 
 /**
  * Cohesity Cluster Health Tiles — System → Health → Components (GET-only)
- * Source: /v2/mcm/cluster-mgmt/info (all clusters) + /v2/mcm/alerts (dedup + re-aggregate)
- *
- * Key properties:
- * - Markdown-only (email-safe)
- * - ALL clusters included
+ * - ALL clusters from /v2/mcm/cluster-mgmt/info
+ * - Alerts from /v2/mcm/alerts (dedupe by alertsList[].id, ignore dedupCount)
+ * - Email-safe markdown tables (Hardware / Maintenance / Data Service + combined)
  * - FAIL-CLOSED:
- *     - isConnectedToHelios=false => ⚠️NO_DATA for all cells (all sections)
- *     - any /mcm/alerts batch failure => ⚠️NO_DATA for clusters in that batch (that section)
- * - DEDUPE: counts each alert ONCE by alertsList[].id (ignores dedupCount)
- *
- * Returns:
- *  - note
- *  - markdownHardware
- *  - markdownMaintenance
- *  - markdownDataService
- *  - markdown
+ *    - isConnectedToHelios === false  -> ⚠️NO_DATA (all cells, all sections)
+ *    - /mcm/alerts batch call fails   -> ⚠️NO_DATA for clusters in that batch (that section)
  */
 
 export default async function () {
@@ -37,70 +27,30 @@ export default async function () {
   // PERF / LIMITS
   // ==============================
   const CONCURRENCY = 8;
-
-  // Batch clusterIdentifiers to avoid huge responses
   const CLUSTER_BATCH_SIZE = 25;
-
-  // /v2/mcm/alerts page sizing (if supported); keep moderate
   const MAX_ALERTS_PER_CALL = 5000;
-
-  // Time window (controls volume). Default: last 24 hours.
-  const WINDOW_HOURS = 24;
-
-  // Safety caps
   const MAX_PAGES_PER_BATCH = 50;
+
+  // Rolling window to avoid 10k+ active alerts
+  const WINDOW_HOURS = 24;
 
   // ==============================
   // CATEGORY LISTS (sorted)
   // ==============================
   const HW_Cats = [
-    "kDisk",
-    "kNode",
-    "kCluster",
-    "kChassis",
-    "kPowerSupply",
-    "kCPU",
-    "kMemory",
-    "kTemperature",
-    "kFan",
-    "kNIC",
-    "kFirmware",
-    "kNodeHealth",
-    "kOperatingSystem",
-    "kStorageDevice",
-    "kStoragePool",
+    "kDisk","kNode","kCluster","kChassis","kPowerSupply","kCPU","kMemory","kTemperature",
+    "kFan","kNIC","kFirmware","kNodeHealth","kOperatingSystem","kStorageDevice","kStoragePool"
   ].sort();
 
   const MAINT_Cats = [
-    "kHelios",
-    "kAppMarketPlace",
-    "kSystemService",
-    "kLicense",
-    "kSecurity",
-    "kUpgrade",
-    "kClusterManagement",
-    "kAuditLog",
-    "kNetworking",
-    "kConfiguration",
-    "kStorageUsage",
-    "kFaultTolerance",
-    "kGeneralSoftwareFailure",
+    "kHelios","kAppMarketPlace","kSystemService","kLicense","kSecurity","kUpgrade",
+    "kClusterManagement","kAuditLog","kNetworking","kConfiguration","kStorageUsage",
+    "kFaultTolerance","kGeneralSoftwareFailure"
   ].sort();
 
   const DS_Cats = [
-    "kDataPath",
-    "kDataSourceConnector",
-    "kMetadata",
-    "kIndexing",
-    "kBackupRestore",
-    "kArchivalRestore",
-    "kRemoteReplication",
-    "kQuota",
-    "kCDP",
-    "kViewFailover",
-    "kDisasterRecovery",
-    "kAgent",
-    "kNetBackup",
+    "kDataPath","kDataSourceConnector","kMetadata","kIndexing","kBackupRestore","kArchivalRestore",
+    "kRemoteReplication","kQuota","kCDP","kViewFailover","kDisasterRecovery","kAgent","kNetBackup"
   ].sort();
 
   // ==============================
@@ -123,9 +73,7 @@ export default async function () {
     const resp = await fetch(url, { method: "GET", headers });
     if (!resp.ok) {
       let txt = "";
-      try {
-        txt = await resp.text();
-      } catch (_) {}
+      try { txt = await resp.text(); } catch (_) {}
       throw new Error(`GET ${url} -> HTTP ${resp.status} ${txt}`.trim());
     }
     return resp.json();
@@ -176,16 +124,27 @@ export default async function () {
     return { startTimeUsecs: Math.floor(start), endTimeUsecs: Math.floor(end) };
   }
 
+  function normalizeMcmAlertsPayload(payload) {
+    const alertsList = toArray(payload?.alertsList);
+    const nextCursor =
+      payload?.nextCursor ?? payload?.cursor ?? payload?.next_cursor ?? payload?.next ?? null;
+    const nextPageToken =
+      payload?.nextPageToken ?? payload?.pageToken ?? payload?.next_page_token ?? payload?.continuationToken ?? null;
+    const hasMore = Boolean(payload?.hasMore || payload?.has_more);
+    return { alertsList, nextCursor, nextPageToken, hasMore };
+  }
+
   // ==============================
-  // 1) CLUSTERS (name + id + connected)
+  // 1) CLUSTERS
   // ==============================
   const clu = await getJson(`${baseUrl}/v2/mcm/cluster-mgmt/info`, commonHeaders);
 
   const clusters = toArray(clu?.cohesityClusters)
     .map((c) => ({
       clusterName: norm(c?.clusterName),
-      clusterId: norm(c?.clusterId), // used as clusterIdentifiers (string)
-      isConnectedToHelios: Boolean(c?.isConnectedToHelios),
+      clusterId: norm(c?.clusterId),
+      // IMPORTANT: treat missing as connected; only explicit false is disconnected
+      isConnectedToHelios: c?.isConnectedToHelios !== false,
     }))
     .filter((c) => c.clusterName && c.clusterId)
     .sort((a, b) => a.clusterName.localeCompare(b.clusterName));
@@ -197,54 +156,37 @@ export default async function () {
   const disconnectedClusterIds = new Set(clusters.filter((c) => !c.isConnectedToHelios).map((c) => String(c.clusterId)));
 
   // ==============================
-  // 2) Fetch /v2/mcm/alerts (batched) and aggregate
+  // 2) /v2/mcm/alerts (DEDUP + AGG)
   // ==============================
   const { startTimeUsecs, endTimeUsecs } = buildWindowUsecs(WINDOW_HOURS);
 
+  // IMPORTANT: arrays must be encoded as repeated query params (per docs)
   function buildAlertsUrl({ bucket, clusterIds, cursor, pageToken }) {
-    // Keep your calling style (query params), but encoded safely
     const u = new URL(`${baseUrl}/v2/mcm/alerts`);
-    u.searchParams.set("alertIdList", ""); // as you showed
-    u.searchParams.set("alertStateList", "kOpen,kNote");
-    u.searchParams.set("clusterIdentifiers", clusterIds.join(","));
-    u.searchParams.set("alertTypeBucketList", bucket);
+
+    u.searchParams.set("alertIdList", "");
+
+    // alertStateList: array-of-strings => repeat param
+    ["kOpen", "kNote"].forEach((s) => u.searchParams.append("alertStateList", s));
+
+    // clusterIdentifiers: array-of-strings => repeat param
+    clusterIds.forEach((id) => u.searchParams.append("clusterIdentifiers", String(id)));
+
+    // alertTypeBucketList: array-of-strings => repeat param
+    u.searchParams.append("alertTypeBucketList", bucket);
+
+    // time window + cap
     u.searchParams.set("startTimeUsecs", String(startTimeUsecs));
     u.searchParams.set("endTimeUsecs", String(endTimeUsecs));
     u.searchParams.set("maxAlerts", String(MAX_ALERTS_PER_CALL));
 
-    // Paging (best-effort; only used if API returns a token)
     if (cursor) u.searchParams.set("cursor", String(cursor));
     if (pageToken) u.searchParams.set("pageToken", String(pageToken));
 
     return u.toString();
   }
 
-  function normalizeMcmAlertsPayload(payload) {
-    const alertsList = toArray(payload?.alertsList);
-    const nextCursor =
-      payload?.nextCursor ??
-      payload?.cursor ??
-      payload?.next_cursor ??
-      payload?.next ??
-      null;
-    const nextPageToken =
-      payload?.nextPageToken ??
-      payload?.pageToken ??
-      payload?.next_page_token ??
-      payload?.continuationToken ??
-      null;
-
-    // Some APIs signal "hasMore"
-    const hasMore = Boolean(payload?.hasMore || payload?.has_more);
-
-    return { alertsList, nextCursor, nextPageToken, hasMore };
-  }
-
   // Aggregation store: bucket -> clusterId -> category -> {c,w,i}
-  function makeAgg() {
-    return new Map(); // bucket
-  }
-
   function ensureAgg(agg, bucket, clusterId, category) {
     if (!agg.has(bucket)) agg.set(bucket, new Map());
     const b = agg.get(bucket);
@@ -255,21 +197,20 @@ export default async function () {
   }
 
   async function fetchBucketAggregates(bucket) {
-    const agg = makeAgg(); // only this bucket, but keep structure consistent
-    const failedClusterIds = new Set(); // clusters we must mark NO_DATA for this bucket
+    const agg = new Map(); // bucket -> ...
+    const failedClusterIds = new Set();
 
     const batches = chunk(connectedClusterIds, CLUSTER_BATCH_SIZE);
 
     await poolMap(
       batches,
       async (clusterIdBatch) => {
-        // If the batch request fails, mark those clusters NO_DATA for this bucket
         try {
           let pages = 0;
           let cursor = null;
           let pageToken = null;
 
-          // Dedup per batch+bucket: ensure each alertsList[].id is counted once
+          // DEDUP within this batch+bucket
           const seen = new Set();
 
           while (pages < MAX_PAGES_PER_BATCH) {
@@ -281,43 +222,31 @@ export default async function () {
 
             for (const a of alertsList) {
               const id = norm(a?.id);
-              if (!id) continue;
-              if (seen.has(id)) continue;
+              if (!id || seen.has(id)) continue;
               seen.add(id);
 
               const clusterId = String(a?.clusterId ?? "");
+              const alertBucket = norm(a?.alertTypeBucket);
               const category = norm(a?.alertCategory);
               const severity = norm(a?.severity);
 
               if (!clusterId || !clusterIdToName.has(clusterId)) continue;
-              if (norm(a?.alertTypeBucket) !== bucket) continue; // safety
+              if (alertBucket !== bucket) continue;
               if (!category) continue;
 
               const cell = ensureAgg(agg, bucket, clusterId, category);
               if (severity === "kCritical") cell.c += 1;
               else if (severity === "kWarning") cell.w += 1;
               else if (severity === "kInfo") cell.i += 1;
-              // ignore other severities for tile counts
             }
 
-            // paging decision (best effort)
-            if (nextCursor) {
-              cursor = nextCursor;
-              pageToken = null;
-              continue;
-            }
-            if (nextPageToken) {
-              pageToken = nextPageToken;
-              cursor = null;
-              continue;
-            }
-            if (hasMore) {
-              // hasMore=true but no token -> break to avoid infinite loop
-              break;
-            }
+            if (nextCursor) { cursor = nextCursor; pageToken = null; continue; }
+            if (nextPageToken) { pageToken = nextPageToken; cursor = null; continue; }
+            if (hasMore) break; // hasMore without token -> stop
             break;
           }
         } catch (_) {
+          // FAIL-CLOSED for this bucket on this batch
           for (const cid of clusterIdBatch) failedClusterIds.add(String(cid));
         }
       },
@@ -327,19 +256,18 @@ export default async function () {
     return { agg, failedClusterIds };
   }
 
-  // Fetch all 3 buckets (separately; keeps response sizes manageable)
-  const buckets = ["kHardware", "kMaintenance", "kDataService"];
-  const bucketResults = {};
-  for (const b of buckets) bucketResults[b] = await fetchBucketAggregates(b);
+  const bucketResults = {
+    kHardware: await fetchBucketAggregates("kHardware"),
+    kMaintenance: await fetchBucketAggregates("kMaintenance"),
+    kDataService: await fetchBucketAggregates("kDataService"),
+  };
 
-  // Helper to read counts for a cluster/category
   function getCounts(bucket, clusterId, category) {
     const { agg } = bucketResults[bucket] || {};
     const b = agg?.get(bucket);
     const c = b?.get(String(clusterId));
     const v = c?.get(category);
-    if (!v) return { c: 0, w: 0, i: 0 };
-    return v;
+    return v || { c: 0, w: 0, i: 0 };
   }
 
   function clusterIsNoDataForBucket(bucket, clusterId) {
@@ -348,10 +276,11 @@ export default async function () {
   }
 
   // ==============================
-  // 3) Build section tables (ALL clusters)
+  // 3) Build markdown sections
   // ==============================
   function buildSection(bucket, cats) {
     const rows = [];
+
     for (const cl of clusters) {
       const row = { ClusterName: cl.clusterName };
 
@@ -365,6 +294,7 @@ export default async function () {
         const { c, w, i } = getCounts(bucket, cl.clusterId, cat);
         row[cat] = cellFromCounts(c, w, i);
       }
+
       rows.push(row);
     }
 
@@ -373,7 +303,7 @@ export default async function () {
   }
 
   // ==============================
-  // 4) NOTE / HEADER (exact wording)
+  // NOTE / HEADER (exact wording)
   // ==============================
   const note = [
     "### Cohesity Hardware Health Check",
@@ -381,21 +311,11 @@ export default async function () {
     "**Legend:** ✅ Healthy | ⛔<N> Critical | ⚠️<N> Warning | ℹ️<N> Info | ⚠️NO_DATA Unreachable",
   ].join("\n\n");
 
-  // ==============================
-  // 5) MARKDOWN SECTIONS (independent)
-  // ==============================
   const markdownHardware = `\n**Hardware**\n${buildSection("kHardware", HW_Cats)}`;
   const markdownMaintenance = `\n**Maintenance**\n${buildSection("kMaintenance", MAINT_Cats)}`;
   const markdownDataService = `\n**Data Service**\n${buildSection("kDataService", DS_Cats)}`;
 
-  // Combined for email body (double newlines between sections)
   const markdown = [note, markdownHardware, markdownMaintenance, markdownDataService].join("\n\n");
 
-  return {
-    note,
-    markdownHardware,
-    markdownMaintenance,
-    markdownDataService,
-    markdown,
-  };
+  return { note, markdownHardware, markdownMaintenance, markdownDataService, markdown };
 }
