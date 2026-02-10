@@ -1,16 +1,21 @@
 import { credentialVaultClient } from "@dynatrace-sdk/client-classic-environment-v2";
 
 /**
- * Cohesity Cluster Health Tiles — Email-safe Markdown (GET-only)
- * Source: GET /v2/mcm/alerts (single call)
+ * Cohesity Health Tiles (GET-only) — Alerts-only (NO cluster-mgmt baseline)
+ * - GET /v2/mcm/alerts (single call)
+ * - Filter: alertState in (kOpen, kNote)
+ * - Hardware table ONLY counts UNIQUE alertCode per CLUSTER for kHardware
+ * - Cell shows: ⛔<N> ⚠️<N> ℹ️<N> where N = unique alertCodes in that severity for that category on that cluster
  *
- * Noise reduction (your requirement):
- * - DEDUPE per cluster per alertCode (key = clusterId|alertCode)
- * - Ignore id/dedupCount
+ * LIMITATION:
+ * - Clusters with zero active alerts will not appear (no baseline endpoint).
  *
- * Notes:
- * - No /cluster-mgmt/info (clusters with no alerts won't appear => cannot show ✅ rows)
- * - No maxAlerts param (API default cap still applies)
+ * Returns:
+ *  - note
+ *  - markdownHardware
+ *  - markdownMaintenance
+ *  - markdownDataService
+ *  - markdown
  */
 
 export default async function () {
@@ -78,27 +83,16 @@ export default async function () {
     return [head, sep, ...body].join("\n");
   }
 
-  function cellFromCounts(c, w, i) {
-    const cc = Number(c || 0);
-    const ww = Number(w || 0);
-    const ii = Number(i || 0);
-    if (cc === 0 && ww === 0 && ii === 0) return SYM_OK;
-    return `${SYM_C}${cc} ${SYM_W}${ww} ${SYM_I}${ii}`;
-  }
-
-  // bucket -> clusterName -> category -> {c,w,i}
-  const store = new Map();
-  function ensure(bucket, clusterName, category) {
-    if (!store.has(bucket)) store.set(bucket, new Map());
-    const b = store.get(bucket);
-    if (!b.has(clusterName)) b.set(clusterName, new Map());
-    const c = b.get(clusterName);
-    if (!c.has(category)) c.set(category, { c: 0, w: 0, i: 0 });
-    return c.get(category);
+  function cellFromSets(setC, setW, setI) {
+    const c = setC ? setC.size : 0;
+    const w = setW ? setW.size : 0;
+    const i = setI ? setI.size : 0;
+    if (c === 0 && w === 0 && i === 0) return SYM_OK;
+    return `${SYM_C}${c} ${SYM_W}${w} ${SYM_I}${i}`;
   }
 
   // ==============================
-  // 1) Fetch alerts (single global call, no maxAlerts)
+  // 1) Fetch alerts (single global call)
   // ==============================
   function buildAlertsUrl() {
     const u = new URL(`${baseUrl}/v2/mcm/alerts`);
@@ -111,73 +105,74 @@ export default async function () {
   const alerts = toArray(payload?.alertsList);
 
   // ==============================
-  // 2) Dedupe per clusterId|alertCode (NOT alertCode-only)
+  // 2) Build per-cluster unique alertCode sets (per bucket/category/severity)
+  // store[bucket][clusterName][category] = { C:Set, W:Set, I:Set }
   // ==============================
-  const seen = new Set();
+  const store = new Map();
+
+  function ensureCell(bucket, clusterName, category) {
+    if (!store.has(bucket)) store.set(bucket, new Map());
+    const b = store.get(bucket);
+    if (!b.has(clusterName)) b.set(clusterName, new Map());
+    const c = b.get(clusterName);
+    if (!c.has(category)) c.set(category, { C: new Set(), W: new Set(), I: new Set() });
+    return c.get(category);
+  }
 
   for (const a of alerts) {
     const state = norm(a?.alertState);
     if (state !== "kOpen" && state !== "kNote") continue;
 
-    const clusterId = String(a?.clusterId ?? "");
-    const code = norm(a?.alertCode);
-    if (!clusterId || !code) continue;
-
-    const dedupeKey = `${clusterId}|${code}`;
-    if (seen.has(dedupeKey)) continue;
-    seen.add(dedupeKey);
-
     const bucket = norm(a?.alertTypeBucket);
     const category = norm(a?.alertCategory);
     const severity = norm(a?.severity);
+    const code = norm(a?.alertCode);
 
-    // clusterName is in payload; fallback to clusterId
-    const clusterName = norm(a?.clusterName) || clusterId;
+    // per your ask: “unique codes for hardware type”
+    if (bucket !== "kHardware") continue;
 
-    if (!bucket || !category || !clusterName) continue;
-    if (bucket !== "kHardware" && bucket !== "kMaintenance" && bucket !== "kDataService") continue;
+    const clusterName = norm(a?.clusterName) || String(a?.clusterId ?? "");
+    if (!clusterName || !category || !code) continue;
+    if (!HW_Cats.includes(category)) continue;
 
-    const cell = ensure(bucket, clusterName, category);
-    if (severity === "kCritical") cell.c += 1;
-    else if (severity === "kWarning") cell.w += 1;
-    else if (severity === "kInfo") cell.i += 1;
+    const cell = ensureCell(bucket, clusterName, category);
+    if (severity === "kCritical") cell.C.add(code);
+    else if (severity === "kWarning") cell.W.add(code);
+    else if (severity === "kInfo") cell.I.add(code);
   }
 
   // ==============================
-  // 3) Build section tables (clusters with alerts only)
+  // 3) Build Hardware table (clusters with at least one hardware alert)
   // ==============================
-  function buildSection(bucket, cats) {
-    const b = store.get(bucket) || new Map();
+  function buildHardware() {
+    const b = store.get("kHardware") || new Map();
     const clusterNames = Array.from(b.keys()).sort((x, y) => x.localeCompare(y));
 
     const rows = [];
     for (const name of clusterNames) {
       const row = { ClusterName: name };
       const catMap = b.get(name) || new Map();
-      for (const cat of cats) {
-        const v = catMap.get(cat) || { c: 0, w: 0, i: 0 };
-        row[cat] = cellFromCounts(v.c, v.w, v.i);
+
+      for (const cat of HW_Cats) {
+        const v = catMap.get(cat) || { C: new Set(), W: new Set(), I: new Set() };
+        row[cat] = cellFromSets(v.C, v.W, v.I);
       }
       rows.push(row);
     }
-    return mdTable(["ClusterName", ...cats], rows);
+    return mdTable(["ClusterName", ...HW_Cats], rows);
   }
 
-  // ==============================
-  // 4) NOTE / HEADER (exact wording)
-  // ==============================
   const note = [
     "### Cohesity Hardware Health Check",
     "This report mimics the System → Health → Components view for each Cohesity cluster.",
     "**Legend:** ✅ Healthy | ⛔<N> Critical | ⚠️<N> Warning | ℹ️<N> Info | ⚠️NO_DATA Unreachable",
   ].join("\n\n");
 
-  // ==============================
-  // 5) MARKDOWN SECTIONS
-  // ==============================
-  const markdownHardware = `\n**Hardware**\n${buildSection("kHardware", HW_Cats)}`;
-  const markdownMaintenance = `\n**Maintenance**\n${buildSection("kMaintenance", MAINT_Cats)}`;
-  const markdownDataService = `\n**Data Service**\n${buildSection("kDataService", DS_Cats)}`;
+  const markdownHardware = `\n**Hardware**\n${buildHardware()}`;
+
+  // Placeholders (not populated in this version since you asked hardware only)
+  const markdownMaintenance = `\n**Maintenance**\nNo data (hardware-only unique alertCode mode).`;
+  const markdownDataService = `\n**Data Service**\nNo data (hardware-only unique alertCode mode).`;
 
   const markdown = [note, markdownHardware, markdownMaintenance, markdownDataService].join("\n\n");
 
@@ -187,8 +182,6 @@ export default async function () {
     markdownMaintenance,
     markdownDataService,
     markdown,
-    // Optional quick debug (remove later):
     debug_alertsReturned: alerts.length,
-    debug_uniqueClusterAlertCodes: seen.size,
   };
 }
