@@ -2,11 +2,16 @@ import { credentialVaultClient } from "@dynatrace-sdk/client-classic-environment
 import { result } from "@dynatrace-sdk/automation-utils";
 
 /**
- * Part 3: HEAVY runs + partial-rerun logic (no policy filter)
+ * cohesity_backup_failures_p3
  * - GET-only
- * - Pulls last N runs per PG with includeObjectDetails=true
- * - Tracks latest failure per object with NO later object-level success (within N runs), per RunType
- * Output consumed by Part 4 via result("cohesity_backup_failures_p3")
+ * - HEAVY runs (includeObjectDetails=true)
+ * - Partial rerun logic (same as PowerShell):
+ *   latest failure per object with NO later object-level success (within last N runs), per RunType
+ *
+ * IMPORTANT FIX vs earlier JS:
+ * - Helios sometimes returns singletons (object) instead of arrays for:
+ *     run.objects, localBackupInfo, localSnapshotInfo.failedAttempts
+ *   PowerShell @() handles that; JS must normalize. This script does.
  */
 export default async function () {
   const PART2 = "cohesity_backup_failures_p2";
@@ -16,17 +21,32 @@ export default async function () {
   }
 
   const baseUrl = p2.baseUrl;
-  const numRuns = Number(p2.numRuns ?? 20);
+  const numRuns = Number(p2.numRuns ?? 10);
   const pgIndex = p2.pgIndex;
 
-  // Vault auth
+  // Vault auth (required)
   const vaultId = "credentials_vault-312312";
-  const d = await credentialVaultClient.getCredentialsDetails({ id: vaultId });
-  const apiKey = (d?.token || d?.password || "").trim();
+  const vaultCred = await credentialVaultClient.getCredentialsDetails({ id: vaultId });
+  const apiKey = (vaultCred?.token || vaultCred?.password || "").trim();
   if (!apiKey) throw new Error("No Helios API key available (empty token/password).");
 
   const commonHeaders = { accept: "application/json", apiKey };
+
+  // -----------------------------
+  // helpers
+  // -----------------------------
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+  function toArray(v) {
+    if (v == null) return [];
+    return Array.isArray(v) ? v : [v];
+  }
+
+  function getInfo(run) {
+    const lb = run?.localBackupInfo;
+    if (!lb) return null;
+    return Array.isArray(lb) ? (lb[0] ?? null) : lb;
+  }
 
   async function getJsonWithRetry(url, headers, retries = 2) {
     for (let i = 0; i <= retries; i++) {
@@ -35,7 +55,7 @@ export default async function () {
 
       const st = resp.status;
       if ((st === 429 || st >= 500) && i < retries) {
-        await sleep(600 * (i + 1));
+        await sleep(700 * (i + 1));
         continue;
       }
 
@@ -78,19 +98,23 @@ export default async function () {
     return `${o.environment || ""}|${o.objectType || ""}|${o.name || ""}|${sid}`;
   }
 
+  function failedAttemptsArr(ob) {
+    return toArray(ob?.localSnapshotInfo?.failedAttempts);
+  }
+
   function hasFailedAttempts(ob) {
-    const fa = ob?.localSnapshotInfo?.failedAttempts;
-    return Array.isArray(fa) && fa.length > 0;
+    return failedAttemptsArr(ob).length > 0;
   }
 
   function isObjectSuccess(ob) {
-    // Object present + no failedAttempts => success that clears older failures
-    return ob?.localSnapshotInfo && !hasFailedAttempts(ob);
+    // PowerShell logic: object present in run + no failedAttempts => success clearing older failures
+    return !!ob?.localSnapshotInfo && !hasFailedAttempts(ob);
   }
 
   function combineFailedAttempts(attempts) {
-    if (!Array.isArray(attempts) || attempts.length === 0) return "";
-    return attempts.map((a) => cleanMsg(a?.message)).filter(Boolean).join(" | ");
+    const arr = toArray(attempts);
+    const msgs = arr.map((a) => cleanMsg(a?.message)).filter(Boolean);
+    return msgs.join(" | ");
   }
 
   async function mapLimit(items, limit, fn) {
@@ -108,11 +132,13 @@ export default async function () {
     return out;
   }
 
-  const CONCURRENCY = 3; // heavy calls; keep conservative
+  // heavy calls: keep conservative
+  const CONCURRENCY = 3;
   const pgErrors = [];
 
   async function processPg(pg) {
     const headers = { ...commonHeaders, Accept: "application/json", accessClusterId: String(pg.clusterId) };
+
     const url =
       `${baseUrl}/v2/data-protect/protection-groups/${encodeURIComponent(String(pg.pgId))}` +
       `/runs?numRuns=${numRuns}&excludeNonRestorableRuns=false&includeObjectDetails=true`;
@@ -125,43 +151,45 @@ export default async function () {
       return [];
     }
 
-    const runs = Array.isArray(jsonRuns?.runs) ? jsonRuns.runs : [];
+    const runs = toArray(jsonRuns?.runs);
     if (!runs.length) return [];
 
     const runTypes = Array.from(
-      new Set(runs.map((r) => r?.localBackupInfo?.[0]?.runType).filter(Boolean).map(String))
+      new Set(
+        runs
+          .map((r) => getInfo(r)?.runType)
+          .filter(Boolean)
+          .map((x) => String(x))
+      )
     );
 
     const failuresOut = [];
 
     for (const rType of runTypes) {
       const runsForType = runs
-        .filter((r) => String(r?.localBackupInfo?.[0]?.runType || "") === rType)
-        .sort((a, b) => Number(b?.localBackupInfo?.[0]?.endTimeUsecs || 0) - Number(a?.localBackupInfo?.[0]?.endTimeUsecs || 0));
+        .filter((r) => String(getInfo(r)?.runType || "") === rType)
+        .sort((a, b) => Number(getInfo(b)?.endTimeUsecs || 0) - Number(getInfo(a)?.endTimeUsecs || 0));
       if (!runsForType.length) continue;
 
-      // best-effort: id->name mapping for DB host resolution (sourceId)
+      // best-effort id->name mapping (PowerShell does this across runs)
       const idToName = new Map();
       for (const rr of runsForType) {
-        const objs = Array.isArray(rr?.objects) ? rr.objects : [];
-        for (const ob of objs) {
+        for (const ob of toArray(rr?.objects)) {
           const o = ob?.object;
           if (o?.id && o?.name && !idToName.has(String(o.id))) idToName.set(String(o.id), String(o.name));
         }
       }
 
-      const cleared = new Set();          // object keys cleared by newer success
-      const latestFailByKey = new Map();  // first failure seen newest->oldest
+      const cleared = new Set();         // object keys cleared by newer success
+      const latestFailByKey = new Map(); // first failure encountered newest->oldest
 
       for (const run of runsForType) {
-        const info = run?.localBackupInfo?.[0] || {};
+        const info = getInfo(run) || {};
         const endTimeET = fmtETFromUsecs(info?.endTimeUsecs);
 
-        const objsAll = (Array.isArray(run?.objects) ? run.objects : []).filter(
-          (x) => x?.object && x?.localSnapshotInfo
-        );
+        const objsAll = toArray(run?.objects).filter((x) => x?.object && x?.localSnapshotInfo);
 
-        // run-level fallback when objects missing
+        // run-level fallback
         if (!objsAll.length) {
           if (String(info.status || "") === "Failed") {
             const rk = `RUNLEVEL|${pg.pgId}|${rType}`;
@@ -183,7 +211,7 @@ export default async function () {
           continue;
         }
 
-        // 1) mark successes in this run (newer clears older failures)
+        // 1) mark successes (newer clears older failures)
         for (const ob of objsAll) {
           if (isObjectSuccess(ob)) {
             const k = getObjKey(ob);
@@ -199,7 +227,7 @@ export default async function () {
           if (latestFailByKey.has(k)) continue;
           if (!hasFailedAttempts(ob)) continue;
 
-          const msg = combineFailedAttempts(ob?.localSnapshotInfo?.failedAttempts);
+          const msg = combineFailedAttempts(failedAttemptsArr(ob));
           if (!msg) continue;
 
           const o = ob.object || {};
