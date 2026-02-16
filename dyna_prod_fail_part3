@@ -2,39 +2,27 @@ import { credentialVaultClient } from "@dynatrace-sdk/client-classic-environment
 import { result } from "@dynatrace-sdk/automation-utils";
 
 /**
- * cohesity_backup_failures (FINAL / Part 3)
- * READ-ONLY (GET-only)
- * - Vault auth inside Part 3
- * - Reads Part 2 via result("cohesity_backup_failures_p2")
- * - Two-stage:
- *    1) LIGHT runs (includeObjectDetails=false) for last numRuns
- *    2) HEAVY runs (includeObjectDetails=true) ONLY when needed
- * - Failure rule: latest failure per object with NO later success within last numRuns
- *
- * Returns SNOW-friendly keys:
- *  - count, failures, markdownTable, markdownEmail, incidentText_create/update, snow_*
- * + debug pgIndexCount, heavyPgCount (safe extras)
+ * Part 3: HEAVY runs + partial-rerun logic (no policy filter)
+ * - GET-only
+ * - Pulls last N runs per PG with includeObjectDetails=true
+ * - Tracks latest failure per object with NO later object-level success (within N runs), per RunType
+ * Output consumed by Part 4 via result("cohesity_backup_failures_p3")
  */
 export default async function () {
-  const PART2_TASK = "cohesity_backup_failures_p2";
-  const p2 = await result(PART2_TASK);
-  if (!p2 || !Array.isArray(p2.pgIndex)) {
-    throw new Error(`Part 3: missing Part 2 output. Check task name: ${PART2_TASK}`);
+  const PART2 = "cohesity_backup_failures_p2";
+  const p2 = await result(PART2);
+  if (!p2?.baseUrl || !Array.isArray(p2.pgIndex)) {
+    throw new Error(`Part 3: missing Part 2 output. Check step name: ${PART2}`);
   }
 
-  const baseUrl = p2.baseUrl || "https://helios.cohesity.com";
-  const numRuns = Number(p2.numRuns ?? 10);
+  const baseUrl = p2.baseUrl;
+  const numRuns = Number(p2.numRuns ?? 20);
   const pgIndex = p2.pgIndex;
-  const pgIndexCount = pgIndex.length;
 
-  // Optional correctness vs speed:
-  // true => probe latest run (HEAVY numRuns=1) even when LIGHT looks clean (catches object-level failures hidden under "Succeeded").
-  const PROBE_LATEST_OBJECT_FAILURES = true;
-
-  // Vault auth (same pattern)
+  // Vault auth
   const vaultId = "credentials_vault-312312";
-  const d2 = await credentialVaultClient.getCredentialsDetails({ id: vaultId });
-  const apiKey = (d2?.token || d2?.password || "").trim();
+  const d = await credentialVaultClient.getCredentialsDetails({ id: vaultId });
+  const apiKey = (d?.token || d?.password || "").trim();
   if (!apiKey) throw new Error("No Helios API key available (empty token/password).");
 
   const commonHeaders = { accept: "application/json", apiKey };
@@ -47,7 +35,7 @@ export default async function () {
 
       const st = resp.status;
       if ((st === 429 || st >= 500) && i < retries) {
-        await sleep(500 * (i + 1));
+        await sleep(600 * (i + 1));
         continue;
       }
 
@@ -66,7 +54,7 @@ export default async function () {
   function fmtETFromUsecs(usecs) {
     if (!usecs) return "";
     const ms = Math.floor(Number(usecs) / 1000);
-    const d = new Date(ms);
+    const dt = new Date(ms);
     try {
       return new Intl.DateTimeFormat("en-US", {
         timeZone: "America/New_York",
@@ -76,21 +64,10 @@ export default async function () {
         hour: "2-digit",
         minute: "2-digit",
         hour12: false,
-      }).format(d);
+      }).format(dt);
     } catch {
-      return d.toISOString();
+      return dt.toISOString();
     }
-  }
-
-  function etDateYYYYMMDD() {
-    const now = new Date();
-    const parts = new Intl.DateTimeFormat("en-CA", {
-      timeZone: "America/New_York",
-      year: "numeric",
-      month: "2-digit",
-      day: "2-digit",
-    }).formatToParts(now).reduce((a, p) => ((a[p.type] = p.value), a), {});
-    return `${parts.year}-${parts.month}-${parts.day}`;
   }
 
   function getObjKey(ob) {
@@ -106,23 +83,14 @@ export default async function () {
     return Array.isArray(fa) && fa.length > 0;
   }
 
-  function isSuccessForClear(ob) {
+  function isObjectSuccess(ob) {
+    // Object present + no failedAttempts => success that clears older failures
     return ob?.localSnapshotInfo && !hasFailedAttempts(ob);
   }
 
   function combineFailedAttempts(attempts) {
     if (!Array.isArray(attempts) || attempts.length === 0) return "";
     return attempts.map((a) => cleanMsg(a?.message)).filter(Boolean).join(" | ");
-  }
-
-  // Decide if we should go HEAVY based on LIGHT data
-  function lightNeedsHeavy(runsLight) {
-    // If ANY run in the window is not Succeeded => go HEAVY
-    for (const r of runsLight) {
-      const st = String(r?.localBackupInfo?.[0]?.status || "");
-      if (st && st !== "Succeeded") return true;
-    }
-    return false;
   }
 
   async function mapLimit(items, limit, fn) {
@@ -140,57 +108,24 @@ export default async function () {
     return out;
   }
 
-  const CONCURRENCY = 4;
+  const CONCURRENCY = 3; // heavy calls; keep conservative
+  const pgErrors = [];
 
-  async function processPg(wi) {
-    const headers = { ...commonHeaders, Accept: "application/json", accessClusterId: String(wi.clusterId) };
-
-    // LIGHT (numRuns=10, no object details)
-    const lightUrl =
-      `${baseUrl}/v2/data-protect/protection-groups/${encodeURIComponent(String(wi.pgId))}` +
-      `/runs?numRuns=${numRuns}&excludeNonRestorableRuns=false&includeObjectDetails=false`;
-
-    let light;
-    try {
-      light = await getJsonWithRetry(lightUrl, headers, 2);
-    } catch (_) {
-      return [];
-    }
-
-    const runsLight = Array.isArray(light?.runs) ? light.runs : [];
-    if (!runsLight.length) return [];
-
-    let doHeavy = lightNeedsHeavy(runsLight);
-
-    // Optional probe: check latest run objects even if status is Succeeded
-    if (!doHeavy && PROBE_LATEST_OBJECT_FAILURES) {
-      const probeUrl =
-        `${baseUrl}/v2/data-protect/protection-groups/${encodeURIComponent(String(wi.pgId))}` +
-        `/runs?numRuns=1&excludeNonRestorableRuns=false&includeObjectDetails=true`;
-      try {
-        const probe = await getJsonWithRetry(probeUrl, headers, 1);
-        const pr = Array.isArray(probe?.runs) ? probe.runs : [];
-        const objs = pr[0]?.objects || [];
-        const anyObjFail = Array.isArray(objs) && objs.some((o) => hasFailedAttempts(o));
-        if (anyObjFail) doHeavy = true;
-      } catch (_) {}
-    }
-
-    if (!doHeavy) return [];
-
-    // HEAVY (numRuns=10)
-    const heavyUrl =
-      `${baseUrl}/v2/data-protect/protection-groups/${encodeURIComponent(String(wi.pgId))}` +
+  async function processPg(pg) {
+    const headers = { ...commonHeaders, Accept: "application/json", accessClusterId: String(pg.clusterId) };
+    const url =
+      `${baseUrl}/v2/data-protect/protection-groups/${encodeURIComponent(String(pg.pgId))}` +
       `/runs?numRuns=${numRuns}&excludeNonRestorableRuns=false&includeObjectDetails=true`;
 
-    let heavy;
+    let jsonRuns;
     try {
-      heavy = await getJsonWithRetry(heavyUrl, headers, 2);
-    } catch (_) {
+      jsonRuns = await getJsonWithRetry(url, headers, 2);
+    } catch (e) {
+      pgErrors.push({ cluster: pg.clusterName, pg: pg.pgName, error: String(e?.message || e) });
       return [];
     }
 
-    const runs = Array.isArray(heavy?.runs) ? heavy.runs : [];
+    const runs = Array.isArray(jsonRuns?.runs) ? jsonRuns.runs : [];
     if (!runs.length) return [];
 
     const runTypes = Array.from(
@@ -205,26 +140,37 @@ export default async function () {
         .sort((a, b) => Number(b?.localBackupInfo?.[0]?.endTimeUsecs || 0) - Number(a?.localBackupInfo?.[0]?.endTimeUsecs || 0));
       if (!runsForType.length) continue;
 
-      const cleared = new Set();
-      const latestFailByKey = new Map();
+      // best-effort: id->name mapping for DB host resolution (sourceId)
+      const idToName = new Map();
+      for (const rr of runsForType) {
+        const objs = Array.isArray(rr?.objects) ? rr.objects : [];
+        for (const ob of objs) {
+          const o = ob?.object;
+          if (o?.id && o?.name && !idToName.has(String(o.id))) idToName.set(String(o.id), String(o.name));
+        }
+      }
+
+      const cleared = new Set();          // object keys cleared by newer success
+      const latestFailByKey = new Map();  // first failure seen newest->oldest
 
       for (const run of runsForType) {
         const info = run?.localBackupInfo?.[0] || {};
-        const endTimeET = fmtETFromUsecs(info.endTimeUsecs);
+        const endTimeET = fmtETFromUsecs(info?.endTimeUsecs);
 
-        const objsAll = (Array.isArray(run?.objects) ? run.objects : [])
-          .filter((x) => x?.object && x?.localSnapshotInfo);
+        const objsAll = (Array.isArray(run?.objects) ? run.objects : []).filter(
+          (x) => x?.object && x?.localSnapshotInfo
+        );
 
-        // run-level fallback
+        // run-level fallback when objects missing
         if (!objsAll.length) {
           if (String(info.status || "") === "Failed") {
-            const rk = `RUNLEVEL|${wi.pgId}|${rType}`;
+            const rk = `RUNLEVEL|${pg.pgId}|${rType}`;
             if (!latestFailByKey.has(rk)) {
               const msg = Array.isArray(info.messages) ? info.messages.join(" | ") : info.messages;
               latestFailByKey.set(rk, {
-                Environment: wi.pgEnv,
-                Cluster: wi.clusterName,
-                ProtectionGroup: wi.pgName,
+                Environment: pg.pgEnv,
+                Cluster: pg.clusterName,
+                ProtectionGroup: pg.pgName,
                 Host: "",
                 ObjectType: "RunLevel",
                 ObjectName: "(Run-level)",
@@ -237,15 +183,15 @@ export default async function () {
           continue;
         }
 
-        // mark successes first (newer clears older)
+        // 1) mark successes in this run (newer clears older failures)
         for (const ob of objsAll) {
-          if (isSuccessForClear(ob)) {
+          if (isObjectSuccess(ob)) {
             const k = getObjKey(ob);
             if (k) cleared.add(k);
           }
         }
 
-        // capture latest uncleared failures per object
+        // 2) capture latest uncleared failures per object
         for (const ob of objsAll) {
           const k = getObjKey(ob);
           if (!k) continue;
@@ -257,11 +203,14 @@ export default async function () {
           if (!msg) continue;
 
           const o = ob.object || {};
+          let hostName = "";
+          if (o.sourceId && idToName.has(String(o.sourceId))) hostName = idToName.get(String(o.sourceId));
+
           latestFailByKey.set(k, {
-            Environment: o.environment ? String(o.environment) : wi.pgEnv,
-            Cluster: wi.clusterName,
-            ProtectionGroup: wi.pgName,
-            Host: "",
+            Environment: o.environment ? String(o.environment) : pg.pgEnv,
+            Cluster: pg.clusterName,
+            ProtectionGroup: pg.pgName,
+            Host: hostName,
             ObjectType: o.objectType ? String(o.objectType) : "UnknownType",
             ObjectName: o.name ? String(o.name) : "",
             RunType: rType,
@@ -277,79 +226,16 @@ export default async function () {
     return failuresOut;
   }
 
-  const heavyRows = await mapLimit(pgIndex, CONCURRENCY, processPg);
-  const heavyPgCount = heavyRows.length > 0 ? 1 : 0; // not exact per-pg; kept minimal
-
-  // final dedup
-  const dedup = new Map();
-  for (const r of heavyRows) {
-    const key = `${r.Environment}|${r.Cluster}|${r.ProtectionGroup}|${r.RunType}|${r.Host}|${r.ObjectType}|${r.ObjectName}`;
-    const prev = dedup.get(key);
-    if (!prev || String(r.EndTimeET) > String(prev.EndTimeET)) dedup.set(key, r);
-  }
-
-  const failures = Array.from(dedup.values()).sort((a, b) => {
-    const c = String(a.Cluster).localeCompare(String(b.Cluster));
-    if (c) return c;
-    const p = String(a.ProtectionGroup).localeCompare(String(b.ProtectionGroup));
-    if (p) return p;
-    return String(b.EndTimeET).localeCompare(String(a.EndTimeET));
-  });
-
-  function toMarkdownTable(rows) {
-    if (!rows.length) return "✅ No backup failures found across all clusters.";
-    const cols = ["Environment","Cluster","ProtectionGroup","Host","ObjectType","ObjectName","RunType","EndTimeET","FailedMessage"];
-    const lines = [];
-    lines.push("### Cohesity Backup Failures — All Clusters");
-    lines.push(`Total failures: **${rows.length}**`);
-    lines.push("");
-    lines.push(`| ${cols.join(" | ")} |`);
-    lines.push(`| ${cols.map(() => "---").join(" | ")} |`);
-    for (const r of rows) {
-      const row = [
-        r.Environment, r.Cluster, r.ProtectionGroup, r.Host || "",
-        r.ObjectType, r.ObjectName, r.RunType, r.EndTimeET, r.FailedMessage
-      ].map(cleanMsg);
-      lines.push(`| ${row.join(" | ")} |`);
-    }
-    return lines.join("\n");
-  }
-
-  function toIncidentTextCreate(rows, md) {
-    const d = etDateYYYYMMDD();
-    if (!rows.length) return `Cohesity Backup Failures (${d})\n\nNo failures detected.`;
-    return `Cohesity Backup Failures (${d})\n\n${md}`;
-  }
-
-  function toIncidentTextUpdate(rows, md) {
-    const d = etDateYYYYMMDD();
-    if (!rows.length) return `Cohesity Backup Failures (${d})\n\nUpdate: No failures detected.`;
-    return `Cohesity Backup Failures (${d}) — Update\n\n${md}`;
-  }
-
-  const markdownTable = toMarkdownTable(failures);
-  const d = etDateYYYYMMDD();
-  const correlationId = `Cohesity_Backup_Failures_${d}`;
-  const snow_query = `correlation_id=${correlationId}`;
+  const failures = await mapLimit(pgIndex, CONCURRENCY, processPg);
 
   return {
     authMode: "vault",
-    pgIndexCount,
-    // (kept minimal; remove if you want zero extras)
-    heavyPgCount,
-
-    count: failures.length,
+    baseUrl,
+    numRuns,
+    pgIndexCount: pgIndex.length,
+    pgErrors,
+    pgErrorsCount: pgErrors.length,
     failures,
-
-    incidentText_create: toIncidentTextCreate(failures, markdownTable),
-    incidentText_update: toIncidentTextUpdate(failures, markdownTable),
-
-    markdownTable,
-    markdownEmail: markdownTable,
-
-    snow_query,
-    snow_short_description: `Cohesity Backup Failures (${d})`,
-    snow_description_create: toIncidentTextCreate(failures, markdownTable),
-    snow_description_update: toIncidentTextUpdate(failures, markdownTable),
+    failuresCount: failures.length,
   };
 }
