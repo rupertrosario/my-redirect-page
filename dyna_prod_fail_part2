@@ -1,36 +1,27 @@
-import { credentialVaultClient } from "@dynatrace-sdk/client-classic-environment-v2";
 import { result } from "@dynatrace-sdk/automation-utils";
 
 /**
  * cohesity_backup_failures_p2
  * READ-ONLY (GET-only)
- * - Vault auth inside Part 2  ✅
- * - Reads Part 1 output via result("cohesity_backup_failures_p1")
- * - LIGHT runs only (includeObjectDetails=false)
- * - Outputs ONLY PGs that need HEAVY (any runType latest != Succeeded)
  *
+ * Reads Part 1 output via result("cohesity_backup_failures_p1")
  * Output -> Part 3 reads via result("cohesity_backup_failures_p2")
  */
 export default async function () {
   const PART1_TASK = "cohesity_backup_failures_p1";
+
   const p1 = await result(PART1_TASK);
-  if (!p1 || !Array.isArray(p1.pgIndex)) {
+  if (!p1?.apiKey || !Array.isArray(p1.pgIndex)) {
     throw new Error(`Part 2: missing Part 1 output. Check task name: ${PART1_TASK}`);
   }
 
   const baseUrl = p1.baseUrl || "https://helios.cohesity.com";
+  const apiKey = String(p1.apiKey).trim();
+  const commonHeaders = { accept: "application/json", ...(p1.commonHeaders || {}), apiKey };
+
+  const daysToKeepMin = Number(p1.daysToKeepMin ?? 35);
   const numRuns = Number(p1.numRuns ?? 5);
   const pgIndex = p1.pgIndex;
-
-  // ==============================
-  // AUTH (vault id)  ✅ (same style)
-  // ==============================
-  const vaultId = "credentials_vault-312312";
-  const d2 = await credentialVaultClient.getCredentialsDetails({ id: vaultId });
-  const apiKey = (d2?.token || d2?.password || "").trim();
-  if (!apiKey) throw new Error("No Helios API key available (empty token/password).");
-
-  const commonHeaders = { accept: "application/json", apiKey };
 
   async function getJson(url, headers) {
     const resp = await fetch(url, { method: "GET", headers });
@@ -42,62 +33,65 @@ export default async function () {
     return resp.json();
   }
 
-  // single-pass: latest status per runType (no sort)
-  function needsHeavy(runsLight) {
-    const latest = new Map(); // runType -> { endUsecs, status }
-    for (const r of runsLight) {
-      const info = r?.localBackupInfo?.[0];
-      const rt = info?.runType ? String(info.runType) : "";
-      const end = Number(info?.endTimeUsecs || 0);
-      const st = info?.status ? String(info.status) : "";
-      if (!rt || !end) continue;
-
-      const prev = latest.get(rt);
-      if (!prev || end > prev.endUsecs) latest.set(rt, { endUsecs: end, status: st });
-    }
-    for (const v of latest.values()) {
-      if (v.status !== "Succeeded") return true;
-    }
-    return false;
+  // group by cluster (policy cache per cluster)
+  const byCluster = new Map();
+  for (const it of pgIndex) {
+    const cid = String(it?.clusterId || "");
+    if (!cid) continue;
+    if (!byCluster.has(cid)) byCluster.set(cid, { clusterName: it?.clusterName || `Unknown-${cid}`, items: [] });
+    byCluster.get(cid).items.push(it);
   }
 
   const pgWorkItems = [];
 
-  for (const it of pgIndex) {
-    const clusterId = it?.clusterId;
-    const clusterName = it?.clusterName;
-    const pgId = it?.pgId;
-    if (!clusterId || !clusterName || !pgId) continue;
-
+  for (const [clusterId, group] of byCluster.entries()) {
     const headers = { ...commonHeaders, Accept: "application/json", accessClusterId: String(clusterId) };
 
-    let runsLightJson;
-    try {
-      runsLightJson = await getJson(
-        `${baseUrl}/v2/data-protect/protection-groups/${encodeURIComponent(String(pgId))}/runs?numRuns=${numRuns}&excludeNonRestorableRuns=false&includeObjectDetails=false`,
-        headers
-      );
-    } catch (_) {
-      continue; // fail-open per PG
+    const policyCache = new Map(); // policyId -> { daysToKeep, name }
+
+    async function getPolicy(policyId) {
+      if (!policyId) return null;
+      const pid = String(policyId);
+      if (policyCache.has(pid)) return policyCache.get(pid);
+
+      const url = `${baseUrl}/irisservices/api/v1/public/protectionPolicies/${encodeURIComponent(pid)}`;
+      try {
+        const p = await getJson(url, headers);
+        const obj = { daysToKeep: p?.daysToKeep ?? null, name: p?.name ?? "" };
+        policyCache.set(pid, obj);
+        return obj;
+      } catch (_) {
+        const obj = { daysToKeep: null, name: "PolicyLookupFailed" };
+        policyCache.set(pid, obj);
+        return obj;
+      }
     }
 
-    const runsLight = Array.isArray(runsLightJson?.runs) ? runsLightJson.runs : [];
-    if (!runsLight.length) continue;
+    for (const it of group.items) {
+      const pol = await getPolicy(it.policyId);
+      const days = pol?.daysToKeep;
 
-    if (!needsHeavy(runsLight)) continue;
-
-    pgWorkItems.push({
-      clusterId: String(clusterId),
-      clusterName,
-      pgId: String(pgId),
-      pgName: it.pgName || "",
-      pgEnv: it.pgEnv || "UnknownEnv",
-    });
+      if (days !== null && Number(days) >= daysToKeepMin) {
+        pgWorkItems.push({
+          clusterId: String(it.clusterId),
+          clusterName: it.clusterName || group.clusterName,
+          pgId: String(it.pgId),
+          pgName: it.pgName || "",
+          pgEnv: it.pgEnv || "UnknownEnv",
+          policyId: String(it.policyId),
+          policyName: pol?.name || "",
+          daysToKeep: Number(days),
+        });
+      }
+    }
   }
 
   return {
-    authMode: "vault",
+    authMode: p1.authMode || "vault",
     baseUrl,
+    apiKey,
+    commonHeaders,
+    daysToKeepMin,
     numRuns,
     pgWorkItems,
   };
