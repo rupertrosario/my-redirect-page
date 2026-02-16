@@ -2,52 +2,33 @@ import { credentialVaultClient } from "@dynatrace-sdk/client-classic-environment
 import { result } from "@dynatrace-sdk/automation-utils";
 
 /**
- * PART 2 (LIGHT TRIAGE — FAIL-OPEN): send the "right" PGs to Part 3
+ * cohesity_backup_failures_p2
  * READ-ONLY (GET-only)
+ * - Vault auth inside Part 2  ✅
+ * - Reads Part 1 output via result("cohesity_backup_failures_p1")
+ * - LIGHT runs only (includeObjectDetails=false)
+ * - Outputs ONLY PGs that need HEAVY (any runType latest != Succeeded)
  *
- * - Reads Part 1 output internally: await result("run_javascript_1")
- * - Uses LIGHT runs: includeObjectDetails=false
- * - FAIL-OPEN: if LIGHT is ambiguous (errors / no runs / no runType / running), PG is INCLUDED as candidate
- * - Candidate rule (broad on purpose to avoid missing failures):
- *     Include PG if ANY run in last numRuns has:
- *       - status != "Succeeded"  OR
- *       - failedObjectsCount/failedAppObjectsCount/cancelled* > 0  OR
- *       - status in Running/Queued/Accepted (in-progress)
- *
- * Output to Part 3:
- * {
- *   baseUrl, numRuns,
- *   apiKey, commonHeaders,
- *   pgCandidates: [{
- *     clusterId, clusterName, pgId, pgName, pgEnv, policyId,
- *     lightIssues: [{ runType, status, failedCount, endTimeUsecs, reason }]
- *   }],
- *   candidateCount
- * }
+ * Output -> Part 3 reads via result("cohesity_backup_failures_p2")
  */
-
 export default async function () {
-  const PART1_STEP = "run_javascript_1";
-  const DEFAULT_NUM_RUNS = 10;
-
-  // ---- pull Part 1 output ----
-  const p1 = await result(PART1_STEP);
+  const PART1_TASK = "cohesity_backup_failures_p1";
+  const p1 = await result(PART1_TASK);
   if (!p1 || !Array.isArray(p1.pgIndex)) {
-    throw new Error(`Part 2: missing pgIndex from ${PART1_STEP} output.`);
+    throw new Error(`Part 2: missing Part 1 output. Check task name: ${PART1_TASK}`);
   }
 
   const baseUrl = p1.baseUrl || "https://helios.cohesity.com";
-  const numRuns = Number(p1.numRuns ?? DEFAULT_NUM_RUNS);
+  const numRuns = Number(p1.numRuns ?? 5);
   const pgIndex = p1.pgIndex;
 
-  // ---- apiKey pass-through preferred; fallback to vault ----
-  let apiKey = String(p1.apiKey || p1.commonHeaders?.apiKey || "").trim();
-  if (!apiKey) {
-    const vaultId = "credentials_vault-312312";
-    const d2 = await credentialVaultClient.getCredentialsDetails({ id: vaultId });
-    apiKey = (d2?.token || d2?.password || "").trim();
-  }
-  if (!apiKey) throw new Error("Part 2: No Helios API key available.");
+  // ==============================
+  // AUTH (vault id)  ✅ (same style)
+  // ==============================
+  const vaultId = "credentials_vault-312312";
+  const d2 = await credentialVaultClient.getCredentialsDetails({ id: vaultId });
+  const apiKey = (d2?.token || d2?.password || "").trim();
+  if (!apiKey) throw new Error("No Helios API key available (empty token/password).");
 
   const commonHeaders = { accept: "application/json", apiKey };
 
@@ -61,149 +42,63 @@ export default async function () {
     return resp.json();
   }
 
-  // localBackupInfo can be OBJECT or ARRAY
-  function infoOf(run) {
-    const lbi = run?.localBackupInfo;
-    if (Array.isArray(lbi)) return lbi[0] || {};
-    if (lbi && typeof lbi === "object") return lbi;
-    return {};
-  }
-  function runTypeOf(run) { return String(infoOf(run)?.runType || "").trim(); }
-  function statusOf(run) { return String(infoOf(run)?.status || "").trim(); }
-  function endUsecsOf(run) { return Number(infoOf(run)?.endTimeUsecs || 0); }
-  function failedCountOf(run) {
-    const i = infoOf(run);
-    return (
-      Number(i?.failedObjectsCount || 0) +
-      Number(i?.failedAppObjectsCount || 0) +
-      Number(i?.cancelledObjectsCount || 0) +
-      Number(i?.cancelledAppObjectsCount || 0)
-    );
-  }
+  // single-pass: latest status per runType (no sort)
+  function needsHeavy(runsLight) {
+    const latest = new Map(); // runType -> { endUsecs, status }
+    for (const r of runsLight) {
+      const info = r?.localBackupInfo?.[0];
+      const rt = info?.runType ? String(info.runType) : "";
+      const end = Number(info?.endTimeUsecs || 0);
+      const st = info?.status ? String(info.status) : "";
+      if (!rt || !end) continue;
 
-  const IN_PROGRESS = new Set(["Running", "Accepted", "Queued", "kRunning", "kAccepted", "kQueued"]);
-
-  async function mapLimit(arr, limit, fn) {
-    const out = [];
-    let i = 0;
-    const workers = Array.from({ length: Math.min(limit, arr.length) }, async () => {
-      while (i < arr.length) {
-        const idx = i++;
-        try { out[idx] = await fn(arr[idx], idx); }
-        catch (e) { out[idx] = { __error: e }; }
-      }
-    });
-    await Promise.all(workers);
-    return out;
-  }
-
-  // ---- group PGs by cluster ----
-  const byCluster = new Map();
-  for (const it of pgIndex) {
-    const cid = String(it?.clusterId || "");
-    if (!cid) continue;
-    if (!byCluster.has(cid)) {
-      byCluster.set(cid, { clusterName: it?.clusterName || `Unknown-${cid}`, items: [] });
+      const prev = latest.get(rt);
+      if (!prev || end > prev.endUsecs) latest.set(rt, { endUsecs: end, status: st });
     }
-    byCluster.get(cid).items.push(it);
+    for (const v of latest.values()) {
+      if (v.status !== "Succeeded") return true;
+    }
+    return false;
   }
 
-  const pgCandidates = [];
-  const CONCURRENCY_PER_CLUSTER = 4;
+  const pgWorkItems = [];
 
-  for (const [clusterId, group] of byCluster.entries()) {
+  for (const it of pgIndex) {
+    const clusterId = it?.clusterId;
+    const clusterName = it?.clusterName;
+    const pgId = it?.pgId;
+    if (!clusterId || !clusterName || !pgId) continue;
+
     const headers = { ...commonHeaders, Accept: "application/json", accessClusterId: String(clusterId) };
 
-    async function triagePg(pg) {
-      const pgId = String(pg?.pgId || "");
-      if (!pgId) return;
-
-      const candidateBase = {
-        clusterId: String(pg.clusterId),
-        clusterName: pg.clusterName || group.clusterName,
-        pgId: String(pg.pgId),
-        pgName: pg.pgName || "",
-        pgEnv: pg.pgEnv || "UnknownEnv",
-        policyId: String(pg.policyId || ""),
-      };
-
-      // LIGHT runs
-      let light;
-      try {
-        light = await getJson(
-          `${baseUrl}/v2/data-protect/protection-groups/${encodeURIComponent(pgId)}/runs?numRuns=${numRuns}&excludeNonRestorableRuns=false&includeObjectDetails=false`,
-          headers
-        );
-      } catch {
-        // FAIL-OPEN: include PG for Part 3
-        pgCandidates.push({
-          ...candidateBase,
-          lightIssues: [{ runType: "", status: "", failedCount: 0, endTimeUsecs: 0, reason: "LIGHT_FETCH_ERROR" }],
-        });
-        return;
-      }
-
-      const runsArr = Array.isArray(light?.runs) ? light.runs : [];
-      if (!runsArr.length) {
-        // FAIL-OPEN
-        pgCandidates.push({
-          ...candidateBase,
-          lightIssues: [{ runType: "", status: "", failedCount: 0, endTimeUsecs: 0, reason: "NO_RUNS_RETURNED" }],
-        });
-        return;
-      }
-
-      // Candidate rule: ANY run in window indicates possible failure or in-progress
-      const lightIssues = [];
-      let sawRunType = false;
-
-      for (const r of runsArr) {
-        const rt = runTypeOf(r);
-        const st = statusOf(r);
-        const fc = failedCountOf(r);
-        const end = endUsecsOf(r);
-
-        if (rt) sawRunType = true;
-
-        const isInProgress = IN_PROGRESS.has(st);
-        const notSucceeded = st && st !== "Succeeded";
-
-        if (fc > 0 || isInProgress || notSucceeded) {
-          lightIssues.push({
-            runType: rt || "UnknownRunType",
-            status: st || "Unknown",
-            failedCount: fc,
-            endTimeUsecs: end,
-            reason: fc > 0 ? "FAILED_COUNT_GT0" : (isInProgress ? "IN_PROGRESS" : "STATUS_NOT_SUCCEEDED"),
-          });
-        }
-      }
-
-      // If runType is missing/ambiguous, FAIL-OPEN
-      if (!sawRunType) {
-        pgCandidates.push({
-          ...candidateBase,
-          lightIssues: [{ runType: "UnknownRunType", status: "Unknown", failedCount: 0, endTimeUsecs: 0, reason: "NO_RUNTYPES" }],
-        });
-        return;
-      }
-
-      // Healthy by LIGHT signals -> skip (Part 3 not needed)
-      if (lightIssues.length === 0) return;
-
-      // Include candidate
-      pgCandidates.push({ ...candidateBase, lightIssues });
+    let runsLightJson;
+    try {
+      runsLightJson = await getJson(
+        `${baseUrl}/v2/data-protect/protection-groups/${encodeURIComponent(String(pgId))}/runs?numRuns=${numRuns}&excludeNonRestorableRuns=false&includeObjectDetails=false`,
+        headers
+      );
+    } catch (_) {
+      continue; // fail-open per PG
     }
 
-    await mapLimit(group.items, CONCURRENCY_PER_CLUSTER, triagePg);
+    const runsLight = Array.isArray(runsLightJson?.runs) ? runsLightJson.runs : [];
+    if (!runsLight.length) continue;
+
+    if (!needsHeavy(runsLight)) continue;
+
+    pgWorkItems.push({
+      clusterId: String(clusterId),
+      clusterName,
+      pgId: String(pgId),
+      pgName: it.pgName || "",
+      pgEnv: it.pgEnv || "UnknownEnv",
+    });
   }
 
   return {
+    authMode: "vault",
     baseUrl,
     numRuns,
-    apiKey,
-    commonHeaders,
-    pgCandidates,
-    candidateCount: pgCandidates.length,
+    pgWorkItems,
   };
 }
