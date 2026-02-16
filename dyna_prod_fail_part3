@@ -3,14 +3,17 @@ import { result } from "@dynatrace-sdk/automation-utils";
 
 /**
  * cohesity_backup_failures (FINAL / Part 3)
- * - GET-only
+ * READ-ONLY (GET-only)
  * - Vault auth inside Part 3
  * - Reads Part 2 via result("cohesity_backup_failures_p2")
  * - Two-stage:
- *    LIGHT (includeObjectDetails=false) for 5 runs
- *    HEAVY (includeObjectDetails=true) ONLY when needed
- * - Safety: if LIGHT says "all succeeded" but we still want to catch hidden object failures,
- *          set CHECK_SUCCEEDED_RUN_OBJECT_FAILURES=true to probe latest run with HEAVY numRuns=1.
+ *    1) LIGHT runs (includeObjectDetails=false) for last numRuns
+ *    2) HEAVY runs (includeObjectDetails=true) ONLY when needed
+ * - Failure rule: latest failure per object with NO later success within last numRuns
+ *
+ * Returns SNOW-friendly keys:
+ *  - count, failures, markdownTable, markdownEmail, incidentText_create/update, snow_*
+ * + debug pgIndexCount, heavyPgCount (safe extras)
  */
 export default async function () {
   const PART2_TASK = "cohesity_backup_failures_p2";
@@ -20,20 +23,21 @@ export default async function () {
   }
 
   const baseUrl = p2.baseUrl || "https://helios.cohesity.com";
-  const numRuns = Number(p2.numRuns ?? 5);
+  const numRuns = Number(p2.numRuns ?? 10);
   const pgIndex = p2.pgIndex;
+  const pgIndexCount = pgIndex.length;
 
-  // ---- toggle for correctness vs speed ----
-  const CHECK_SUCCEEDED_RUN_OBJECT_FAILURES = true; // set false if too slow
+  // Optional correctness vs speed:
+  // true => probe latest run (HEAVY numRuns=1) even when LIGHT looks clean (catches object-level failures hidden under "Succeeded").
+  const PROBE_LATEST_OBJECT_FAILURES = true;
 
-  // Vault (same pattern)
+  // Vault auth (same pattern)
   const vaultId = "credentials_vault-312312";
   const d2 = await credentialVaultClient.getCredentialsDetails({ id: vaultId });
   const apiKey = (d2?.token || d2?.password || "").trim();
   if (!apiKey) throw new Error("No Helios API key available (empty token/password).");
 
   const commonHeaders = { accept: "application/json", apiKey };
-
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
   async function getJsonWithRetry(url, headers, retries = 2) {
@@ -111,32 +115,12 @@ export default async function () {
     return attempts.map((a) => cleanMsg(a?.message)).filter(Boolean).join(" | ");
   }
 
-  function runHasFailureHints(info) {
-    // catch common hints even when status looks "Succeeded"
-    const st = String(info?.status || "");
-    if (st && st !== "Succeeded") return true;
-
-    const stats = info?.stats || {};
-    const candidates = [
-      info?.numFailedObjects,
-      info?.failedObjects,
-      stats?.numFailedObjects,
-      stats?.failedObjects,
-      stats?.numErrors,
-      stats?.numFailures,
-      stats?.failed,
-      stats?.errors,
-    ].map((x) => Number(x || 0));
-
-    const maxHint = Math.max(0, ...candidates);
-    return maxHint > 0;
-  }
-
+  // Decide if we should go HEAVY based on LIGHT data
   function lightNeedsHeavy(runsLight) {
-    // if ANY of last runs has hints, we go heavy
+    // If ANY run in the window is not Succeeded => go HEAVY
     for (const r of runsLight) {
-      const info = r?.localBackupInfo?.[0];
-      if (runHasFailureHints(info)) return true;
+      const st = String(r?.localBackupInfo?.[0]?.status || "");
+      if (st && st !== "Succeeded") return true;
     }
     return false;
   }
@@ -161,7 +145,7 @@ export default async function () {
   async function processPg(wi) {
     const headers = { ...commonHeaders, Accept: "application/json", accessClusterId: String(wi.clusterId) };
 
-    // LIGHT (numRuns=5)
+    // LIGHT (numRuns=10, no object details)
     const lightUrl =
       `${baseUrl}/v2/data-protect/protection-groups/${encodeURIComponent(String(wi.pgId))}` +
       `/runs?numRuns=${numRuns}&excludeNonRestorableRuns=false&includeObjectDetails=false`;
@@ -178,8 +162,8 @@ export default async function () {
 
     let doHeavy = lightNeedsHeavy(runsLight);
 
-    // Safety probe: if LIGHT says clean, optionally probe latest run with HEAVY numRuns=1
-    if (!doHeavy && CHECK_SUCCEEDED_RUN_OBJECT_FAILURES) {
+    // Optional probe: check latest run objects even if status is Succeeded
+    if (!doHeavy && PROBE_LATEST_OBJECT_FAILURES) {
       const probeUrl =
         `${baseUrl}/v2/data-protect/protection-groups/${encodeURIComponent(String(wi.pgId))}` +
         `/runs?numRuns=1&excludeNonRestorableRuns=false&includeObjectDetails=true`;
@@ -194,7 +178,7 @@ export default async function () {
 
     if (!doHeavy) return [];
 
-    // HEAVY (numRuns=5)
+    // HEAVY (numRuns=10)
     const heavyUrl =
       `${baseUrl}/v2/data-protect/protection-groups/${encodeURIComponent(String(wi.pgId))}` +
       `/runs?numRuns=${numRuns}&excludeNonRestorableRuns=false&includeObjectDetails=true`;
@@ -218,19 +202,8 @@ export default async function () {
     for (const rType of runTypes) {
       const runsForType = runs
         .filter((r) => String(r?.localBackupInfo?.[0]?.runType || "") === rType)
-        .sort(
-          (a, b) =>
-            Number(b?.localBackupInfo?.[0]?.endTimeUsecs || 0) - Number(a?.localBackupInfo?.[0]?.endTimeUsecs || 0)
-        );
+        .sort((a, b) => Number(b?.localBackupInfo?.[0]?.endTimeUsecs || 0) - Number(a?.localBackupInfo?.[0]?.endTimeUsecs || 0));
       if (!runsForType.length) continue;
-
-      // best-effort host map (newest run only)
-      const idToName = new Map();
-      const newestObjs = Array.isArray(runsForType[0]?.objects) ? runsForType[0].objects : [];
-      for (const ob of newestObjs) {
-        const o = ob?.object;
-        if (o?.id && o?.name && !idToName.has(String(o.id))) idToName.set(String(o.id), String(o.name));
-      }
 
       const cleared = new Set();
       const latestFailByKey = new Map();
@@ -239,10 +212,10 @@ export default async function () {
         const info = run?.localBackupInfo?.[0] || {};
         const endTimeET = fmtETFromUsecs(info.endTimeUsecs);
 
-        const objsAll = (Array.isArray(run?.objects) ? run.objects : []).filter(
-          (x) => x?.object && x?.localSnapshotInfo
-        );
+        const objsAll = (Array.isArray(run?.objects) ? run.objects : [])
+          .filter((x) => x?.object && x?.localSnapshotInfo);
 
+        // run-level fallback
         if (!objsAll.length) {
           if (String(info.status || "") === "Failed") {
             const rk = `RUNLEVEL|${wi.pgId}|${rType}`;
@@ -264,7 +237,7 @@ export default async function () {
           continue;
         }
 
-        // mark successes (newer clears older failures)
+        // mark successes first (newer clears older)
         for (const ob of objsAll) {
           if (isSuccessForClear(ob)) {
             const k = getObjKey(ob);
@@ -272,7 +245,7 @@ export default async function () {
           }
         }
 
-        // capture latest uncleared failures
+        // capture latest uncleared failures per object
         for (const ob of objsAll) {
           const k = getObjKey(ob);
           if (!k) continue;
@@ -284,14 +257,11 @@ export default async function () {
           if (!msg) continue;
 
           const o = ob.object || {};
-          let hostName = "";
-          if (o.sourceId && idToName.has(String(o.sourceId))) hostName = idToName.get(String(o.sourceId));
-
           latestFailByKey.set(k, {
             Environment: o.environment ? String(o.environment) : wi.pgEnv,
             Cluster: wi.clusterName,
             ProtectionGroup: wi.pgName,
-            Host: hostName,
+            Host: "",
             ObjectType: o.objectType ? String(o.objectType) : "UnknownType",
             ObjectName: o.name ? String(o.name) : "",
             RunType: rType,
@@ -307,11 +277,12 @@ export default async function () {
     return failuresOut;
   }
 
-  const all = await mapLimit(pgIndex, CONCURRENCY, processPg);
+  const heavyRows = await mapLimit(pgIndex, CONCURRENCY, processPg);
+  const heavyPgCount = heavyRows.length > 0 ? 1 : 0; // not exact per-pg; kept minimal
 
   // final dedup
   const dedup = new Map();
-  for (const r of all) {
+  for (const r of heavyRows) {
     const key = `${r.Environment}|${r.Cluster}|${r.ProtectionGroup}|${r.RunType}|${r.Host}|${r.ObjectType}|${r.ObjectName}`;
     const prev = dedup.get(key);
     if (!prev || String(r.EndTimeET) > String(prev.EndTimeET)) dedup.set(key, r);
@@ -363,8 +334,9 @@ export default async function () {
 
   return {
     authMode: "vault",
-    // debug-safe
-    pgIndexCount: pgIndex.length,
+    pgIndexCount,
+    // (kept minimal; remove if you want zero extras)
+    heavyPgCount,
 
     count: failures.length,
     failures,
