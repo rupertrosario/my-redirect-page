@@ -1,0 +1,258 @@
+import { credentialVaultClient } from "@dynatrace-sdk/client-classic-environment-v2";
+
+/**
+ * =====================================================================
+ * Cohesity Helios – Cluster + PG Selector (GET-only) — Dynatrace Workflow JS
+ *
+ * Non-interactive selector (driven by inputs):
+ *  1) Fetch clusters
+ *  2) Select cluster scope:
+ *        - ALL (default) OR match by ClusterId OR exact ClusterName
+ *  3) For selected clusters, fetch active PGs
+ *  4) Select PG scope:
+ *        - ALL (default) OR match by PGId OR exact PGName
+ *
+ * Inputs (set as Dynatrace action input params or env vars):
+ *   COHESITY_VAULT_CRED_ID  : Credential Vault entry id (apiKey stored as password/secret)
+ *   CLUSTER_SELECT_MODE     : "ALL" | "ID" | "NAME"
+ *   CLUSTER_SELECT_VALUE    : clusterId OR exact cluster name (depending on mode)
+ *   PG_SELECT_MODE          : "ALL" | "ID" | "NAME"
+ *   PG_SELECT_VALUE         : pgId OR exact pg name (depending on mode)
+ *
+ * Output:
+ *   selectedClusters : [{ index, clusterName, clusterId }]
+ *   selectedPGs      : [{ index, clusterName, clusterId, pgName, pgId, policyId, environment }]
+ *   markdownEmail    : single combined markdown body
+ * =====================================================================
+ */
+
+const BASE_URL = "https://helios.cohesity.com";
+
+// -------------------------------
+// Helpers
+// -------------------------------
+function escapeMd(s) {
+  return String(s ?? "").replace(/\|/g, "\\|").replace(/\n/g, " ").trim();
+}
+
+function toMdTable(headers, rows) {
+  const head = `| ${headers.map(escapeMd).join(" | ")} |`;
+  const sep = `| ${headers.map(() => "---").join(" | ")} |`;
+  const body = rows
+    .map((r) => `| ${headers.map((h) => escapeMd(r[h])).join(" | ")} |`)
+    .join("\n");
+  return [head, sep, body].filter(Boolean).join("\n");
+}
+
+async function heliosGet(path, headers) {
+  const url = `${BASE_URL}${path}`;
+  const res = await fetch(url, { method: "GET", headers });
+  const text = await res.text();
+  if (!res.ok) {
+    throw new Error(`HTTP ${res.status} ${res.statusText} for ${url}: ${text?.slice(0, 300)}`);
+  }
+  if (!text || !text.trim()) return null;
+  return JSON.parse(text);
+}
+
+function pickFirstNonEmpty(...vals) {
+  for (const v of vals) {
+    if (typeof v === "string" && v.trim()) return v.trim();
+  }
+  return null;
+}
+
+function envOrDefault(key, def = "") {
+  const v = process.env[key];
+  if (v === undefined || v === null) return def;
+  return String(v);
+}
+
+// -------------------------------
+// Main
+// -------------------------------
+export default async function () {
+  // ---- Inputs ----
+  const COHESITY_VAULT_CRED_ID = envOrDefault("COHESITY_VAULT_CRED_ID", "").trim(); // REQUIRED
+  const CLUSTER_SELECT_MODE = envOrDefault("CLUSTER_SELECT_MODE", "ALL").trim().toUpperCase(); // ALL | ID | NAME
+  const CLUSTER_SELECT_VALUE = envOrDefault("CLUSTER_SELECT_VALUE", "").trim();
+
+  const PG_SELECT_MODE = envOrDefault("PG_SELECT_MODE", "ALL").trim().toUpperCase(); // ALL | ID | NAME
+  const PG_SELECT_VALUE = envOrDefault("PG_SELECT_VALUE", "").trim();
+
+  if (!COHESITY_VAULT_CRED_ID) {
+    throw new Error("Missing COHESITY_VAULT_CRED_ID (Credential Vault entry id that stores the Helios apiKey).");
+  }
+
+  // ---- Get apiKey from Dynatrace Credential Vault ----
+  // Store Helios apiKey in the credential's password (secret) field.
+  const cred = await credentialVaultClient.getCredentialsDetails({ id: COHESITY_VAULT_CRED_ID });
+  const apiKey = (cred?.password || cred?.token || "").trim();
+  if (!apiKey) throw new Error("Credential Vault entry does not contain apiKey in password/token field.");
+
+  const commonHeaders = { apiKey, accept: "application/json" };
+
+  // ---- 1) Fetch clusters ----
+  const cluJson = await heliosGet("/v2/mcm/cluster-mgmt/info", commonHeaders);
+  const cohesityClusters = Array.isArray(cluJson?.cohesityClusters) ? cluJson.cohesityClusters : [];
+  if (!cohesityClusters.length) throw new Error("No clusters returned from Helios (/v2/mcm/cluster-mgmt/info).");
+
+  const clusters = cohesityClusters
+    .map((c) => {
+      const name = pickFirstNonEmpty(c?.name, c?.clusterName, c?.displayName) || `Unknown-${c?.clusterId ?? "NA"}`;
+      return { clusterName: name, clusterId: String(c?.clusterId ?? "").trim() };
+    })
+    .filter((c) => c.clusterId)
+    .sort((a, b) => a.clusterName.localeCompare(b.clusterName, undefined, { sensitivity: "base" }))
+    .map((c, i) => ({ index: i + 1, ...c }));
+
+  // ---- 2) Select cluster scope ----
+  let selectedClusters = clusters;
+
+  if (CLUSTER_SELECT_MODE === "ID") {
+    if (!CLUSTER_SELECT_VALUE) throw new Error("CLUSTER_SELECT_MODE=ID requires CLUSTER_SELECT_VALUE=clusterId");
+    selectedClusters = clusters.filter((c) => c.clusterId === CLUSTER_SELECT_VALUE);
+  } else if (CLUSTER_SELECT_MODE === "NAME") {
+    if (!CLUSTER_SELECT_VALUE) throw new Error("CLUSTER_SELECT_MODE=NAME requires CLUSTER_SELECT_VALUE=exact clusterName");
+    selectedClusters = clusters.filter((c) => c.clusterName === CLUSTER_SELECT_VALUE);
+  } else if (CLUSTER_SELECT_MODE !== "ALL") {
+    throw new Error(`Invalid CLUSTER_SELECT_MODE: ${CLUSTER_SELECT_MODE} (use ALL|ID|NAME)`);
+  }
+
+  if (!selectedClusters.length) {
+    throw new Error(
+      `No clusters matched selection. Mode=${CLUSTER_SELECT_MODE} Value=${CLUSTER_SELECT_VALUE || "(empty)"}`
+    );
+  }
+
+  // ---- 3) Fetch active PGs per selected cluster ----
+  const pgRows = [];
+  const pgPath = "/v2/data-protect/protection-groups?isDeleted=false&isPaused=false&isActive=true";
+
+  for (const c of selectedClusters) {
+    const headers = { apiKey, accept: "application/json", accessClusterId: c.clusterId };
+
+    try {
+      const pgJson = await heliosGet(pgPath, headers);
+      const pgs = Array.isArray(pgJson?.protectionGroups) ? pgJson.protectionGroups : [];
+      for (const pg of pgs) {
+        pgRows.push({
+          clusterName: c.clusterName,
+          clusterId: c.clusterId,
+          pgName: String(pg?.name ?? "").trim(),
+          pgId: String(pg?.id ?? "").trim(),
+          policyId: String(pg?.policyId ?? "").trim(),
+          environment: pg?.environment ?? null,
+        });
+      }
+    } catch (e) {
+      // Keep behavior: cluster failure doesn't break whole script; it yields NO_DATA row
+      pgRows.push({
+        clusterName: c.clusterName,
+        clusterId: c.clusterId,
+        pgName: "⚠️NO_DATA",
+        pgId: "",
+        policyId: "",
+        environment: "",
+        _error: String(e?.message || e),
+      });
+    }
+  }
+
+  const pgRowsActive = pgRows
+    .filter((r) => r.pgName && r.pgName !== "⚠️NO_DATA")
+    .sort((a, b) =>
+      a.clusterName.localeCompare(b.clusterName, undefined, { sensitivity: "base" }) ||
+      a.pgName.localeCompare(b.pgName, undefined, { sensitivity: "base" })
+    )
+    .map((r, i) => ({ index: i + 1, ...r }));
+
+  if (!pgRowsActive.length) {
+    throw new Error("No protection groups found in selected cluster scope (or all PG fetches failed).");
+  }
+
+  // ---- 4) Select PG scope ----
+  let selectedPGs = pgRowsActive;
+
+  if (PG_SELECT_MODE === "ID") {
+    if (!PG_SELECT_VALUE) throw new Error("PG_SELECT_MODE=ID requires PG_SELECT_VALUE=pgId");
+    selectedPGs = pgRowsActive.filter((p) => p.pgId === PG_SELECT_VALUE);
+  } else if (PG_SELECT_MODE === "NAME") {
+    if (!PG_SELECT_VALUE) throw new Error("PG_SELECT_MODE=NAME requires PG_SELECT_VALUE=exact pgName");
+    selectedPGs = pgRowsActive.filter((p) => p.pgName === PG_SELECT_VALUE);
+  } else if (PG_SELECT_MODE !== "ALL") {
+    throw new Error(`Invalid PG_SELECT_MODE: ${PG_SELECT_MODE} (use ALL|ID|NAME)`);
+  }
+
+  if (!selectedPGs.length) {
+    throw new Error(`No PGs matched selection. Mode=${PG_SELECT_MODE} Value=${PG_SELECT_VALUE || "(empty)"}`);
+  }
+
+  // ---- Build markdown tables + combined email ----
+  const markdownClustersTable = toMdTable(
+    ["Index", "ClusterName", "ClusterId"],
+    selectedClusters.map((c) => ({
+      Index: c.index,
+      ClusterName: c.clusterName,
+      ClusterId: c.clusterId,
+    }))
+  );
+
+  const markdownPGsTable = toMdTable(
+    ["Index", "ClusterName", "PGName", "PGId", "PolicyId", "Environment"],
+    selectedPGs.map((p) => ({
+      Index: p.index,
+      ClusterName: p.clusterName,
+      PGName: p.pgName,
+      PGId: p.pgId,
+      PolicyId: p.policyId,
+      Environment: p.environment ?? "",
+    }))
+  );
+
+  const markdownEmail =
+    `### Cohesity – Selected Clusters\n\n` +
+    markdownClustersTable +
+    `\n\n### Cohesity – Selected Protection Groups\n\n` +
+    markdownPGsTable;
+
+  // ---- Return payload ----
+  return {
+    // objects similar to your PowerShell outputs
+    selectedClusters: selectedClusters.map((c) => ({
+      index: c.index,
+      clusterName: c.clusterName,
+      clusterId: c.clusterId,
+    })),
+    selectedPGs: selectedPGs.map((p) => ({
+      index: p.index,
+      clusterName: p.clusterName,
+      clusterId: p.clusterId,
+      pgName: p.pgName,
+      pgId: p.pgId,
+      policyId: p.policyId,
+      environment: p.environment,
+    })),
+
+    // email-ready markdown
+    markdownEmail,
+    markdownClustersTable,
+    markdownPGsTable,
+
+    // diagnostics
+    counts: {
+      clustersReturned: clusters.length,
+      clustersSelected: selectedClusters.length,
+      pgsReturnedInScope: pgRowsActive.length,
+      pgsSelected: selectedPGs.length,
+    },
+
+    // echo inputs for traceability
+    selector: {
+      CLUSTER_SELECT_MODE,
+      CLUSTER_SELECT_VALUE,
+      PG_SELECT_MODE,
+      PG_SELECT_VALUE,
+    },
+  };
+}
