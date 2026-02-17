@@ -1,33 +1,36 @@
 import { credentialVaultClient } from "@dynatrace-sdk/client-classic-environment-v2";
 
 /**
- * =====================================================================
- * Cohesity Helios – Cluster + PG Selector (GET-only) — Dynatrace Workflow JS
- * - Non-interactive selector driven by variables (ALL/ID/NAME)
- * - Returns selectedClusters, selectedPGs, markdownEmail
+ * Cohesity PROD Failures (Policy DaysToKeep >= 35) — Multi-Cluster (Helios)
+ * STRICTLY READ-ONLY (GET-only)
  *
- * Vaulting: uses the EXACT vault section style from your reference script.
- * =====================================================================
+ * NO selection menus:
+ * - Runs across ALL clusters
+ * - Includes ALL active PGs (isDeleted=false, isPaused=false, isActive=true)
+ *
+ * Logic (minimal-change, correct partial-rerun handling):
+ * - Pre-filter PGs by Policy daysToKeep >= 35 (policy calls cached per cluster)
+ * - For each PG: fetch last N runs (default 20) includeObjectDetails=true
+ * - Cross-RunType clearing:
+ *     object success (failedAttempts empty) clears older failures for that object
+ * - Capture latest uncleared failure per object (first failure seen newest->oldest)
+ *
+ * Output:
+ * - markdownEmail (single consolidated markdown table)
+ * - failures[] + count
+ *
+ * Vaulting: EXACT style (vaultId + token/password)
  */
 
 export default async function () {
   const baseUrl = "https://helios.cohesity.com";
+  const NUM_RUNS = Number(process.env.NUM_RUNS || 20);
+  const MIN_DAYS_TO_KEEP = Number(process.env.MIN_DAYS_TO_KEEP || 35);
 
-  // =========================================================
-  // SELECTOR INPUTS (edit these defaults or pass as env vars)
-  // =========================================================
-  // Cluster selection: ALL | ID | NAME
-  const CLUSTER_SELECT_MODE = String(process.env.CLUSTER_SELECT_MODE || "ALL").trim().toUpperCase();
-  const CLUSTER_SELECT_VALUE = String(process.env.CLUSTER_SELECT_VALUE || "").trim();
-
-  // PG selection: ALL | ID | NAME
-  const PG_SELECT_MODE = String(process.env.PG_SELECT_MODE || "ALL").trim().toUpperCase();
-  const PG_SELECT_VALUE = String(process.env.PG_SELECT_VALUE || "").trim();
-
-  // =========================================================
-  // AUTH (vault id) ✅ EXACT style from your reference script
-  // =========================================================
-  const vaultId = String(process.env.COHESITY_VAULT_ID || "credentials_vault-312312").trim();
+  // ==============================
+  // AUTH (vault id) ✅ EXACT style
+  // ==============================
+  const vaultId = "credentials_vault-312312";
   const d2 = await credentialVaultClient.getCredentialsDetails({ id: vaultId });
   const apiKey = (d2?.token || d2?.password || "").trim();
   if (!apiKey) throw new Error("No Helios API key available (empty token/password).");
@@ -35,92 +38,145 @@ export default async function () {
   const commonHeaders = { accept: "application/json", apiKey };
 
   // ==============================
-  // GET helper (same style)
+  // GET helper
   // ==============================
   async function getJson(url, headers) {
     const resp = await fetch(url, { method: "GET", headers });
     if (!resp.ok) {
       let txt = "";
-      try {
-        txt = await resp.text();
-      } catch (_) {}
+      try { txt = await resp.text(); } catch (_) {}
       throw new Error(`GET ${url} -> HTTP ${resp.status} ${txt}`);
     }
     return resp.json();
   }
 
   // ==============================
-  // Markdown helpers
+  // Helpers
   // ==============================
-  function mdEscape(s) {
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+  async function getJsonWithRetry(url, headers, retries = 2) {
+    for (let i = 0; i <= retries; i++) {
+      const resp = await fetch(url, { method: "GET", headers });
+      if (resp.ok) return resp.json();
+
+      const st = resp.status;
+      if ((st === 429 || st >= 500) && i < retries) {
+        await sleep(700 * (i + 1));
+        continue;
+      }
+
+      let txt = "";
+      try { txt = await resp.text(); } catch (_) {}
+      throw new Error(`GET ${url} -> HTTP ${st} ${txt}`);
+    }
+    return null;
+  }
+
+  function toArray(v) {
+    if (v == null) return [];
+    return Array.isArray(v) ? v : [v];
+  }
+
+  function cleanMsg(s) {
+    if (!s) return "";
+    return String(s)
+      .replace(/[\r\n]+/g, " ")
+      .replace(/\|/g, " ")
+      .replace(/"/g, "'")
+      .replace(/,/g, " ")
+      .trim();
+  }
+
+  function fmtETFromUsecs(usecs) {
+    if (!usecs) return "";
+    const ms = Math.floor(Number(usecs) / 1000);
+    const dt = new Date(ms);
+    try {
+      return new Intl.DateTimeFormat("en-US", {
+        timeZone: "America/New_York",
+        year: "numeric",
+        month: "2-digit",
+        day: "2-digit",
+        hour: "2-digit",
+        minute: "2-digit",
+        hour12: false,
+      }).format(dt);
+    } catch {
+      return dt.toISOString();
+    }
+  }
+
+  function getInfo(run) {
+    const lb = run?.localBackupInfo;
+    if (!lb) return null;
+    return Array.isArray(lb) ? (lb[0] ?? null) : lb; // normalize singleton
+  }
+
+  function getObjKey(ob) {
+    const o = ob?.object;
+    if (!o) return "";
+    // stable-ish key (matches your PS idea): env|type|name|sourceId
+    const sid = o.sourceId ? String(o.sourceId) : "";
+    return `${o.environment || ""}|${o.objectType || ""}|${o.name || ""}|${sid}`;
+  }
+
+  function failedAttemptsArr(ob) {
+    return toArray(ob?.localSnapshotInfo?.failedAttempts); // normalize singleton
+  }
+
+  function hasFailedAttempts(ob) {
+    return failedAttemptsArr(ob).length > 0;
+  }
+
+  function isObjectSuccess(ob) {
+    return !!ob?.localSnapshotInfo && !hasFailedAttempts(ob);
+  }
+
+  function combineFailedAttempts(attempts) {
+    const arr = toArray(attempts);
+    const msgs = arr.map((a) => cleanMsg(a?.message)).filter(Boolean);
+    return msgs.join(" | ");
+  }
+
+  async function mapLimit(items, limit, fn) {
+    const out = [];
+    let i = 0;
+    const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+      while (true) {
+        const idx = i++;
+        if (idx >= items.length) break;
+        const vals = await fn(items[idx], idx);
+        if (Array.isArray(vals) && vals.length) out.push(...vals);
+      }
+    });
+    await Promise.all(workers);
+    return out;
+  }
+
+  function mdEsc(s) {
     return String(s ?? "").replace(/\|/g, "\\|").replace(/[\r\n]+/g, " ").trim();
   }
 
-  function mdTable(headers, rows) {
-    const out = [];
-    out.push(`| ${headers.map(mdEscape).join(" | ")} |`);
-    out.push(`| ${headers.map(() => "---").join(" | ")} |`);
-    for (const r of rows) {
-      out.push(`| ${headers.map((h) => mdEscape(r[h])).join(" | ")} |`);
-    }
-    return out.join("\n");
-  }
-
-  function pickName(c) {
-    return (
-      String(c?.name || "").trim() ||
-      String(c?.clusterName || "").trim() ||
-      String(c?.displayName || "").trim() ||
-      `Unknown-${c?.clusterId}`
-    );
-  }
-
   // ==============================
-  // 1) CLUSTERS
+  // 1) CLUSTERS (ALL)
   // ==============================
   const clu = await getJson(`${baseUrl}/v2/mcm/cluster-mgmt/info`, { ...commonHeaders, Accept: "application/json" });
-  const clustersRaw = Array.isArray(clu?.cohesityClusters) ? clu.cohesityClusters : [];
-  if (!clustersRaw.length) throw new Error("No clusters returned from /v2/mcm/cluster-mgmt/info");
-
-  const clusters = clustersRaw
-    .map((c) => ({
-      clusterName: pickName(c),
-      clusterId: String(c?.clusterId ?? "").trim(),
-    }))
-    .filter((c) => c.clusterId)
-    .sort((a, b) => a.clusterName.localeCompare(b.clusterName))
-    .map((c, i) => ({ index: i + 1, ...c }));
+  const clusters = Array.isArray(clu?.cohesityClusters) ? clu.cohesityClusters : [];
+  if (!clusters.length) throw new Error("No clusters returned from /v2/mcm/cluster-mgmt/info");
 
   // ==============================
-  // 2) SELECT CLUSTERS (ALL/ID/NAME)
+  // 2) Build PG index across ALL clusters (active only)
   // ==============================
-  let selectedClusters = clusters;
+  const pgIndex = [];
 
-  if (CLUSTER_SELECT_MODE === "ID") {
-    if (!CLUSTER_SELECT_VALUE) throw new Error("CLUSTER_SELECT_MODE=ID requires CLUSTER_SELECT_VALUE=<clusterId>");
-    selectedClusters = clusters.filter((c) => c.clusterId === CLUSTER_SELECT_VALUE);
-  } else if (CLUSTER_SELECT_MODE === "NAME") {
-    if (!CLUSTER_SELECT_VALUE) throw new Error("CLUSTER_SELECT_MODE=NAME requires CLUSTER_SELECT_VALUE=<exact clusterName>");
-    selectedClusters = clusters.filter((c) => c.clusterName === CLUSTER_SELECT_VALUE);
-  } else if (CLUSTER_SELECT_MODE !== "ALL") {
-    throw new Error("CLUSTER_SELECT_MODE must be ALL | ID | NAME");
-  }
+  for (const cl of clusters) {
+    const clusterId = cl?.clusterId;
+    const clusterName =
+      String(cl?.name || cl?.clusterName || cl?.displayName || "").trim() || `Unknown-${clusterId}`;
+    if (!clusterId) continue;
 
-  if (!selectedClusters.length) {
-    throw new Error(`No clusters matched. Mode=${CLUSTER_SELECT_MODE} Value=${CLUSTER_SELECT_VALUE || "(empty)"}`);
-  }
-
-  // ==============================
-  // 3) PGs (active only) per selected cluster
-  // ==============================
-  const pgRows = [];
-
-  for (const c of selectedClusters) {
-    const headers = {
-      ...commonHeaders,
-      Accept: "application/json",
-      accessClusterId: String(c.clusterId),
-    };
+    const headers = { ...commonHeaders, Accept: "application/json", accessClusterId: String(clusterId) };
 
     let pgJson;
     try {
@@ -128,122 +184,268 @@ export default async function () {
         `${baseUrl}/v2/data-protect/protection-groups?isDeleted=false&isPaused=false&isActive=true`,
         headers
       );
-    } catch (e) {
-      // fail-open per cluster (but you still get visibility in markdown)
-      pgRows.push({
-        clusterName: c.clusterName,
-        clusterId: c.clusterId,
-        pgName: "⚠️NO_DATA",
-        pgId: "",
-        policyId: "",
-        environment: "",
-        _error: String(e?.message || e),
-      });
-      continue;
+    } catch (_) {
+      continue; // fail-open per cluster
     }
 
     const pgs = Array.isArray(pgJson?.protectionGroups) ? pgJson.protectionGroups : [];
     for (const pg of pgs) {
-      pgRows.push({
-        clusterName: c.clusterName,
-        clusterId: c.clusterId,
-        pgName: String(pg?.name ?? "").trim(),
+      pgIndex.push({
+        clusterId: String(clusterId),
+        clusterName,
         pgId: String(pg?.id ?? "").trim(),
+        pgName: String(pg?.name ?? "").trim(),
         policyId: String(pg?.policyId ?? "").trim(),
-        environment: pg?.environment ?? "",
+        pgEnv: pg?.environment ?? "",
       });
     }
   }
 
-  const pgsActive = pgRows
-    .filter((r) => r.pgName && r.pgName !== "⚠️NO_DATA")
-    .sort((a, b) => a.clusterName.localeCompare(b.clusterName) || a.pgName.localeCompare(b.pgName))
-    .map((r, i) => ({ index: i + 1, ...r }));
-
-  if (!pgsActive.length) throw new Error("No protection groups found in selected cluster scope.");
-
-  // ==============================
-  // 4) SELECT PGs (ALL/ID/NAME)
-  // ==============================
-  let selectedPGs = pgsActive;
-
-  if (PG_SELECT_MODE === "ID") {
-    if (!PG_SELECT_VALUE) throw new Error("PG_SELECT_MODE=ID requires PG_SELECT_VALUE=<pgId>");
-    selectedPGs = pgsActive.filter((p) => p.pgId === PG_SELECT_VALUE);
-  } else if (PG_SELECT_MODE === "NAME") {
-    if (!PG_SELECT_VALUE) throw new Error("PG_SELECT_MODE=NAME requires PG_SELECT_VALUE=<exact pgName>");
-    selectedPGs = pgsActive.filter((p) => p.pgName === PG_SELECT_VALUE);
-  } else if (PG_SELECT_MODE !== "ALL") {
-    throw new Error("PG_SELECT_MODE must be ALL | ID | NAME");
-  }
-
-  if (!selectedPGs.length) {
-    throw new Error(`No PGs matched. Mode=${PG_SELECT_MODE} Value=${PG_SELECT_VALUE || "(empty)"}`);
+  if (!pgIndex.length) {
+    return {
+      markdownEmail: `✅ No active Protection Groups found across all clusters.`,
+      failures: [],
+      count: 0,
+    };
   }
 
   // ==============================
-  // MARKDOWN EMAIL
+  // 3) Policy cache per cluster + filter PGs by daysToKeep >= MIN_DAYS_TO_KEEP
   // ==============================
-  const clustersTable = mdTable(
-    ["Index", "ClusterName", "ClusterId"],
-    selectedClusters.map((x) => ({
-      Index: x.index,
-      ClusterName: x.clusterName,
-      ClusterId: x.clusterId,
-    }))
-  );
+  const policyCacheByCluster = new Map(); // clusterId -> Map(policyId -> {daysToKeep,name})
 
-  const pgsTable = mdTable(
-    ["Index", "ClusterName", "PGName", "PGId", "PolicyId", "Environment"],
-    selectedPGs.map((x) => ({
-      Index: x.index,
-      ClusterName: x.clusterName,
-      PGName: x.pgName,
-      PGId: x.pgId,
-      PolicyId: x.policyId,
-      Environment: x.environment ?? "",
-    }))
-  );
+  async function getPolicyCached(clusterId, headers, policyId) {
+    if (!policyId) return null;
+    if (!policyCacheByCluster.has(clusterId)) policyCacheByCluster.set(clusterId, new Map());
+    const cache = policyCacheByCluster.get(clusterId);
+    if (cache.has(policyId)) return cache.get(policyId);
 
-  const markdownEmail =
-    `### Cohesity – Selected Clusters\n\n` +
-    clustersTable +
-    `\n\n### Cohesity – Selected Protection Groups\n\n` +
-    pgsTable;
+    const enc = encodeURIComponent(String(policyId));
+    const url = `${baseUrl}/irisservices/api/v1/public/protectionPolicies/${enc}`;
+    try {
+      const p = await getJson(url, headers);
+      const obj = { daysToKeep: p?.daysToKeep ?? null, name: p?.name ?? "" };
+      cache.set(policyId, obj);
+      return obj;
+    } catch (_) {
+      const obj = { daysToKeep: null, name: "PolicyLookupFailed" };
+      cache.set(policyId, obj);
+      return obj;
+    }
+  }
+
+  const pgIndex35 = [];
+  for (const pg of pgIndex) {
+    if (!pg.policyId) continue;
+    const headers = { ...commonHeaders, Accept: "application/json", accessClusterId: String(pg.clusterId) };
+    const pol = await getPolicyCached(String(pg.clusterId), headers, String(pg.policyId));
+    const days = pol?.daysToKeep;
+    if (days !== null && Number(days) >= MIN_DAYS_TO_KEEP) pgIndex35.push(pg);
+  }
+
+  if (!pgIndex35.length) {
+    return {
+      markdownEmail: `✅ No active PGs meet Policy daysToKeep >= ${MIN_DAYS_TO_KEEP} across all clusters.`,
+      failures: [],
+      count: 0,
+    };
+  }
 
   // ==============================
-  // OUTPUT
+  // 4) Runs + failure logic (heavy)
   // ==============================
+  const CONCURRENCY = Number(process.env.CONCURRENCY || 3);
+  const pgErrors = [];
+
+  async function processPg(pg) {
+    const headers = { ...commonHeaders, Accept: "application/json", accessClusterId: String(pg.clusterId) };
+    const url =
+      `${baseUrl}/v2/data-protect/protection-groups/${encodeURIComponent(String(pg.pgId))}` +
+      `/runs?numRuns=${NUM_RUNS}&excludeNonRestorableRuns=false&includeObjectDetails=true`;
+
+    let jsonRuns;
+    try {
+      jsonRuns = await getJsonWithRetry(url, headers, 2);
+    } catch (e) {
+      pgErrors.push({ cluster: pg.clusterName, pg: pg.pgName, error: String(e?.message || e) });
+      return [];
+    }
+
+    const runs = toArray(jsonRuns?.runs);
+    if (!runs.length) return [];
+
+    const runTypes = Array.from(
+      new Set(
+        runs
+          .map((r) => getInfo(r)?.runType)
+          .filter(Boolean)
+          .map((x) => String(x))
+      )
+    );
+
+    const failuresOut = [];
+
+    for (const rType of runTypes) {
+      const runsForType = runs
+        .filter((r) => String(getInfo(r)?.runType || "") === rType)
+        .sort((a, b) => Number(getInfo(b)?.endTimeUsecs || 0) - Number(getInfo(a)?.endTimeUsecs || 0));
+      if (!runsForType.length) continue;
+
+      const idToName = new Map();
+      for (const rr of runsForType) {
+        for (const ob of toArray(rr?.objects)) {
+          const o = ob?.object;
+          if (o?.id && o?.name && !idToName.has(String(o.id))) idToName.set(String(o.id), String(o.name));
+        }
+      }
+
+      const cleared = new Set();
+      const latestFailByKey = new Map();
+
+      for (const run of runsForType) {
+        const info = getInfo(run) || {};
+        const endTimeET = fmtETFromUsecs(info?.endTimeUsecs);
+
+        const objsAll = toArray(run?.objects).filter((x) => x?.object && x?.localSnapshotInfo);
+
+        if (!objsAll.length) {
+          if (String(info.status || "") === "Failed") {
+            const rk = `RUNLEVEL|${pg.pgId}|${rType}`;
+            if (!latestFailByKey.has(rk)) {
+              const msg = Array.isArray(info.messages) ? info.messages.join(" | ") : info.messages;
+              latestFailByKey.set(rk, {
+                Environment: pg.pgEnv || "UnknownEnv",
+                Cluster: pg.clusterName,
+                ProtectionGroup: pg.pgName,
+                Host: "",
+                ObjectType: "RunLevel",
+                ObjectName: "(Run-level)",
+                RunType: rType,
+                EndTimeET: endTimeET,
+                FailedMessage: cleanMsg(msg),
+              });
+            }
+          }
+          continue;
+        }
+
+        // cross-runType clearing
+        for (const ob of objsAll) {
+          if (isObjectSuccess(ob)) {
+            const k = getObjKey(ob);
+            if (k) cleared.add(k);
+          }
+        }
+
+        // latest uncleared failure
+        for (const ob of objsAll) {
+          const k = getObjKey(ob);
+          if (!k) continue;
+          if (cleared.has(k)) continue;
+          if (latestFailByKey.has(k)) continue;
+          if (!hasFailedAttempts(ob)) continue;
+
+          const msg = combineFailedAttempts(failedAttemptsArr(ob));
+          if (!msg) continue;
+
+          const o = ob.object || {};
+          let hostName = "";
+          if (o.sourceId && idToName.has(String(o.sourceId))) hostName = idToName.get(String(o.sourceId));
+
+          latestFailByKey.set(k, {
+            Environment: o.environment ? String(o.environment) : (pg.pgEnv || "UnknownEnv"),
+            Cluster: pg.clusterName,
+            ProtectionGroup: pg.pgName,
+            Host: hostName,
+            ObjectType: o.objectType ? String(o.objectType) : "UnknownType",
+            ObjectName: o.name ? String(o.name) : "",
+            RunType: rType,
+            EndTimeET: endTimeET,
+            FailedMessage: msg,
+          });
+        }
+      }
+
+      for (const v of latestFailByKey.values()) failuresOut.push(v);
+    }
+
+    return failuresOut;
+  }
+
+  const allFailures = await mapLimit(pgIndex35, CONCURRENCY, processPg);
+
+  // final dedup safety (same idea as your reference)
+  const dedup = new Map();
+  for (const r of allFailures) {
+    const key = `${r.Environment}|${r.Cluster}|${r.ProtectionGroup}|${r.RunType}|${r.Host}|${r.ObjectType}|${r.ObjectName}`;
+    const prev = dedup.get(key);
+    if (!prev || String(r.EndTimeET) > String(prev.EndTimeET)) dedup.set(key, r);
+  }
+
+  const final = Array.from(dedup.values()).sort((a, b) => {
+    const c = String(a.Cluster).localeCompare(String(b.Cluster));
+    if (c) return c;
+    const p = String(a.ProtectionGroup).localeCompare(String(b.ProtectionGroup));
+    if (p) return p;
+    const e = String(a.Environment).localeCompare(String(b.Environment));
+    if (e) return e;
+    const rt = String(a.RunType).localeCompare(String(b.RunType));
+    if (rt) return rt;
+    return String(b.EndTimeET).localeCompare(String(a.EndTimeET));
+  });
+
+  // markdownEmail (single body)
+  if (!final.length) {
+    return {
+      markdownEmail: `✅ No failures found for Policy DaysToKeep >= ${MIN_DAYS_TO_KEEP} across ALL clusters (Last ${NUM_RUNS} runs).`,
+      failures: [],
+      count: 0,
+      pgErrors,
+      pgErrorsCount: pgErrors.length,
+    };
+  }
+
+  const headers = [
+    "Environment",
+    "Cluster",
+    "ProtectionGroup",
+    "Host",
+    "ObjectType",
+    "ObjectName",
+    "RunType",
+    "EndTimeET",
+    "FailedMessage",
+  ];
+
+  const lines = [];
+  lines.push(`### Cohesity PROD Failures (Policy DaysToKeep >= ${MIN_DAYS_TO_KEEP}) — ALL Clusters`);
+  lines.push(`PGs scanned (>=${MIN_DAYS_TO_KEEP}d): **${pgIndex35.length}** | Failures: **${final.length}** | Runs: **${NUM_RUNS}**`);
+  if (pgErrors.length) lines.push(`PG fetch errors: **${pgErrors.length}** (see pgErrors[])`);
+  lines.push("");
+  lines.push(`| ${headers.join(" | ")} |`);
+  lines.push(`| ${headers.map(() => "---").join(" | ")} |`);
+  for (const r of final) {
+    const row = [
+      r.Environment,
+      r.Cluster,
+      r.ProtectionGroup,
+      r.Host || "",
+      r.ObjectType,
+      r.ObjectName,
+      r.RunType,
+      r.EndTimeET,
+      cleanMsg(r.FailedMessage),
+    ].map(mdEsc);
+    lines.push(`| ${row.join(" | ")} |`);
+  }
+
   return {
-    selectedClusters: selectedClusters.map((c) => ({
-      index: c.index,
-      clusterName: c.clusterName,
-      clusterId: c.clusterId,
-    })),
-    selectedPGs: selectedPGs.map((p) => ({
-      index: p.index,
-      clusterName: p.clusterName,
-      clusterId: p.clusterId,
-      pgName: p.pgName,
-      pgId: p.pgId,
-      policyId: p.policyId,
-      environment: p.environment ?? "",
-    })),
-    markdownEmail,
-    markdownClustersTable: clustersTable,
-    markdownPGsTable: pgsTable,
-    counts: {
-      clustersReturned: clusters.length,
-      clustersSelected: selectedClusters.length,
-      pgsReturnedInScope: pgsActive.length,
-      pgsSelected: selectedPGs.length,
-    },
-    selector: {
-      CLUSTER_SELECT_MODE,
-      CLUSTER_SELECT_VALUE,
-      PG_SELECT_MODE,
-      PG_SELECT_VALUE,
-      vaultIdUsed: vaultId,
-    },
+    markdownEmail: lines.join("\n"),
+    failures: final,
+    count: final.length,
+    pgErrors,
+    pgErrorsCount: pgErrors.length,
+    scanned: { clusters: clusters.length, pgsActive: pgIndex.length, pgs35: pgIndex35.length },
+    tunables: { NUM_RUNS, MIN_DAYS_TO_KEEP, CONCURRENCY },
   };
 }
