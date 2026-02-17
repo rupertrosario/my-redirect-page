@@ -1,0 +1,321 @@
+# =====================================================================
+# Cohesity PROD Failures (Policy DaysToKeep >= 35) – Multi-Cluster (Helios)
+# SCOPE: ALL environments (no menu)
+# STRICTLY READ-ONLY (GET-only)
+#
+# RIGHT LOGIC (minimal change, fixes your issue):
+# - Look back last N runs per PG (default 20) with includeObjectDetails=true
+# - Track LATEST failure per object that has NO later object-level success
+# - CLEAR is now cross-RunType (Regular success clears earlier Full/Regular failure)
+# - Object key is stable (env|type|name|sourceId) to avoid object.id drift
+#
+# Output: ONE consolidated CSV only if failures exist
+# =====================================================================
+
+$ErrorActionPreference = "Stop"
+
+# -------------------------------
+# Tunables
+# -------------------------------
+$NUM_RUNS = 20
+$MIN_DAYS_TO_KEEP = 35
+
+# -------------------------------
+# Output folder + API key
+# -------------------------------
+$logDirectory = "X:\PowerShell\Data\Cohesity\BackupFailures"
+if (-not (Test-Path -Path $logDirectory -PathType Container)) {
+    New-Item -Path $logDirectory -ItemType Directory | Out-Null
+}
+
+# Hygiene: keep at most 50 newest files
+try {
+    $files = Get-ChildItem -Path $logDirectory -File -ErrorAction Stop
+    if ($files.Count -gt 50) {
+        $toDelete = $files | Sort-Object CreationTime | Select-Object -First ($files.Count - 50)
+        $toDelete | Remove-Item -Force -ErrorAction SilentlyContinue
+    }
+} catch {}
+
+# Hygiene: delete anything older than 30 days
+try {
+    $threshold = (Get-Date).AddDays(-30)
+    Get-ChildItem -Path $logDirectory -File -ErrorAction SilentlyContinue |
+        Where-Object { $_.LastWriteTime -lt $threshold } |
+        Remove-Item -Force -ErrorAction SilentlyContinue
+} catch {}
+
+$apikeypath = "X:\PowerShell\Cohesity_API_Scripts\DO_NOT_Delete\apikey.txt"
+if (-not (Test-Path $apikeypath)) { throw "API key file not found at $apikeypath" }
+$apiKey = (Get-Content -Path $apikeypath -Raw).Trim()
+
+$baseUrl = "https://helios.cohesity.com"
+$commonHeaders = @{ "apiKey" = $apiKey; "accept"="application/json" }
+
+# -------------------------------
+# GET wrapper (PS 5.1 safe)
+# -------------------------------
+function Invoke-HeliosGetJson {
+    param(
+        [Parameter(Mandatory)][string]$Uri,
+        [Parameter(Mandatory)][hashtable]$Headers
+    )
+    if ($PSVersionTable.PSVersion.Major -lt 6) {
+        $resp = Invoke-WebRequest -Uri $Uri -Headers $Headers -Method Get -UseBasicParsing
+    } else {
+        $resp = Invoke-WebRequest -Uri $Uri -Headers $Headers -Method Get
+    }
+    if (-not $resp -or [string]::IsNullOrWhiteSpace($resp.Content)) { return $null }
+    return ($resp.Content | ConvertFrom-Json)
+}
+
+# -------------------------------
+# Helpers
+# -------------------------------
+function Convert-ToUtcFromEpoch($v){
+    if ($null -eq $v -or $v -eq 0) { return $null }
+    try { [DateTimeOffset]::FromUnixTimeMilliseconds([int64]([double]$v/1000)).UtcDateTime }
+    catch { [DateTimeOffset]::FromUnixTimeMilliseconds([int64]$v).UtcDateTime }
+}
+function Convert-ToLocalFromUsecs($usecs, $tz){
+    $utc = Convert-ToUtcFromEpoch $usecs
+    if ($null -eq $utc) { return $null }
+    if ($tz) { [System.TimeZoneInfo]::ConvertTimeFromUtc($utc,$tz) } else { $utc.ToLocalTime() }
+}
+function CleanMsg([string]$s){
+    if([string]::IsNullOrWhiteSpace($s)){ return $null }
+    return ($s -replace '[\r\n]+',' ' -replace ',',' ' -replace '"','''').Trim()
+}
+function Combine-FailedAttempts($attempts){
+    if (-not $attempts) { return $null }
+    $msgs = @()
+    foreach($fa in @($attempts)){
+        $m = CleanMsg $fa.message
+        if($m){ $msgs += $m }
+    }
+    if($msgs.Count -eq 0){ return $null }
+    return ($msgs -join " | ")
+}
+$tz = $null
+try { $tz = [System.TimeZoneInfo]::FindSystemTimeZoneById("Eastern Standard Time") } catch { $tz = $null }
+
+# IMPORTANT: stable key (do NOT rely on object.id)
+function Get-ObjKey($ob){
+    if ($null -eq $ob -or $null -eq $ob.object) { return $null }
+    $env  = [string]$ob.object.environment
+    $type = [string]$ob.object.objectType
+    $name = [string]$ob.object.name
+    $sid  = ""
+    if ($ob.object.PSObject.Properties["sourceId"]) { $sid = [string]$ob.object.sourceId }
+    return "$env|$type|$name|$sid"
+}
+function Has-FailedAttempts($ob){
+    try {
+        $fa = $ob.localSnapshotInfo.failedAttempts
+        return ($fa -and $fa.Count -gt 0)
+    } catch { return $false }
+}
+function Is-ObjectSuccess($ob){
+    if ($null -eq $ob -or $null -eq $ob.localSnapshotInfo) { return $false }
+    return (-not (Has-FailedAttempts $ob))
+}
+
+# -------------------------------
+# Get clusters
+# -------------------------------
+$cluJson = Invoke-HeliosGetJson -Uri "$baseUrl/v2/mcm/cluster-mgmt/info" -Headers $commonHeaders
+$json_clu = $cluJson.cohesityClusters
+if (-not $json_clu -or $json_clu.Count -eq 0) { throw "No clusters returned from Helios." }
+
+# -------------------------------
+# Consolidated results
+# -------------------------------
+$allFailures = @()
+
+foreach ($cluster in $json_clu) {
+
+    $cluster_name = ($cluster.name,$cluster.clusterName,$cluster.displayName | Where-Object { $_ -and $_.Trim() } | Select-Object -First 1)
+    if (-not $cluster_name) { $cluster_name = "Unknown-$($cluster.clusterId)" }
+
+    Write-Host "`n🔹 Processing cluster: $cluster_name" -ForegroundColor Cyan
+    $headers = @{ apiKey=$apiKey; accessClusterId=$cluster.clusterId; accept="application/json" }
+
+    # 1) List active PGs (ALL envs)
+    $pgs = @()
+    try {
+        $pgUri  = "$baseUrl/v2/data-protect/protection-groups?isDeleted=false&isPaused=false&isActive=true"
+        $pgJson = Invoke-HeliosGetJson -Uri $pgUri -Headers $headers
+        $pgs    = @($pgJson.protectionGroups)
+    } catch {
+        Write-Host "⚠️ PG list failed for $cluster_name: $($_.Exception.Message)" -ForegroundColor Yellow
+        continue
+    }
+    if (-not $pgs -or $pgs.Count -eq 0) { continue }
+
+    # 2) Policy cache + prefilter daysToKeep >= 35
+    $policyCache = @{}  # policyId -> @{ daysToKeep=...; name=... }
+
+    function Get-PolicyLocal {
+        param([string]$PolicyId)
+        if ([string]::IsNullOrWhiteSpace($PolicyId)) { return $null }
+        if ($policyCache.ContainsKey($PolicyId)) { return $policyCache[$PolicyId] }
+        $enc = [uri]::EscapeDataString($PolicyId)
+        $u   = "$baseUrl/irisservices/api/v1/public/protectionPolicies/$enc"
+        try {
+            $p = Invoke-HeliosGetJson -Uri $u -Headers $headers
+            $policyCache[$PolicyId] = @{ daysToKeep = $p.daysToKeep; name = $p.name }
+        } catch {
+            $policyCache[$PolicyId] = @{ daysToKeep = $null; name = "PolicyLookupFailed" }
+        }
+        return $policyCache[$PolicyId]
+    }
+
+    $pgTotal = $pgs.Count
+    $pgs35 = @()
+
+    foreach ($pg in $pgs) {
+        $polid = $pg.policyId   # NOTE: polid (NOT $pid)
+        if ([string]::IsNullOrWhiteSpace($polid)) { continue }
+        $pol = Get-PolicyLocal -PolicyId $polid
+        if ($null -eq $pol) { continue }
+        $days = $pol.daysToKeep
+        if ($null -ne $days -and [int]$days -ge $MIN_DAYS_TO_KEEP) { $pgs35 += $pg }
+    }
+
+    $pgs = $pgs35
+    Write-Host ("📌 PGs total={0}, PGs>=35d={1}, unique policies={2}" -f $pgTotal, $pgs.Count, $policyCache.Keys.Count) -ForegroundColor DarkCyan
+    if (-not $pgs -or $pgs.Count -eq 0) { continue }
+
+    foreach ($pg in $pgs) {
+
+        $pgId   = $pg.id
+        $pgName = $pg.name
+
+        $pgEnv = $null
+        if ($pg.PSObject.Properties["environment"]) { $pgEnv = [string]$pg.environment }
+        elseif ($pg.PSObject.Properties["environments"]) { $pgEnv = [string]$pg.environments }
+        elseif ($pg.PSObject.Properties["environmentTypes"]) { $pgEnv = (@($pg.environmentTypes) -join ",") }
+        if ([string]::IsNullOrWhiteSpace($pgEnv)) { $pgEnv = "UnknownEnv" }
+
+        # 3) Runs (HEAVY) – required for partial rerun clearing logic
+        $jsonRuns = $null
+        try {
+            $runsUri  = "$baseUrl/v2/data-protect/protection-groups/$pgId/runs?numRuns=$NUM_RUNS&excludeNonRestorableRuns=false&includeObjectDetails=true"
+            $jsonRuns = Invoke-HeliosGetJson -Uri $runsUri -Headers $headers
+        } catch { continue }
+
+        if (-not $jsonRuns -or -not $jsonRuns.runs) { continue }
+
+        # NEW: process ALL returned runs newest->oldest (clearing is cross-runType)
+        $runsSorted = @($jsonRuns.runs | Sort-Object { $_.localBackupInfo[0].endTimeUsecs } -Descending)
+
+        $cleared = New-Object "System.Collections.Generic.HashSet[string]"
+        $latestFailByKey = @{}   # key -> row (first failure seen is latest)
+
+        foreach ($run in $runsSorted) {
+
+            $info    = $run.localBackupInfo[0]
+            $runType = $info.runType
+            $endTime = Convert-ToLocalFromUsecs $info.endTimeUsecs $tz
+
+            # Run-level fallback when objects missing
+            if (-not $run.objects -or @($run.objects).Count -eq 0) {
+                if ($info.status -eq "Failed") {
+                    $rk = "RUNLEVEL|$pgId|$runType"
+                    if (-not $latestFailByKey.ContainsKey($rk)) {
+                        $msg = $info.messages
+                        if ($msg -is [System.Array]) { $msg = ($msg -join ' | ') }
+                        $latestFailByKey[$rk] = [pscustomobject]@{
+                            Environment     = $pgEnv
+                            Cluster         = $cluster_name
+                            ProtectionGroup = $pgName
+                            Host            = $null
+                            ObjectType      = "RunLevel"
+                            ObjectName      = "(Run-level)"
+                            RunType         = $runType
+                            EndTime         = $endTime
+                            FailedMessage   = (CleanMsg $msg)
+                        }
+                    }
+                }
+                continue
+            }
+
+            $objsAll = @($run.objects) | Where-Object { $_ -and $_.object -and $_.localSnapshotInfo }
+
+            # 1) Mark successes (later clean appearance clears older failures, regardless of RunType)
+            foreach ($ob in $objsAll) {
+                if (Is-ObjectSuccess $ob) {
+                    $k = Get-ObjKey $ob
+                    if ($k) { [void]$cleared.Add($k) }
+                }
+            }
+
+            # 2) Capture latest uncleared failures per object (first seen is latest)
+            foreach ($ob in $objsAll) {
+
+                $k = Get-ObjKey $ob
+                if (-not $k) { continue }
+                if ($cleared.Contains($k)) { continue }
+                if ($latestFailByKey.ContainsKey($k)) { continue }
+                if (-not (Has-FailedAttempts $ob)) { continue }
+
+                $msg = Combine-FailedAttempts $ob.localSnapshotInfo.failedAttempts
+                if (-not $msg) { continue }
+
+                $objType = $ob.object.objectType
+                $objEnv  = $ob.object.environment
+                $objName = $ob.object.name
+
+                # DB host mapping (best-effort via sourceId -> host object name within same run)
+                $hostName = $null
+                try {
+                    if ($ob.object.PSObject.Properties["sourceId"]) {
+                        $sid = [string]$ob.object.sourceId
+                        $hostObj = $objsAll | Where-Object { $_.object -and [string]$_.object.id -eq $sid } | Select-Object -First 1
+                        if ($hostObj -and $hostObj.object.name) { $hostName = $hostObj.object.name }
+                    }
+                } catch {}
+
+                $latestFailByKey[$k] = [pscustomobject]@{
+                    Environment     = $(if ($objEnv) { [string]$objEnv } else { $pgEnv })
+                    Cluster         = $cluster_name
+                    ProtectionGroup = $pgName
+                    Host            = $hostName
+                    ObjectType      = $(if ($objType) { [string]$objType } else { "UnknownType" })
+                    ObjectName      = $objName
+                    RunType         = $runType
+                    EndTime         = $endTime
+                    FailedMessage   = $msg
+                }
+            }
+        }
+
+        foreach ($key in $latestFailByKey.Keys) {
+            $allFailures += $latestFailByKey[$key]
+        }
+    }
+}
+
+# -------------------------------
+# Output (one CSV only if failures exist)
+# -------------------------------
+if ($allFailures -and $allFailures.Count -gt 0) {
+
+    $final = $allFailures |
+        Group-Object { "$($_.Environment)|$($_.Cluster)|$($_.ProtectionGroup)|$($_.RunType)|$($_.Host)|$($_.ObjectType)|$($_.ObjectName)" } |
+        ForEach-Object { $_.Group | Sort-Object EndTime -Descending | Select-Object -First 1 } |
+        Sort-Object Cluster,ProtectionGroup,Environment,RunType,EndTime -Descending
+
+    $timestamp = Get-Date -Format "yyyyMMdd_HHmm"
+    $csvPath   = Join-Path $logDirectory "PROD_Failures_35dPlus_ALLENV_$timestamp.csv"
+
+    $final | Select-Object Environment,Cluster,ProtectionGroup,Host,ObjectType,ObjectName,RunType,EndTime,FailedMessage |
+        Export-Csv -Path $csvPath -NoTypeInformation -Encoding utf8
+
+    $final | Format-Table Environment,Cluster,ProtectionGroup,Host,ObjectType,ObjectName,RunType,EndTime,FailedMessage -AutoSize
+    Write-Host "`n📂 CSV saved: $csvPath" -ForegroundColor Gray
+}
+else {
+    Write-Host "`n✅ No failures found for Policy DaysToKeep >= $MIN_DAYS_TO_KEEP across all clusters (no CSV created)." -ForegroundColor Green
+}
