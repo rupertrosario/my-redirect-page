@@ -1,0 +1,338 @@
+// ===============================
+// cohesity_prod_failures_p3
+// - GET-only
+// - HEAVY runs (includeObjectDetails=true)
+// - Cross-RunType clearing:
+//     object success (failedAttempts empty) clears older failures for that object
+// - Captures latest uncleared failure per object (newest->oldest)
+// - Output: markdownEmail + failures[] + counts
+// ===============================
+
+import { credentialVaultClient } from "@dynatrace-sdk/client-classic-environment-v2";
+import { result } from "@dynatrace-sdk/automation-utils";
+
+export default async function () {
+  const PART2 = "cohesity_prod_failures_p2";
+  const p2 = await result(PART2);
+
+  if (!p2?.baseUrl || !Array.isArray(p2.pgIndex35)) {
+    throw new Error(`Part 3: missing Part 2 output. Check step name: ${PART2}`);
+  }
+
+  const baseUrl = p2.baseUrl;
+  const numRuns = Number(p2.numRuns ?? 20);
+  const minDaysToKeep = Number(p2.minDaysToKeep ?? 35);
+  const pgIndex35 = p2.pgIndex35;
+
+  // ==============================
+  // AUTH (vault id) ✅ EXACT style
+  // ==============================
+  const vaultId = "credentials_vault-312312";
+  const vaultCred = await credentialVaultClient.getCredentialsDetails({ id: vaultId });
+  const apiKey = (vaultCred?.token || vaultCred?.password || "").trim();
+  if (!apiKey) throw new Error("No Helios API key available (empty token/password).");
+
+  const commonHeaders = { accept: "application/json", apiKey };
+
+  // -----------------------------
+  // helpers
+  // -----------------------------
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+  function toArray(v) {
+    if (v == null) return [];
+    return Array.isArray(v) ? v : [v];
+  }
+
+  function getInfo(run) {
+    const lb = run?.localBackupInfo;
+    if (!lb) return null;
+    return Array.isArray(lb) ? (lb[0] ?? null) : lb;
+  }
+
+  async function getJsonWithRetry(url, headers, retries = 2) {
+    for (let i = 0; i <= retries; i++) {
+      const resp = await fetch(url, { method: "GET", headers });
+      if (resp.ok) return resp.json();
+
+      const st = resp.status;
+      if ((st === 429 || st >= 500) && i < retries) {
+        await sleep(700 * (i + 1));
+        continue;
+      }
+
+      let txt = "";
+      try { txt = await resp.text(); } catch (_) {}
+      throw new Error(`GET ${url} -> HTTP ${st} ${txt}`);
+    }
+    return null;
+  }
+
+  function cleanMsg(s) {
+    if (!s) return "";
+    return String(s).replace(/[\r\n]+/g, " ").replace(/\|/g, " ").replace(/"/g, "'").replace(/,/g, " ").trim();
+  }
+
+  function fmtETFromUsecs(usecs) {
+    if (!usecs) return "";
+    const ms = Math.floor(Number(usecs) / 1000);
+    const dt = new Date(ms);
+    try {
+      return new Intl.DateTimeFormat("en-US", {
+        timeZone: "America/New_York",
+        year: "numeric",
+        month: "2-digit",
+        day: "2-digit",
+        hour: "2-digit",
+        minute: "2-digit",
+        hour12: false,
+      }).format(dt);
+    } catch {
+      return dt.toISOString();
+    }
+  }
+
+  function getObjKey(ob) {
+    const o = ob?.object;
+    if (!o) return "";
+    const sid = o.sourceId ? String(o.sourceId) : "";
+    return `${o.environment || ""}|${o.objectType || ""}|${o.name || ""}|${sid}`;
+  }
+
+  function failedAttemptsArr(ob) {
+    return toArray(ob?.localSnapshotInfo?.failedAttempts);
+  }
+
+  function hasFailedAttempts(ob) {
+    return failedAttemptsArr(ob).length > 0;
+  }
+
+  function isObjectSuccess(ob) {
+    return !!ob?.localSnapshotInfo && !hasFailedAttempts(ob);
+  }
+
+  function combineFailedAttempts(attempts) {
+    const arr = toArray(attempts);
+    const msgs = arr.map((a) => cleanMsg(a?.message)).filter(Boolean);
+    return msgs.join(" | ");
+  }
+
+  async function mapLimit(items, limit, fn) {
+    const out = [];
+    let i = 0;
+    const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+      while (true) {
+        const idx = i++;
+        if (idx >= items.length) break;
+        const vals = await fn(items[idx], idx);
+        if (Array.isArray(vals) && vals.length) out.push(...vals);
+      }
+    });
+    await Promise.all(workers);
+    return out;
+  }
+
+  function mdEsc(s) {
+    return String(s ?? "").replace(/\|/g, "\\|").replace(/[\r\n]+/g, " ").trim();
+  }
+
+  // heavy calls: keep conservative
+  const CONCURRENCY = Number(process.env.CONCURRENCY || 3);
+  const pgErrors = [];
+
+  async function processPg(pg) {
+    const headers = { ...commonHeaders, Accept: "application/json", accessClusterId: String(pg.clusterId) };
+
+    const url =
+      `${baseUrl}/v2/data-protect/protection-groups/${encodeURIComponent(String(pg.pgId))}` +
+      `/runs?numRuns=${numRuns}&excludeNonRestorableRuns=false&includeObjectDetails=true`;
+
+    let jsonRuns;
+    try {
+      jsonRuns = await getJsonWithRetry(url, headers, 2);
+    } catch (e) {
+      pgErrors.push({ cluster: pg.clusterName, pg: pg.pgName, error: String(e?.message || e) });
+      return [];
+    }
+
+    const runs = toArray(jsonRuns?.runs);
+    if (!runs.length) return [];
+
+    const runTypes = Array.from(
+      new Set(
+        runs
+          .map((r) => getInfo(r)?.runType)
+          .filter(Boolean)
+          .map((x) => String(x))
+      )
+    );
+
+    const failuresOut = [];
+
+    for (const rType of runTypes) {
+      const runsForType = runs
+        .filter((r) => String(getInfo(r)?.runType || "") === rType)
+        .sort((a, b) => Number(getInfo(b)?.endTimeUsecs || 0) - Number(getInfo(a)?.endTimeUsecs || 0));
+      if (!runsForType.length) continue;
+
+      // best-effort host map for sourceId -> name
+      const idToName = new Map();
+      for (const rr of runsForType) {
+        for (const ob of toArray(rr?.objects)) {
+          const o = ob?.object;
+          if (o?.id && o?.name && !idToName.has(String(o.id))) idToName.set(String(o.id), String(o.name));
+        }
+      }
+
+      const cleared = new Set();
+      const latestFailByKey = new Map();
+
+      for (const run of runsForType) {
+        const info = getInfo(run) || {};
+        const endTimeET = fmtETFromUsecs(info?.endTimeUsecs);
+
+        const objsAll = toArray(run?.objects).filter((x) => x?.object && x?.localSnapshotInfo);
+
+        // run-level fallback
+        if (!objsAll.length) {
+          if (String(info.status || "") === "Failed") {
+            const rk = `RUNLEVEL|${pg.pgId}|${rType}`;
+            if (!latestFailByKey.has(rk)) {
+              const msg = Array.isArray(info.messages) ? info.messages.join(" | ") : info.messages;
+              latestFailByKey.set(rk, {
+                Environment: pg.pgEnv || "UnknownEnv",
+                Cluster: pg.clusterName,
+                ProtectionGroup: pg.pgName,
+                Host: "",
+                ObjectType: "RunLevel",
+                ObjectName: "(Run-level)",
+                RunType: rType,
+                EndTimeET: endTimeET,
+                FailedMessage: cleanMsg(msg),
+              });
+            }
+          }
+          continue;
+        }
+
+        // 1) mark successes (cross-runType)
+        for (const ob of objsAll) {
+          if (isObjectSuccess(ob)) {
+            const k = getObjKey(ob);
+            if (k) cleared.add(k);
+          }
+        }
+
+        // 2) capture latest uncleared failures
+        for (const ob of objsAll) {
+          const k = getObjKey(ob);
+          if (!k) continue;
+          if (cleared.has(k)) continue;
+          if (latestFailByKey.has(k)) continue;
+          if (!hasFailedAttempts(ob)) continue;
+
+          const msg = combineFailedAttempts(failedAttemptsArr(ob));
+          if (!msg) continue;
+
+          const o = ob.object || {};
+          let hostName = "";
+          if (o.sourceId && idToName.has(String(o.sourceId))) hostName = idToName.get(String(o.sourceId));
+
+          latestFailByKey.set(k, {
+            Environment: o.environment ? String(o.environment) : (pg.pgEnv || "UnknownEnv"),
+            Cluster: pg.clusterName,
+            ProtectionGroup: pg.pgName,
+            Host: hostName,
+            ObjectType: o.objectType ? String(o.objectType) : "UnknownType",
+            ObjectName: o.name ? String(o.name) : "",
+            RunType: rType,
+            EndTimeET: endTimeET,
+            FailedMessage: msg,
+          });
+        }
+      }
+
+      for (const v of latestFailByKey.values()) failuresOut.push(v);
+    }
+
+    return failuresOut;
+  }
+
+  const allFailures = await mapLimit(pgIndex35, CONCURRENCY, processPg);
+
+  // final dedup safety
+  const dedup = new Map();
+  for (const r of allFailures) {
+    const key = `${r.Environment}|${r.Cluster}|${r.ProtectionGroup}|${r.RunType}|${r.Host}|${r.ObjectType}|${r.ObjectName}`;
+    const prev = dedup.get(key);
+    if (!prev || String(r.EndTimeET) > String(prev.EndTimeET)) dedup.set(key, r);
+  }
+
+  const final = Array.from(dedup.values()).sort((a, b) => {
+    const c = String(a.Cluster).localeCompare(String(b.Cluster));
+    if (c) return c;
+    const p = String(a.ProtectionGroup).localeCompare(String(b.ProtectionGroup));
+    if (p) return p;
+    const e = String(a.Environment).localeCompare(String(b.Environment));
+    if (e) return e;
+    const rt = String(a.RunType).localeCompare(String(b.RunType));
+    if (rt) return rt;
+    return String(b.EndTimeET).localeCompare(String(a.EndTimeET));
+  });
+
+  // markdownEmail
+  if (!final.length) {
+    return {
+      markdownEmail: `✅ No failures found for Policy DaysToKeep >= ${minDaysToKeep} across ALL clusters (Last ${numRuns} runs).`,
+      failures: [],
+      count: 0,
+      pgErrors,
+      pgErrorsCount: pgErrors.length,
+      pgIndex35Count: pgIndex35.length,
+    };
+  }
+
+  const headers = [
+    "Environment",
+    "Cluster",
+    "ProtectionGroup",
+    "Host",
+    "ObjectType",
+    "ObjectName",
+    "RunType",
+    "EndTimeET",
+    "FailedMessage",
+  ];
+
+  const lines = [];
+  lines.push(`### Cohesity PROD Failures (Policy DaysToKeep >= ${minDaysToKeep}) — ALL Clusters`);
+  lines.push(`PGs scanned (>=${minDaysToKeep}d): **${pgIndex35.length}** | Failures: **${final.length}** | Runs: **${numRuns}**`);
+  if (pgErrors.length) lines.push(`PG fetch errors: **${pgErrors.length}** (see pgErrors[])`);
+  lines.push("");
+  lines.push(`| ${headers.join(" | ")} |`);
+  lines.push(`| ${headers.map(() => "---").join(" | ")} |`);
+  for (const r of final) {
+    const row = [
+      r.Environment,
+      r.Cluster,
+      r.ProtectionGroup,
+      r.Host || "",
+      r.ObjectType,
+      r.ObjectName,
+      r.RunType,
+      r.EndTimeET,
+      cleanMsg(r.FailedMessage),
+    ].map(mdEsc);
+    lines.push(`| ${row.join(" | ")} |`);
+  }
+
+  return {
+    markdownEmail: lines.join("\n"),
+    failures: final,
+    count: final.length,
+    pgErrors,
+    pgErrorsCount: pgErrors.length,
+    pgIndex35Count: pgIndex35.length,
+    tunables: { numRuns, minDaysToKeep, CONCURRENCY },
+  };
+}
