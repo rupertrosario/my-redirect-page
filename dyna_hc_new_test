@@ -1,19 +1,31 @@
-
 import { credentialVaultClient } from "@dynatrace-sdk/client-classic-environment-v2";
 
 /**
- * Cohesity Helios — Active Alerts (Unique by alertCode, latest only) — Matrix View
+ * Cohesity Helios — Active Alerts (Unique by alertCode, latest only) — Matrix + Email Output
  * GET-only
  *
  * Endpoints:
  *  - GET https://helios.cohesity.com/v2/mcm/cluster-mgmt/info
  *  - GET https://helios.cohesity.com/v2/mcm/alerts   (with accessClusterId per cluster)
  *
- * Output:
- *  - markdownMatrix: rows=clusters, cols=Category→Type, cells= C/W/I (unique codes, latest only)
- *  - markdownDetails: per cluster latest alert per code (optional, capped)
- *  - markdown: combined
- *  - raw: compact json (per cluster)
+ * Dedupe:
+ *  - Per cluster, group by alertCode
+ *  - Keep ONLY the latest occurrence row per code (max latestTimestampUsecs)
+ *  - Aggregate occurrences = sum(dedupCount || 1)
+ *
+ * Matrix:
+ *  - Rows = Cluster
+ *  - Cols = alertCategory → alertType (built from deduped rows)
+ *  - Cell = "xC / yW / zI" (unique alertCodes)
+ *
+ * Returns:
+ *  - subject
+ *  - emailBodyMarkdown
+ *  - note
+ *  - markdownMatrix
+ *  - markdownDetails
+ *  - markdown (combined)
+ *  - raw (compact json)
  */
 export default async function () {
   const baseUrl = "https://helios.cohesity.com";
@@ -30,10 +42,16 @@ export default async function () {
   // SETTINGS
   // ==============================
   const CONCURRENCY = 8;
-  const MAX_ALERTS = 5000; // fetch more since no time window
-  const ALERT_STATES = ["kOpen", "kNote"]; // active-ish states
-  const MAX_DETAIL_ROWS_PER_CLUSTER = 50; // email-safe
-  const MAX_TOTAL_DETAIL_ROWS = 1200; // email-safe
+  const MAX_ALERTS = 5000; // no time window; fetch more
+  const ALERT_STATES = ["kOpen", "kNote"];
+
+  // Email safety
+  const MAX_DETAIL_ROWS_PER_CLUSTER = 50;
+  const MAX_TOTAL_DETAIL_ROWS = 1200;
+
+  // Email subject/body control
+  const EMAIL_SUBJECT_PREFIX = "Cohesity Helios — Alerts (Unique by Code)";
+  const INCLUDE_DETAILS_IN_EMAIL = true; // false => send matrix only
 
   // ==============================
   // SYMBOLS
@@ -202,7 +220,8 @@ export default async function () {
     const map = new Map(); // code -> agg
     for (const a of alerts) {
       const code = norm(a?.alertCode);
-      if (!code) continue; // user assumption: always present; safety anyway
+      if (!code) continue;
+
       const latest = Number(a?.latestTimestampUsecs || 0);
       const first = Number(a?.firstTimestampUsecs || 0);
       const occ = Number(a?.dedupCount || 1);
@@ -218,6 +237,7 @@ export default async function () {
         });
       } else {
         prev.occurrences += occ;
+
         if (first && (!prev.firstTimestampUsecs || first < prev.firstTimestampUsecs)) {
           prev.firstTimestampUsecs = first;
         }
@@ -227,6 +247,7 @@ export default async function () {
         }
       }
     }
+
     return Array.from(map.values()).sort(
       (x, y) => Number(y.latestTimestampUsecs || 0) - Number(x.latestTimestampUsecs || 0)
     );
@@ -239,7 +260,7 @@ export default async function () {
   });
 
   // ==============================
-  // 4) Build matrix dimensions (Category→Type columns) from deduped latest rows
+  // 4) Build matrix columns: alertCategory → alertType (from deduped rows)
   // ==============================
   function catTypeKey(a) {
     return `${norm(a?.alertCategory) || "Unknown"} → ${norm(a?.alertType) || "Unknown"}`;
@@ -253,7 +274,7 @@ export default async function () {
   const columns = Array.from(colSet).sort((a, b) => a.localeCompare(b));
 
   // ==============================
-  // 5) Matrix counts: rows=clusters, cols=Category→Type, counts by severity bucket
+  // 5) Matrix: rows=clusters, cols=Category→Type, cells=C/W/I counts (unique codes)
   // ==============================
   const matrixRows = perCluster.map((c) => {
     const row = { Cluster: c.clusterName };
@@ -263,7 +284,6 @@ export default async function () {
       return row;
     }
 
-    // counts[col] = {C,W,I}
     const counts = new Map();
     for (const col of columns) counts.set(col, { C: 0, W: 0, I: 0 });
 
@@ -274,7 +294,6 @@ export default async function () {
       const b = severityBucket(a?.severity);
       const cur = counts.get(col);
       if (b === "C" || b === "W" || b === "I") cur[b] += 1;
-      // ignore Unknown for matrix (add if you want)
     }
 
     for (const col of columns) row[col] = cellText(counts.get(col));
@@ -307,6 +326,7 @@ export default async function () {
     const rows = [];
     for (let k = 0; k < take; k++) {
       if (totalDetailRows >= MAX_TOTAL_DETAIL_ROWS) break;
+
       const u = c.unique[k];
       const a = u.alert;
 
@@ -351,7 +371,9 @@ export default async function () {
     );
 
     if (totalDetailRows >= MAX_TOTAL_DETAIL_ROWS) {
-      detailParts.push(`\n${SYM_W} Detail rows capped at ${MAX_TOTAL_DETAIL_ROWS} total to keep email safe.\n`);
+      detailParts.push(
+        `\n${SYM_W} Detail rows capped at ${MAX_TOTAL_DETAIL_ROWS} total to keep email safe.\n`
+      );
       break;
     }
   }
@@ -361,7 +383,7 @@ export default async function () {
   )}`;
 
   // ==============================
-  // 7) NOTE + COMBINED + RAW
+  // 7) NOTE + COMBINED
   // ==============================
   const note =
     `### Cohesity Helios — Active Alerts (Unique by alertCode)\n\n` +
@@ -370,6 +392,19 @@ export default async function () {
 
   const markdown = [note, markdownMatrix, markdownDetails].join("\n\n");
 
+  // ==============================
+  // 8) EMAIL OUTPUT (subject + body)
+  // ==============================
+  const subjectDateUtc = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
+  const subject = `${EMAIL_SUBJECT_PREFIX} — ${subjectDateUtc}`;
+
+  const emailBodyMarkdown = INCLUDE_DETAILS_IN_EMAIL
+    ? markdown
+    : [note, markdownMatrix].join("\n\n");
+
+  // ==============================
+  // 9) COMPACT RAW (downstream)
+  // ==============================
   const raw = perCluster.map((c) => ({
     ok: c.ok,
     clusterName: c.clusterName,
@@ -380,6 +415,8 @@ export default async function () {
   }));
 
   return {
+    subject,
+    emailBodyMarkdown,
     note,
     markdownMatrix,
     markdownDetails,
