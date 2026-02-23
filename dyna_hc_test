@@ -1,59 +1,46 @@
 import { credentialVaultClient } from "@dynatrace-sdk/client-classic-environment-v2";
 
 /**
- * Cohesity Helios — Active Alerts (Unique by alertCode, latest occurrence) — Split emails by alertTypeBucket
+ * Cohesity Helios — Active Alerts (Unique by alertCode, latest occurrence) — 4 emails (no loop)
  * GET-only
  *
- * What you asked (same style as your working script):
- * - Email bodies use MARKDOWN PIPE TABLES (no code blocks, no HTML).
- * - “Unique alerts” = dedupe by alertCode, keep ONLY the latest occurrence per cluster.
- * - Per alertTypeBucket (kHardware/kSoftware/kDataService/kMaintenance):
- *    1) SUMMARY email: Cluster on Y, alertCategory on X, cells show counts by severity (C/W/I) for unique alertCodes.
- *    2) DETAILS email: per cluster table listing the latest alert per alertCode (for that bucket).
+ * - Dedupe by alertCode (per cluster, per alertTypeBucket), keep ONLY the latest occurrence.
+ * - For each bucket (kHardware/kSoftware/kDataService/kMaintenance):
+ *    - Summary table: Cluster (Y) x alertCategory (X), cell = xC/yW/zI counts (unique alertCodes)
+ *    - Details section: per cluster table listing latest alert per alertCode
  *
- * Returns ONLY:
- *  - emails: [{ bucket, kind, subject, markdown }]
- *
- * Dynatrace Send email mappings (loop):
- * - Subject: {{ _.item.subject }}
- * - Message: {{ _.item.markdown }}
+ * Returns ONLY 8 fields:
+ *  - kHardwareSubject, kHardwareMarkdown
+ *  - kSoftwareSubject, kSoftwareMarkdown
+ *  - kDataServiceSubject, kDataServiceMarkdown
+ *  - kMaintenanceSubject, kMaintenanceMarkdown
  */
 export default async function () {
   const baseUrl = "https://helios.cohesity.com";
 
-  // ==============================
-  // AUTH (vault id)
-  // ==============================
+  // AUTH
   const vaultId = "credentials_vault-312312";
   const d2 = await credentialVaultClient.getCredentialsDetails({ id: vaultId });
   const apiKey = (d2?.token || d2?.password || "").trim();
   if (!apiKey) throw new Error("No Helios API key available (empty token/password).");
 
-  // ==============================
   // SETTINGS
-  // ==============================
   const CONCURRENCY = 8;
-  const MAX_ALERTS = 5000; // no time filter; increase if needed
+  const MAX_ALERTS = 5000;
   const ALERT_STATES = ["kOpen", "kNote"];
+  const BUCKETS = ["kHardware", "kSoftware", "kDataService", "kMaintenance"];
 
-  const TYPE_BUCKETS = ["kHardware", "kSoftware", "kDataService", "kMaintenance"];
-  const EMAIL_PREFIX = "Cohesity Helios — Active Alerts (Unique)";
+  // email safety
+  const MAX_DETAIL_ROWS_PER_CLUSTER = 35;
+  const MAX_TOTAL_DETAIL_ROWS_PER_BUCKET = 1200;
 
-  // keep email safe
-  const MAX_DETAIL_ROWS_PER_CLUSTER = 60;
-  const MAX_TOTAL_DETAIL_ROWS_PER_BUCKET = 1600;
-
-  // ==============================
   // SYMBOLS
-  // ==============================
   const SYM_OK = "✅";
   const SYM_C = "⛔";
   const SYM_W = "⚠️";
   const SYM_I = "ℹ️";
 
-  // ==============================
   // HELPERS
-  // ==============================
   const norm = (v) => (v === null || v === undefined ? "" : String(v).trim());
   const toArray = (v) => (!v ? [] : Array.isArray(v) ? v : [v]);
   const safeCell = (v) => (v === null || v === undefined ? "" : String(v).replace(/\|/g, " "));
@@ -73,22 +60,16 @@ export default async function () {
   function usecsToUtc(usecs) {
     const u = Number(usecs || 0);
     if (!u) return "";
-    const d = new Date(Math.floor(u / 1000)); // usecs -> ms
-    const iso = d.toISOString(); // ...Z
-    return iso.replace("T", " ").replace(".000Z", "Z");
+    const d = new Date(Math.floor(u / 1000));
+    return d.toISOString().replace("T", " ").replace(".000Z", "Z");
   }
 
   async function getJson(url, headers) {
     const resp = await fetch(url, { method: "GET", headers });
     if (!resp.ok) {
       let txt = "";
-      try {
-        txt = await resp.text();
-      } catch (_) {}
-      const e = new Error(`GET ${url} -> HTTP ${resp.status} ${txt}`);
-      e.status = resp.status;
-      e.body = txt;
-      throw e;
+      try { txt = await resp.text(); } catch (_) {}
+      throw new Error(`GET ${url} -> HTTP ${resp.status} ${txt}`);
     }
     return resp.json();
   }
@@ -157,24 +138,41 @@ export default async function () {
     return `${C}C/${W}W/${I}I`;
   }
 
-  // ==============================
-  // COMMON HEADERS
-  // ==============================
-  const commonHeaders = { accept: "application/json", apiKey };
+  // Dedupe: latest per alertCode (sum dedupCount across occurrences)
+  function dedupeLatestByAlertCode(alerts) {
+    const m = new Map(); // code -> { latestUsecs, occurrences, alert }
+    for (const a of alerts) {
+      const code = norm(a?.alertCode);
+      if (!code) continue;
+      const latest = Number(a?.latestTimestampUsecs || 0);
+      const occ = Number(a?.dedupCount || 1);
+
+      const prev = m.get(code);
+      if (!prev) m.set(code, { alertCode: code, latestUsecs: latest, occurrences: occ, alert: a });
+      else {
+        prev.occurrences += occ;
+        if (latest >= Number(prev.latestUsecs || 0)) {
+          prev.latestUsecs = latest;
+          prev.alert = a;
+        }
+      }
+    }
+    return Array.from(m.values()).sort((x, y) => Number(y.latestUsecs || 0) - Number(x.latestUsecs || 0));
+  }
 
   // ==============================
-  // 1) CLUSTERS
+  // FETCH CLUSTERS
   // ==============================
+  const commonHeaders = { accept: "application/json", apiKey };
   const clu = await getJson(`${baseUrl}/v2/mcm/cluster-mgmt/info`, commonHeaders);
   const clusters = toArray(clu?.cohesityClusters)
     .map((c) => ({ clusterName: norm(c?.clusterName), clusterId: norm(c?.clusterId) }))
     .filter((c) => c.clusterName && c.clusterId)
     .sort((a, b) => a.clusterName.localeCompare(b.clusterName));
-
   if (!clusters.length) throw new Error("No clusters returned from /v2/mcm/cluster-mgmt/info");
 
   // ==============================
-  // 2) PER-CLUSTER /v2/mcm/alerts (NO time filter)
+  // FETCH ALERTS (NO time filter)
   // ==============================
   async function fetchAlertsForCluster(clusterId) {
     const headers = { ...commonHeaders, accessClusterId: String(clusterId) };
@@ -182,8 +180,7 @@ export default async function () {
     params.set("maxAlerts", String(MAX_ALERTS));
     params.set("alertStateList", ALERT_STATES.join(","));
     const url = `${baseUrl}/v2/mcm/alerts?${params.toString()}`;
-    const data = await getJson(url, headers);
-    return extractAlerts(data);
+    return extractAlerts(await getJson(url, headers));
   }
 
   const perCluster = await poolMap(
@@ -199,88 +196,64 @@ export default async function () {
     CONCURRENCY
   );
 
-  // ==============================
-  // 3) DEDUPE: latest per alertCode (per cluster, per bucket)
-  // ==============================
-  function dedupeLatestByAlertCode(alerts) {
-    // returns array of { alertCode, alert, occurrences }
-    const m = new Map(); // code -> { latestUsecs, occurrences, alert }
-    for (const a of alerts) {
-      const code = norm(a?.alertCode);
-      if (!code) continue;
-      const latest = Number(a?.latestTimestampUsecs || 0);
-      const occ = Number(a?.dedupCount || 1);
-
-      const prev = m.get(code);
-      if (!prev) {
-        m.set(code, { alertCode: code, latestUsecs: latest, occurrences: occ, alert: a });
-      } else {
-        prev.occurrences += occ;
-        if (latest >= Number(prev.latestUsecs || 0)) {
-          prev.latestUsecs = latest;
-          prev.alert = a;
-        }
-      }
-    }
-    return Array.from(m.values()).sort((x, y) => Number(y.latestUsecs || 0) - Number(x.latestUsecs || 0));
-  }
-
-  // Build per cluster -> per bucket -> deduped list; also gather categories per bucket
-  const perClusterBucketMap = new Map(); // clusterName -> { ok, error?, buckets: Map(bucket -> deduped[]) }
-  const categoriesByBucket = new Map(); // bucket -> Set(category)
-  for (const b of TYPE_BUCKETS) categoriesByBucket.set(b, new Set());
+  // Build: per cluster -> per bucket -> deduped list; categories per bucket
+  const perClusterBucket = new Map(); // clusterName -> { ok, error?, buckets: Map(bucket->deduped[]) }
+  const categoriesByBucket = new Map();
+  for (const b of BUCKETS) categoriesByBucket.set(b, new Set());
 
   for (const c of perCluster) {
     const buckets = new Map();
-    for (const b of TYPE_BUCKETS) buckets.set(b, []);
+    for (const b of BUCKETS) buckets.set(b, []);
 
     if (!c.ok) {
-      perClusterBucketMap.set(c.clusterName, { ok: false, error: c.error, buckets });
+      perClusterBucket.set(c.clusterName, { ok: false, error: c.error, buckets });
       continue;
     }
 
-    // group raw alerts by bucket
     const grouped = new Map();
     for (const a of c.alerts) {
       const b = bucketOf(a);
-      if (!TYPE_BUCKETS.includes(b)) continue;
+      if (!BUCKETS.includes(b)) continue;
       if (!grouped.has(b)) grouped.set(b, []);
       grouped.get(b).push(a);
     }
 
-    for (const b of TYPE_BUCKETS) {
+    for (const b of BUCKETS) {
       const deduped = dedupeLatestByAlertCode(grouped.get(b) || []);
       buckets.set(b, deduped);
-      const catSet = categoriesByBucket.get(b);
-      for (const u of deduped) catSet.add(categoryOf(u.alert));
+      const s = categoriesByBucket.get(b);
+      for (const u of deduped) s.add(categoryOf(u.alert));
     }
 
-    perClusterBucketMap.set(c.clusterName, { ok: true, buckets });
+    perClusterBucket.set(c.clusterName, { ok: true, buckets });
   }
 
   // ==============================
-  // 4) BUILD EMAILS (same style: markdown tables)
+  // RENDER ONE BUCKET (summary + details)
   // ==============================
-  const utcDate = new Date().toISOString().slice(0, 10);
-  const emails = [];
-
-  for (const bucket of TYPE_BUCKETS) {
+  function renderBucket(bucket) {
     const categories = Array.from(categoriesByBucket.get(bucket) || new Set()).sort((a, b) => a.localeCompare(b));
 
-    // ---------- SUMMARY (matrix): X=category, Y=cluster ----------
+    const headerNote =
+      `### Cohesity Helios — Active Alerts (Unique by alertCode) — ${bucket}\n\n` +
+      `**States:** ${ALERT_STATES.join(", ")} | **MaxAlerts/cluster:** ${MAX_ALERTS} | **Window:** not filtered\n` +
+      `**Unique logic:** latest per **alertCode** (per cluster, per ${bucket}) | **Cell:** xC/yW/zI (unique alertCodes)\n\n` +
+      `**Legend:** ✅ none | ⛔ Critical | ⚠️ Warning | ℹ️ Info | ⚠️NO_DATA unreachable\n`;
+
+    // SUMMARY: Cluster x Category
     const summaryRows = [];
     for (const cl of clusters) {
-      const entry = perClusterBucketMap.get(cl.clusterName);
+      const entry = perClusterBucket.get(cl.clusterName);
+      const r = { Cluster: cl.clusterName };
 
       if (!entry || !entry.ok) {
-        const r = { Cluster: cl.clusterName };
         for (const cat of categories) r[cat] = `${SYM_W}NO_DATA`;
         summaryRows.push(r);
         continue;
       }
 
       const deduped = entry.buckets.get(bucket) || [];
-      const byCat = new Map(); // cat -> {C,W,I}
+      const byCat = new Map();
       for (const cat of categories) byCat.set(cat, { C: 0, W: 0, I: 0 });
 
       for (const u of deduped) {
@@ -291,7 +264,6 @@ export default async function () {
         if (sev === "C" || sev === "W" || sev === "I") byCat.get(cat)[sev] += 1;
       }
 
-      const r = { Cluster: cl.clusterName };
       for (const cat of categories) {
         const cwc = byCat.get(cat) || { C: 0, W: 0, I: 0 };
         r[cat] = cellCWI(cwc.C, cwc.W, cwc.I);
@@ -299,29 +271,18 @@ export default async function () {
       summaryRows.push(r);
     }
 
-    const summaryNote =
-      `### ${EMAIL_PREFIX} — ${bucket}\n\n` +
-      `**States:** ${ALERT_STATES.join(", ")} | **MaxAlerts/cluster:** ${MAX_ALERTS} | **Window:** not filtered\n` +
-      `**Unique logic:** latest per **alertCode** (per cluster) | **Matrix:** X=alertCategory, Y=cluster | **Cell:** xC/yW/zI (unique alertCodes)\n\n` +
-      `**Legend:** ✅ none | ⛔ Critical | ⚠️ Warning | ℹ️ Info | ⚠️NO_DATA unreachable\n`;
-
-    const markdownSummary =
-      `**Summary Matrix (Cluster × alertCategory) — ${bucket}**\n` +
+    const summary =
+      `**Summary (Cluster × alertCategory)**\n` +
       mdTable(["Cluster", ...categories], summaryRows);
 
-    const summarySubject = `${EMAIL_PREFIX} — ${bucket} — SUMMARY — ${utcDate}`;
-    const summaryMarkdown = [summaryNote, markdownSummary].join("\n\n");
-
-    emails.push({ bucket, kind: "summary", subject: summarySubject, markdown: summaryMarkdown });
-
-    // ---------- DETAILS: per cluster (latest per alertCode) ----------
+    // DETAILS: per cluster table
     const detailParts = [];
     let totalDetailRows = 0;
 
     for (let i = 0; i < clusters.length; i++) {
       const cl = clusters[i];
       const n = i + 1;
-      const entry = perClusterBucketMap.get(cl.clusterName);
+      const entry = perClusterBucket.get(cl.clusterName);
 
       if (!entry || !entry.ok) {
         detailParts.push(
@@ -354,17 +315,13 @@ export default async function () {
           occurrences: String(u.occurrences || 0),
           props: cap(summarizeProps(a?.propertyList), 180),
         });
-
         totalDetailRows++;
       }
 
       detailParts.push(
         `**${n}. ${cl.clusterName}**\n\n` +
-          mdTable(
-            ["Sev", "alertCategory", "alertCode", "alertState", "latestSeenUtc", "occurrences", "props"],
-            rows
-          ) +
-          "\n"
+          mdTable(["Sev", "alertCategory", "alertCode", "alertState", "latestSeenUtc", "occurrences", "props"], rows) +
+          "\n`
       );
 
       if (totalDetailRows >= MAX_TOTAL_DETAIL_ROWS_PER_BUCKET) {
@@ -373,16 +330,32 @@ export default async function () {
       }
     }
 
-    const detailsNote =
-      `### ${EMAIL_PREFIX} — ${bucket} (Details)\n\n` +
-      `**States:** ${ALERT_STATES.join(", ")} | **MaxAlerts/cluster:** ${MAX_ALERTS} | **Window:** not filtered\n` +
-      `**Unique logic:** latest per **alertCode** (per cluster)\n\n`;
+    const details = `**Details (latest per alertCode)**\n\n${detailParts.join("\n")}`;
 
-    const detailsSubject = `${EMAIL_PREFIX} — ${bucket} — DETAILS — ${utcDate}`;
-    const detailsMarkdown = [detailsNote, `**Latest alert per alertCode — ${bucket}**\n\n${detailParts.join("\n")}`].join("\n");
-
-    emails.push({ bucket, kind: "details", subject: detailsSubject, markdown: detailsMarkdown });
+    return [headerNote, summary, details].join("\n\n");
   }
 
-  return { emails };
+  // ==============================
+  // RETURN 4 EMAIL BODIES
+  // ==============================
+  const utcDate = new Date().toISOString().slice(0, 10);
+
+  const kHardwareSubject = `Cohesity Helios — Active Alerts (Unique) — kHardware — ${utcDate}`;
+  const kSoftwareSubject = `Cohesity Helios — Active Alerts (Unique) — kSoftware — ${utcDate}`;
+  const kDataServiceSubject = `Cohesity Helios — Active Alerts (Unique) — kDataService — ${utcDate}`;
+  const kMaintenanceSubject = `Cohesity Helios — Active Alerts (Unique) — kMaintenance — ${utcDate}`;
+
+  return {
+    kHardwareSubject,
+    kHardwareMarkdown: renderBucket("kHardware"),
+
+    kSoftwareSubject,
+    kSoftwareMarkdown: renderBucket("kSoftware"),
+
+    kDataServiceSubject,
+    kDataServiceMarkdown: renderBucket("kDataService"),
+
+    kMaintenanceSubject,
+    kMaintenanceMarkdown: renderBucket("kMaintenance"),
+  };
 }
