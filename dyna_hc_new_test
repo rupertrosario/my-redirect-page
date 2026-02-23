@@ -4,18 +4,12 @@ import { credentialVaultClient } from "@dynatrace-sdk/client-classic-environment
  * Cohesity Helios — Active Alerts (Latest per alertCode) → Split by alertTypeBucket → 2 Emails per Bucket
  * GET-only
  *
- * Fetch:
- *  - GET /v2/mcm/cluster-mgmt/info
- *  - GET /v2/mcm/alerts (accessClusterId header) with alertStateList=kOpen,kNote, no time filter
+ * Returns BOTH:
+ *  - emails:        Array<object>   (normal)
+ *  - emailsJson:    string          (JSON string for Dynatrace Loop list fields that "expect a string")
  *
- * Dedupe:
- *  - per cluster, per bucket: keep ONLY latest row per alertCode (max latestTimestampUsecs)
- *  - occurrences = sum(dedupCount||1) across all rows with same alertCode (shown in details)
- *
- * Emails (returned as emails[]; workflow sends each):
- *  - For each alertTypeBucket in [kHardware,kSoftware,kDataService,kMaintenance]:
- *      1) SUMMARY email: Matrix (X=alertCategory, Y=Cluster, cell=C/W/I unique codes)
- *      2) DETAILS email: Per-cluster table of latest alert per code (all clusters, capped)
+ * Dynatrace Loop task List (recommended):
+ *  - use output.emailsJson  (string)  OR  toJson(output.emails)
  */
 export default async function () {
   const baseUrl = "https://helios.cohesity.com";
@@ -32,13 +26,10 @@ export default async function () {
   // SETTINGS
   // ==============================
   const CONCURRENCY = 8;
-  const MAX_ALERTS = 5000; // no time filter; increase if needed
+  const MAX_ALERTS = 5000;
   const ALERT_STATES = ["kOpen", "kNote"];
 
-  // Split emails by these buckets (type)
   const TYPE_BUCKETS = ["kHardware", "kSoftware", "kDataService", "kMaintenance"];
-
-  // Email subject prefix
   const EMAIL_PREFIX = "Cohesity Helios — Active Alerts";
 
   // Email safety
@@ -154,13 +145,8 @@ export default async function () {
   function bucketOf(a) {
     return norm(a?.alertTypeBucket) || "Unknown";
   }
-
   function categoryOf(a) {
     return norm(a?.alertCategory) || "Unknown";
-  }
-
-  function catKey(a) {
-    return categoryOf(a); // columns are categories (per your ask)
   }
 
   // ==============================
@@ -215,10 +201,10 @@ export default async function () {
   // 3) DEDUPE helper (latest per alertCode), with occurrences sum
   // ==============================
   function dedupeLatestByCodeWithOcc(alerts) {
-    const map = new Map(); // alertCode -> { latestUsecs, occ, alert }
+    const map = new Map(); // alertCode -> { latestUsecs, occ, firstUsecs, alert }
     for (const a of alerts) {
       const code = norm(a?.alertCode);
-      if (!code) continue; // you said all have code; safety only
+      if (!code) continue;
 
       const latest = Number(a?.latestTimestampUsecs || 0);
       const first = Number(a?.firstTimestampUsecs || 0);
@@ -250,13 +236,10 @@ export default async function () {
   }
 
   // ==============================
-  // 4) Split by bucket, per cluster
-  // perClusterBuckets[clusterName][bucket] = deduped list
-  // also build category universe per bucket
+  // 4) Split by bucket per cluster, collect categories per bucket
   // ==============================
   const perClusterBuckets = new Map(); // clusterName -> { ok, clusterId, error?, buckets: Map(bucket->deduped[]) }
   const categoriesByBucket = new Map(); // bucket -> Set(category)
-
   for (const b of TYPE_BUCKETS) categoriesByBucket.set(b, new Set());
 
   for (const c of perClusterRaw) {
@@ -264,20 +247,14 @@ export default async function () {
     for (const b of TYPE_BUCKETS) bucketMap.set(b, []);
 
     if (!c.ok) {
-      perClusterBuckets.set(c.clusterName, {
-        ok: false,
-        clusterId: c.clusterId,
-        error: c.error,
-        buckets: bucketMap,
-      });
+      perClusterBuckets.set(c.clusterName, { ok: false, clusterId: c.clusterId, error: c.error, buckets: bucketMap });
       continue;
     }
 
-    // group raw alerts by bucket, then dedupe within each bucket
     const grouped = new Map(); // bucket -> alerts[]
     for (const a of c.alerts) {
       const b = bucketOf(a);
-      if (!TYPE_BUCKETS.includes(b)) continue; // ignore unknown buckets unless you want a 5th email
+      if (!TYPE_BUCKETS.includes(b)) continue;
       if (!grouped.has(b)) grouped.set(b, []);
       grouped.get(b).push(a);
     }
@@ -285,17 +262,11 @@ export default async function () {
     for (const b of TYPE_BUCKETS) {
       const deduped = dedupeLatestByCodeWithOcc(grouped.get(b) || []);
       bucketMap.set(b, deduped);
-
-      // collect categories for matrix columns
       const catSet = categoriesByBucket.get(b);
-      for (const u of deduped) catSet.add(catKey(u.alert));
+      for (const u of deduped) catSet.add(categoryOf(u.alert));
     }
 
-    perClusterBuckets.set(c.clusterName, {
-      ok: true,
-      clusterId: c.clusterId,
-      buckets: bucketMap,
-    });
+    perClusterBuckets.set(c.clusterName, { ok: true, clusterId: c.clusterId, buckets: bucketMap });
   }
 
   // ==============================
@@ -305,11 +276,9 @@ export default async function () {
   const emails = [];
 
   for (const bucket of TYPE_BUCKETS) {
-    const categories = Array.from(categoriesByBucket.get(bucket) || new Set()).sort((a, b) =>
-      a.localeCompare(b)
-    );
+    const categories = Array.from(categoriesByBucket.get(bucket) || new Set()).sort((a, b) => a.localeCompare(b));
 
-    // ---------- SUMMARY MATRIX (X=category, Y=cluster) ----------
+    // SUMMARY MATRIX: X=category, Y=cluster
     const summaryHeaders = ["Cluster", ...categories];
     const summaryRows = [];
 
@@ -324,13 +293,12 @@ export default async function () {
       }
 
       const deduped = entry.buckets.get(bucket) || [];
-      // countsByCategory[cat] = {C,W,I}
       const countsByCategory = new Map();
       for (const cat of categories) countsByCategory.set(cat, { C: 0, W: 0, I: 0 });
 
       for (const u of deduped) {
         const a = u.alert;
-        const cat = catKey(a);
+        const cat = categoryOf(a);
         if (!countsByCategory.has(cat)) countsByCategory.set(cat, { C: 0, W: 0, I: 0 });
         const sev = severityBucket(a?.severity);
         const cur = countsByCategory.get(cat);
@@ -348,20 +316,14 @@ export default async function () {
       `**Matrix:** X=alertCategory | Y=Cluster | Cell=C/W/I unique alertCodes\n\n` +
       `**Legend:** ${SYM_OK} none | ${SYM_C} Critical | ${SYM_W} Warning | ${SYM_I} Info | ${SYM_W}NO_DATA cluster unreachable\n`;
 
-    const markdownMatrix =
-      `**Summary Matrix (${bucket})**\n\n` + mdTable(summaryHeaders, summaryRows);
+    const markdownMatrix = `**Summary Matrix (${bucket})**\n\n` + mdTable(summaryHeaders, summaryRows);
 
     const summarySubject = `${EMAIL_PREFIX} — ${bucket} — SUMMARY — ${utcDate}`;
     const summaryBody = [summaryNote, markdownMatrix].join("\n\n");
 
-    emails.push({
-      bucket,
-      kind: "summary",
-      subject: summarySubject,
-      emailBodyMarkdown: summaryBody,
-    });
+    emails.push({ bucket, kind: "summary", subject: summarySubject, emailBodyMarkdown: summaryBody });
 
-    // ---------- DETAILS (per cluster) ----------
+    // DETAILS: per cluster
     const detailParts = [];
     let totalRows = 0;
 
@@ -383,6 +345,7 @@ export default async function () {
 
       const take = Math.min(MAX_DETAIL_ROWS_PER_CLUSTER, deduped.length);
       const rows = [];
+
       for (let i = 0; i < take; i++) {
         if (totalRows >= MAX_TOTAL_DETAIL_ROWS_PER_BUCKET) break;
 
@@ -405,17 +368,12 @@ export default async function () {
 
       detailParts.push(
         `${title}\n\n` +
-          mdTable(
-            ["Sev", "alertCategory", "alertCode", "alertState", "latestSeenUtc", "occurrences", "props"],
-            rows
-          ) +
+          mdTable(["Sev", "alertCategory", "alertCode", "alertState", "latestSeenUtc", "occurrences", "props"], rows) +
           "\n"
       );
 
       if (totalRows >= MAX_TOTAL_DETAIL_ROWS_PER_BUCKET) {
-        detailParts.push(
-          `\n${SYM_W} Detail rows capped at ${MAX_TOTAL_DETAIL_ROWS_PER_BUCKET} for ${bucket} to keep email safe.\n`
-        );
+        detailParts.push(`\n${SYM_W} Detail rows capped at ${MAX_TOTAL_DETAIL_ROWS_PER_BUCKET} for ${bucket}.\n`);
         break;
       }
     }
@@ -428,17 +386,14 @@ export default async function () {
     const detailsSubject = `${EMAIL_PREFIX} — ${bucket} — DETAILS — ${utcDate}`;
     const detailsBody = [detailsNote, ...detailParts].join("\n");
 
-    emails.push({
-      bucket,
-      kind: "details",
-      subject: detailsSubject,
-      emailBodyMarkdown: detailsBody,
-    });
+    emails.push({ bucket, kind: "details", subject: detailsSubject, emailBodyMarkdown: detailsBody });
   }
 
   // ==============================
-  // 6) Return for workflow
+  // 6) Return for workflow (emailsJson helps when Loop List requires string)
   // ==============================
+  const emailsJson = JSON.stringify(emails);
+
   const raw = perClusterRaw.map((c) => ({
     ok: c.ok,
     clusterName: c.clusterName,
@@ -447,8 +402,17 @@ export default async function () {
     error: c.ok ? null : c.error,
   }));
 
+  // Optional: quick debug fields (helpful while wiring loop)
+  const debug = {
+    emailsCount: emails.length,
+    firstSubject: emails[0]?.subject || "",
+    firstBodyPreview: (emails[0]?.emailBodyMarkdown || "").slice(0, 180),
+  };
+
   return {
-    emails, // 8 items (2 per bucket × 4 buckets)
+    emails,      // array (normal)
+    emailsJson,  // string (for Loop list fields that expect a string)
+    debug,
     raw,
   };
 }
