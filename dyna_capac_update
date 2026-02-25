@@ -1,0 +1,211 @@
+// Cohesity Helios — Capacity + Garbage + Version + Location + Node Count
+// GET-only, no metrics writeback
+import { credentialVaultClient } from "@dynatrace-sdk/client-classic-environment-v2";
+
+export default async function () {
+  const baseUrl = "https://helios.cohesity.com";
+
+  // ===== Units (DECIMAL) =====
+  // GB = 1e9 bytes,  TB = 1e12 bytes
+  const oneGB = 1e9;
+  const oneTB = 1e12;
+
+  // ===== Auth (Vault name -> Vault id -> manual fallback) =====
+  const vaultName = "Cohesity_API_Key";
+  const vaultId = "CREDENTIALS_VAULT-7F2FF2BB6BCD9B63";
+
+  let apiKey = null;
+  let authMode = "vault-name";
+
+  async function getKeyByName(name) {
+    const all = await credentialVaultClient.getCredentials();
+    const found = all.credentials.find((c) => c.name === name);
+    if (!found) return null;
+    const detail = await credentialVaultClient.getCredentialsDetails({ id: found.id });
+    console.log(`✓ loaded Helios key from vault (name): ${found.name}`);
+    return detail?.token || null;
+  }
+
+  try {
+    apiKey = await getKeyByName(vaultName);
+    if (!apiKey) throw new Error("not-found");
+  } catch {
+    try {
+      const detail = await credentialVaultClient.getCredentialsDetails({ id: vaultId });
+      apiKey = detail?.token || null;
+      authMode = "vault-id";
+      console.log(`✓ loaded Helios key from vault (id): ${detail?.name || vaultId}`);
+    } catch {
+      authMode = "manual";
+      apiKey = "PASTE_YOUR_API_KEY_HERE";
+      console.log("⚠ using manual Helios API key (fallback)");
+    }
+  }
+
+  const headers = { accept: "application/json", apiKey };
+
+  // ===== small helpers =====
+  const fmt = (v, digits = 2) => (v === null || v === undefined || Number.isNaN(v) ? "-" : (+v).toFixed(digits));
+  const fmtPct = (v) => (v === null || v === undefined || Number.isNaN(v) ? "-" : `${(+v).toFixed(2)}%`);
+  const badge = (p) => (p === null || p === undefined || Number.isNaN(p) ? "⚠️" : p >= 80 ? "🔴" : p > 70 ? "🟡" : "🟢");
+
+  async function safeText(resp) {
+    try { return await resp.text(); } catch { return ""; }
+  }
+  async function safeJson(resp) {
+    try { return await resp.json(); } catch { return null; }
+  }
+
+  // ===== cluster list =====
+  const listResp = await fetch(`${baseUrl}/v2/mcm/cluster-mgmt/info`, { method: "GET", headers });
+  if (listResp.status !== 200) {
+    const txt = await safeText(listResp);
+    throw new Error(`cluster list failed (${listResp.status}) ${txt}`);
+  }
+
+  const listJson = await safeJson(listResp);
+  const clusters = listJson?.cohesityClusters || [];
+  if (!clusters.length) {
+    const msg = "📊 **Cohesity Cluster Capacity Report**\n\n_No clusters returned._";
+    return { clusters: [], report: msg, authMode };
+  }
+
+  console.log(`found ${clusters.length} clusters`);
+
+  // ===== Garbage helper (returns bytes; 0 if all variants fail) =====
+  async function getGarbageLatest(clusterName, clusterId, h) {
+    const safeName = (clusterName || "").replace(/\s+/g, " ").trim();
+    const variants = [
+      `${safeName}+(ID+${clusterId})`,   // original with plus encoding (first try)
+      `${safeName}(ID ${clusterId})`,    // no plus
+      `${safeName} (ID ${clusterId})`,   // space before (
+      `${clusterName}(ID ${clusterId})`  // full name as-is
+    ];
+
+    for (const v of variants) {
+      const encId = encodeURIComponent(v);
+      const url =
+        `${baseUrl}/irisservices/api/v1/public/statistics/timeSeriesStats` +
+        `?schemaName=ApolloV2ClusterStats` +
+        `&metricName=EstimatedGarbageBytes` +
+        `&startTimeMsecs=2` +
+        `&entityId=${encId}` +
+        `&rollupFunction=latest` +
+        `&rollupIntervalSecs=30` +
+        `&metricUnitType=0` +
+        `&range=day`;
+
+      const resp = await fetch(url, { method: "GET", headers: h });
+      if (resp.status !== 200) {
+        const t = await safeText(resp);
+        console.log(`  garbage variant failed [${clusterName}] HTTP ${resp.status} ${t}`);
+        continue;
+      }
+
+      const js = await safeJson(resp);
+      const vec = js?.dataPointVec || [];
+      if (!vec.length) continue;
+
+      const last = vec[vec.length - 1];
+      const bytes = last?.data?.int64Value ?? 0;
+      return bytes;
+    }
+    return 0;
+  }
+
+  const results = [];
+
+  // ===== per-cluster stats =====
+  await Promise.all(
+    clusters.map(async ({ clusterName, clusterId, currentVersion, location, numberOfNodes }) => {
+      const h = { ...headers, accessClusterId: String(clusterId) };
+
+      // capacity (storage)
+      const capUrl = `${baseUrl}/irisservices/api/v1/public/stats/storage`;
+      const capResp = await fetch(capUrl, { method: "GET", headers: h });
+
+      if (capResp.status !== 200) {
+        const t = await safeText(capResp);
+        console.log(`capacity failed for ${clusterName} (${capResp.status}) ${t}`);
+        results.push({
+          clusterName,
+          location: location || "Unknown",
+          version: currentVersion || "Unknown",
+          numberOfNodes: numberOfNodes || 0,
+          totalTB: null,
+          usedTB: null,
+          availTB: null,
+          consumedPercent: null,
+          garbageGB: null,
+          garbageTB: null
+        });
+        return;
+      }
+
+      const s = await safeJson(capResp);
+      const totalBytes = s?.totalCapacityBytes ?? 0;
+      const usedBytes = s?.localUsageBytes ?? 0;
+      const availBytes = s?.localAvailableBytes ?? 0;
+
+      // ===== Capacity in TB (DECIMAL) =====
+      const totalTB = +(totalBytes / oneTB).toFixed(2);
+      const usedTB = +(usedBytes / oneTB).toFixed(2);
+      const availTB = +(availBytes / oneTB).toFixed(2);
+      const percent = +(totalBytes ? ((usedBytes / totalBytes) * 100).toFixed(2) : (0).toFixed(2));
+
+      // garbage (bytes -> GB/TB DECIMAL)
+      const garbageBytes = await getGarbageLatest(clusterName, clusterId, h);
+      const garbageGB = +(garbageBytes / oneGB).toFixed(2);
+      const garbageTB = +(garbageBytes / oneTB).toFixed(3);
+
+      results.push({
+        clusterName,
+        location: location || "Unknown",
+        version: currentVersion || "Unknown",
+        numberOfNodes: numberOfNodes || 0,
+        totalTB,
+        usedTB,
+        availTB,
+        consumedPercent: percent,
+        garbageGB,
+        garbageTB
+      });
+
+      console.log(`✓ ${clusterName} | v${currentVersion || "?"} | nodes:${numberOfNodes || 0} | ${usedTB}/${totalTB} TB | ${percent}%`);
+    })
+  );
+
+  // ===== build markdown report (TB/GB everywhere, no TiB/GiB) =====
+  const rows = results.sort((a, b) => a.clusterName.localeCompare(b.clusterName));
+
+  const header = [
+    "📊 **Cohesity Cluster Capacity Report**",
+    "",
+    "| Cluster | Location | Version | Nodes | Used TB | Avail TB | % Used | Status | Garbage GB | Garbage TB |",
+    "|---|---|---|---:|---:|---:|---:|:---:|---:|---:|"
+  ].join("\n");
+
+  const body = rows
+    .map((c) =>
+      `| ${c.clusterName} | ${c.location} | ${c.version} | ${c.numberOfNodes} | ` +
+      `${fmt(c.usedTB, 2)} | ${fmt(c.availTB, 2)} | ${fmtPct(c.consumedPercent)} | ${badge(c.consumedPercent)} | ` +
+      `${fmt(c.garbageGB, 2)} | ${fmt(c.garbageTB, 3)} |`
+    )
+    .join("\n");
+
+  const footer = [
+    "",
+    `**Total clusters in report: ${rows.length}**`,
+    "",
+    "🟢 = Healthy (≤ 70%)",
+    "🟡 = Warning (70–79%)",
+    "🔴 = Critical (≥ 80%)",
+    "⚠️ = NO_DATA",
+    "",
+    `// Auth mode used: **${authMode}**`
+  ].join("\n");
+
+  const report = [header, body, footer].join("\n");
+
+  return { clusters: rows, report, authMode };
+}
