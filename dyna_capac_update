@@ -1,12 +1,16 @@
 // Cohesity Helios — Capacity + Garbage + Version + Location + Node Count
-// GET-only, no metrics writeback
+// GET-only. Decimal units: GB=1e9, TB=1e12.
+// Behavior:
+// - Cluster down / non-200 on capacity: SKIP cluster (no row)
+// - Garbage entityId variants: silence expected HTTP 400 (kInvalidInput/entity does not exist)
+// - If all garbage variants fail: garbageBytes=0 (shows 0.00)
+
 import { credentialVaultClient } from "@dynatrace-sdk/client-classic-environment-v2";
 
 export default async function () {
   const baseUrl = "https://helios.cohesity.com";
 
   // ===== Units (DECIMAL) =====
-  // GB = 1e9 bytes,  TB = 1e12 bytes
   const oneGB = 1e9;
   const oneTB = 1e12;
 
@@ -44,20 +48,42 @@ export default async function () {
 
   const headers = { accept: "application/json", apiKey };
 
-  // ===== small helpers =====
-  const fmt = (v, digits = 2) => (v === null || v === undefined || Number.isNaN(v) ? "-" : (+v).toFixed(digits));
-  const fmtPct = (v) => (v === null || v === undefined || Number.isNaN(v) ? "-" : `${(+v).toFixed(2)}%`);
-  const badge = (p) => (p === null || p === undefined || Number.isNaN(p) ? "⚠️" : p >= 80 ? "🔴" : p > 70 ? "🟡" : "🟢");
+  // ===== Helpers =====
+  const fmt = (v, digits = 2) =>
+    v === null || v === undefined || Number.isNaN(v) ? "-" : (+v).toFixed(digits);
+  const fmtPct = (v) =>
+    v === null || v === undefined || Number.isNaN(v) ? "-" : `${(+v).toFixed(2)}%`;
+  const badge = (p) =>
+    p === null || p === undefined || Number.isNaN(p) ? "⚠️" : p >= 80 ? "🔴" : p > 70 ? "🟡" : "🟢";
 
   async function safeText(resp) {
-    try { return await resp.text(); } catch { return ""; }
+    try {
+      return await resp.text();
+    } catch {
+      return "";
+    }
   }
   async function safeJson(resp) {
-    try { return await resp.json(); } catch { return null; }
+    try {
+      return await resp.json();
+    } catch {
+      return null;
+    }
   }
 
-  // ===== cluster list =====
-  const listResp = await fetch(`${baseUrl}/v2/mcm/cluster-mgmt/info`, { method: "GET", headers });
+  // Prevent hangs
+  async function fetchWithTimeout(url, opts, timeoutMs = 15000) {
+    const ctrl = new AbortController();
+    const t = setTimeout(() => ctrl.abort(), timeoutMs);
+    try {
+      return await fetch(url, { ...opts, signal: ctrl.signal });
+    } finally {
+      clearTimeout(t);
+    }
+  }
+
+  // ===== Cluster list =====
+  const listResp = await fetchWithTimeout(`${baseUrl}/v2/mcm/cluster-mgmt/info`, { method: "GET", headers }, 15000);
   if (listResp.status !== 200) {
     const txt = await safeText(listResp);
     throw new Error(`cluster list failed (${listResp.status}) ${txt}`);
@@ -76,10 +102,10 @@ export default async function () {
   async function getGarbageLatest(clusterName, clusterId, h) {
     const safeName = (clusterName || "").replace(/\s+/g, " ").trim();
     const variants = [
-      `${safeName}+(ID+${clusterId})`,   // original with plus encoding (first try)
-      `${safeName}(ID ${clusterId})`,    // no plus
-      `${safeName} (ID ${clusterId})`,   // space before (
-      `${clusterName}(ID ${clusterId})`  // full name as-is
+      `${safeName}+(ID+${clusterId})`,
+      `${safeName}(ID ${clusterId})`,
+      `${safeName} (ID ${clusterId})`,
+      `${clusterName}(ID ${clusterId})`,
     ];
 
     for (const v of variants) {
@@ -95,11 +121,17 @@ export default async function () {
         `&metricUnitType=0` +
         `&range=day`;
 
-      const resp = await fetch(url, { method: "GET", headers: h });
-      if (resp.status !== 200) {
-        const t = await safeText(resp);
-        console.log(`  garbage variant failed [${clusterName}] HTTP ${resp.status} ${t}`);
+      let resp;
+      try {
+        resp = await fetchWithTimeout(url, { method: "GET", headers: h }, 15000);
+      } catch {
         continue;
+      }
+
+      if (resp.status !== 200) {
+        // Silence expected bad-entityId responses
+        if (resp.status === 400) continue; // kInvalidInput / entity does not exist
+        continue; // keep quiet for other non-200s too
       }
 
       const js = await safeJson(resp);
@@ -107,53 +139,52 @@ export default async function () {
       if (!vec.length) continue;
 
       const last = vec[vec.length - 1];
-      const bytes = last?.data?.int64Value ?? 0;
-      return bytes;
+      return last?.data?.int64Value ?? 0;
     }
+
     return 0;
   }
 
   const results = [];
 
-  // ===== per-cluster stats =====
+  // ===== Per-cluster stats =====
   await Promise.all(
     clusters.map(async ({ clusterName, clusterId, currentVersion, location, numberOfNodes }) => {
       const h = { ...headers, accessClusterId: String(clusterId) };
 
-      // capacity (storage)
+      // capacity
       const capUrl = `${baseUrl}/irisservices/api/v1/public/stats/storage`;
-      const capResp = await fetch(capUrl, { method: "GET", headers: h });
+
+      let capResp;
+      try {
+        capResp = await fetchWithTimeout(capUrl, { method: "GET", headers: h }, 15000);
+      } catch {
+        console.log(`skipping ${clusterName}: fetch error`);
+        return; // DO NOT REPORT
+      }
 
       if (capResp.status !== 200) {
-        const t = await safeText(capResp);
-        console.log(`capacity failed for ${clusterName} (${capResp.status}) ${t}`);
-        results.push({
-          clusterName,
-          location: location || "Unknown",
-          version: currentVersion || "Unknown",
-          numberOfNodes: numberOfNodes || 0,
-          totalTB: null,
-          usedTB: null,
-          availTB: null,
-          consumedPercent: null,
-          garbageGB: null,
-          garbageTB: null
-        });
-        return;
+        console.log(`skipping ${clusterName}: HTTP ${capResp.status}`);
+        return; // DO NOT REPORT
       }
 
       const s = await safeJson(capResp);
+      if (!s) {
+        console.log(`skipping ${clusterName}: invalid JSON`);
+        return; // DO NOT REPORT
+      }
+
       const totalBytes = s?.totalCapacityBytes ?? 0;
       const usedBytes = s?.localUsageBytes ?? 0;
       const availBytes = s?.localAvailableBytes ?? 0;
 
-      // ===== Capacity in TB (DECIMAL) =====
+      // Capacity in TB (DECIMAL)
       const totalTB = +(totalBytes / oneTB).toFixed(2);
       const usedTB = +(usedBytes / oneTB).toFixed(2);
       const availTB = +(availBytes / oneTB).toFixed(2);
       const percent = +(totalBytes ? ((usedBytes / totalBytes) * 100).toFixed(2) : (0).toFixed(2));
 
-      // garbage (bytes -> GB/TB DECIMAL)
+      // Garbage in GB/TB (DECIMAL)
       const garbageBytes = await getGarbageLatest(clusterName, clusterId, h);
       const garbageGB = +(garbageBytes / oneGB).toFixed(2);
       const garbageTB = +(garbageBytes / oneTB).toFixed(3);
@@ -168,28 +199,31 @@ export default async function () {
         availTB,
         consumedPercent: percent,
         garbageGB,
-        garbageTB
+        garbageTB,
       });
 
-      console.log(`✓ ${clusterName} | v${currentVersion || "?"} | nodes:${numberOfNodes || 0} | ${usedTB}/${totalTB} TB | ${percent}%`);
+      console.log(
+        `✓ ${clusterName} | v${currentVersion || "?"} | nodes:${numberOfNodes || 0} | ${usedTB}/${totalTB} TB | ${percent}%`
+      );
     })
   );
 
-  // ===== build markdown report (TB/GB everywhere, no TiB/GiB) =====
+  // ===== Markdown report =====
   const rows = results.sort((a, b) => a.clusterName.localeCompare(b.clusterName));
 
   const header = [
     "📊 **Cohesity Cluster Capacity Report**",
     "",
     "| Cluster | Location | Version | Nodes | Used TB | Avail TB | % Used | Status | Garbage GB | Garbage TB |",
-    "|---|---|---|---:|---:|---:|---:|:---:|---:|---:|"
+    "|---|---|---|---:|---:|---:|---:|:---:|---:|---:|",
   ].join("\n");
 
   const body = rows
-    .map((c) =>
-      `| ${c.clusterName} | ${c.location} | ${c.version} | ${c.numberOfNodes} | ` +
-      `${fmt(c.usedTB, 2)} | ${fmt(c.availTB, 2)} | ${fmtPct(c.consumedPercent)} | ${badge(c.consumedPercent)} | ` +
-      `${fmt(c.garbageGB, 2)} | ${fmt(c.garbageTB, 3)} |`
+    .map(
+      (c) =>
+        `| ${c.clusterName} | ${c.location} | ${c.version} | ${c.numberOfNodes} | ` +
+        `${fmt(c.usedTB, 2)} | ${fmt(c.availTB, 2)} | ${fmtPct(c.consumedPercent)} | ${badge(c.consumedPercent)} | ` +
+        `${fmt(c.garbageGB, 2)} | ${fmt(c.garbageTB, 3)} |`
     )
     .join("\n");
 
@@ -200,9 +234,8 @@ export default async function () {
     "🟢 = Healthy (≤ 70%)",
     "🟡 = Warning (70–79%)",
     "🔴 = Critical (≥ 80%)",
-    "⚠️ = NO_DATA",
     "",
-    `// Auth mode used: **${authMode}**`
+    `// Auth mode used: **${authMode}**`,
   ].join("\n");
 
   const report = [header, body, footer].join("\n");
