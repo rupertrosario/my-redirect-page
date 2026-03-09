@@ -3,6 +3,7 @@ $ErrorActionPreference = "Stop"
 # -------------------------------------------------------------
 # Config
 # -------------------------------------------------------------
+$Days = 30
 $baseMcm  = "https://helios.cohesity.com/v2/mcm"
 $baseIris = "https://helios.cohesity.com/irisservices/api/v1/public"
 
@@ -10,18 +11,32 @@ $apikeypath = "X:\PowerShell\Cohesity_API_Scripts\DO_NOT_Delete\apikey.txt"
 $apiKey = (Get-Content $apikeypath -Raw).Trim()
 
 # -------------------------------------------------------------
-# Size formatting
+# Helpers
 # -------------------------------------------------------------
 function Format-Size {
     param([long]$bytes)
-
     if ($bytes -ge 1TB) { "{0:N1} TB" -f ($bytes/1TB) }
     elseif ($bytes -ge 1GB) { "{0:N1} GB" -f ($bytes/1GB) }
     else { "{0:N1} MB" -f ($bytes/1MB) }
 }
 
+function Get-TimeMsecs {
+    param([datetime]$date)
+    $epoch = [datetime]'1970-01-01T00:00:00Z'
+    [int64]($date.ToUniversalTime() - $epoch).TotalMilliseconds
+}
+
 # -------------------------------------------------------------
-# Get clusters
+# Time window
+# -------------------------------------------------------------
+$endDate   = Get-Date
+$startDate = $endDate.AddDays(-$Days)
+
+$startMsec = Get-TimeMsecs $startDate
+$endMsec   = Get-TimeMsecs $endDate
+
+# -------------------------------------------------------------
+# Get cluster inventory
 # -------------------------------------------------------------
 $response = Invoke-WebRequest `
     -Uri "$baseMcm/cluster-mgmt/info" `
@@ -32,8 +47,8 @@ $response = Invoke-WebRequest `
 $clusters = ($response.Content | ConvertFrom-Json).cohesityClusters |
             Sort-Object clusterName
 
-$results = @()
-$unreachable = @()
+$globalResults = @()
+$unreachable   = @()
 
 # -------------------------------------------------------------
 # Process clusters
@@ -52,6 +67,7 @@ foreach ($cluster in $clusters) {
 
     try {
 
+        # Get protection jobs
         $jobsResp = Invoke-WebRequest `
             -Uri "$baseIris/protectionJobs" `
             -Headers $headers `
@@ -59,63 +75,92 @@ foreach ($cluster in $clusters) {
             -UseBasicParsing
 
         $jobs = ($jobsResp.Content | ConvertFrom-Json).jobs
-
     }
     catch {
-
         $unreachable += $clusterName
         continue
     }
 
+    $clusterResults = @()
+
     foreach ($job in $jobs) {
 
-        $jobName = $job.name
-        $env     = $job.environment
+        $entityId = $job.id
+        $jobName  = $job.name
+        $env      = $job.environment
+
+        $statsUrl =
+        "$baseIris/statistics/timeSeriesStats" +
+        "?startTimeMsecs=$startMsec" +
+        "&endTimeMsecs=$endMsec" +
+        "&entityId=$entityId" +
+        "&schemaName=BookKeeperStats" +
+        "&metricName=LogicalUsage" +
+        "&rollupIntervalSecs=86400" +
+        "&rollupFunction=latest"
 
         try {
 
             $statsResp = Invoke-WebRequest `
-                -Uri "$baseIris/stats?entityId=$($job.id)&schemaName=BookKeeperStats" `
+                -Uri $statsUrl `
                 -Headers $headers `
                 -Method Get `
                 -UseBasicParsing
 
-            $stats = ($statsResp.Content | ConvertFrom-Json).statsList.stats
-
-            if (-not $stats) { continue }
-
-            $logical = [int64]$stats.logicalUsageBytes
-            $unique  = [int64]$stats.uniquePhysicalDataBytes
-
+            $points = ($statsResp.Content | ConvertFrom-Json).dataPointVec
         }
         catch { continue }
 
-        if ($logical -eq 0 -and $unique -eq 0) { continue }
+        if (-not $points -or $points.Count -lt 2) { continue }
 
-        $results += [pscustomobject]@{
+        $startBytes = [int64]$points[0].data.int64Value
+        $endBytes   = [int64]$points[-1].data.int64Value
+        $growth     = $endBytes - $startBytes
 
+        if ($growth -le 0) { continue }
+
+        $clusterResults += [pscustomobject]@{
             Cluster     = $clusterName
             Job         = $jobName
             Environment = $env
-            Growth      = Format-Size $logical
-            UniqueData  = Format-Size $unique
+            GrowthBytes = $growth
+        }
+    }
+
+    if (-not $clusterResults) { continue }
+
+    # Top 5 growth drivers
+    $top5 = $clusterResults |
+            Sort-Object GrowthBytes -Descending |
+            Select-Object -First 5
+
+    foreach ($row in $top5) {
+
+        $globalResults += [pscustomobject]@{
+            Cluster     = $row.Cluster
+            Job         = $row.Job
+            Environment = $row.Environment
+            Growth      = Format-Size $row.GrowthBytes
         }
     }
 }
 
 # -------------------------------------------------------------
-# Show results
+# Display table
 # -------------------------------------------------------------
 Write-Host ""
-Write-Host "Top Backup Data Consumers" -ForegroundColor Cyan
+Write-Host "Top Growth Drivers (Last $Days Days)" -ForegroundColor Cyan
 
-$results |
+$globalResults |
 Sort-Object Cluster |
-Select-Object -First 50 |
-Format-Table -AutoSize
+Format-Table `
+    @{Label="Cluster";Expression={$_.Cluster};Width=20},
+    @{Label="Protection Job";Expression={$_.Job};Width=35},
+    @{Label="Env";Expression={$_.Environment};Width=10},
+    @{Label="30-Day Growth";Expression={$_.Growth};Width=15}
 
 # -------------------------------------------------------------
-# Show unreachable clusters
+# Unreachable clusters
 # -------------------------------------------------------------
 if ($unreachable.Count -gt 0) {
 
