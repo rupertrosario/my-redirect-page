@@ -1,143 +1,125 @@
-$ErrorActionPreference = 'Stop'
+$ErrorActionPreference = "Stop"
 
 # -------------------------------------------------------------
 # Config
 # -------------------------------------------------------------
-$Days = 30
 $baseMcm  = "https://helios.cohesity.com/v2/mcm"
 $baseIris = "https://helios.cohesity.com/irisservices/api/v1/public"
 
 $apikeypath = "X:\PowerShell\Cohesity_API_Scripts\DO_NOT_Delete\apikey.txt"
 $apiKey = (Get-Content $apikeypath -Raw).Trim()
 
-$headersCommon = @{
-    "apiKey" = $apiKey
-}
-
 # -------------------------------------------------------------
-# Size Formatter
+# Size formatting
 # -------------------------------------------------------------
 function Format-Size {
     param([long]$bytes)
 
-    if ($bytes -ge 1TB) { return "{0:N1} TB" -f ($bytes / 1TB) }
-    elseif ($bytes -ge 1GB) { return "{0:N1} GB" -f ($bytes / 1GB) }
-    elseif ($bytes -ge 1MB) { return "{0:N1} MB" -f ($bytes / 1MB) }
-    elseif ($bytes -ge 1KB) { return "{0:N1} KB" -f ($bytes / 1KB) }
-    else { return "$bytes B" }
+    if ($bytes -ge 1TB) { "{0:N1} TB" -f ($bytes/1TB) }
+    elseif ($bytes -ge 1GB) { "{0:N1} GB" -f ($bytes/1GB) }
+    else { "{0:N1} MB" -f ($bytes/1MB) }
 }
 
 # -------------------------------------------------------------
-# Get Clusters
+# Get clusters
 # -------------------------------------------------------------
-$clusterUrl = "$baseMcm/cluster-mgmt/info"
+$response = Invoke-WebRequest `
+    -Uri "$baseMcm/cluster-mgmt/info" `
+    -Headers @{apiKey=$apiKey} `
+    -Method Get `
+    -UseBasicParsing
 
-$response = Invoke-WebRequest -Uri $clusterUrl -Headers $headersCommon -Method Get
-$json = $response.Content | ConvertFrom-Json
-$clusters = $json.cohesityClusters | Sort-Object clusterName
+$clusters = ($response.Content | ConvertFrom-Json).cohesityClusters |
+            Sort-Object clusterName
+
+$results = @()
+$unreachable = @()
 
 # -------------------------------------------------------------
-# Final results container
+# Process clusters
 # -------------------------------------------------------------
-$globalResults = @()
-
 foreach ($cluster in $clusters) {
 
     $clusterName = $cluster.clusterName
     $clusterId   = $cluster.clusterId
 
-    Write-Host "Processing cluster $clusterName..."
+    Write-Host "Processing $clusterName..."
 
     $headers = @{
-        "apiKey" = $apiKey
-        "accessClusterId" = "$clusterId"
+        apiKey = $apiKey
+        accessClusterId = "$clusterId"
     }
-
-    $runsUrl = "$baseIris/protectionRuns?consumerType=kProtectionRuns&numRuns=200"
 
     try {
 
-        $runsResp = Invoke-WebRequest -Uri $runsUrl -Headers $headers -Method Get
-        $runsJson = $runsResp.Content | ConvertFrom-Json
-        $runs     = $runsJson.runs
+        $jobsResp = Invoke-WebRequest `
+            -Uri "$baseIris/protectionJobs" `
+            -Headers $headers `
+            -Method Get `
+            -UseBasicParsing
+
+        $jobs = ($jobsResp.Content | ConvertFrom-Json).jobs
 
     }
     catch {
-        Write-Host "Cluster $clusterName unreachable" -ForegroundColor Yellow
+
+        $unreachable += $clusterName
         continue
     }
 
-    if (-not $runs) { continue }
+    foreach ($job in $jobs) {
 
-    $clusterResults = @()
+        $jobName = $job.name
+        $env     = $job.environment
 
-    foreach ($run in $runs) {
+        try {
 
-        $jobName = $run.protectionRun.jobName
-        $env     = $run.protectionRun.environment
+            $statsResp = Invoke-WebRequest `
+                -Uri "$baseIris/stats?entityId=$($job.id)&schemaName=BookKeeperStats" `
+                -Headers $headers `
+                -Method Get `
+                -UseBasicParsing
 
-        $growth  = [int64]$run.protectionRun.stats.logicalBytesWritten
-        $unique  = [int64]$run.protectionRun.stats.uniquePhysicalDataBytes
+            $stats = ($statsResp.Content | ConvertFrom-Json).statsList.stats
 
-        if ($growth -eq 0 -and $unique -eq 0) { continue }
+            if (-not $stats) { continue }
 
-        $clusterResults += [pscustomobject]@{
+            $logical = [int64]$stats.logicalUsageBytes
+            $unique  = [int64]$stats.uniquePhysicalDataBytes
+
+        }
+        catch { continue }
+
+        if ($logical -eq 0 -and $unique -eq 0) { continue }
+
+        $results += [pscustomobject]@{
 
             Cluster     = $clusterName
             Job         = $jobName
             Environment = $env
-            GrowthBytes = $growth
-            UniqueBytes = $unique
-        }
-    }
-
-    if (-not $clusterResults) { continue }
-
-    # -------------------------------------------------------------
-    # Top 5 growth
-    # -------------------------------------------------------------
-    $topGrowth = $clusterResults |
-        Sort-Object GrowthBytes -Descending |
-        Select-Object -First 5
-
-    # -------------------------------------------------------------
-    # Top 5 unique data
-    # -------------------------------------------------------------
-    $topUnique = $clusterResults |
-        Sort-Object UniqueBytes -Descending |
-        Select-Object -First 5
-
-    # Merge and remove duplicates
-    $topCombined = $topGrowth + $topUnique |
-        Sort-Object Job -Unique
-
-    foreach ($row in $topCombined) {
-
-        $globalResults += [pscustomobject]@{
-
-            Cluster     = $row.Cluster
-            Job         = $row.Job
-            Environment = $row.Environment
-            Growth      = Format-Size $row.GrowthBytes
-            UniqueData  = Format-Size $row.UniqueBytes
+            Growth      = Format-Size $logical
+            UniqueData  = Format-Size $unique
         }
     }
 }
 
 # -------------------------------------------------------------
-# Display output
+# Show results
 # -------------------------------------------------------------
-$globalResults |
+Write-Host ""
+Write-Host "Top Backup Data Consumers" -ForegroundColor Cyan
+
+$results |
 Sort-Object Cluster |
+Select-Object -First 50 |
 Format-Table -AutoSize
 
 # -------------------------------------------------------------
-# CSV export (optional for validation)
+# Show unreachable clusters
 # -------------------------------------------------------------
-$outFile = "X:\PowerShell\Data\Cohesity\TopGrowthDrivers.csv"
+if ($unreachable.Count -gt 0) {
 
-$globalResults |
-Export-Csv $outFile -NoTypeInformation
-
-Write-Host ""
-Write-Host "Report written to $outFile" -ForegroundColor Green
+    Write-Host ""
+    Write-Host "Unreachable clusters:" -ForegroundColor Yellow
+    $unreachable
+}
