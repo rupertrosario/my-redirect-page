@@ -1,132 +1,156 @@
-param(
-    [Parameter(Mandatory=$true)]
-    [string]$ChangeID
-)
+# -------------------------------------------------------------
+# Cohesity Backup Status Validation – Multi Cluster (Helios)
+# Reads CI list from CHG CSV and appends backup status
+# -------------------------------------------------------------
 
-# =========================
-# CONFIGURATION
-# =========================
-$apiKey  = "PASTE_YOUR_HELIOS_API_KEY"
-$baseUrl = "https://helios.cohesity.com"
+$ChangeID = "CHG234234"
+$csvDirectory = "X:\PowerShell\Data\BackupValidation"
 
-$basePath = "X:\BackupValidation"
+$inputCsv  = "$csvDirectory\$ChangeID.csv"
+$outputCsv = "$csvDirectory\$ChangeID"_BackupStatus.csv
 
-$inputCsv  = Join-Path $basePath "$ChangeID.csv"
-$outputCsv = Join-Path $basePath "$ChangeID_backup_status.csv"
+# -------------------------------------------------------------
+# Load CI list
+# -------------------------------------------------------------
+if (-not (Test-Path $inputCsv)) { throw "CSV not found: $inputCsv" }
 
-$headers = @{
-    accept = "application/json"
+$ciList = Import-Csv $inputCsv
+$ciLookup = $ciList.ci_item
+
+# -------------------------------------------------------------
+# Load API key
+# -------------------------------------------------------------
+$apikeypath = "X:\PowerShell\Cohesity_API_Scripts\DO_NOT_Delete\apikey.txt"
+$apiKey = (Get-Content $apikeypath -Raw).Trim()
+
+$commonHeaders = @{
     apiKey = $apiKey
 }
 
-# =========================
-# VERIFY FILE
-# =========================
-if (!(Test-Path $inputCsv)) {
-    Write-Host "Input CSV not found: $inputCsv"
-    exit
-}
+$baseUrl = "https://helios.cohesity.com"
 
-# =========================
-# READ CSV
-# =========================
-$csv = Import-Csv $inputCsv
+# -------------------------------------------------------------
+# Get cluster inventory
+# -------------------------------------------------------------
+$url = "$baseUrl/v2/mcm/cluster-mgmt/info"
+$response = Invoke-WebRequest -Uri $url -Headers $commonHeaders -Method Get
+$clusters = ($response.Content | ConvertFrom-Json).cohesityClusters
 
-# =========================
-# GET PROTECTION RUNS
-# =========================
-$url = "$baseUrl/v2/data-protect/protection-runs"
+if (-not $clusters) { throw "No clusters returned." }
 
-$clusterReachable = $true
+# -------------------------------------------------------------
+# Lookup table
+# -------------------------------------------------------------
+$objectStatus = @{}
 
-try {
-    $response = Invoke-RestMethod -Method GET -Uri $url -Headers $headers -TimeoutSec 30
-}
-catch {
-    $clusterReachable = $false
-}
+foreach ($cluster in $clusters) {
 
-# =========================
-# IF CLUSTER NOT REACHABLE
-# =========================
-if (!$clusterReachable) {
+    $clusterName = $cluster.name
+    $clusterId   = $cluster.clusterId
 
-    $result = foreach ($row in $csv) {
-        [PSCustomObject]@{
-            ci_item       = $row.ci_item
-            BackupStatus  = "ClusterUnreachable"
-            LastCompleted = ""
-        }
+    Write-Host "`n🔹 Checking cluster: $clusterName" -ForegroundColor Cyan
+
+    $headers = @{
+        apiKey = $apiKey
+        accessClusterId = $clusterId
     }
 
-    $result | Export-Csv $outputCsv -NoTypeInformation
-    Write-Host "Cluster unreachable. Output saved to $outputCsv"
-    exit
-}
+    try {
 
-$runs = $response.runs
+        $runUrl = "$baseUrl/v2/data-protect/protection-runs"
 
-# =========================
-# BUILD LOOKUP
-# =========================
-$lookup = @{}
+        $runs = (Invoke-WebRequest -Uri $runUrl -Headers $headers -Method Get |
+            ConvertFrom-Json).runs
 
-foreach ($run in $runs) {
+    } catch {
 
-    $objectName = $run.entity.name
-    $status     = $run.backupRun.status
-    $time       = $run.startTimeUsecs
+        Write-Host "⚠️ Cluster unreachable: $clusterName"
 
-    if (!$lookup.ContainsKey($objectName)) {
+        foreach ($ci in $ciLookup) {
 
-        $lookup[$objectName] = [PSCustomObject]@{
-            Status = $status
-            Time   = $time
+            if (-not $objectStatus.ContainsKey($ci)) {
+
+                $objectStatus[$ci] = [PSCustomObject]@{
+                    Status = "ClusterUnreachable"
+                    Time   = $null
+                }
+            }
         }
+
+        continue
     }
-    else {
 
-        if ($time -gt $lookup[$objectName].Time) {
+    foreach ($run in $runs) {
 
-            $lookup[$objectName] = [PSCustomObject]@{
-                Status = $status
-                Time   = $time
+        $objName = $run.entity.name
+
+        if ($ciLookup -contains $objName) {
+
+            $status = $run.backupRun.status
+            $time   = $run.startTimeUsecs
+
+            if (-not $objectStatus.ContainsKey($objName)) {
+
+                $objectStatus[$objName] = [PSCustomObject]@{
+                    Status = $status
+                    Time   = $time
+                }
+
+            } else {
+
+                if ($time -gt $objectStatus[$objName].Time) {
+
+                    $objectStatus[$objName] = [PSCustomObject]@{
+                        Status = $status
+                        Time   = $time
+                    }
+                }
             }
         }
     }
 }
 
-# =========================
-# PROCESS CSV
-# =========================
-$result = foreach ($row in $csv) {
+# -------------------------------------------------------------
+# Build result table
+# -------------------------------------------------------------
+$result = foreach ($row in $ciList) {
 
     $ci = $row.ci_item
 
-    if ($lookup.ContainsKey($ci)) {
+    if ($objectStatus.ContainsKey($ci)) {
 
-        $status = if ($lookup[$ci].Status -eq "kSuccess") { "Completed" } else { "Failed" }
+        $statusRaw = $objectStatus[$ci].Status
 
-        $date = [DateTimeOffset]::FromUnixTimeMilliseconds($lookup[$ci].Time / 1000).DateTime
-    }
-    else {
+        $status = switch ($statusRaw) {
+            "kSuccess" { "Completed" }
+            "kFailed"  { "Failed" }
+            default    { $statusRaw }
+        }
+
+        $date = if ($objectStatus[$ci].Time) {
+            [DateTimeOffset]::FromUnixTimeMilliseconds(
+                $objectStatus[$ci].Time / 1000
+            ).DateTime
+        }
+
+    } else {
 
         $status = "NoObject"
         $date   = ""
     }
 
     [PSCustomObject]@{
+
         ci_item        = $ci
         BackupStatus   = $status
         LastCompleted  = $date
     }
 }
 
-# =========================
-# EXPORT
-# =========================
+# -------------------------------------------------------------
+# Export CSV
+# -------------------------------------------------------------
 $result | Export-Csv $outputCsv -NoTypeInformation
 
-Write-Host ""
-Write-Host "Completed."
-Write-Host "Output file: $outputCsv"
+Write-Host "`n✅ Validation complete"
+Write-Host "📂 Output file: $outputCsv"
