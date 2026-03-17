@@ -1,6 +1,6 @@
 # ============================================
-# Cohesity Path Rules Inventory
-# GET-only | Active PGs only | CSV output
+# Cohesity Users and Groups Inventory
+# GET-only | All clusters | CSV output
 # ============================================
 
 # ---------- API KEY ----------
@@ -15,11 +15,36 @@ $commonHeaders = @{
 # ---------- OUTPUT ----------
 $reportDate = Get-Date -Format "yyyy-MM-dd_HHmm"
 
-$globalCsv = "X:\PowerShell\Data\Cohesity\Alerts\Global_Exclude_List_$reportDate.csv"
-$objectCsv = "X:\PowerShell\Data\Cohesity\Alerts\Object_Path_Rules_$reportDate.csv"
+$detailCsv = "X:\PowerShell\Data\Cohesity\Alerts\Cluster_User_Group_Details_$reportDate.csv"
+$uniqueCsv = "X:\PowerShell\Data\Cohesity\Alerts\Unique_User_Group_Consolidated_$reportDate.csv"
 
-$globalResults = @()
-$objectResults = @()
+$detailResults = @()
+$nonWorkingClusters = @()
+
+# ---------- HELPER ----------
+function Get-FlatValue {
+    param($value)
+
+    if ($null -eq $value) { return "" }
+
+    if ($value -is [string] -or $value -is [int] -or $value -is [long] -or $value -is [bool]) {
+        return "$value"
+    }
+
+    if ($value -is [System.Array]) {
+        return (($value | ForEach-Object {
+            if ($_ -is [string]) { $_ }
+            elseif ($_.name) { $_.name }
+            elseif ($_.roleName) { $_.roleName }
+            else { "$_" }
+        } | Select-Object -Unique) -join ", ")
+    }
+
+    if ($value.name)     { return "$($value.name)" }
+    if ($value.roleName) { return "$($value.roleName)" }
+
+    return "$value"
+}
 
 # ---------- GET CLUSTERS ----------
 $url = "https://helios.cohesity.com/v2/mcm/cluster-mgmt/info"
@@ -31,81 +56,106 @@ foreach ($clus in $clusters) {
     $clusterId   = $clus.clusterId
 
     try {
-
         $headers = @{
             accept = "application/json"
             apiKey = $ApiKey
             accessClusterId = $clusterId
         }
 
-        # ---------- GET ACTIVE PROTECTION GROUPS ----------
-        $pgUrl = "https://helios.cohesity.com/v2/data-protect/protection-groups?isActive=true&isDeleted=false"
+        # ---------- USERS ----------
+        $usersUrl = "https://helios.cohesity.com/irisservices/api/v1/public/users"
+        $usersResp = Invoke-RestMethod -Method Get -Uri $usersUrl -Headers $headers -ErrorAction Stop
 
-        $json = Invoke-RestMethod -Method Get -Uri $pgUrl -Headers $headers -ErrorAction Stop
+        $users = if ($usersResp.users) { $usersResp.users } else { $usersResp }
 
-        $protectionGroups = $json.protectionGroups
+        foreach ($u in $users) {
+            $name   = if ($u.username) { $u.username } elseif ($u.userName) { $u.userName } elseif ($u.name) { $u.name } else { "" }
+            $domain = if ($u.domain) { $u.domain } elseif ($u.domainName) { $u.domainName } elseif ($name -match "\\") { ($name -split "\\")[0] } elseif ($name -match "@") { ($name -split "@")[-1] } else { "" }
+            $roles  = if ($u.roles) { Get-FlatValue $u.roles } elseif ($u.roleNames) { Get-FlatValue $u.roleNames } else { "" }
 
-        foreach ($pg in $protectionGroups) {
-
-            $pgName = $pg.name
-            $params = $pg.physicalParams.fileProtectionTypeParams
-
-            # ---------- GLOBAL EXCLUDES ----------
-            if ($params.globalExcludePaths) {
-
-                foreach ($path in $params.globalExcludePaths) {
-
-                    $globalResults += [PSCustomObject]@{
-                        Cluster           = $clusterName
-                        ProtectionGroup   = $pgName
-                        GlobalExcludePath = $path
-                    }
-
+            if ($name) {
+                $detailResults += [PSCustomObject]@{
+                    Cluster     = $clusterName
+                    UserOrGroup = $name
+                    Domain      = $domain
+                    Roles       = $roles
                 }
-
             }
-
-            # ---------- OBJECT PATH RULES ----------
-            if ($params.objects) {
-
-                foreach ($obj in $params.objects) {
-
-                    if ($obj.filePaths) {
-
-                        foreach ($rule in $obj.filePaths) {
-
-                            $objectResults += [PSCustomObject]@{
-                                Cluster           = $clusterName
-                                ProtectionGroup   = $pgName
-                                ObjectName        = $obj.name
-                                IncludedPath      = $rule.includedPath
-                                ExcludedPath      = $rule.excludedPath
-                                SkipNestedVolumes = $rule.skipNestedVolumes
-                            }
-
-                        }
-
-                    }
-
-                }
-
-            }
-
         }
 
+        # ---------- GROUPS ----------
+        $groupsUrl = "https://helios.cohesity.com/irisservices/api/v1/public/groups"
+        $groupsResp = Invoke-RestMethod -Method Get -Uri $groupsUrl -Headers $headers -ErrorAction Stop
+
+        $groups = if ($groupsResp.groups) { $groupsResp.groups } elseif ($groupsResp.groupVec) { $groupsResp.groupVec } else { $groupsResp }
+
+        foreach ($g in $groups) {
+            $name   = if ($g.name) { $g.name } elseif ($g.groupName) { $g.groupName } else { "" }
+            $domain = if ($g.domain) { $g.domain } elseif ($g.domainName) { $g.domainName } elseif ($name -match "\\") { ($name -split "\\")[0] } elseif ($name -match "@") { ($name -split "@")[-1] } else { "" }
+            $roles  = if ($g.roles) { Get-FlatValue $g.roles } elseif ($g.roleNames) { Get-FlatValue $g.roleNames } else { "" }
+
+            if ($name) {
+                $detailResults += [PSCustomObject]@{
+                    Cluster     = $clusterName
+                    UserOrGroup = $name
+                    Domain      = $domain
+                    Roles       = $roles
+                }
+            }
+        }
     }
     catch {
-        # Skip cluster if unreachable (502 etc.)
+        $nonWorkingClusters += [PSCustomObject]@{
+            Cluster = $clusterName
+            Reason  = $_.Exception.Message
+        }
         continue
     }
+}
 
+# ---------- REMOVE EXACT DUPLICATES ----------
+$detailResults = $detailResults | Sort-Object Cluster,UserOrGroup,Domain,Roles -Unique
+
+# ---------- UNIQUE CONSOLIDATED ----------
+$uniqueResults = $detailResults |
+Group-Object UserOrGroup,Domain,Roles |
+ForEach-Object {
+    $first = $_.Group | Select-Object -First 1
+    [PSCustomObject]@{
+        UserOrGroup = $first.UserOrGroup
+        Domain      = $first.Domain
+        Roles       = $first.Roles
+        Clusters    = (($_.Group.Cluster | Sort-Object -Unique) -join ", ")
+    }
+}
+
+# ---------- CONSOLE OUTPUT ----------
+Write-Host ""
+Write-Host "=== Cluster-by-Cluster User and Group Details ===" -ForegroundColor Cyan
+$detailResults | Sort-Object Cluster,UserOrGroup | Format-Table Cluster,UserOrGroup,Domain,Roles -Wrap -AutoSize
+
+Write-Host ""
+Write-Host "=== Unique Consolidated User and Group Details ===" -ForegroundColor Cyan
+$uniqueResults | Sort-Object UserOrGroup,Domain | Format-Table UserOrGroup,Domain,Roles,Clusters -Wrap -AutoSize
+
+Write-Host ""
+Write-Host "=== Non-Working Clusters ===" -ForegroundColor Cyan
+if ($nonWorkingClusters.Count -gt 0) {
+    $nonWorkingClusters | Sort-Object Cluster | Format-Table Cluster,Reason -Wrap -AutoSize
+}
+else {
+    Write-Host "No non-working clusters found." -ForegroundColor Green
 }
 
 # ---------- EXPORT CSV ----------
-$globalResults |
-Sort-Object Cluster,ProtectionGroup |
-Export-Csv -Path $globalCsv -NoTypeInformation
+$detailResults |
+Sort-Object Cluster,UserOrGroup |
+Export-Csv -Path $detailCsv -NoTypeInformation
 
-$objectResults |
-Sort-Object Cluster,ProtectionGroup,ObjectName |
-Export-Csv -Path $objectCsv -NoTypeInformation
+$uniqueResults |
+Sort-Object UserOrGroup,Domain |
+Export-Csv -Path $uniqueCsv -NoTypeInformation
+
+Write-Host ""
+Write-Host "Saved detail CSV : $detailCsv" -ForegroundColor Green
+Write-Host "Saved unique CSV : $uniqueCsv" -ForegroundColor Green
