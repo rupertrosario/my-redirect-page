@@ -1,26 +1,54 @@
-# =========================
-# Cohesity Helios - Users + Groups
-# Uses:
-#   /irisservices/api/v1/public/users?includeTenantInfo=true&allUnderHierarchy=true
-#   /irisservices/api/v1/public/groups?includeTenantInfo=true&allUnderHierarchy=true
-# =========================
+# ============================================================
+# Cohesity Helios - All Clusters - Users + Groups
+# Cluster-wise output first, then consolidated Users / Groups
+# No Tenant, no Members
+# ============================================================
 
-# --- API key path ---
+# ---------- CONFIG ----------
 $apiKeyPath = "X:\Powershell\Cohesity\API Scripts\DO NOT Delete\apikey.txt"
-if (-not (Test-Path $apiKeyPath)) {
-    throw "API key file not found: $apiKeyPath"
-}
-$apiKey = (Get-Content -Path $apiKeyPath -Raw).Trim()
+$clusterInfoUrl = "https://helios.cohesity.com/v2/mcm/cluster-mgmt/info"
 
-# --- Headers ---
-$headers = @{
-    accept = "application/json"
-    apiKey = $apiKey
+$usersUrl  = "https://helios.cohesity.com/irisservices/api/v1/public/users"
+$groupsUrl = "https://helios.cohesity.com/irisservices/api/v1/public/groups"
+
+# ---------- FUNCTIONS ----------
+function Get-ApiKey {
+    param([string]$Path)
+
+    if (-not (Test-Path $Path)) {
+        throw "API key file not found: $Path"
+    }
+
+    return (Get-Content -Path $Path -Raw).Trim()
 }
 
-# --- URLs ---
-$usersUrl  = "https://helios.cohesity.com/irisservices/api/v1/public/users?includeTenantInfo=true&allUnderHierarchy=true"
-$groupsUrl = "https://helios.cohesity.com/irisservices/api/v1/public/groups?includeTenantInfo=true&allUnderHierarchy=true"
+function Convert-ToArray {
+    param($InputObject)
+
+    if ($null -eq $InputObject) { return @() }
+    if ($InputObject -is [System.Array]) { return $InputObject }
+    if ($InputObject -is [System.Collections.IEnumerable] -and $InputObject -isnot [string]) { return @($InputObject) }
+    return @($InputObject)
+}
+
+function Get-RoleText {
+    param($Roles)
+
+    if ($null -eq $Roles) { return "" }
+
+    $roleArray = Convert-ToArray $Roles
+    if (-not $roleArray -or $roleArray.Count -eq 0) { return "" }
+
+    $names = foreach ($r in $roleArray) {
+        if ($null -eq $r) { continue }
+        elseif ($r -is [string]) { $r }
+        elseif ($r.name) { $r.name }
+        elseif ($r.roleName) { $r.roleName }
+        else { [string]$r }
+    }
+
+    ($names | Where-Object { $_ -and $_.Trim() -ne "" } | Select-Object -Unique) -join ", "
+}
 
 function Invoke-HeliosGet {
     param(
@@ -29,73 +57,184 @@ function Invoke-HeliosGet {
     )
 
     try {
-        $resp = Invoke-RestMethod -Method Get -Uri $Uri -Headers $Headers -TimeoutSec 60 -ErrorAction Stop
-        return $resp
+        return Invoke-RestMethod -Method Get -Uri $Uri -Headers $Headers -TimeoutSec 60 -ErrorAction Stop
     }
     catch {
-        Write-Host "Failed: $Uri" -ForegroundColor Red
-        Write-Host $_.Exception.Message -ForegroundColor Yellow
-        return @()
+        return $null
     }
 }
 
-# --- Get data ---
-$usersRaw  = Invoke-HeliosGet -Uri $usersUrl  -Headers $headers
-$groupsRaw = Invoke-HeliosGet -Uri $groupsUrl -Headers $headers
+function Get-Clusters {
+    param([hashtable]$Headers)
 
-# Normalize in case single object comes back
-if ($null -eq $usersRaw)  { $usersRaw  = @() }
-if ($null -eq $groupsRaw) { $groupsRaw = @() }
-if ($usersRaw  -isnot [System.Collections.IEnumerable] -or $usersRaw  -is [string]) { $usersRaw  = @($usersRaw) }
-if ($groupsRaw -isnot [System.Collections.IEnumerable] -or $groupsRaw -is [string]) { $groupsRaw = @($groupsRaw) }
+    $resp = Invoke-HeliosGet -Uri $clusterInfoUrl -Headers $Headers
+    if ($null -eq $resp) { return @() }
 
-# --- Flatten USERS ---
-$userResults = foreach ($u in $usersRaw) {
-    [PSCustomObject]@{
-        RecordType = "User"
-        Name       = $u.username          # username for user
-        Domain     = $u.domain
-        Roles      = if ($u.roles) { ($u.roles -join ", ") } else { "" }
-        Tenant     = if ($u.tenantInfo) { $u.tenantInfo.name } else { "" }
-        Members    = ""
+    if ($resp.cohesityClusters) {
+        return @(Convert-ToArray $resp.cohesityClusters)
+    }
+    elseif ($resp.data) {
+        return @(Convert-ToArray $resp.data)
+    }
+    else {
+        return @(Convert-ToArray $resp)
     }
 }
 
-# --- Flatten GROUPS ---
-$groupResults = foreach ($g in $groupsRaw) {
+# ---------- API KEY ----------
+$apiKey = Get-ApiKey -Path $apiKeyPath
 
-    $groupUsers =
-        if ($g.users) {
-            if ($g.users -is [System.Array]) {
-                ($g.users | ForEach-Object {
-                    if ($_ -is [string]) { $_ }
-                    elseif ($_.username) { $_.username }
-                    elseif ($_.name) { $_.name }
-                    else { $_ | Out-String }
-                }) -join ", "
-            }
-            else {
-                if ($g.users -is [string]) { $g.users }
-                elseif ($g.users.username) { $g.users.username }
-                elseif ($g.users.name) { $g.users.name }
-                else { $g.users | Out-String }
-            }
+$commonHeaders = @{
+    accept = "application/json"
+    apiKey = $apiKey
+}
+
+# ---------- GET CLUSTERS ----------
+$clusters = Get-Clusters -Headers $commonHeaders
+
+if (-not $clusters -or $clusters.Count -eq 0) {
+    throw "No clusters returned from Helios cluster-mgmt/info"
+}
+
+# ---------- COLLECT RESULTS ----------
+$allResults = @()
+$failedClusters = @()
+
+foreach ($clus in $clusters) {
+
+    $clusterName = $null
+    $clusterId   = $null
+
+    if ($clus.clusterName)      { $clusterName = $clus.clusterName }
+    elseif ($clus.name)         { $clusterName = $clus.name }
+    else                        { $clusterName = "UnknownCluster" }
+
+    if ($clus.clusterId)        { $clusterId = $clus.clusterId }
+    elseif ($clus.id)           { $clusterId = $clus.id }
+    else                        { $clusterId = $null }
+
+    if (-not $clusterId) {
+        $failedClusters += [PSCustomObject]@{
+            Cluster = $clusterName
+            Reason  = "Missing ClusterId"
         }
-        else { "" }
+        continue
+    }
 
-    [PSCustomObject]@{
-        RecordType = "Group"
-        Name       = $g.name
-        Domain     = $g.domain
-        Roles      = if ($g.roles) { ($g.roles -join ", ") } else { "" }
-        Tenant     = if ($g.tenantInfo) { $g.tenantInfo.name } else { "" }
-        Members    = $groupUsers         # users for group
+    $clusterHeaders = @{
+        accept          = "application/json"
+        apiKey          = $apiKey
+        accessClusterId = "$clusterId"
+    }
+
+    $usersRaw  = Invoke-HeliosGet -Uri $usersUrl  -Headers $clusterHeaders
+    $groupsRaw = Invoke-HeliosGet -Uri $groupsUrl -Headers $clusterHeaders
+
+    if ($null -eq $usersRaw -and $null -eq $groupsRaw) {
+        $failedClusters += [PSCustomObject]@{
+            Cluster = $clusterName
+            Reason  = "Users/Groups API returned nothing"
+        }
+        continue
+    }
+
+    $users  = Convert-ToArray $usersRaw
+    $groups = Convert-ToArray $groupsRaw
+
+    foreach ($u in $users) {
+        $name =
+            if ($u.username)   { $u.username }
+            elseif ($u.name)   { $u.name }
+            else               { "" }
+
+        $domain =
+            if ($u.domain)     { $u.domain }
+            elseif ($u.domainName) { $u.domainName }
+            else               { "" }
+
+        $allResults += [PSCustomObject]@{
+            Cluster = $clusterName
+            Type    = "User"
+            Name    = $name
+            Domain  = $domain
+            Roles   = Get-RoleText -Roles $u.roles
+        }
+    }
+
+    foreach ($g in $groups) {
+        $name =
+            if ($g.name)       { $g.name }
+            elseif ($g.groupName) { $g.groupName }
+            else               { "" }
+
+        $domain =
+            if ($g.domain)     { $g.domain }
+            elseif ($g.domainName) { $g.domainName }
+            else               { "" }
+
+        $allResults += [PSCustomObject]@{
+            Cluster = $clusterName
+            Type    = "Group"
+            Name    = $name
+            Domain  = $domain
+            Roles   = Get-RoleText -Roles $g.roles
+        }
     }
 }
 
-# --- Combined output ---
-$results = @($userResults) + @($groupResults)
+# ---------- CLEAN ----------
+$allResults = $allResults | Where-Object { $_.Name -and $_.Name.Trim() -ne "" }
 
-$results |
-    Sort-Object RecordType, Name |
-    Format-Table RecordType, Name, Domain, Roles, Tenant, Members -AutoSize
+# ---------- CLUSTER-WISE COMBINED ----------
+Write-Host ""
+Write-Host "================ CLUSTER-WISE USERS + GROUPS ================" -ForegroundColor Cyan
+$allResults |
+    Sort-Object Cluster, Type, Name |
+    Format-Table Cluster, Type, Name, Domain, Roles -AutoSize
+
+# ---------- CONSOLIDATED USERS ----------
+$usersConsolidated = $allResults |
+    Where-Object { $_.Type -eq "User" } |
+    Group-Object Name, Domain, Roles |
+    ForEach-Object {
+        $first = $_.Group | Select-Object -First 1
+        [PSCustomObject]@{
+            Name     = $first.Name
+            Domain   = $first.Domain
+            Roles    = $first.Roles
+            Clusters = ($_.Group.Cluster | Sort-Object -Unique) -join ", "
+        }
+    } |
+    Sort-Object Name
+
+Write-Host ""
+Write-Host "================ CONSOLIDATED USERS ================" -ForegroundColor Green
+$usersConsolidated |
+    Format-Table Name, Domain, Roles, Clusters -AutoSize
+
+# ---------- CONSOLIDATED GROUPS ----------
+$groupsConsolidated = $allResults |
+    Where-Object { $_.Type -eq "Group" } |
+    Group-Object Name, Domain, Roles |
+    ForEach-Object {
+        $first = $_.Group | Select-Object -First 1
+        [PSCustomObject]@{
+            Name     = $first.Name
+            Domain   = $first.Domain
+            Roles    = $first.Roles
+            Clusters = ($_.Group.Cluster | Sort-Object -Unique) -join ", "
+        }
+    } |
+    Sort-Object Name
+
+Write-Host ""
+Write-Host "================ CONSOLIDATED GROUPS ================" -ForegroundColor Yellow
+$groupsConsolidated |
+    Format-Table Name, Domain, Roles, Clusters -AutoSize
+
+# ---------- FAILED CLUSTERS ----------
+if ($failedClusters.Count -gt 0) {
+    Write-Host ""
+    Write-Host "================ FAILED / SKIPPED CLUSTERS ================" -ForegroundColor Red
+    $failedClusters | Format-Table Cluster, Reason -AutoSize
+}
