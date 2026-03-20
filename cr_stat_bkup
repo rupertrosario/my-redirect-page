@@ -1,58 +1,103 @@
 # ==========================================================
 # Cohesity Backup Validation – OS / Hyper-V Backups
 # ----------------------------------------------------------
-# - Uses Invoke-WebRequest (GET only)
-# - Reads CI list from CHGxxxx.csv
-# - Displays only failures or missing backups
-# - Shows processing per cluster
-# - Exports CSV with findings
+# - GET only
+# - Uses Invoke-WebRequest -UseBasicParsing
+# - Reads CI list from <CHG>.csv (header: ci_item)
+# - Filters Protection Groups at PG level: kPhysical + kHyperV
+# - Checks latest run status per matched object
+# - Captures last successful backup date per matched object
+# - Displays cluster progress + exception tables
+# - Exports full CSV for all CI items
 # ==========================================================
 
 # =========================
-# Change Number + User
+# 0) Change Number + User
 # =========================
-$ChangeID = Read-Host "Enter Change Number (example CHG234234)"
-$executedBy = (whoami).Trim()
+$ChangeID   = Read-Host "Enter Change Number (example CHG234234)"
+$ExecutedBy = (whoami).Trim()
 
 # =========================
-# CSV PATH
+# 1) Paths
 # =========================
-$csvDirectory = "X:\PowerShell\Data\BackupValidation"
-$inputCsv = Join-Path $csvDirectory "$ChangeID.csv"
+$CsvDirectory = "X:\PowerShell\Data\BackupValidation"
+$InputCsv     = Join-Path $CsvDirectory "$ChangeID.csv"
+$ReportDate   = Get-Date -Format "yyyy-MM-dd_HHmm"
+$OutputCsv    = Join-Path $CsvDirectory "${ChangeID}_BackupStatus_$ReportDate.csv"
 
-if (-not (Test-Path $inputCsv)) {
-    throw "CSV not found: $inputCsv"
-}
-
-$ciList = Import-Csv $inputCsv
-$totalObjects = $ciList.Count
-
-# Fast lookup
-$ciSet = [System.Collections.Generic.HashSet[string]]::new()
-foreach ($row in $ciList) {
-    $ciSet.Add($row.ci_item.ToLower()) | Out-Null
+if (-not (Test-Path $InputCsv)) {
+    throw "CSV not found: $InputCsv"
 }
 
 # =========================
-# API KEY
+# 2) Load CSV
 # =========================
-$apikeypath = "X:\PowerShell\Cohesity_API_Scripts\DO_NOT_Delete\apikey.txt"
-if (-not (Test-Path $apikeypath)) { throw "API key file not found" }
+$CiList = Import-Csv $InputCsv
+if (-not $CiList) {
+    throw "CSV is empty: $InputCsv"
+}
+if (-not ($CiList[0].PSObject.Properties.Name -contains "ci_item")) {
+    throw "CSV must contain header: ci_item"
+}
 
-$ApiKey = (Get-Content -Path $apikeypath -Raw).Trim()
-$commonHeaders = @{ "apiKey" = $ApiKey }
+function Normalize-Name {
+    param([string]$Value)
+    if ([string]::IsNullOrWhiteSpace($Value)) { return "" }
+    return $Value.Trim().ToLower()
+}
+
+# Pending set = objects still not matched anywhere
+$PendingSet = [System.Collections.Generic.HashSet[string]]::new()
+foreach ($row in $CiList) {
+    $key = Normalize-Name $row.ci_item
+    if ($key) { [void]$PendingSet.Add($key) }
+}
+
+$TotalObjects = $PendingSet.Count
 
 # =========================
-# Time Conversion
+# 3) API Key
+# =========================
+$ApiKeyPath = "X:\PowerShell\Cohesity_API_Scripts\DO_NOT_Delete\apikey.txt"
+if (-not (Test-Path $ApiKeyPath)) {
+    throw "API key file not found: $ApiKeyPath"
+}
+
+$ApiKey = (Get-Content -Path $ApiKeyPath -Raw).Trim()
+$CommonHeaders = @{
+    accept = "application/json"
+    apiKey = $ApiKey
+}
+
+# =========================
+# 4) Helpers
 # =========================
 function Convert-UsecsToDate {
-    param($usecs)
-    if (!$usecs) { return "" }
-    return [DateTimeOffset]::FromUnixTimeMilliseconds($usecs/1000).LocalDateTime
+    param($Usecs)
+    if (-not $Usecs -or [int64]$Usecs -le 0) { return $null }
+    try {
+        return [DateTimeOffset]::FromUnixTimeMilliseconds([int64]($Usecs / 1000)).LocalDateTime
+    }
+    catch {
+        return $null
+    }
+}
+
+function Is-SuccessStatus {
+    param([string]$Status)
+    return ($Status -in @("Succeeded","SucceededWithWarning","kSuccess"))
+}
+
+function Get-ClusterName {
+    param($Cluster)
+    if ($Cluster.ClusterName) { return $Cluster.ClusterName }
+    if ($Cluster.name)        { return $Cluster.name }
+    if ($Cluster.displayName) { return $Cluster.displayName }
+    return "Unknown-$($Cluster.clusterId)"
 }
 
 # =========================
-# HEADER
+# 5) Header
 # =========================
 Write-Host ""
 Write-Host "------------------------------------------------------------"
@@ -60,168 +105,318 @@ Write-Host "Cohesity Backup Validation – OS / Hyper-V Backups"
 Write-Host "------------------------------------------------------------"
 Write-Host ""
 Write-Host "Change Number : $ChangeID"
-Write-Host "Executed By   : $executedBy"
+Write-Host "Executed By   : $ExecutedBy"
 Write-Host "Run Date      : $(Get-Date)"
 Write-Host ""
-Write-Host "Total CI objects in CSV : $totalObjects"
+Write-Host "Total CI objects in CSV : $TotalObjects"
 Write-Host ""
 
 # =========================
-# GET CLUSTERS
+# 6) Get Clusters
 # =========================
-$url = "https://helios.cohesity.com/v2/mcm/cluster-mgmt/info"
+$ClusterUrl = "https://helios.cohesity.com/v2/mcm/cluster-mgmt/info"
 
-$response = Invoke-WebRequest -Method Get -Uri $url -Headers $commonHeaders
-$clusters = ($response.Content | ConvertFrom-Json).cohesityClusters |
-            Sort-Object ClusterName
+$ClusterResp = Invoke-WebRequest `
+    -Method Get `
+    -Uri $ClusterUrl `
+    -Headers $CommonHeaders `
+    -UseBasicParsing
+
+$Clusters = ($ClusterResp.Content | ConvertFrom-Json).cohesityClusters |
+    Sort-Object { Get-ClusterName $_ }
+
+if (-not $Clusters) {
+    throw "No clusters returned from Helios."
+}
 
 # =========================
-# STORAGE
+# 7) Storage
 # =========================
-$AllRows = @()
+$AllExceptionRows = @()
+$FinalResults = @{}   # key = normalized ci_item
 
-$foundCount = 0
-$completedCount = 0
-$failedCount = 0
-$clusterUnreachable = 0
+$FoundCount = 0
+$CompletedCount = 0
+$FailedCount = 0
+$ClusterUnreachable = 0
+$ClustersProcessed = 0
 
 # =========================
-# PROCESS CLUSTERS
+# 8) Process Clusters
 # =========================
-foreach ($clus in $clusters) {
+foreach ($clus in $Clusters) {
 
-    if ($ciSet.Count -eq 0) { break }
+    if ($PendingSet.Count -eq 0) { break }
 
-    $cluster_name = $clus.ClusterName
-    $cluster_id   = $clus.ClusterId
+    $ClusterName = Get-ClusterName $clus
+    $ClusterId   = $clus.clusterId
 
     Write-Host ""
-    Write-Host "Cluster: $cluster_name"
+    Write-Host "Cluster: $ClusterName"
     Write-Host "----------------------------------------"
 
-    $clusterResults = @()
+    $ClusterExceptionRows = @()
+    $ClusterMatchedCount  = 0
 
     try {
-
-        $headers = @{
-            apiKey = $ApiKey
-            accessClusterId = $cluster_id
+        $Headers = @{
+            accept          = "application/json"
+            apiKey          = $ApiKey
+            accessClusterId = $ClusterId
         }
 
-        # Get active protection groups
-        $pgUrl = "https://helios.cohesity.com/v2/data-protect/protection-groups?isActive=true&isDeleted=false"
+        # PG-level environment filter
+        $PgUrl = "https://helios.cohesity.com/v2/data-protect/protection-groups?isActive=true&isDeleted=false&isPaused=false&environments=kPhysical&environments=kHyperV"
 
-        $pgResp = Invoke-WebRequest -Method Get -Uri $pgUrl -Headers $headers
-        $pgs = ($pgResp.Content | ConvertFrom-Json).protectionGroups
+        $PgResp = Invoke-WebRequest `
+            -Method Get `
+            -Uri $PgUrl `
+            -Headers $Headers `
+            -UseBasicParsing `
+            -ErrorAction Stop
 
-        foreach ($pg in $pgs) {
+        $Pgs = ($PgResp.Content | ConvertFrom-Json).protectionGroups
+        if (-not $Pgs) {
+            Write-Host "Objects Found : 0"
+            Write-Host ""
+            Write-Host "Objects Found So Far : $FoundCount"
+            Write-Host "Remaining To Find    : $($PendingSet.Count)"
+            $ClustersProcessed++
+            continue
+        }
 
-            $runUrl = "https://helios.cohesity.com/v2/data-protect/protection-groups/$($pg.id)/runs"
+        foreach ($pg in $Pgs) {
 
-            $runResp = Invoke-WebRequest -Method Get -Uri $runUrl -Headers $headers
-            $runs = ($runResp.Content | ConvertFrom-Json).runs
+            if ($PendingSet.Count -eq 0) { break }
 
-            foreach ($run in $runs) {
+            $PgId = $pg.id
+            if (-not $PgId) { continue }
 
-                foreach ($obj in $run.objects) {
+            $RunUrl = "https://helios.cohesity.com/v2/data-protect/protection-groups/$PgId/runs?numRuns=30&excludeNonRestorableRuns=false&includeObjectDetails=true"
 
-                    $env = $obj.object.environment
-                    if ($env -notin @("kPhysical","kHyperV")) { continue }
+            try {
+                $RunResp = Invoke-WebRequest `
+                    -Method Get `
+                    -Uri $RunUrl `
+                    -Headers $Headers `
+                    -UseBasicParsing `
+                    -ErrorAction Stop
 
-                    $host = $obj.object.name.ToLower()
+                $Runs = ($RunResp.Content | ConvertFrom-Json).runs
+            }
+            catch {
+                continue
+            }
 
-                    if ($ciSet.Contains($host)) {
+            if (-not $Runs) { continue }
 
-                        $statusRaw = $run.localBackupInfo[0].status
-                        $date = Convert-UsecsToDate $run.localBackupInfo[0].endTimeUsecs
+            # Sort newest -> oldest by run end time
+            $SortedRuns = $Runs | Sort-Object {
+                if ($_.localBackupInfo -is [System.Array]) {
+                    [int64]$_.localBackupInfo[0].endTimeUsecs
+                } else {
+                    [int64]$_.localBackupInfo.endTimeUsecs
+                }
+            } -Descending
 
-                        if ($statusRaw -match "Succeeded") {
-                            $completedCount++
-                            $ciSet.Remove($host) | Out-Null
-                            $foundCount++
-                            continue
-                        }
+            # Tracks matched objects for THIS PG so we can get latest run + older success
+            $PgMatchState = @{}
 
-                        $row = [PSCustomObject]@{
-                            Cluster = $cluster_name
-                            HostName = $obj.object.name
-                            Environment = $env
-                            Status = $statusRaw
-                            LastSuccessfulBackup = $date
-                        }
+            foreach ($run in $SortedRuns) {
 
-                        $clusterResults += $row
-                        $AllRows += $row
+                $Info = $null
+                if ($run.localBackupInfo -is [System.Array]) {
+                    if ($run.localBackupInfo.Count -gt 0) { $Info = $run.localBackupInfo[0] }
+                } else {
+                    $Info = $run.localBackupInfo
+                }
+                if (-not $Info) { continue }
 
-                        $failedCount++
-                        $foundCount++
+                $RunStatus = [string]$Info.status
+                $RunEndUsecs = [int64]$Info.endTimeUsecs
+                $Objects = $run.objects
+                if (-not $Objects) { continue }
 
-                        $ciSet.Remove($host) | Out-Null
+                foreach ($objEntry in $Objects) {
+
+                    if (-not $objEntry.object) { continue }
+
+                    $ObjName = $objEntry.object.name
+                    $ObjEnv  = $objEntry.object.environment
+                    if ($ObjEnv -notin @("kPhysical","kHyperV")) { continue }
+
+                    $Key = Normalize-Name $ObjName
+                    if (-not $Key) { continue }
+
+                    # Ignore objects that are already finalized from an earlier/larger cluster
+                    if ((-not $PendingSet.Contains($Key)) -and (-not $PgMatchState.ContainsKey($Key))) {
+                        continue
                     }
+
+                    # First time we see this object in this PG = latest run for that object in this PG
+                    if (-not $PgMatchState.ContainsKey($Key)) {
+
+                        if (-not $PendingSet.Contains($Key)) { continue }
+
+                        $PgMatchState[$Key] = [PSCustomObject]@{
+                            ci_item         = $ObjName
+                            Cluster         = $ClusterName
+                            Environment     = $ObjEnv
+                            LatestStatus    = $RunStatus
+                            LatestRunUsecs  = $RunEndUsecs
+                            LastSuccessUsecs= $(if (Is-SuccessStatus $RunStatus) { $RunEndUsecs } else { 0 })
+                        }
+                    }
+                    else {
+                        # Older runs: only care until we find a last success date
+                        if (($PgMatchState[$Key].LastSuccessUsecs -eq 0) -and (Is-SuccessStatus $RunStatus)) {
+                            $PgMatchState[$Key].LastSuccessUsecs = $RunEndUsecs
+                        }
+                    }
+                }
+            }
+
+            # Finalize objects matched in this PG
+            foreach ($state in $PgMatchState.Values) {
+
+                $Key = Normalize-Name $state.ci_item
+                if (-not $PendingSet.Contains($Key)) { continue }
+
+                $LatestStatusText = if (Is-SuccessStatus $state.LatestStatus) { "Completed" } else { "Failed" }
+                $LastCompletedDt  = Convert-UsecsToDate $state.LastSuccessUsecs
+                $LatestRunDt      = Convert-UsecsToDate $state.LatestRunUsecs
+
+                $FinalResults[$Key] = [PSCustomObject]@{
+                    ci_item        = $state.ci_item
+                    Cluster        = $state.Cluster
+                    Environment    = $state.Environment
+                    BackupStatus   = $LatestStatusText
+                    LastCompleted  = $(if ($LastCompletedDt) { $LastCompletedDt.ToString("dd-MMM-yyyy HH:mm:ss") } else { "" })
+                    LatestRunDate  = $(if ($LatestRunDt) { $LatestRunDt.ToString("dd-MMM-yyyy HH:mm:ss") } else { "" })
+                }
+
+                [void]$PendingSet.Remove($Key)
+
+                $FoundCount++
+                $ClusterMatchedCount++
+
+                if ($LatestStatusText -eq "Completed") {
+                    $CompletedCount++
+                }
+                else {
+                    $FailedCount++
+
+                    $ExceptionRow = [PSCustomObject]@{
+                        Cluster              = $state.Cluster
+                        HostName             = $state.ci_item
+                        Environment          = $state.Environment
+                        Status               = $LatestStatusText
+                        LastSuccessfulBackup = $(if ($LastCompletedDt) { $LastCompletedDt } else { $null })
+                    }
+
+                    $ClusterExceptionRows += $ExceptionRow
+                    $AllExceptionRows += $ExceptionRow
                 }
             }
         }
 
-        if ($clusterResults.Count -gt 0) {
-            Write-Host "Objects Found : $($clusterResults.Count)"
-            $clusterResults | Format-Table -AutoSize
+        Write-Host "Objects Found : $ClusterMatchedCount"
+        if ($ClusterExceptionRows.Count -gt 0) {
+            $ClusterExceptionRows |
+                Sort-Object HostName |
+                Format-Table Cluster,HostName,Environment,Status,LastSuccessfulBackup -AutoSize
         }
 
+        Write-Host ""
+        Write-Host "Objects Found So Far : $FoundCount"
+        Write-Host "Remaining To Find    : $($PendingSet.Count)"
+
+        $ClustersProcessed++
     }
     catch {
         Write-Host "Cluster unreachable"
-        $clusterUnreachable++
-    }
+        $ClusterUnreachable++
+        $ClustersProcessed++
 
-    Write-Host ""
-    Write-Host "Objects Found So Far : $foundCount"
-    Write-Host "Remaining To Find    : $($ciSet.Count)"
+        Write-Host ""
+        Write-Host "Objects Found So Far : $FoundCount"
+        Write-Host "Remaining To Find    : $($PendingSet.Count)"
+    }
 }
 
 # =========================
-# FINAL TABLE
+# 9) Final Exception Table
 # =========================
-if ($AllRows.Count -gt 0) {
-
+if ($AllExceptionRows.Count -gt 0) {
     Write-Host ""
     Write-Host "------------------------------------------------------------"
     Write-Host "Backup Exceptions"
     Write-Host "------------------------------------------------------------"
 
-    $AllRows |
-    Sort-Object Cluster,HostName |
-    Format-Table -AutoSize
+    $AllExceptionRows |
+        Sort-Object Cluster,HostName |
+        Format-Table Cluster,HostName,Environment,Status,LastSuccessfulBackup -AutoSize
 }
 
 # =========================
-# SUMMARY
+# 10) Summary Table
 # =========================
+# If every processed cluster failed, unresolved objects are cluster unreachable
+$NoObjectCount = $PendingSet.Count
+$AllClustersUnreachable = ($ClustersProcessed -gt 0 -and $ClusterUnreachable -eq $ClustersProcessed)
+
 Write-Host ""
 Write-Host "------------------------------------------------------------"
 Write-Host "Validation Summary"
 Write-Host "------------------------------------------------------------"
 
-$summary = @(
-    [PSCustomObject]@{Metric="Total CI Objects Checked";Count=$totalObjects}
-    [PSCustomObject]@{Metric="Objects Found in Backup";Count=$foundCount}
-    [PSCustomObject]@{Metric="Successful Backups";Count=$completedCount}
-    [PSCustomObject]@{Metric="Backup Failures";Count=$failedCount}
-    [PSCustomObject]@{Metric="No Object in Cohesity";Count=$ciSet.Count}
-    [PSCustomObject]@{Metric="Cluster Unreachable Hits";Count=$clusterUnreachable}
+$Summary = @(
+    [PSCustomObject]@{ Metric = "Total CI Objects Checked"; Count = $TotalObjects }
+    [PSCustomObject]@{ Metric = "Objects Found in Backup";  Count = $FoundCount }
+    [PSCustomObject]@{ Metric = "Successful Backups";       Count = $CompletedCount }
+    [PSCustomObject]@{ Metric = "Backup Failures";          Count = $FailedCount }
+    [PSCustomObject]@{ Metric = "No Object in Cohesity";    Count = $(if ($AllClustersUnreachable) { 0 } else { $NoObjectCount }) }
+    [PSCustomObject]@{ Metric = "Cluster Unreachable Hits"; Count = $ClusterUnreachable }
 )
 
-$summary | Format-Table -AutoSize
+$Summary | Format-Table -AutoSize
 
 # =========================
-# EXPORT CSV
+# 11) Build Full CSV Output
 # =========================
-$reportDate = Get-Date -Format "yyyy-MM-dd_HHmm"
-$outputCsv = "$csvDirectory\${ChangeID}_BackupStatus_$reportDate.csv"
+$CsvRows = foreach ($row in $CiList) {
 
-$AllRows |
-Sort-Object Cluster,HostName |
-Export-Csv -Path $outputCsv -NoTypeInformation
+    $Key = Normalize-Name $row.ci_item
+
+    if ($FinalResults.ContainsKey($Key)) {
+        $Result = $FinalResults[$Key]
+
+        [PSCustomObject]@{
+            ci_item        = $row.ci_item
+            BackupStatus   = $Result.BackupStatus
+            LastCompleted  = $Result.LastCompleted
+            Cluster        = $Result.Cluster
+            Environment    = $Result.Environment
+            ExecutedBy     = $ExecutedBy
+            ChangeNumber   = $ChangeID
+        }
+    }
+    else {
+        [PSCustomObject]@{
+            ci_item        = $row.ci_item
+            BackupStatus   = $(if ($AllClustersUnreachable) { "ClusterUnreachable" } else { "NoObject" })
+            LastCompleted  = ""
+            Cluster        = ""
+            Environment    = ""
+            ExecutedBy     = $ExecutedBy
+            ChangeNumber   = $ChangeID
+        }
+    }
+}
+
+$CsvRows |
+    Export-Csv -Path $OutputCsv -NoTypeInformation
 
 Write-Host ""
 Write-Host "CSV exported:"
-Write-Host $outputCsv
+Write-Host $OutputCsv
