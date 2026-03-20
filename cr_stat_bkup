@@ -1,15 +1,12 @@
 # ==========================================================
-# Cohesity Backup Validation – OBJECT-FIRST (AUDIT READY)
-# HyperV / Nutanix / Physical ONLY
+# Cohesity Backup Validation – SEARCH + RUN (GET ONLY)
+# Fastest, No PG Traversal
 # ==========================================================
 
 $ChangeID   = Read-Host "Enter Change Number"
 $ExecutedBy = (whoami).Trim()
 
-# -------------------------
-# Toggle
-# -------------------------
-$VerboseMode = $true   # set $false for clean output
+$VerboseMode = $true   # set to $false later
 
 # -------------------------
 # Paths
@@ -30,7 +27,7 @@ function GetShort($v){ if(!$v){return ""}; return $v.Split('.')[0].ToLower() }
 # API
 # -------------------------
 $ApiKey = (Get-Content "X:\PowerShell\Cohesity_API_Scripts\DO_NOT_Delete\apikey.txt" -Raw).Trim()
-$CommonHeaders = @{ accept="application/json"; apiKey=$ApiKey }
+$Headers = @{ accept="application/json"; apiKey=$ApiKey }
 
 function ToDate($u){
     if(!$u){return ""}
@@ -39,14 +36,7 @@ function ToDate($u){
 
 function IsSuccess($s){ return $s -in @("Succeeded","SucceededWithWarning","kSuccess") }
 
-# -------------------------
-# Get clusters
-# -------------------------
-$clusters = (Invoke-WebRequest `
-    -Uri "https://helios.cohesity.com/v2/mcm/cluster-mgmt/info" `
-    -Headers $CommonHeaders -Method Get).Content | ConvertFrom-Json
-
-$clusters = $clusters.cohesityClusters
+$AllowedEnv = @("kHyperV","kAcropolis","kPhysical")
 
 # -------------------------
 # Storage
@@ -57,112 +47,128 @@ $found=0;$success=0;$fail=0
 $totalCI = $CiList.Count
 $ciIndex=0
 
-$AllowedEnv = @("kHyperV","kAcropolis","kPhysical")
-
 # -------------------------
 # PROCESS
 # -------------------------
 foreach($r in $CiList){
 
     $ciIndex++
-    $full  = Normalize $r.ci_item
-    $short = GetShort $r.ci_item
+    $ciName = $r.ci_item
+    $full  = Normalize $ciName
+    $short = GetShort $ciName
 
     Write-Progress -Activity "Validating CIs" `
-        -Status "$($r.ci_item) ($ciIndex/$totalCI)" `
+        -Status "$ciName ($ciIndex/$totalCI)" `
         -PercentComplete (($ciIndex/$totalCI)*100)
 
-    if($VerboseMode){ Write-Host "`n[CI] $($r.ci_item)" }
+    if($VerboseMode){ Write-Host "`n[CI] $ciName" }
 
-    $foundFlag = $false
+    try{
+        # -------------------------
+        # SEARCH OBJECT
+        # -------------------------
+        $searchUrl = "https://helios.cohesity.com/v2/data-protect/search/protected-objects?searchString=$ciName"
 
-    foreach($c in $clusters){
+        $searchResp = (Invoke-WebRequest `
+            -Uri $searchUrl `
+            -Headers $Headers -Method Get).Content | ConvertFrom-Json
 
-        if($foundFlag){ break }
+        $match = $null
 
-        if($VerboseMode){ Write-Host "  → Checking Cluster: $($c.name)" }
+        foreach($obj in $searchResp.objects){
 
-        try{
-            $h = @{accept="application/json";apiKey=$ApiKey;accessClusterId=$c.clusterId}
+            $env = $obj.environment
+            if($AllowedEnv -notcontains $env){ continue }
 
-            $pgs = (Invoke-WebRequest `
-                -Uri "https://helios.cohesity.com/v2/data-protect/protection-groups?isActive=true&isDeleted=false" `
-                -Headers $h -Method Get).Content | ConvertFrom-Json
+            $nameFull  = Normalize $obj.name
+            $nameShort = GetShort $obj.name
 
-            foreach($pg in $pgs.protectionGroups){
-
-                if($foundFlag){ break }
-
-                $runs = (Invoke-WebRequest `
-                    -Uri "https://helios.cohesity.com/v2/data-protect/protection-groups/$($pg.id)/runs?numRuns=10&includeObjectDetails=true" `
-                    -Headers $h -Method Get).Content | ConvertFrom-Json
-
-                foreach($run in $runs.runs){
-
-                    if($foundFlag){ break }
-
-                    $info = $run.localBackupInfo[0]
-                    if(!$info){continue}
-
-                    foreach($o in $run.objects){
-
-                        $env = $o.object.environment
-                        if($AllowedEnv -notcontains $env){ continue }
-
-                        $nameFull  = Normalize $o.object.name
-                        $nameShort = GetShort $o.object.name
-
-                        if($nameFull -eq $full -or $nameShort -eq $short){
-
-                            $status = $info.status
-                            $date   = ToDate $info.endTimeUsecs
-
-                            $Results += [pscustomobject]@{
-                                ci_item=$r.ci_item
-                                BackupStatus=$status
-                                LastCompleted=$date
-                                Cluster=$c.name
-                                Environment=$env
-                                ProtectionGroup=$pg.name
-                            }
-
-                            $found++
-                            if(IsSuccess $status){$success++}else{$fail++}
-
-                            if($VerboseMode){
-                                Write-Host "    ✔ FOUND → $($c.name) [$env] | $status"
-                            }
-
-                            $foundFlag = $true
-                            break
-                        }
-                    }
-                }
+            if($nameFull -eq $full -or $nameShort -eq $short){
+                $match = $obj
+                break
             }
+        }
 
-        }catch{
+        if(-not $match){
+            if($VerboseMode){ Write-Host "  ✖ Not found in search" }
+
+            $Results += [pscustomobject]@{
+                ci_item=$ciName
+                BackupStatus="NoObject"
+                LastCompleted=""
+                Cluster=""
+                Environment=""
+                ProtectionGroup=""
+            }
             continue
         }
-    }
 
-    if(-not $foundFlag){
+        if($VerboseMode){
+            Write-Host "  ✔ Found Object → $($match.name) [$($match.environment)]"
+        }
+
+        # -------------------------
+        # GET RUN
+        # -------------------------
+        $runUrl = "https://helios.cohesity.com/v2/data-protect/objects/$($match.id)/runs?numRuns=1"
+
+        $runResp = (Invoke-WebRequest `
+            -Uri $runUrl `
+            -Headers $Headers -Method Get).Content | ConvertFrom-Json
+
+        $run = $runResp.runs[0]
+
+        if($run){
+            $info = $run.localBackupInfo[0]
+
+            $status = $info.status
+            $date   = ToDate $info.endTimeUsecs
+
+            $Results += [pscustomobject]@{
+                ci_item=$ciName
+                BackupStatus=$status
+                LastCompleted=$date
+                Cluster=$match.clusterName
+                Environment=$match.environment
+                ProtectionGroup=$run.protectionGroupName
+            }
+
+            $found++
+            if(IsSuccess $status){$success++}else{$fail++}
+
+            if($VerboseMode){
+                Write-Host "    → $status | $date"
+            }
+        }
+        else{
+            $Results += [pscustomobject]@{
+                ci_item=$ciName
+                BackupStatus="NoRun"
+                LastCompleted=""
+                Cluster=$match.clusterName
+                Environment=$match.environment
+                ProtectionGroup=""
+            }
+        }
+
+    }catch{
+        if($VerboseMode){ Write-Host "  ERROR: $($_.Exception.Message)" }
+
         $Results += [pscustomobject]@{
-            ci_item=$r.ci_item
-            BackupStatus="NoObject"
+            ci_item=$ciName
+            BackupStatus="Error"
             LastCompleted=""
             Cluster=""
             Environment=""
             ProtectionGroup=""
         }
-
-        if($VerboseMode){ Write-Host "    ✖ NOT FOUND" }
     }
 }
 
 Write-Progress -Completed
 
 # -------------------------
-# FINAL TABLE
+# FINAL OUTPUT
 # -------------------------
 Write-Host "`n------------------------------------------------------------"
 Write-Host "Backup Validation Results"
@@ -174,37 +180,23 @@ $Results | Format-Table -AutoSize
 # AUDIT SUMMARY
 # -------------------------
 Write-Host "`n------------------------------------------------------------"
-Write-Host "Backup Validation Summary (Audit View)"
+Write-Host "Backup Validation Summary"
 Write-Host "------------------------------------------------------------"
 
-$NoObject = ($Results | Where-Object {$_.BackupStatus -eq "NoObject"}).Count
-$Success  = ($Results | Where-Object {$_.BackupStatus -in @("Succeeded","SucceededWithWarning","kSuccess")}).Count
-$Fail     = ($Results | Where-Object {$_.BackupStatus -notin @("Succeeded","SucceededWithWarning","kSuccess","NoObject")}).Count
+$NoObject = ($Results | Where {$_.BackupStatus -eq "NoObject"}).Count
+$Success  = ($Results | Where {$_.BackupStatus -in @("Succeeded","SucceededWithWarning","kSuccess")}).Count
+$Fail     = ($Results | Where {$_.BackupStatus -notin @("Succeeded","SucceededWithWarning","kSuccess","NoObject")}).Count
 
-$Summary = @(
-    [pscustomobject]@{
-        ChangeNumber = $ChangeID
-        ExecutedBy   = $ExecutedBy
-        TotalObjects = $totalCI
-        FoundObjects = $found
-        Successful   = $Success
-        Failed       = $Fail
-        NotFound     = $NoObject
-        RunDate      = (Get-Date)
-    }
-)
-
-$Summary | Format-Table -AutoSize
-
-# -------------------------
-# CLUSTER DISTRIBUTION
-# -------------------------
-Write-Host "`nCluster Distribution"
-$Results | Where-Object {$_.Cluster} |
-Group-Object Cluster |
-Select-Object Name,Count |
-Sort-Object Count -Descending |
-Format-Table -AutoSize
+[pscustomobject]@{
+    ChangeNumber = $ChangeID
+    ExecutedBy   = $ExecutedBy
+    TotalObjects = $totalCI
+    FoundObjects = $found
+    Successful   = $Success
+    Failed       = $Fail
+    NotFound     = $NoObject
+    RunDate      = (Get-Date)
+} | Format-Table -AutoSize
 
 # -------------------------
 # EXPORT
