@@ -1,8 +1,10 @@
 # ==========================================================
 # Cohesity Backup Validation – SIMPLE DISPLAY ONLY
 # GET ONLY | SEARCH ONLY | ALL CLUSTERS
-# Stops at first match per CI
+# Uses same cluster pattern as your interface script
 # ==========================================================
+
+$ErrorActionPreference = "Stop"
 
 $ChangeID   = Read-Host "Enter Change Number"
 $ExecutedBy = (whoami).Trim()
@@ -16,19 +18,18 @@ if (-not (Test-Path $InputCsv)) {
 
 $CiList = Import-Csv $InputCsv
 
-# -------------------------
-# API Key
-# -------------------------
+# ==============================
+# 0) API key from your path
+# ==============================
 $apikeypath = "X:\PowerShell\Cohesity_API_Scripts\DO_NOT_Delete\apikey.txt"
 if (-not (Test-Path $apikeypath)) {
-    throw "API key file not found: $apikeypath"
+    throw "API key file not found at $apikeypath"
 }
 
-$ApiKey = (Get-Content -Path $apikeypath -Raw).Trim()
-
+$apiKey = (Get-Content -Path $apikeypath -Raw).Trim()
 $commonHeaders = @{
-    accept = "application/json"
-    apiKey = $ApiKey
+    "accept" = "application/json"
+    "apiKey" = $apiKey
 }
 
 # -------------------------
@@ -58,24 +59,41 @@ function ToDate {
 
     if (-not $Usecs) { return "" }
 
-    return [DateTimeOffset]::FromUnixTimeMilliseconds([int64]($Usecs / 1000)).LocalDateTime.ToString("dd-MMM-yyyy HH:mm:ss")
+    [DateTimeOffset]::FromUnixTimeMilliseconds([int64]($Usecs / 1000)).LocalDateTime.ToString("dd-MMM-yyyy HH:mm:ss")
 }
 
-# -------------------------
-# Get Clusters
-# -------------------------
-$clusterUrl  = "https://helios.cohesity.com/v2/mcm/cluster-mgmt/info"
-$clusterJson = Invoke-HeliosJson -Uri $clusterUrl -Headers $commonHeaders
+# ==========================================
+# 1) Get Clusters (ClusterName + ClusterId)
+# ==========================================
+$url      = "https://helios.cohesity.com/v2/mcm/cluster-mgmt/info"
+$response = Invoke-WebRequest -UseBasicParsing -Method Get -Uri $url -Headers $commonHeaders
+$json     = $response.Content | ConvertFrom-Json
+$json_clu = $json.cohesityClusters
 
-if (-not $clusterJson -or -not $clusterJson.cohesityClusters -or $clusterJson.cohesityClusters.Count -eq 0) {
+if (-not $json_clu -or $json_clu.Count -eq 0) {
     throw "No clusters returned from Helios."
 }
 
-$AllClusters = $clusterJson.cohesityClusters | Sort-Object -Property clusterName
+# ==========================================
+# 2) Build cluster list like your example
+# ==========================================
+$sorted = $json_clu | Sort-Object -Property clusterName
 
-# -------------------------
-# Process each CI
-# -------------------------
+$clusters = for ($i = 0; $i -lt $sorted.Count; $i++) {
+    [pscustomobject]@{
+        Index       = $i + 1
+        ClusterName = $sorted[$i].clusterName
+        ClusterId   = $sorted[$i].clusterId
+    }
+}
+
+$SelectedClusters   = $clusters
+$SelectedClusterIds = $clusters.ClusterId
+
+# ==========================================
+# 3) Process each CI across all clusters
+#    Stop searching more clusters once found
+# ==========================================
 $Results = foreach ($r in $CiList) {
 
     $ciName = "$($r.ci_item)".Trim()
@@ -94,15 +112,19 @@ $Results = foreach ($r in $CiList) {
     $encodedCI = [uri]::EscapeDataString($ciName)
     $matchedResult = $null
 
-    foreach ($clu in $AllClusters) {
+    foreach ($cid in $SelectedClusterIds) {
 
+        $clus = $SelectedClusters | Where-Object { $_.ClusterId -eq $cid } | Select-Object -First 1
+        $cluster_name = $clus.ClusterName
+        $cluster_id   = $clus.ClusterId
+
+        $url = "https://helios.cohesity.com/v2/data-protect/search/protected-objects?searchString=$encodedCI"
         $headers = @{
-            accept          = "application/json"
-            apiKey          = $ApiKey
-            accessClusterId = $clu.clusterId
+            "accept"          = "application/json"
+            "apiKey"          = $apiKey
+            "accessClusterId" = $cluster_id
         }
 
-        $url  = "https://helios.cohesity.com/v2/data-protect/search/protected-objects?searchString=$encodedCI"
         $json = Invoke-HeliosJson -Uri $url -Headers $headers
 
         if (-not $json -or -not $json.objects) {
@@ -116,26 +138,28 @@ $Results = foreach ($r in $CiList) {
             $_.objectName -like "$ciName.*"
         } | Select-Object -First 1
 
-        if ($obj) {
-            if ($obj.latestSnapshotInfo) {
-                $matchedResult = [pscustomobject]@{
-                    ServerName      = $ciName
-                    ClusterName     = $clu.clusterName
-                    ProtectionGroup = $obj.latestSnapshotInfo.protectionGroupName
-                    LastBackupTime  = ToDate $obj.latestSnapshotInfo.protectionRunStartTimeUsecs
-                }
-            }
-            else {
-                $matchedResult = [pscustomobject]@{
-                    ServerName      = $ciName
-                    ClusterName     = $clu.clusterName
-                    ProtectionGroup = ""
-                    LastBackupTime  = "NoBackup"
-                }
-            }
-
-            break
+        if (-not $obj) {
+            continue
         }
+
+        if ($obj.latestSnapshotInfo) {
+            $matchedResult = [pscustomobject]@{
+                ServerName      = $ciName
+                ClusterName     = $cluster_name
+                ProtectionGroup = $obj.latestSnapshotInfo.protectionGroupName
+                LastBackupTime  = ToDate $obj.latestSnapshotInfo.protectionRunStartTimeUsecs
+            }
+        }
+        else {
+            $matchedResult = [pscustomobject]@{
+                ServerName      = $ciName
+                ClusterName     = $cluster_name
+                ProtectionGroup = ""
+                LastBackupTime  = "NoBackup"
+            }
+        }
+
+        break
     }
 
     if ($matchedResult) {
