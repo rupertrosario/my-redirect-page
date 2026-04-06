@@ -1,7 +1,7 @@
 # ==========================================================
 # Cohesity Backup Validation – SIMPLE DISPLAY ONLY
 # GET ONLY | SEARCH ONLY | ALL CLUSTERS
-# Uses same cluster pattern as your interface script
+# Stops at first match per CI
 # ==========================================================
 
 $ErrorActionPreference = "Stop"
@@ -19,7 +19,7 @@ if (-not (Test-Path $InputCsv)) {
 $CiList = Import-Csv $InputCsv
 
 # ==============================
-# 0) API key from your path
+# API key
 # ==============================
 $apikeypath = "X:\PowerShell\Cohesity_API_Scripts\DO_NOT_Delete\apikey.txt"
 if (-not (Test-Path $apikeypath)) {
@@ -27,9 +27,10 @@ if (-not (Test-Path $apikeypath)) {
 }
 
 $apiKey = (Get-Content -Path $apikeypath -Raw).Trim()
+
 $commonHeaders = @{
-    "accept" = "application/json"
-    "apiKey" = $apiKey
+    accept = "application/json"
+    apiKey = $apiKey
 }
 
 # -------------------------
@@ -59,40 +60,30 @@ function ToDate {
 
     if (-not $Usecs) { return "" }
 
-    [DateTimeOffset]::FromUnixTimeMilliseconds([int64]($Usecs / 1000)).LocalDateTime.ToString("dd-MMM-yyyy HH:mm:ss")
+    return [DateTimeOffset]::FromUnixTimeMilliseconds([int64]($Usecs / 1000)).LocalDateTime.ToString("dd-MMM-yyyy HH:mm:ss")
 }
 
 # ==========================================
-# 1) Get Clusters (ClusterName + ClusterId)
+# 1) Get Clusters
 # ==========================================
-$url      = "https://helios.cohesity.com/v2/mcm/cluster-mgmt/info"
-$response = Invoke-WebRequest -UseBasicParsing -Method Get -Uri $url -Headers $commonHeaders
-$json     = $response.Content | ConvertFrom-Json
-$json_clu = $json.cohesityClusters
+$clusterUrl  = "https://helios.cohesity.com/v2/mcm/cluster-mgmt/info"
+$clusterJson = Invoke-HeliosJson -Uri $clusterUrl -Headers $commonHeaders
 
-if (-not $json_clu -or $json_clu.Count -eq 0) {
+if (-not $clusterJson -or -not $clusterJson.cohesityClusters -or $clusterJson.cohesityClusters.Count -eq 0) {
     throw "No clusters returned from Helios."
 }
 
-# ==========================================
-# 2) Build cluster list like your example
-# ==========================================
-$sorted = $json_clu | Sort-Object -Property clusterName
-
-$clusters = for ($i = 0; $i -lt $sorted.Count; $i++) {
-    [pscustomobject]@{
-        Index       = $i + 1
-        ClusterName = $sorted[$i].clusterName
-        ClusterId   = $sorted[$i].clusterId
+$clusters = $clusterJson.cohesityClusters |
+    Sort-Object -Property clusterName |
+    ForEach-Object {
+        [pscustomobject]@{
+            ClusterName = $_.clusterName
+            ClusterId   = $_.clusterId
+        }
     }
-}
-
-$SelectedClusters   = $clusters
-$SelectedClusterIds = $clusters.ClusterId
 
 # ==========================================
-# 3) Process each CI across all clusters
-#    Stop searching more clusters once found
+# 2) Process each CI across all clusters
 # ==========================================
 $Results = foreach ($r in $CiList) {
 
@@ -109,57 +100,56 @@ $Results = foreach ($r in $CiList) {
         continue
     }
 
-    $encodedCI = [uri]::EscapeDataString($ciName)
+    $encodedCI = [System.Uri]::EscapeDataString($ciName)
+    $url       = "https://helios.cohesity.com/v2/data-protect/search/protected-objects?searchString=$encodedCI"
+
     $matchedResult = $null
 
-    foreach ($cid in $SelectedClusterIds) {
+    foreach ($clu in $clusters) {
 
-        $clus = $SelectedClusters | Where-Object { $_.ClusterId -eq $cid } | Select-Object -First 1
-        $cluster_name = $clus.ClusterName
-        $cluster_id   = $clus.ClusterId
-
-        $url = "https://helios.cohesity.com/v2/data-protect/search/protected-objects?searchString=$encodedCI"
         $headers = @{
-            "accept"          = "application/json"
-            "apiKey"          = $apiKey
-            "accessClusterId" = $cluster_id
+            accept          = "application/json"
+            apiKey          = $apiKey
+            accessClusterId = $clu.ClusterId
         }
 
         $json = Invoke-HeliosJson -Uri $url -Headers $headers
 
-        if (-not $json -or -not $json.objects) {
+        if (-not $json -or -not $json.objects -or $json.objects.Count -eq 0) {
             continue
         }
 
         $obj = $json.objects | Where-Object {
-            $_.name -eq $ciName -or
-            $_.objectName -eq $ciName -or
-            $_.name -like "$ciName.*" -or
-            $_.objectName -like "$ciName.*"
+            ($_.name -and $_.name -eq $ciName) -or
+            ($_.objectName -and $_.objectName -eq $ciName) -or
+            ($_.name -and $_.name -like "$ciName.*") -or
+            ($_.objectName -and $_.objectName -like "$ciName.*")
         } | Select-Object -First 1
 
         if (-not $obj) {
-            continue
+            $obj = $json.objects | Select-Object -First 1
         }
 
-        if ($obj.latestSnapshotInfo) {
-            $matchedResult = [pscustomobject]@{
-                ServerName      = $ciName
-                ClusterName     = $cluster_name
-                ProtectionGroup = $obj.latestSnapshotInfo.protectionGroupName
-                LastBackupTime  = ToDate $obj.latestSnapshotInfo.protectionRunStartTimeUsecs
+        if ($obj) {
+            if ($obj.latestSnapshotInfo) {
+                $matchedResult = [pscustomobject]@{
+                    ServerName      = $ciName
+                    ClusterName     = $clu.ClusterName
+                    ProtectionGroup = $obj.latestSnapshotInfo.protectionGroupName
+                    LastBackupTime  = ToDate $obj.latestSnapshotInfo.protectionRunStartTimeUsecs
+                }
             }
-        }
-        else {
-            $matchedResult = [pscustomobject]@{
-                ServerName      = $ciName
-                ClusterName     = $cluster_name
-                ProtectionGroup = ""
-                LastBackupTime  = "NoBackup"
+            else {
+                $matchedResult = [pscustomobject]@{
+                    ServerName      = $ciName
+                    ClusterName     = $clu.ClusterName
+                    ProtectionGroup = ""
+                    LastBackupTime  = "NoBackup"
+                }
             }
-        }
 
-        break
+            break
+        }
     }
 
     if ($matchedResult) {
