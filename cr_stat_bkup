@@ -3,6 +3,15 @@
 # GET ONLY | SEARCH ONLY | ALL CLUSTERS
 # Reads CIs from CSV, writes them to TXT in same location,
 # then uses that TXT for validation
+#
+# Logic:
+# 1) Read CI list from CSV
+# 2) Write unique cleaned CIs to TXT
+# 3) Read TXT
+# 4) Get all clusters from Helios
+# 5) For each CI, search cluster by cluster using accessClusterId
+# 6) From returned objects, pick the first one that has latestSnapshotInfo
+# 7) Display result
 # ==========================================================
 
 $ErrorActionPreference = "Stop"
@@ -22,44 +31,9 @@ if (-not (Test-Path $InputCsv)) {
 }
 
 # -------------------------
-# Build TXT from CSV
-# -------------------------
-$CsvRows = Import-Csv $InputCsv
-
-$CiNames = $CsvRows | ForEach-Object {
-    "$($_.ci_item)".Trim().Trim('"').Trim("'")
-} | Where-Object {
-    -not [string]::IsNullOrWhiteSpace($_)
-} | Sort-Object -Unique
-
-if (-not $CiNames -or $CiNames.Count -eq 0) {
-    throw "No CI names found in CSV: $InputCsv"
-}
-
-$CiNames | Set-Content -Path $InputTxt
-
-if (-not (Test-Path $InputTxt)) {
-    throw "Failed to create TXT: $InputTxt"
-}
-
-# -------------------------
-# Load CI list from TXT
-# -------------------------
-$CiList = Get-Content -Path $InputTxt | ForEach-Object {
-    $_.Trim().Trim('"').Trim("'")
-} | Where-Object {
-    -not [string]::IsNullOrWhiteSpace($_)
-}
-
-if (-not $CiList -or $CiList.Count -eq 0) {
-    throw "No CI names found in TXT: $InputTxt"
-}
-
-# -------------------------
 # API key
 # -------------------------
 $apikeypath = "X:\PowerShell\Cohesity_API_Scripts\DO_NOT_Delete\apikey.txt"
-
 if (-not (Test-Path $apikeypath)) {
     throw "API key file not found: $apikeypath"
 }
@@ -83,6 +57,7 @@ function Invoke-HeliosJson {
 
     try {
         $r = Invoke-WebRequest -UseBasicParsing -Method Get -Uri $Uri -Headers $Headers -TimeoutSec $TimeoutSec -ErrorAction Stop
+        if ([string]::IsNullOrWhiteSpace($r.Content)) { return $null }
         return ($r.Content | ConvertFrom-Json)
     }
     catch {
@@ -94,11 +69,63 @@ function Invoke-HeliosJson {
 # Time Convert
 # -------------------------
 function ToDate {
-    param([long]$Usecs)
+    param([Nullable[long]]$Usecs)
 
     if (-not $Usecs) { return "" }
 
-    return [DateTimeOffset]::FromUnixTimeMilliseconds([int64]($Usecs / 1000)).LocalDateTime.ToString("dd-MMM-yyyy HH:mm:ss")
+    try {
+        return [DateTimeOffset]::FromUnixTimeMilliseconds([int64]($Usecs / 1000)).LocalDateTime.ToString("dd-MMM-yyyy HH:mm:ss")
+    }
+    catch {
+        return ""
+    }
+}
+
+# -------------------------
+# Build TXT from CSV
+# -------------------------
+$CsvRows = Import-Csv $InputCsv
+
+if (-not $CsvRows) {
+    throw "CSV is empty: $InputCsv"
+}
+
+if (-not ($CsvRows[0].PSObject.Properties.Name -contains "ci_item")) {
+    throw "Column 'ci_item' not found in CSV: $InputCsv"
+}
+
+$CiNames = $CsvRows |
+ForEach-Object {
+    "$($_.ci_item)".Trim().Trim('"').Trim("'")
+} |
+Where-Object {
+    -not [string]::IsNullOrWhiteSpace($_)
+} |
+Sort-Object -Unique
+
+if (-not $CiNames -or $CiNames.Count -eq 0) {
+    throw "No CI names found in CSV: $InputCsv"
+}
+
+$CiNames | Set-Content -Path $InputTxt
+
+if (-not (Test-Path $InputTxt)) {
+    throw "Failed to create TXT: $InputTxt"
+}
+
+# -------------------------
+# Load CI list from TXT
+# -------------------------
+$CiList = Get-Content -Path $InputTxt |
+ForEach-Object {
+    $_.Trim().Trim('"').Trim("'")
+} |
+Where-Object {
+    -not [string]::IsNullOrWhiteSpace($_)
+}
+
+if (-not $CiList -or $CiList.Count -eq 0) {
+    throw "No CI names found in TXT: $InputTxt"
 }
 
 # ==========================================
@@ -119,10 +146,20 @@ $clusters = $clusterJson.cohesityClusters | Sort-Object -Property clusterName
 $Results = foreach ($ci in $CiList) {
 
     $ciName = $ci.Trim()
-
     Write-Host "Processing: [$ciName]"
 
-    $url = "https://helios.cohesity.com/v2/data-protect/search/protected-objects?searchString=$ciName"
+    if ([string]::IsNullOrWhiteSpace($ciName)) {
+        [pscustomobject]@{
+            ServerName      = ""
+            ClusterName     = ""
+            ProtectionGroup = ""
+            LastBackupTime  = "BlankCI"
+        }
+        continue
+    }
+
+    $encodedCI = [System.Uri]::EscapeDataString($ciName)
+    $url       = "https://helios.cohesity.com/v2/data-protect/search/protected-objects?searchString=$encodedCI"
 
     $result = $null
 
@@ -131,7 +168,7 @@ $Results = foreach ($ci in $CiList) {
         $headers = @{
             accept          = "application/json"
             apiKey          = $apiKey
-            accessClusterId = $clu.clusterId
+            accessClusterId = "$($clu.clusterId)"
         }
 
         $json = Invoke-HeliosJson -Uri $url -Headers $headers
@@ -140,23 +177,19 @@ $Results = foreach ($ci in $CiList) {
             continue
         }
 
-        $obj = $json.objects[0]
+        # Pick the first object that actually has snapshot info
+        $obj = $json.objects | Where-Object { $_.latestSnapshotInfo } | Select-Object -First 1
 
-        if ($obj.latestSnapshotInfo) {
-            $result = [pscustomobject]@{
-                ServerName      = $ciName
-                ClusterName     = $clu.clusterName
-                ProtectionGroup = $obj.latestSnapshotInfo.protectionGroupName
-                LastBackupTime  = ToDate $obj.latestSnapshotInfo.protectionRunStartTimeUsecs
-            }
+        # If no object in this cluster has snapshot info, continue to next cluster
+        if (-not $obj) {
+            continue
         }
-        else {
-            $result = [pscustomobject]@{
-                ServerName      = $ciName
-                ClusterName     = $clu.clusterName
-                ProtectionGroup = ""
-                LastBackupTime  = "NoBackup"
-            }
+
+        $result = [pscustomobject]@{
+            ServerName      = $ciName
+            ClusterName     = $clu.clusterName
+            ProtectionGroup = $obj.latestSnapshotInfo.protectionGroupName
+            LastBackupTime  = ToDate $obj.latestSnapshotInfo.protectionRunStartTimeUsecs
         }
 
         break
@@ -170,7 +203,7 @@ $Results = foreach ($ci in $CiList) {
             ServerName      = $ciName
             ClusterName     = ""
             ProtectionGroup = ""
-            LastBackupTime  = "NoObject"
+            LastBackupTime  = "NoObjectOrBackup"
         }
     }
 }
