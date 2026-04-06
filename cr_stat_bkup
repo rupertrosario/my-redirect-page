@@ -1,98 +1,162 @@
 # ==========================================================
 # Cohesity Backup Validation – SIMPLE DISPLAY ONLY
-# WORKING CSV VERSION
+# GET ONLY | SEARCH ONLY | ALL CLUSTERS
+# Uses raw CI name in URL
+# Uses objects[0] directly
+# Cleans CSV value before search
 # ==========================================================
 
-$ChangeID = Read-Host "Enter Change Number"
+$ErrorActionPreference = "Stop"
 
-$CsvDirectory = "X:\PowerShell\Data\BackupValidation"
+$ChangeID   = Read-Host "Enter Change Number"
+$ExecutedBy = (whoami).Trim()
+
+$CsvDirectory = "X:\PowerShell\Data\Cohesity\BackupValidation"
 $InputCsv     = Join-Path $CsvDirectory "$ChangeID.csv"
 
 if (-not (Test-Path $InputCsv)) {
     throw "CSV not found: $InputCsv"
 }
 
-# -------------------------
-# API Key
-# -------------------------
-$apikeypath = "X:\PowerShell\Cohesity_API_Scripts\DO_NOT_Delete\apikey.txt"
-$ApiKey = (Get-Content -Path $apikeypath -Raw).Trim()
-
-$Headers = @{
-    accept = "application/json"
-    apiKey = $ApiKey
-    accessClusterId = "16344234237976"
-}
-
-# -------------------------
-# Load CSV
-# -------------------------
 $CiList = Import-Csv $InputCsv
 
 # -------------------------
-# Time convert
+# API key
 # -------------------------
-function ToDate($u){
-    if(!$u){ return "" }
-    return [DateTimeOffset]::FromUnixTimeMilliseconds([int64]($u / 1000)).LocalDateTime.ToString("dd-MMM-yyyy HH:mm:ss")
+$apikeypath = "X:\PowerShell\Cohesity_API_Scripts\DO_NOT_Delete\apikey.txt"
+if (-not (Test-Path $apikeypath)) {
+    throw "API key file not found: $apikeypath"
+}
+
+$apiKey = (Get-Content -Path $apikeypath -Raw).Trim()
+
+$commonHeaders = @{
+    accept = "application/json"
+    apiKey = $apiKey
 }
 
 # -------------------------
-# Process
+# Wrapper
 # -------------------------
-$Results = foreach($r in $CiList){
+function Invoke-HeliosJson {
+    param(
+        [Parameter(Mandatory)] [string]$Uri,
+        [Parameter(Mandatory)] [hashtable]$Headers,
+        [int]$TimeoutSec = 20
+    )
 
-    # force clean read from CSV
-    $ciName = "$($r.ci_item)".Trim()
-
-    # skip blank rows
-    if([string]::IsNullOrWhiteSpace($ciName)){
-        continue
+    try {
+        $r = Invoke-WebRequest -UseBasicParsing -Method Get -Uri $Uri -Headers $Headers -TimeoutSec $TimeoutSec -ErrorAction Stop
+        return ($r.Content | ConvertFrom-Json)
     }
+    catch {
+        return $null
+    }
+}
+
+# -------------------------
+# Time Convert
+# -------------------------
+function ToDate {
+    param([long]$Usecs)
+
+    if (-not $Usecs) { return "" }
+
+    return [DateTimeOffset]::FromUnixTimeMilliseconds([int64]($Usecs / 1000)).LocalDateTime.ToString("dd-MMM-yyyy HH:mm:ss")
+}
+
+# ==========================================
+# 1) Get Clusters
+# ==========================================
+$clusterUrl  = "https://helios.cohesity.com/v2/mcm/cluster-mgmt/info"
+$clusterJson = Invoke-HeliosJson -Uri $clusterUrl -Headers $commonHeaders
+
+if (-not $clusterJson -or -not $clusterJson.cohesityClusters -or $clusterJson.cohesityClusters.Count -eq 0) {
+    throw "No clusters returned from Helios."
+}
+
+$clusters = $clusterJson.cohesityClusters | Sort-Object -Property clusterName
+
+# ==========================================
+# 2) Process each CI across all clusters
+# ==========================================
+$Results = foreach ($r in $CiList) {
+
+    $rawCI  = "$($r.ci_item)"
+    $ciName = $rawCI.Trim().Trim('"').Trim("'")
 
     Write-Host "Processing: [$ciName]"
 
-    $encodedCI = [uri]::EscapeDataString($ciName)
-    $url = "https://helios.cohesity.com/v2/data-protect/search/protected-objects?searchString=$encodedCI"
-
-    try {
-        $response = Invoke-WebRequest -Uri $url -Method Get -Headers $Headers -UseBasicParsing
-        $json = $response.Content | ConvertFrom-Json
-    }
-    catch {
+    if ([string]::IsNullOrWhiteSpace($ciName)) {
         [pscustomobject]@{
-            ServerName      = $ciName
+            ServerName      = ""
+            ClusterName     = ""
             ProtectionGroup = ""
-            LastBackupTime  = "Error"
+            LastBackupTime  = "BlankCI"
         }
         continue
     }
 
-    if(-not $json.objects){
+    $url = "https://helios.cohesity.com/v2/data-protect/search/protected-objects?searchString=$ciName"
+
+    $result = $null
+
+    foreach ($clu in $clusters) {
+
+        $headers = @{
+            accept          = "application/json"
+            apiKey          = $apiKey
+            accessClusterId = $clu.clusterId
+        }
+
+        $json = Invoke-HeliosJson -Uri $url -Headers $headers
+
+        if (-not $json -or -not $json.objects -or $json.objects.Count -eq 0) {
+            continue
+        }
+
+        $obj = $json.objects[0]
+
+        if ($obj.latestSnapshotInfo) {
+            $result = [pscustomobject]@{
+                ServerName      = $ciName
+                ClusterName     = $clu.clusterName
+                ProtectionGroup = $obj.latestSnapshotInfo.protectionGroupName
+                LastBackupTime  = ToDate $obj.latestSnapshotInfo.protectionRunStartTimeUsecs
+            }
+        }
+        else {
+            $result = [pscustomobject]@{
+                ServerName      = $ciName
+                ClusterName     = $clu.clusterName
+                ProtectionGroup = ""
+                LastBackupTime  = "NoBackup"
+            }
+        }
+
+        break
+    }
+
+    if ($result) {
+        $result
+    }
+    else {
         [pscustomobject]@{
             ServerName      = $ciName
+            ClusterName     = ""
             ProtectionGroup = ""
             LastBackupTime  = "NoObject"
-        }
-        continue
-    }
-
-    $snap = $json.objects.latestSnapshotInfo | Select-Object -First 1
-
-    if($snap){
-        [pscustomobject]@{
-            ServerName      = $ciName
-            ProtectionGroup = $snap.protectionGroupName
-            LastBackupTime  = ToDate $snap.protectionRunStartTimeUsecs
-        }
-    }
-    else{
-        [pscustomobject]@{
-            ServerName      = $ciName
-            ProtectionGroup = ""
-            LastBackupTime  = "NoBackup"
         }
     }
 }
 
-$Results | Format-Table -AutoSize
+# -------------------------
+# Display
+# -------------------------
+Write-Host ""
+Write-Host "Cohesity Backup Validation"
+Write-Host "Change Number : $ChangeID"
+Write-Host "Executed By   : $ExecutedBy"
+Write-Host ""
+
+$Results | Format-Table ServerName, ClusterName, ProtectionGroup, LastBackupTime -AutoSize
