@@ -1,9 +1,16 @@
 # ==========================================================
-# Cohesity Backup Validation – TXT REPORT OUTPUT
+# Cohesity Backup Validation – DISPLAY + TXT REPORT OUTPUT
 # GET ONLY | SEARCH ONLY | ALL CLUSTERS
-# Reads CIs from CSV, writes them to TXT in same location,
-# validates backup presence cluster by cluster,
-# and writes a TXT report with summary + details
+#
+# What it does
+# 1) Reads CIs from CSV
+# 2) Writes unique cleaned CIs to TXT in same folder
+# 3) Searches each CI cluster by cluster using accessClusterId
+# 4) If CI is protected by multiple PGs, evaluates all PG/time pairs
+# 5) Picks the latest backup across all PGs for the main details view
+# 6) Also writes an expanded section showing all PGs found per CI
+# 7) Displays summary + details on screen
+# 8) Writes the same report to TXT and shows the TXT location
 # ==========================================================
 
 $ErrorActionPreference = "Stop"
@@ -72,23 +79,10 @@ function ToDate {
     }
 }
 
-function Get-UsecsValue {
+function Convert-ToInt64OrNull {
     param($Value)
 
-    if (-not $Value) {
-        return $null
-    }
-
-    if ($Value -is [array]) {
-        $FirstValue = $Value | Where-Object { $_ } | Select-Object -First 1
-        if ($null -ne $FirstValue) {
-            try {
-                return [int64]$FirstValue
-            }
-            catch {
-                return $null
-            }
-        }
+    if ($null -eq $Value -or $Value -eq "") {
         return $null
     }
 
@@ -120,6 +114,46 @@ function Get-SnapshotInfo {
     }
 
     return $null
+}
+
+function Get-SnapshotPairs {
+    param($SnapshotInfo)
+
+    $pairs = @()
+
+    if (-not $SnapshotInfo) {
+        return $pairs
+    }
+
+    $pgValues   = @($SnapshotInfo.protectionGroupName)
+    $timeValues = @($SnapshotInfo.protectionRunStartTimeUsecs)
+
+    if (($pgValues.Count -eq 0) -and ($timeValues.Count -eq 0)) {
+        return $pairs
+    }
+
+    $maxCount = [Math]::Max($pgValues.Count, $timeValues.Count)
+
+    for ($i = 0; $i -lt $maxCount; $i++) {
+
+        $pgName = "-"
+        if ($i -lt $pgValues.Count -and -not [string]::IsNullOrWhiteSpace("$($pgValues[$i])")) {
+            $pgName = "$($pgValues[$i])"
+        }
+
+        $usecs = $null
+        if ($i -lt $timeValues.Count) {
+            $usecs = Convert-ToInt64OrNull $timeValues[$i]
+        }
+
+        $pairs += [pscustomobject]@{
+            ProtectionGroup = $pgName
+            Usecs           = $usecs
+            BackupTime      = if ($usecs) { ToDate $usecs } else { "NoBackupTime" }
+        }
+    }
+
+    return $pairs
 }
 
 # -------------------------
@@ -184,7 +218,8 @@ $Clusters = $ClusterJson.cohesityClusters | Sort-Object -Property clusterName
 # -------------------------
 # Process Each CI
 # -------------------------
-$Results = @()
+$LatestResults   = @()
+$ExpandedResults = @()
 
 foreach ($CiName in $CiList) {
 
@@ -192,12 +227,6 @@ foreach ($CiName in $CiList) {
     Write-Host "Processing: [$CiName]"
 
     if ([string]::IsNullOrWhiteSpace($CiName)) {
-        $Results += [pscustomobject]@{
-            ServerName      = ""
-            ClusterName     = ""
-            ProtectionGroup = ""
-            LastBackupTime  = "BlankCI"
-        }
         continue
     }
 
@@ -222,39 +251,48 @@ foreach ($CiName in $CiList) {
 
         $FoundInAnyCluster = $true
 
-        $SnapshotInfo = $null
+        $AllPairs = @()
+
         foreach ($Obj in $Json.objects) {
-            $Snap = Get-SnapshotInfo -Object $Obj
-            if ($Snap) {
-                $SnapshotInfo = $Snap
-                break
+            $SnapshotInfo = Get-SnapshotInfo -Object $Obj
+            if ($SnapshotInfo) {
+                $Pairs = Get-SnapshotPairs -SnapshotInfo $SnapshotInfo
+                if ($Pairs -and $Pairs.Count -gt 0) {
+                    $AllPairs += $Pairs
+                }
             }
         }
 
-        if ($SnapshotInfo) {
-            $Usecs = Get-UsecsValue -Value $SnapshotInfo.protectionRunStartTimeUsecs
-
-            if ($Usecs) {
-                $LastBackupTime = ToDate $Usecs
-            }
-            else {
-                $LastBackupTime = "NoBackupTime"
-            }
-
-            $ProtectionGroup = $SnapshotInfo.protectionGroupName
-            if ([string]::IsNullOrWhiteSpace($ProtectionGroup)) {
-                $ProtectionGroup = "-"
+        if ($AllPairs.Count -gt 0) {
+            foreach ($Pair in $AllPairs) {
+                $ExpandedResults += [pscustomobject]@{
+                    ServerName      = $CiName
+                    ClusterName     = $Clu.clusterName
+                    ProtectionGroup = $Pair.ProtectionGroup
+                    LastBackupTime  = $Pair.BackupTime
+                }
             }
 
-            $Results += [pscustomobject]@{
+            $LatestPair = $AllPairs |
+                Sort-Object -Property @{ Expression = { if ($_.Usecs) { $_.Usecs } else { 0 } } } -Descending |
+                Select-Object -First 1
+
+            $LatestResults += [pscustomobject]@{
                 ServerName      = $CiName
                 ClusterName     = $Clu.clusterName
-                ProtectionGroup = $ProtectionGroup
-                LastBackupTime  = $LastBackupTime
+                ProtectionGroup = $LatestPair.ProtectionGroup
+                LastBackupTime  = $LatestPair.BackupTime
             }
         }
         else {
-            $Results += [pscustomobject]@{
+            $LatestResults += [pscustomobject]@{
+                ServerName      = $CiName
+                ClusterName     = $Clu.clusterName
+                ProtectionGroup = "-"
+                LastBackupTime  = "NoBackup"
+            }
+
+            $ExpandedResults += [pscustomobject]@{
                 ServerName      = $CiName
                 ClusterName     = $Clu.clusterName
                 ProtectionGroup = "-"
@@ -266,7 +304,14 @@ foreach ($CiName in $CiList) {
     }
 
     if (-not $FoundInAnyCluster) {
-        $Results += [pscustomobject]@{
+        $LatestResults += [pscustomobject]@{
+            ServerName      = $CiName
+            ClusterName     = "-"
+            ProtectionGroup = "-"
+            LastBackupTime  = "NoObject"
+        }
+
+        $ExpandedResults += [pscustomobject]@{
             ServerName      = $CiName
             ClusterName     = "-"
             ProtectionGroup = "-"
@@ -278,10 +323,16 @@ foreach ($CiName in $CiList) {
 # -------------------------
 # Summary
 # -------------------------
-$TotalCIs = $Results.Count
-$BackedUp = ($Results | Where-Object { $_.LastBackupTime -notin @("NoBackup", "NoBackupTime", "NoObject", "BlankCI", "") }).Count
-$NoBackup = ($Results | Where-Object { $_.LastBackupTime -in @("NoBackup", "NoBackupTime") }).Count
-$NoObject = ($Results | Where-Object { $_.LastBackupTime -eq "NoObject" }).Count
+$TotalCIs = $LatestResults.Count
+$BackedUp = ($LatestResults | Where-Object { $_.LastBackupTime -notin @("NoBackup", "NoBackupTime", "NoObject", "") }).Count
+$NoBackup = ($LatestResults | Where-Object { $_.LastBackupTime -in @("NoBackup", "NoBackupTime") }).Count
+$NoObject = ($LatestResults | Where-Object { $_.LastBackupTime -eq "NoObject" }).Count
+
+# -------------------------
+# Build report strings
+# -------------------------
+$LatestTableString = ($LatestResults | Format-Table ServerName, ClusterName, ProtectionGroup, LastBackupTime -AutoSize | Out-String).TrimEnd()
+$ExpandedTableString = ($ExpandedResults | Format-Table ServerName, ClusterName, ProtectionGroup, LastBackupTime -AutoSize | Out-String).TrimEnd()
 
 # -------------------------
 # Build Report
@@ -300,19 +351,24 @@ $Report += "No Backup     : $NoBackup"
 $Report += "No Object     : $NoObject"
 $Report += ""
 $Report += "----------------------------------------------------------"
-$Report += "Details"
+$Report += "Details (Latest Backup Across All Protection Groups)"
 $Report += "----------------------------------------------------------"
 $Report += ""
-
-$Report += ($Results | Format-Table ServerName, ClusterName, ProtectionGroup, LastBackupTime -AutoSize | Out-String).TrimEnd()
-
+$Report += $LatestTableString
+$Report += ""
+$Report += "----------------------------------------------------------"
+$Report += "Expanded View (All Protection Groups Found)"
+$Report += "----------------------------------------------------------"
+$Report += ""
+$Report += $ExpandedTableString
 $Report += ""
 $Report += "----------------------------------------------------------"
 $Report += "Summary Notes"
 $Report += "----------------------------------------------------------"
-$Report += "- Backed Up   : CI found with valid snapshot and backup time"
-$Report += "- No Backup   : CI found in cluster but no usable snapshot time returned"
-$Report += "- No Object   : CI not found in any cluster"
+$Report += "- Latest view selects the most recent backup across all protection groups"
+$Report += "- Expanded view shows all protection groups found for the CI"
+$Report += "- No Backup = CI found in cluster but no usable snapshot time returned"
+$Report += "- No Object = CI not found in any cluster"
 $Report += ""
 $Report += "----------------------------------------------------------"
 $Report += "Report Location"
@@ -326,15 +382,37 @@ $Report += "=========================================================="
 $Report | Set-Content -Path $OutputTxt
 
 # -------------------------
-# Console Output
+# Console Display
 # -------------------------
 Write-Host ""
-Write-Host "Cohesity Backup Validation Report Generated"
+Write-Host "=========================================================="
+Write-Host "Cohesity Backup Validation Report"
+Write-Host "=========================================================="
 Write-Host "Change Number : $ChangeID"
+Write-Host "Executed By   : $ExecutedBy"
+Write-Host "Run Date      : $(Get-Date -Format 'dd-MMM-yyyy HH:mm:ss')"
+Write-Host ""
 Write-Host "Total CIs     : $TotalCIs"
 Write-Host "Backed Up     : $BackedUp"
 Write-Host "No Backup     : $NoBackup"
 Write-Host "No Object     : $NoObject"
 Write-Host ""
-Write-Host "Report Location:"
+Write-Host "----------------------------------------------------------"
+Write-Host "Details (Latest Backup Across All Protection Groups)"
+Write-Host "----------------------------------------------------------"
+Write-Host ""
+$LatestResults | Format-Table ServerName, ClusterName, ProtectionGroup, LastBackupTime -AutoSize
+
+Write-Host ""
+Write-Host "----------------------------------------------------------"
+Write-Host "Expanded View (All Protection Groups Found)"
+Write-Host "----------------------------------------------------------"
+Write-Host ""
+$ExpandedResults | Format-Table ServerName, ClusterName, ProtectionGroup, LastBackupTime -AutoSize
+
+Write-Host ""
+Write-Host "----------------------------------------------------------"
+Write-Host "Report Location"
+Write-Host "----------------------------------------------------------"
 Write-Host $OutputTxt
+Write-Host "=========================================================="
