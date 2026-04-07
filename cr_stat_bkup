@@ -1,5 +1,9 @@
 # ==========================================================
 # Cohesity Backup Validation – TXT REPORT OUTPUT
+# GET ONLY | SEARCH ONLY | ALL CLUSTERS
+# Reads CIs from CSV, writes them to TXT in same location,
+# validates backup presence cluster by cluster,
+# and writes a TXT report with summary + details
 # ==========================================================
 
 $ErrorActionPreference = "Stop"
@@ -16,121 +20,257 @@ $InputTxt  = Join-Path $BaseDir "$ChangeID.txt"
 $TimeStamp = Get-Date -Format "yyyyMMdd_HHmm"
 $OutputTxt = Join-Path $BaseDir "${ChangeID}_BackupReport_$TimeStamp.txt"
 
+if (-not (Test-Path $InputCsv)) {
+    throw "CSV not found: $InputCsv"
+}
+
 # -------------------------
 # API Key
 # -------------------------
-$apiKey = (Get-Content "X:\PowerShell\Cohesity_API_Scripts\DO_NOT_Delete\apikey.txt" -Raw).Trim()
+$ApiKeyPath = "X:\PowerShell\Cohesity_API_Scripts\DO_NOT_Delete\apikey.txt"
+
+if (-not (Test-Path $ApiKeyPath)) {
+    throw "API key file not found: $ApiKeyPath"
+}
+
+$ApiKey = (Get-Content -Path $ApiKeyPath -Raw).Trim()
 
 # -------------------------
 # Helper Functions
 # -------------------------
-function Invoke-HeliosJson($Uri, $Headers) {
+function Invoke-HeliosJson {
+    param(
+        [Parameter(Mandatory)] [string]$Uri,
+        [Parameter(Mandatory)] [hashtable]$Headers,
+        [int]$TimeoutSec = 20
+    )
+
     try {
-        $r = Invoke-WebRequest -UseBasicParsing -Method Get -Uri $Uri -Headers $Headers -TimeoutSec 20
-        return ($r.Content | ConvertFrom-Json)
-    } catch { return $null }
+        $Response = Invoke-WebRequest -UseBasicParsing -Method Get -Uri $Uri -Headers $Headers -TimeoutSec $TimeoutSec -ErrorAction Stop
+        if ([string]::IsNullOrWhiteSpace($Response.Content)) {
+            return $null
+        }
+        return ($Response.Content | ConvertFrom-Json)
+    }
+    catch {
+        return $null
+    }
 }
 
-function ToDate($Usecs) {
-    if (-not $Usecs) { return "" }
+function ToDate {
+    param([Nullable[long]]$Usecs)
+
+    if (-not $Usecs) {
+        return ""
+    }
+
     try {
         return [DateTimeOffset]::FromUnixTimeMilliseconds([int64]($Usecs / 1000)).LocalDateTime.ToString("dd-MMM-yyyy HH:mm:ss")
-    } catch { return "" }
-}
-
-function Get-UsecsValue($Value) {
-    if (-not $Value) { return $null }
-    if ($Value -is [array]) {
-        return [int64]($Value | Where-Object { $_ } | Select-Object -First 1)
     }
-    return [int64]$Value
+    catch {
+        return ""
+    }
 }
 
-function Get-SnapshotInfo($obj) {
-    if ($obj.latestSnapshotInfo) { return $obj.latestSnapshotInfo }
-    if ($obj.latestSnapshotsInfo) { return $obj.latestSnapshotsInfo }
+function Get-UsecsValue {
+    param($Value)
+
+    if (-not $Value) {
+        return $null
+    }
+
+    if ($Value -is [array]) {
+        $FirstValue = $Value | Where-Object { $_ } | Select-Object -First 1
+        if ($null -ne $FirstValue) {
+            try {
+                return [int64]$FirstValue
+            }
+            catch {
+                return $null
+            }
+        }
+        return $null
+    }
+
+    try {
+        return [int64]$Value
+    }
+    catch {
+        return $null
+    }
+}
+
+function Get-SnapshotInfo {
+    param($Object)
+
+    if (-not $Object) {
+        return $null
+    }
+
+    if ($Object.PSObject.Properties.Name -contains "latestSnapshotInfo") {
+        if ($Object.latestSnapshotInfo) {
+            return $Object.latestSnapshotInfo
+        }
+    }
+
+    if ($Object.PSObject.Properties.Name -contains "latestSnapshotsInfo") {
+        if ($Object.latestSnapshotsInfo) {
+            return $Object.latestSnapshotsInfo
+        }
+    }
+
     return $null
 }
 
 # -------------------------
-# CSV → TXT
+# CSV -> TXT
 # -------------------------
-$CiNames = Import-Csv $InputCsv |
-ForEach-Object { "$($_.ci_item)".Trim().Trim('"') } |
-Where-Object { $_ } |
+$CsvRows = Import-Csv -Path $InputCsv
+
+if (-not $CsvRows) {
+    throw "CSV is empty: $InputCsv"
+}
+
+if (-not ($CsvRows[0].PSObject.Properties.Name -contains "ci_item")) {
+    throw "Column 'ci_item' not found in CSV: $InputCsv"
+}
+
+$CiNames = $CsvRows |
+ForEach-Object {
+    "$($_.ci_item)".Trim().Trim('"').Trim("'")
+} |
+Where-Object {
+    -not [string]::IsNullOrWhiteSpace($_)
+} |
 Sort-Object -Unique
 
-$CiNames | Set-Content $InputTxt
-$CiList = Get-Content $InputTxt
+if (-not $CiNames -or $CiNames.Count -eq 0) {
+    throw "No CI names found in CSV: $InputCsv"
+}
+
+$CiNames | Set-Content -Path $InputTxt
+
+if (-not (Test-Path $InputTxt)) {
+    throw "Failed to create TXT: $InputTxt"
+}
+
+$CiList = Get-Content -Path $InputTxt |
+ForEach-Object {
+    $_.Trim().Trim('"').Trim("'")
+} |
+Where-Object {
+    -not [string]::IsNullOrWhiteSpace($_)
+}
+
+if (-not $CiList -or $CiList.Count -eq 0) {
+    throw "No CI names found in TXT: $InputTxt"
+}
 
 # -------------------------
 # Get Clusters
 # -------------------------
-$clusterJson = Invoke-HeliosJson "https://helios.cohesity.com/v2/mcm/cluster-mgmt/info" @{
-    accept="application/json"; apiKey=$apiKey
+$ClusterUrl = "https://helios.cohesity.com/v2/mcm/cluster-mgmt/info"
+$ClusterJson = Invoke-HeliosJson -Uri $ClusterUrl -Headers @{
+    accept = "application/json"
+    apiKey = $ApiKey
 }
 
-$clusters = $clusterJson.cohesityClusters
+if (-not $ClusterJson -or -not $ClusterJson.cohesityClusters -or $ClusterJson.cohesityClusters.Count -eq 0) {
+    throw "No clusters returned from Helios."
+}
+
+$Clusters = $ClusterJson.cohesityClusters | Sort-Object -Property clusterName
 
 # -------------------------
-# Process
+# Process Each CI
 # -------------------------
 $Results = @()
 
-foreach ($ciName in $CiList) {
+foreach ($CiName in $CiList) {
 
-    $ciName = $ciName.Trim()
-    $encoded = [uri]::EscapeDataString($ciName)
+    $CiName = $CiName.Trim()
+    Write-Host "Processing: [$CiName]"
 
-    $found = $false
+    if ([string]::IsNullOrWhiteSpace($CiName)) {
+        $Results += [pscustomobject]@{
+            ServerName      = ""
+            ClusterName     = ""
+            ProtectionGroup = ""
+            LastBackupTime  = "BlankCI"
+        }
+        continue
+    }
 
-    foreach ($clu in $clusters) {
+    $EncodedCi = [System.Uri]::EscapeDataString($CiName)
+    $SearchUrl = "https://helios.cohesity.com/v2/data-protect/search/protected-objects?searchString=$EncodedCi"
 
-        $headers = @{
-            accept="application/json"
-            apiKey=$apiKey
-            accessClusterId="$($clu.clusterId)"
+    $FoundInAnyCluster = $false
+
+    foreach ($Clu in $Clusters) {
+
+        $Headers = @{
+            accept          = "application/json"
+            apiKey          = $ApiKey
+            accessClusterId = "$($Clu.clusterId)"
         }
 
-        $json = Invoke-HeliosJson "https://helios.cohesity.com/v2/data-protect/search/protected-objects?searchString=$encoded" $headers
+        $Json = Invoke-HeliosJson -Uri $SearchUrl -Headers $Headers
 
-        if (-not $json.objects) { continue }
-
-        $snap = $null
-        foreach ($obj in $json.objects) {
-            $snap = Get-SnapshotInfo $obj
-            if ($snap) { break }
+        if (-not $Json -or -not $Json.objects -or $Json.objects.Count -eq 0) {
+            continue
         }
 
-        if ($snap) {
-            $usecs = Get-UsecsValue $snap.protectionRunStartTimeUsecs
+        $FoundInAnyCluster = $true
+
+        $SnapshotInfo = $null
+        foreach ($Obj in $Json.objects) {
+            $Snap = Get-SnapshotInfo -Object $Obj
+            if ($Snap) {
+                $SnapshotInfo = $Snap
+                break
+            }
+        }
+
+        if ($SnapshotInfo) {
+            $Usecs = Get-UsecsValue -Value $SnapshotInfo.protectionRunStartTimeUsecs
+
+            if ($Usecs) {
+                $LastBackupTime = ToDate $Usecs
+            }
+            else {
+                $LastBackupTime = "NoBackupTime"
+            }
+
+            $ProtectionGroup = $SnapshotInfo.protectionGroupName
+            if ([string]::IsNullOrWhiteSpace($ProtectionGroup)) {
+                $ProtectionGroup = "-"
+            }
 
             $Results += [pscustomobject]@{
-                ServerName=$ciName
-                ClusterName=$clu.clusterName
-                ProtectionGroup=$snap.protectionGroupName
-                LastBackupTime=(if ($usecs) { ToDate $usecs } else { "NoBackupTime" })
+                ServerName      = $CiName
+                ClusterName     = $Clu.clusterName
+                ProtectionGroup = $ProtectionGroup
+                LastBackupTime  = $LastBackupTime
             }
         }
         else {
             $Results += [pscustomobject]@{
-                ServerName=$ciName
-                ClusterName=$clu.clusterName
-                ProtectionGroup="-"
-                LastBackupTime="NoBackup"
+                ServerName      = $CiName
+                ClusterName     = $Clu.clusterName
+                ProtectionGroup = "-"
+                LastBackupTime  = "NoBackup"
             }
         }
 
-        $found = $true
         break
     }
 
-    if (-not $found) {
+    if (-not $FoundInAnyCluster) {
         $Results += [pscustomobject]@{
-            ServerName=$ciName
-            ClusterName="-"
-            ProtectionGroup="-"
-            LastBackupTime="NoObject"
+            ServerName      = $CiName
+            ClusterName     = "-"
+            ProtectionGroup = "-"
+            LastBackupTime  = "NoObject"
         }
     }
 }
@@ -138,44 +278,63 @@ foreach ($ciName in $CiList) {
 # -------------------------
 # Summary
 # -------------------------
-$total = $Results.Count
-$backed = ($Results | Where-Object { $_.LastBackupTime -notmatch "No" }).Count
-$noback = ($Results | Where-Object { $_.LastBackupTime -eq "NoBackup" }).Count
-$noobj  = ($Results | Where-Object { $_.LastBackupTime -eq "NoObject" }).Count
+$TotalCIs = $Results.Count
+$BackedUp = ($Results | Where-Object { $_.LastBackupTime -notin @("NoBackup", "NoBackupTime", "NoObject", "BlankCI", "") }).Count
+$NoBackup = ($Results | Where-Object { $_.LastBackupTime -in @("NoBackup", "NoBackupTime") }).Count
+$NoObject = ($Results | Where-Object { $_.LastBackupTime -eq "NoObject" }).Count
 
 # -------------------------
 # Build Report
 # -------------------------
-$report = @()
-$report += "=========================================================="
-$report += "Cohesity Backup Validation Report"
-$report += "=========================================================="
-$report += "Change Number : $ChangeID"
-$report += "Executed By   : $ExecutedBy"
-$report += "Run Date      : $(Get-Date -Format 'dd-MMM-yyyy HH:mm:ss')"
-$report += ""
-$report += "Total CIs     : $total"
-$report += "Backed Up     : $backed"
-$report += "No Backup     : $noback"
-$report += "No Object     : $noobj"
-$report += ""
-$report += "----------------------------------------------------------"
-$report += "Details"
-$report += "----------------------------------------------------------"
-$report += ""
+$Report = @()
+$Report += "=========================================================="
+$Report += "Cohesity Backup Validation Report"
+$Report += "=========================================================="
+$Report += "Change Number : $ChangeID"
+$Report += "Executed By   : $ExecutedBy"
+$Report += "Run Date      : $(Get-Date -Format 'dd-MMM-yyyy HH:mm:ss')"
+$Report += ""
+$Report += "Total CIs     : $TotalCIs"
+$Report += "Backed Up     : $BackedUp"
+$Report += "No Backup     : $NoBackup"
+$Report += "No Object     : $NoObject"
+$Report += ""
+$Report += "----------------------------------------------------------"
+$Report += "Details"
+$Report += "----------------------------------------------------------"
+$Report += ""
 
-$report += ($Results | Format-Table ServerName,ClusterName,ProtectionGroup,LastBackupTime -AutoSize | Out-String)
+$Report += ($Results | Format-Table ServerName, ClusterName, ProtectionGroup, LastBackupTime -AutoSize | Out-String).TrimEnd()
 
-$report += "----------------------------------------------------------"
-$report += "Report Location"
-$report += "----------------------------------------------------------"
-$report += $OutputTxt
-$report += "=========================================================="
+$Report += ""
+$Report += "----------------------------------------------------------"
+$Report += "Summary Notes"
+$Report += "----------------------------------------------------------"
+$Report += "- Backed Up   : CI found with valid snapshot and backup time"
+$Report += "- No Backup   : CI found in cluster but no usable snapshot time returned"
+$Report += "- No Object   : CI not found in any cluster"
+$Report += ""
+$Report += "----------------------------------------------------------"
+$Report += "Report Location"
+$Report += "----------------------------------------------------------"
+$Report += $OutputTxt
+$Report += "=========================================================="
 
 # -------------------------
-# Write File
+# Write Report
 # -------------------------
-$report | Set-Content $OutputTxt
+$Report | Set-Content -Path $OutputTxt
 
-Write-Host "Report generated:"
+# -------------------------
+# Console Output
+# -------------------------
+Write-Host ""
+Write-Host "Cohesity Backup Validation Report Generated"
+Write-Host "Change Number : $ChangeID"
+Write-Host "Total CIs     : $TotalCIs"
+Write-Host "Backed Up     : $BackedUp"
+Write-Host "No Backup     : $NoBackup"
+Write-Host "No Object     : $NoObject"
+Write-Host ""
+Write-Host "Report Location:"
 Write-Host $OutputTxt
