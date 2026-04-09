@@ -1,0 +1,473 @@
+// ------------------------------------------------------------
+// Dynatrace JS | Cohesity Helios Alerts (GET only)
+// JS1 (Get_Alerts) - SNOW-ready output
+//
+// Purpose:
+// - Get Helios alerts for the last 24 hours
+// - Add Cluster Location from cluster-mgmt/info
+// - Keep latest alert per (ClusterId + NodeId)
+// - Return SNOW-ready fields:
+//     SnowIncidentKey      -> stable identity for 1 incident
+//     LastAlertTimeUsecs   -> compare with stored value in SNOW
+//     LastAlertTimeET      -> readable timestamp
+//     ShortDescription     -> for SNOW create/search
+//     Description          -> full incident description
+//     UpdateText           -> work note/update text
+//
+// Create / Update / Skip logic is for later workflow steps:
+// - no incident for SnowIncidentKey                    -> CREATE
+// - incident exists and same LastAlertTimeUsecs       -> SKIP
+// - incident exists and current LastAlertTimeUsecs is newer -> UPDATE
+// ------------------------------------------------------------
+
+import { credentialVaultClient } from "@dynatrace-sdk/client-classic-environment-v2";
+
+export default async function () {
+  var baseUrl = "https://helios.cohesity.com";
+
+  // ---------------------------
+  // User options
+  // ---------------------------
+  var vaultName = "Cohesity_API_Key";
+  var vaultId   = "credentials_vault-312312";
+
+  var AlertTypes      = ["11001", "1105"]; // add/remove as needed
+  var AlertStates     = ["kOpen"];         // or ["kOpen","kNote"]
+  var AlertCategories = [];                // optional
+  var MaxAlerts       = 200;
+
+  // Optional node filter
+  var NodeIds = []; // e.g. ["1","2","3"]
+
+  // ------------------------------
+  // 1) Credential vault: name -> id -> manual
+  // ------------------------------
+  var apiKey = null;
+  var authMode = "vault-name";
+
+  async function getKeyByName(name) {
+    var all = await credentialVaultClient.getCredentials();
+    var creds = (all && all.credentials) ? all.credentials : [];
+    var found = null;
+
+    for (var i = 0; i < creds.length; i++) {
+      if (creds[i] && creds[i].name === name) {
+        found = creds[i];
+        break;
+      }
+    }
+    if (!found) return null;
+
+    var detail = await credentialVaultClient.getCredentialsDetails({ id: found.id });
+    console.log("✓ Helios key from vault (name): " + found.name);
+    return (detail && (detail.token || detail.password)) || null;
+  }
+
+  try {
+    apiKey = await getKeyByName(vaultName);
+    if (!apiKey) throw new Error("not-found");
+  } catch (e) {
+    try {
+      var d2 = await credentialVaultClient.getCredentialsDetails({ id: vaultId });
+      apiKey = (d2 && (d2.token || d2.password)) || null;
+      authMode = "vault-id";
+      console.log("✓ Helios key from vault (id): " + (d2 && d2.name ? d2.name : vaultId));
+    } catch (e2) {
+      authMode = "manual";
+      apiKey = "PASTE_YOUR_API_KEY_HERE";
+      console.log("⚠️ Using manual Helios API key (fallback)");
+    }
+  }
+
+  if (!apiKey) throw new Error("No Helios API key available.");
+
+  // ---------------------------
+  // Helpers
+  // ---------------------------
+  function norm(v) {
+    if (v === null || v === undefined) return "";
+    return String(v).trim();
+  }
+
+  function toArrayMaybe(v) {
+    if (!v) return [];
+    return Array.isArray(v) ? v : [v];
+  }
+
+  function buildQuery(params) {
+    var usp = new URLSearchParams();
+    for (var k in params) {
+      if (!Object.prototype.hasOwnProperty.call(params, k)) continue;
+      var v = params[k];
+      if (v === undefined || v === null) continue;
+
+      if (Array.isArray(v)) {
+        for (var i = 0; i < v.length; i++) {
+          var item = v[i];
+          if (item === undefined || item === null) continue;
+          var s = String(item).trim();
+          if (!s) continue;
+          usp.append(k, s);
+        }
+      } else {
+        var sv = String(v).trim();
+        if (!sv) continue;
+        usp.append(k, sv);
+      }
+    }
+    return usp.toString();
+  }
+
+  async function getJson(url, headers) {
+    var resp = await fetch(url, { method: "GET", headers: headers });
+    if (!resp.ok) {
+      var txt = "";
+      try { txt = await resp.text(); } catch (e) {}
+      throw new Error("GET " + url + " -> HTTP " + resp.status + " " + txt);
+    }
+    return resp.json();
+  }
+
+  function getProp(plist, keys) {
+    var pl = toArrayMaybe(plist);
+    for (var k = 0; k < keys.length; k++) {
+      var wanted = keys[k];
+      for (var i = 0; i < pl.length; i++) {
+        var p = pl[i] || {};
+        if (norm(p.key) !== wanted) continue;
+
+        var v = p.value;
+        if (!v) v = p.values;
+
+        if (Array.isArray(v)) return v.length ? norm(v[0]) : "";
+        return norm(v);
+      }
+    }
+    return "";
+  }
+
+  function usecsToEtString(usecs) {
+    if (!usecs) return "";
+    var ms = Number(usecs) / 1000;
+    if (!Number.isFinite(ms)) return "";
+
+    var dtf = new Intl.DateTimeFormat("en-US", {
+      timeZone: "America/New_York",
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+      hour12: false
+    });
+
+    var parts = dtf.formatToParts(new Date(ms));
+    function pick(t) {
+      for (var i = 0; i < parts.length; i++) {
+        if (parts[i].type === t) return parts[i].value;
+      }
+      return "";
+    }
+
+    var yyyy = pick("year");
+    var mm   = pick("month");
+    var dd   = pick("day");
+    var hh   = pick("hour");
+    var mi   = pick("minute");
+    var ss   = pick("second");
+
+    return yyyy + "-" + mm + "-" + dd + " " + hh + ":" + mi + ":" + ss;
+  }
+
+  function safeCell(v) {
+    if (v === null || v === undefined) return "";
+    return String(v).replace(/\|/g, " ");
+  }
+
+  function locationToString(loc) {
+    if (!loc) return "";
+    if (typeof loc === "string") return norm(loc);
+
+    var guess =
+      loc.name ||
+      loc.location ||
+      loc.site ||
+      loc.city ||
+      loc.region ||
+      "";
+
+    guess = norm(guess);
+
+    if (!guess) {
+      try {
+        var s = JSON.stringify(loc);
+        return s && s.length > 120 ? s.slice(0, 120) + "..." : (s || "");
+      } catch (e) {
+        return "";
+      }
+    }
+    return guess;
+  }
+
+  function makeShortDescription(clusterName, ip) {
+    return "Cohesity Interface DOWN on Cluster: " + norm(clusterName) + " IP: " + norm(ip);
+  }
+
+  function makeDescription(row) {
+    return [
+      "Cohesity interface down alert detected.",
+      "",
+      "Location: " + norm(row.Location),
+      "Cluster: " + norm(row.ClusterName),
+      "ClusterId: " + norm(row.ClusterId),
+      "NodeId: " + norm(row.ClusterNodeId),
+      "IP: " + norm(row.IP),
+      "AlertCode: " + norm(row.AlertCode),
+      "Severity: " + norm(row.Severity),
+      "AlertState: " + norm(row.AlertState),
+      "AlertCause: " + norm(row.AlertCause),
+      "LastAlertTimeET: " + norm(row.LastAlertTimeET),
+      "LastAlertTimeUsecs: " + norm(row.LastAlertTimeUsecs),
+      "SnowIncidentKey: " + norm(row.SnowIncidentKey)
+    ].join("\n");
+  }
+
+  function makeUpdateText(row) {
+    return [
+      "Alert still active / re-detected.",
+      "LastAlertTimeET: " + norm(row.LastAlertTimeET),
+      "LastAlertTimeUsecs: " + norm(row.LastAlertTimeUsecs),
+      "Severity: " + norm(row.Severity),
+      "AlertState: " + norm(row.AlertState),
+      "AlertCause: " + norm(row.AlertCause),
+      "SnowIncidentKey: " + norm(row.SnowIncidentKey)
+    ].join(" | ");
+  }
+
+  // ---------------------------
+  // Last 24h window
+  // ---------------------------
+  var nowMs = Date.now();
+  var startMs = nowMs - (24 * 60 * 60 * 1000);
+  var startUsecs = startMs * 1000;
+  var endUsecs   = nowMs * 1000;
+
+  // ---------------------------
+  // Get clusters
+  // ---------------------------
+  var commonHeaders = { accept: "application/json", apiKey: apiKey };
+
+  var clusterUrl = baseUrl + "/v2/mcm/cluster-mgmt/info";
+  var clusterData = await getJson(clusterUrl, commonHeaders);
+  var clusters = toArrayMaybe(clusterData && clusterData.cohesityClusters);
+
+  if (!clusters.length) {
+    return {
+      authMode: authMode,
+      alertsFetched: 0,
+      rowsAfterWindow: 0,
+      resultsCount: 0,
+      results: [],
+      markdownTable: "⚠️ No clusters returned."
+    };
+  }
+
+  var clusterMeta = {};
+  for (var ci0 = 0; ci0 < clusters.length; ci0++) {
+    var c0 = clusters[ci0] || {};
+    var cid0 = norm(c0.clusterId);
+    if (!cid0) continue;
+
+    clusterMeta[cid0] = {
+      ClusterName: norm(c0.clusterName),
+      Location: locationToString(c0.location)
+    };
+  }
+
+  // ---------------------------
+  // Build alerts URL
+  // ---------------------------
+  var params = {
+    maxAlerts: MaxAlerts,
+    alertTypes: AlertTypes,
+    startDateUsecs: String(startUsecs),
+    endDateUsecs: String(endUsecs)
+  };
+
+  if (AlertStates && AlertStates.length) params.alertStates = AlertStates;
+  if (AlertCategories && AlertCategories.length) params.alertCategories = AlertCategories;
+
+  var alertsUrl = baseUrl + "/v2/alerts?" + buildQuery(params);
+
+  // ---------------------------
+  // Fetch alerts
+  // ---------------------------
+  var raw = [];
+  var alertsFetched = 0;
+
+  for (var ci = 0; ci < clusters.length; ci++) {
+    var clus = clusters[ci] || {};
+    var clusterId = norm(clus.clusterId);
+    if (!clusterId) continue;
+
+    var meta = clusterMeta[clusterId] || {};
+    var clusterName = meta.ClusterName || norm(clus.clusterName);
+    var location = meta.Location || locationToString(clus.location);
+
+    var headers = {
+      accept: "application/json",
+      apiKey: apiKey,
+      accessClusterId: clusterId
+    };
+
+    var json;
+    try {
+      json = await getJson(alertsUrl, headers);
+    } catch (e) {
+      console.log("⚠️ Alerts fetch failed for " + clusterName + " (" + clusterId + "): " + norm(e.message || e));
+      continue;
+    }
+
+    var alerts = toArrayMaybe(json && json.alerts);
+    alertsFetched += alerts.length;
+
+    for (var ai = 0; ai < alerts.length; ai++) {
+      var alt = alerts[ai] || {};
+
+      var latestUsecs = Number(alt.latestTimestampUsecs || 0);
+      if (!latestUsecs) continue;
+      if (latestUsecs < startUsecs || latestUsecs > endUsecs) continue;
+
+      var nodeId = getProp(alt.propertyList, ["node_id", "nodeId"]);
+      var ip = getProp(alt.propertyList, [
+        "node_ip",
+        "ip",
+        "ipAddress",
+        "host_ip",
+        "source_ip",
+        "sourceIp",
+        "remote_ip",
+        "remoteIp"
+      ]);
+
+      if (NodeIds && NodeIds.length > 0) {
+        if (!nodeId) continue;
+        if (NodeIds.indexOf(String(nodeId)) === -1) continue;
+      }
+
+      var alertCode = norm(alt.alertCode);
+      var severity = norm(alt.severity);
+      var alertState = norm(alt.alertState);
+      var alertCause =
+        (alt.alertDocument && alt.alertDocument.alertCause) ||
+        (alt.alertDocument && alt.alertDocument.alertSummary && alt.alertDocument.alertSummary.alertCause) ||
+        "";
+
+      var snowIncidentKey = clusterId + "|" + nodeId + "|" + ip + "|" + alertCode;
+      var lastAlertTimeET = usecsToEtString(latestUsecs);
+      var shortDescription = makeShortDescription(clusterName, ip);
+
+      var row = {
+        Location: location,
+        ClusterName: clusterName,
+        ClusterId: clusterId,
+        ClusterNodeId: nodeId,
+        IP: ip,
+        AlertCode: alertCode,
+        Severity: severity,
+        AlertState: alertState,
+        AlertCause: norm(alertCause),
+        LastAlertTimeUsecs: latestUsecs,
+        LastAlertTimeET: lastAlertTimeET,
+        SnowIncidentKey: snowIncidentKey,
+        ShortDescription: shortDescription
+      };
+
+      row.Description = makeDescription(row);
+      row.UpdateText = makeUpdateText(row);
+
+      raw.push(row);
+    }
+  }
+
+  // ---------------------------
+  // Latest per (ClusterId + NodeId)
+  // Keeps 1 active/latest alert row per node
+  // ---------------------------
+  var latestMap = {};
+  for (var i = 0; i < raw.length; i++) {
+    var r = raw[i];
+    if (!r.ClusterId || !r.ClusterNodeId) continue;
+
+    var key = r.ClusterId + "|" + String(r.ClusterNodeId);
+    if (!latestMap[key] || (Number(r.LastAlertTimeUsecs || 0) > Number(latestMap[key].LastAlertTimeUsecs || 0))) {
+      latestMap[key] = r;
+    }
+  }
+
+  var results = Object.keys(latestMap).map(function (k) { return latestMap[k]; });
+  results.sort(function (a, b) {
+    return Number(b.LastAlertTimeUsecs || 0) - Number(a.LastAlertTimeUsecs || 0);
+  });
+
+  // ---------------------------
+  // Markdown table
+  // ---------------------------
+  function toMarkdownTable(rows) {
+    if (!rows || rows.length === 0) {
+      return "✅ No alerts in the last 24 hours (ET) for the selected filters.";
+    }
+
+    var cols = [
+      "Location",
+      "ClusterName",
+      "ClusterId",
+      "ClusterNodeId",
+      "IP",
+      "AlertCode",
+      "Severity",
+      "AlertState",
+      "LastAlertTimeET",
+      "SnowIncidentKey"
+    ];
+
+    var header = "| " + cols.join(" | ") + " |";
+    var sep = "| " + cols.map(function () { return "---"; }).join(" | ") + " |";
+
+    var body = rows.map(function (r) {
+      var vals = [];
+      for (var i = 0; i < cols.length; i++) vals.push(safeCell(r[cols[i]]));
+      return "| " + vals.join(" | ") + " |";
+    });
+
+    return (
+      "### Helios Alerts for SNOW (latest per ClusterId+NodeId, last 24h ET)\n\n" +
+      "- AlertTypes: " + (AlertTypes || []).join(",") + "\n" +
+      "- AlertStates: " + (AlertStates && AlertStates.length ? AlertStates.join(",") : "(none)") + "\n" +
+      "- AlertCategories: " + (AlertCategories && AlertCategories.length ? AlertCategories.join(",") : "(none)") + "\n" +
+      "- MaxAlerts: " + MaxAlerts + "\n" +
+      "- Alerts fetched (before local 24h filter): " + alertsFetched + "\n" +
+      "- Rows after local 24h filter: " + raw.length + "\n" +
+      "- Latest per ClusterId+NodeId: " + rows.length + "\n\n" +
+      [header, sep].concat(body).join("\n")
+    );
+  }
+
+  return {
+    authMode: authMode,
+    alertsFetched: alertsFetched,
+    rowsAfterWindow: raw.length,
+    resultsCount: results.length,
+
+    // Workflow decision guidance
+    decisionRule: {
+      createWhen: "No incident exists for SnowIncidentKey",
+      skipWhen: "Incident exists and stored LastAlertTimeUsecs equals current LastAlertTimeUsecs",
+      updateWhen: "Incident exists and current LastAlertTimeUsecs is greater than stored LastAlertTimeUsecs"
+    },
+
+    results: results,
+    markdownTable: toMarkdownTable(results)
+  };
+}
