@@ -1,0 +1,308 @@
+# -------------------------------------------------------------
+# Cohesity Helios - Cluster Interface Status (Corrected)
+# -------------------------------------------------------------
+# Fix:
+# - Explicitly loops through interfaces and bondSlavesDetails
+# - Forces arrays for Status / Speed / MAC so all values print
+# - Prevents partial flattening from nested properties
+# -------------------------------------------------------------
+
+$ErrorActionPreference = "Stop"
+
+# ==============================
+# 0) API key from your path
+# ==============================
+$apikeypath = "X:\PowerShell\Cohesity_API_Scripts\DO_NOT_Delete\apikey.txt"
+if (-not (Test-Path $apikeypath)) { throw "API key file not found at $apikeypath" }
+
+$apiKey = (Get-Content -Path $apikeypath -Raw).Trim()
+$commonHeaders = @{ "apiKey" = $apiKey }
+
+# -------------------------------------------------------------
+# CSV helper: Converts arrays -> strings
+# -------------------------------------------------------------
+function To-CsvList {
+    param([object]$v)
+
+    if ($null -eq $v) { return "" }
+
+    $arr = @($v | ForEach-Object { "$_" } | Where-Object { $_ -ne "" })
+
+    if ($arr.Count -eq 0) { return "" }
+    if ($arr.Count -eq 1) { return $arr[0] }
+
+    return "{" + ($arr -join ", ") + "}"
+}
+
+# ==========================================
+# 1) Get Clusters (ClusterName + ClusterId)
+# ==========================================
+$url      = "https://helios.cohesity.com/v2/mcm/cluster-mgmt/info"
+$response = Invoke-WebRequest -Method Get -Uri $url -Headers $commonHeaders
+$json     = $response.Content | ConvertFrom-Json
+$json_clu = $json.cohesityClusters
+
+if (-not $json_clu -or $json_clu.Count -eq 0) {
+    throw "No clusters returned from Helios."
+}
+
+# ==========================================
+# 2) Build indexed menu
+# ==========================================
+$sorted = $json_clu | Sort-Object -Property clusterName
+
+$clusters = for ($i = 0; $i -lt $sorted.Count; $i++) {
+    [pscustomobject]@{
+        Index       = $i + 1
+        ClusterName = $sorted[$i].clusterName
+        ClusterId   = $sorted[$i].clusterId
+    }
+}
+
+Write-Host ""
+Write-Host "Available Helios Clusters (sorted by name):" -ForegroundColor Cyan
+$clusters | Format-Table -AutoSize
+
+Write-Host ""
+Write-Host "[0] All clusters" -ForegroundColor Yellow
+Write-Host "[S] Single cluster (pick 1 index)" -ForegroundColor Yellow
+Write-Host "[M] Multiple clusters (comma list like 1,4,9)" -ForegroundColor Yellow
+Write-Host "[X] Exit" -ForegroundColor Yellow
+Write-Host ""
+
+# ==========================================
+# 3) Selection (All / Single / Multiple)
+# ==========================================
+$mode = $null
+$SelectedClusters = @()
+
+while ($true) {
+    $choice = Read-Host "Choose 0 / S / M / X"
+
+    if ($choice -match '^(x|X|q|Q)$') {
+        Write-Host "Exit selected. No clusters chosen." -ForegroundColor Cyan
+        return
+    }
+
+    if ($choice -match '^(0)$') {
+        $mode = "ALL"
+        $SelectedClusters = $clusters
+        break
+    }
+
+    if ($choice -match '^(s|S)$') {
+        $idx = Read-Host "Enter single cluster index (1-$($clusters.Count))"
+        [int]$n = 0
+        if (-not [int]::TryParse($idx, [ref]$n) -or $n -lt 1 -or $n -gt $clusters.Count) {
+            Write-Host "Invalid index." -ForegroundColor Red
+            continue
+        }
+        $mode = "SINGLE"
+        $SelectedClusters = @($clusters | Where-Object { $_.Index -eq $n })
+        break
+    }
+
+    if ($choice -match '^(m|M)$') {
+        $list = Read-Host "Enter indices separated by comma (example: 1,4,9)"
+        $parts = $list -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne "" }
+
+        $nums = @()
+        $bad  = $false
+        foreach ($p in $parts) {
+            [int]$n = 0
+            if (-not [int]::TryParse($p, [ref]$n) -or $n -lt 1 -or $n -gt $clusters.Count) {
+                $bad = $true
+                break
+            }
+            $nums += $n
+        }
+
+        if ($bad -or $nums.Count -eq 0) {
+            Write-Host "Invalid list. Use indices like 1,4,9" -ForegroundColor Red
+            continue
+        }
+
+        $mode = "MULTI"
+        $nums = $nums | Select-Object -Unique | Sort-Object
+        $SelectedClusters = foreach ($n in $nums) { $clusters | Where-Object { $_.Index -eq $n } }
+        break
+    }
+
+    Write-Host "Invalid option. Choose 0 / S / M / X" -ForegroundColor Red
+}
+
+Write-Host ""
+Write-Host "Selected Mode: $mode" -ForegroundColor Green
+Write-Host "Selected Clusters:" -ForegroundColor Green
+$SelectedClusters | Select-Object Index, ClusterName, ClusterId | Format-Table -AutoSize
+
+$SelectedClusterIds = @($SelectedClusters.ClusterId)
+
+# ==========================================
+# 4) For each selected cluster, call interface API
+# ==========================================
+$AllRows = @()
+
+foreach ($cluster_id in $SelectedClusterIds) {
+
+    $clus = $SelectedClusters | Where-Object { $_.ClusterId -eq $cluster_id } | Select-Object -First 1
+    $cluster_name = $clus.ClusterName
+
+    $url = "https://helios.cohesity.com/irisservices/api/v1/public/interface"
+    $headers = @{
+        "apiKey"          = $apiKey
+        "accessClusterId" = $cluster_id
+    }
+
+    $body = @{
+        bondInterfaceOnly       = "true"
+        ifaceGroupAssignedOnly  = "true"
+        includeUplinkSwitchInfo = "true"
+        includeBondSlaveDetails = "true"
+    }
+
+    try {
+        $responseIF = Invoke-WebRequest -Method Get -Uri $url -Headers $headers -Body $body
+        $jsonIF     = $responseIF.Content | ConvertFrom-Json
+    }
+    catch {
+        Write-Host "Failed to get interface data for cluster '$cluster_name' (Id: $cluster_id): $_" -ForegroundColor Red
+        continue
+    }
+
+    if (-not $jsonIF) {
+        Write-Host "No interface data returned for cluster '$cluster_name' (Id: $cluster_id)." -ForegroundColor Yellow
+        continue
+    }
+
+    foreach ($node in $jsonIF) {
+
+        $bondNames   = @()
+        $mtus        = @()
+        $bondSlaves  = @()
+        $linkStates  = @()
+        $macs        = @()
+        $speeds      = @()
+        $slotTypes   = @()
+
+        foreach ($iface in @($node.interfaces)) {
+            if ($null -eq $iface) { continue }
+
+            if ($null -ne $iface.name -and "$($iface.name)" -ne "") {
+                $bondNames += "$($iface.name)"
+            }
+
+            if ($null -ne $iface.mtu -and "$($iface.mtu)" -ne "") {
+                $mtus += "$($iface.mtu)"
+            }
+
+            foreach ($slave in @($iface.bondSlaves)) {
+                if ($null -ne $slave -and "$slave" -ne "") {
+                    $bondSlaves += "$slave"
+                }
+            }
+
+            foreach ($bsd in @($iface.bondSlavesDetails)) {
+                if ($null -eq $bsd) { continue }
+
+                if ($null -ne $bsd.linkState -and "$($bsd.linkState)" -ne "") {
+                    $linkStates += "$($bsd.linkState)"
+                }
+
+                if ($null -ne $bsd.macAddr -and "$($bsd.macAddr)" -ne "") {
+                    $macs += "$($bsd.macAddr)"
+                }
+
+                if ($null -ne $bsd.speed -and "$($bsd.speed)" -ne "") {
+                    $speeds += "$($bsd.speed)"
+                }
+            }
+
+            foreach ($slot in @($iface.bondSlavesSlotTypes)) {
+                if ($null -ne $slot -and "$slot" -ne "") {
+                    $slotTypes += "$slot"
+                }
+            }
+        }
+
+        $AllRows += [PSCustomObject]@{
+            Cluster              = $cluster_name
+            NodeID               = "$($node.nodeId)"
+            NodeIP               = $node.nodeIp
+            ChassisSerial        = $node.chassisSerial
+            BondName             = $bondNames
+            MTU                  = $mtus
+            BondSlaves           = $bondSlaves
+            SlaveInterfaceStatus = $linkStates
+            mac                  = $macs
+            SlaveSpeed           = $speeds
+            SlotType             = $slotTypes
+        }
+    }
+}
+
+if (-not $AllRows -or $AllRows.Count -eq 0) {
+    Write-Host "No rows collected from interface API." -ForegroundColor Yellow
+    return
+}
+
+# =======================
+# 5) Console output
+# =======================
+Write-Host ""
+Write-Host "=== Interface Details ($mode) ===" -ForegroundColor Cyan
+Write-Host ""
+
+$displayRows = $AllRows | Select-Object `
+    Cluster,
+    NodeID,
+    NodeIP,
+    ChassisSerial,
+    @{n="BondName"; e={ To-CsvList $_.BondName }},
+    @{n="MTU"; e={ To-CsvList $_.MTU }},
+    @{n="BondSlaves"; e={ To-CsvList $_.BondSlaves }},
+    @{n="SlaveInterfaceStatus"; e={ To-CsvList $_.SlaveInterfaceStatus }},
+    @{n="mac"; e={ To-CsvList $_.mac }},
+    @{n="SlaveSpeed"; e={ To-CsvList $_.SlaveSpeed }},
+    @{n="SlotType"; e={ To-CsvList $_.SlotType }}
+
+$displayRows | Sort-Object Cluster, NodeID, NodeIP | Format-Table -AutoSize
+
+# =======================
+# 6) CSV export
+# =======================
+$reportdate = Get-Date -Format "yyyy-MM-dd_HHmm"
+
+$csvDir = "X:\PowerShell\Data\Cohesity\Alerts"
+if (-not (Test-Path $csvDir)) {
+    New-Item -ItemType Directory -Path $csvDir | Out-Null
+}
+
+$suffix = switch ($mode) {
+    "ALL"    { "ALL" }
+    "MULTI"  { "MULTI" }
+    "SINGLE" { ($SelectedClusters[0].ClusterName -replace '[^\w\-]', '_') }
+    default  { "UNKNOWN" }
+}
+
+$excelFile = Join-Path $csvDir "Cluster_Interface_Status_${suffix}_${reportdate}.csv"
+
+$csvRows = $AllRows | Select-Object `
+    Cluster,
+    @{n="NodeID"; e={ "$($_.NodeID)" }},
+    NodeIP,
+    ChassisSerial,
+    @{n="BondName"; e={ To-CsvList $_.BondName }},
+    @{n="MTU"; e={ To-CsvList $_.MTU }},
+    @{n="BondSlaves"; e={ To-CsvList $_.BondSlaves }},
+    @{n="SlaveInterfaceStatus"; e={ To-CsvList $_.SlaveInterfaceStatus }},
+    @{n="mac"; e={ To-CsvList $_.mac }},
+    @{n="SlaveSpeed"; e={ To-CsvList $_.SlaveSpeed }},
+    @{n="SlotType"; e={ To-CsvList $_.SlotType }}
+
+$csvRows |
+    Sort-Object Cluster, NodeID |
+    Export-Csv -Path $excelFile -NoTypeInformation -Encoding UTF8
+
+Write-Host ""
+Write-Host "Saved CSV report at: $excelFile" -ForegroundColor Green
