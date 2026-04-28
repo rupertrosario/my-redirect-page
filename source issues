@@ -1,18 +1,22 @@
 # =====================================================================
 # Cohesity Source Health Issues - Report Only
-# STRICTLY READ-ONLY: GET only
+# STRICTLY READ-ONLY: ALL Cohesity API calls are GET only
 # =====================================================================
 
 $ApiKeyPath = "X:\PowerShell\Cohesity_API_Scripts\DO_NOT_Delete\apikey.txt"
 $BaseUrl    = "https://helios.cohesity.com"
 
-$OutputDir  = "X:\PowerShell\Data\Cohesity\SourceHealth"
-$Timestamp  = Get-Date -Format "yyyyMMdd_HHmmss"
-$CsvPath    = Join-Path $OutputDir "Cohesity_Source_Health_Issues_$Timestamp.csv"
-$XlsxPath   = Join-Path $OutputDir "Cohesity_Source_Health_Issues_$Timestamp.xlsx"
+$OutputDir = "X:\PowerShell\Data\Cohesity\SourceHealth"
+$Timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
+$CsvPath   = Join-Path $OutputDir "Cohesity_Source_Health_Issues_$Timestamp.csv"
+$XlsxPath  = Join-Path $OutputDir "Cohesity_Source_Health_Issues_$Timestamp.xlsx"
 
 if (!(Test-Path $OutputDir)) {
     New-Item -ItemType Directory -Path $OutputDir -Force | Out-Null
+}
+
+if (!(Test-Path $ApiKeyPath)) {
+    throw "API key file not found: $ApiKeyPath"
 }
 
 $ApiKey = (Get-Content $ApiKeyPath -Raw).Trim()
@@ -20,6 +24,10 @@ $ApiKey = (Get-Content $ApiKeyPath -Raw).Trim()
 $CommonHeaders = @{
     apiKey = $ApiKey
 }
+
+# ---------------------------------------------------------------------
+# Generic GET Wrapper
+# ---------------------------------------------------------------------
 
 function Invoke-HeliosGet {
     param(
@@ -44,6 +52,10 @@ function Invoke-HeliosGet {
     }
 }
 
+# ---------------------------------------------------------------------
+# DNS Validation (uses cluster DNS servers)
+# ---------------------------------------------------------------------
+
 function Test-ClusterDns {
     param(
         [Parameter(Mandatory)] [string]$SourceName,
@@ -56,6 +68,7 @@ function Test-ClusterDns {
                 -Name $SourceName `
                 -Server $dns `
                 -Type A `
+                -QuickTimeout `
                 -ErrorAction Stop |
                 Where-Object { $_.IPAddress } |
                 Select-Object -First 1
@@ -65,7 +78,6 @@ function Test-ClusterDns {
                     DnsStatus     = "Pass"
                     DnsServerUsed = $dns
                     ResolvedIP    = $result.IPAddress
-                    DnsMessage    = "Resolved"
                 }
             }
         }
@@ -78,9 +90,12 @@ function Test-ClusterDns {
         DnsStatus     = "Fail"
         DnsServerUsed = "-"
         ResolvedIP    = "-"
-        DnsMessage    = "Not resolved by cluster DNS servers"
     }
 }
+
+# ---------------------------------------------------------------------
+# Ping Validation
+# ---------------------------------------------------------------------
 
 function Test-SourcePing {
     param(
@@ -88,23 +103,31 @@ function Test-SourcePing {
     )
 
     try {
-        $ping = Test-Connection `
+        $pingOk = Test-Connection `
             -ComputerName $Target `
-            -Count 2 `
+            -Count 1 `
+            -Quiet `
             -ErrorAction Stop
 
-        $first = $ping | Select-Object -First 1
-
-        return [PSCustomObject]@{
-            PingStatus  = "Pass"
-            PingIP      = $first.Address
-            PingMessage = "Ping successful"
+        if ($pingOk) {
+            return [PSCustomObject]@{
+                PingStatus = "Pass"
+                PingIP     = $Target
+                PingMessage = "Ping successful"
+            }
+        }
+        else {
+            return [PSCustomObject]@{
+                PingStatus = "Fail"
+                PingIP     = "-"
+                PingMessage = "Ping failed"
+            }
         }
     }
     catch {
         return [PSCustomObject]@{
-            PingStatus  = "Fail"
-            PingIP      = "-"
+            PingStatus = "Fail"
+            PingIP     = "-"
             PingMessage = $_.Exception.Message
         }
     }
@@ -117,38 +140,96 @@ function Test-SourcePing {
 $clustersUrl = "$BaseUrl/v2/mcm/cluster-mgmt/info"
 $clusterJson = Invoke-HeliosGet -Uri $clustersUrl -Headers $CommonHeaders
 
-$clusters = @($clusterJson.cohesityClusters)
-
-if (!$clusters -or $clusters.Count -eq 0) {
+if (!$clusterJson -or !$clusterJson.cohesityClusters) {
     throw "No clusters returned from Helios."
 }
 
+# ==========================================
+# Build menu + pick ALL / SINGLE / EXIT
+# ==========================================
+
+$sorted = @($clusterJson.cohesityClusters) | Sort-Object -Property clusterName
+
+$clusters = for ($i = 0; $i -lt $sorted.Count; $i++) {
+    [pscustomobject]@{
+        Index       = $i + 1
+        ClusterName = $sorted[$i].clusterName
+        ClusterId   = $sorted[$i].clusterId
+    }
+}
+
+Write-Host ""
+Write-Host "Available Helios Clusters (sorted by name):" -ForegroundColor Cyan
+$clusters | Format-Table -AutoSize
+
+Write-Host ""
+Write-Host "[0] All clusters" -ForegroundColor Yellow
+Write-Host "[X] Exit without selecting" -ForegroundColor Yellow
+Write-Host ""
+
+while ($true) {
+    $inputVal = Read-Host "Enter 0 for ALL, 1-$($clusters.Count) for single, or X to exit"
+
+    if ($inputVal -match '^(x|X|q|Q)$') {
+        Write-Host "Exit selected. No report generated." -ForegroundColor Cyan
+        exit
+    }
+
+    [int]$num = 0
+    if (-not [int]::TryParse($inputVal, [ref]$num)) {
+        Write-Host "Please enter a valid number or X to exit." -ForegroundColor Red
+        continue
+    }
+
+    if ($num -lt 0 -or $num -gt $clusters.Count) {
+        Write-Host "Please enter 0, 1-$($clusters.Count), or X to exit." -ForegroundColor Red
+        continue
+    }
+
+    $selection = $num
+    break
+}
+
+if ($selection -eq 0) {
+    $SelectedClusters = $clusters
+
+    Write-Host ""
+    Write-Host "You selected: ALL clusters" -ForegroundColor Green
+}
+else {
+    $selectedCluster  = $clusters | Where-Object { $_.Index -eq $selection }
+    $SelectedClusters = @($selectedCluster)
+
+    Write-Host ""
+    Write-Host "You selected cluster:" -ForegroundColor Green
+    Write-Host "  Name: $($selectedCluster.ClusterName)"
+    Write-Host "  Id:   $($selectedCluster.ClusterId)"
+    Write-Host ""
+}
+
+# ---------------------------------------------------------------------
+# Process Selected Clusters
+# ---------------------------------------------------------------------
+
 $Results = @()
 
-foreach ($cluster in $clusters) {
+foreach ($cluster in $SelectedClusters) {
 
-    $ClusterName = $cluster.clusterName
-    $ClusterId   = $cluster.clusterId
+    $ClusterName = $cluster.ClusterName
+    $ClusterId   = $cluster.ClusterId
 
-    Write-Host "Processing cluster: $ClusterName"
+    Write-Host "Processing cluster: $ClusterName" -ForegroundColor Cyan
 
     $ClusterHeaders = @{
         apiKey          = $ApiKey
         accessClusterId = $ClusterId
     }
 
-    # -----------------------------------------------------------------
-    # Get cluster DNS servers - GET only
-    # -----------------------------------------------------------------
-
+    # Get cluster DNS servers
     $clusterInfoUrl = "$BaseUrl/irisservices/api/v1/public/cluster"
     $clusterInfo = Invoke-HeliosGet -Uri $clusterInfoUrl -Headers $ClusterHeaders
 
     $DnsServers = @($clusterInfo.dnsServerIps) | Where-Object { $_ }
-
-    if (!$DnsServers -or $DnsServers.Count -eq 0) {
-        $DnsServers = @()
-    }
 
     $DnsServerList = if ($DnsServers.Count -gt 0) {
         $DnsServers -join ", "
@@ -157,68 +238,64 @@ foreach ($cluster in $clusters) {
         "-"
     }
 
-    # -----------------------------------------------------------------
-    # Get protection source registration info - GET only
-    # -----------------------------------------------------------------
-
+    # Get source registration info
     $sourceUrl = "$BaseUrl/irisservices/api/v1/public/protectionSources/registrationInfo"
     $sourceJson = Invoke-HeliosGet -Uri $sourceUrl -Headers $ClusterHeaders
 
-    $rootNodes = @($sourceJson.rootNodes)
+    if (!$sourceJson -or !$sourceJson.rootNodes) {
+        Write-Warning "No source registration data returned for $ClusterName"
+        continue
+    }
+
+    $rootNodes = @($sourceJson.rootNodes) | Sort-Object { $_.rootNode.name }
 
     foreach ($node in $rootNodes) {
 
         $SourceName = $node.rootNode.name
         $Env        = $node.rootNode.environment
 
-        $RegistrationRefreshError = $node.registrationInfo.refreshErrorMessage
-        $RegisteredAppRefreshError = $node.registrationInfo.registeredAppRefreshErrorMessage
+        $RefreshError      = $node.registrationInfo.refreshErrorMessage
+        $RegistrationError = $node.registrationInfo.registeredAppRefreshErrorMessage
 
         $WarningMessage = ""
         if ($node.registrationInfo.warningMessages) {
             $WarningMessage = (@($node.registrationInfo.warningMessages) -join " ; ")
         }
 
-        # Skip clean sources
-        if ([string]::IsNullOrWhiteSpace($RegistrationRefreshError) -and
-            [string]::IsNullOrWhiteSpace($RegisteredAppRefreshError) -and
+        # Skip healthy entries
+        if ([string]::IsNullOrWhiteSpace($RefreshError) -and
+            [string]::IsNullOrWhiteSpace($RegistrationError) -and
             [string]::IsNullOrWhiteSpace($WarningMessage)) {
             continue
         }
 
-        # -------------------------------------------------------------
         # Classify issue
-        # -------------------------------------------------------------
-
-        $IssueClass = ""
+        $IssueClass   = ""
         $IssueDetails = ""
 
-        if (![string]::IsNullOrWhiteSpace($RegistrationRefreshError)) {
-            $IssueClass = "Refresh"
-            $IssueDetails = $RegistrationRefreshError
+        if (![string]::IsNullOrWhiteSpace($RefreshError)) {
+            $IssueClass   = "Refresh"
+            $IssueDetails = $RefreshError
         }
-        elseif (![string]::IsNullOrWhiteSpace($RegisteredAppRefreshError)) {
-            $IssueClass = "Registration"
-            $IssueDetails = $RegisteredAppRefreshError
+        elseif (![string]::IsNullOrWhiteSpace($RegistrationError)) {
+            $IssueClass   = "Registration"
+            $IssueDetails = $RegistrationError
         }
         elseif (![string]::IsNullOrWhiteSpace($WarningMessage)) {
-            $IssueClass = "Warning"
+            $IssueClass   = "Warning"
             $IssueDetails = $WarningMessage
         }
 
-        # -------------------------------------------------------------
-        # Validation
-        # Refresh = DNS + Ping
-        # Registration / Warning = placeholder for now
-        # -------------------------------------------------------------
-
+        # Validation logic
         if ($IssueClass -eq "Refresh") {
 
             $CheckType = "DNS + Ping"
 
-            if ($DnsServers.Count -gt 0 -and ![string]::IsNullOrWhiteSpace($SourceName)) {
+            if ($DnsServers.Count -gt 0) {
 
-                $dnsCheck = Test-ClusterDns -SourceName $SourceName -DnsServers $DnsServers
+                $dnsCheck = Test-ClusterDns `
+                    -SourceName $SourceName `
+                    -DnsServers $DnsServers
 
                 if ($dnsCheck.DnsStatus -eq "Pass") {
                     $pingCheck = Test-SourcePing -Target $dnsCheck.ResolvedIP
@@ -233,31 +310,31 @@ foreach ($cluster in $clusters) {
 
                 if ($dnsCheck.DnsStatus -eq "Pass" -and $pingCheck.PingStatus -eq "Pass") {
                     $CheckResult = "Passed"
-                    $Evidence = "DNS $($dnsCheck.DnsServerUsed) -> $($dnsCheck.ResolvedIP); Ping Pass"
-                    $Action = "Eligible For Refresh"
+                    $Evidence    = "DNS $($dnsCheck.DnsServerUsed) -> $($dnsCheck.ResolvedIP); Ping Pass"
+                    $Action      = "Eligible For Refresh"
                 }
                 elseif ($dnsCheck.DnsStatus -eq "Fail") {
                     $CheckResult = "Failed"
-                    $Evidence = "DNS failed using cluster DNS servers: $DnsServerList"
-                    $Action = "Skip"
+                    $Evidence    = "DNS failed using cluster DNS servers: $DnsServerList"
+                    $Action      = "Skip"
                 }
                 else {
                     $CheckResult = "Failed"
-                    $Evidence = "DNS $($dnsCheck.DnsServerUsed) -> $($dnsCheck.ResolvedIP); Ping Fail: $($pingCheck.PingMessage)"
-                    $Action = "Skip"
+                    $Evidence    = "DNS $($dnsCheck.DnsServerUsed) -> $($dnsCheck.ResolvedIP); Ping Fail: $($pingCheck.PingMessage)"
+                    $Action      = "Skip"
                 }
             }
             else {
                 $CheckResult = "Failed"
-                $Evidence = "No cluster DNS servers found"
-                $Action = "Skip"
+                $Evidence    = "No cluster DNS servers found"
+                $Action      = "Skip"
             }
         }
         else {
-            $CheckType = "Pending"
+            $CheckType   = "Pending"
             $CheckResult = "Pending"
-            $Evidence = "Validation not implemented"
-            $Action = "Pending Review"
+            $Evidence    = "Validation not implemented"
+            $Action      = "Pending Review"
         }
 
         $Results += [PSCustomObject]@{
@@ -275,31 +352,39 @@ foreach ($cluster in $clusters) {
 }
 
 # ---------------------------------------------------------------------
-# Export
+# Final Sort
 # ---------------------------------------------------------------------
 
-$Results |
-    Sort-Object Cluster, IssueClass, Source |
-    Export-Csv -Path $CsvPath -NoTypeInformation -Encoding UTF8
+$Results = $Results | Sort-Object Cluster, IssueClass, Source
+
+# ---------------------------------------------------------------------
+# Export CSV
+# ---------------------------------------------------------------------
+
+$Results | Export-Csv `
+    -Path $CsvPath `
+    -NoTypeInformation `
+    -Encoding UTF8
+
+# ---------------------------------------------------------------------
+# Export Excel (if ImportExcel module exists)
+# ---------------------------------------------------------------------
 
 if (Get-Module -ListAvailable -Name ImportExcel) {
-    $Results |
-        Sort-Object Cluster, IssueClass, Source |
-        Export-Excel `
-            -Path $XlsxPath `
-            -WorksheetName "Source_Health_Issues" `
-            -AutoSize `
-            -FreezeTopRow `
-            -BoldTopRow
+    $Results | Export-Excel `
+        -Path $XlsxPath `
+        -WorksheetName "Source_Health_Issues" `
+        -AutoSize `
+        -FreezeTopRow `
+        -BoldTopRow
 }
 
 # ---------------------------------------------------------------------
 # Display
 # ---------------------------------------------------------------------
 
-$Results |
-    Sort-Object Cluster, IssueClass, Source |
-    Format-Table -AutoSize -Wrap
+Write-Host ""
+$Results | Format-Table -AutoSize -Wrap
 
 Write-Host ""
 Write-Host "CSV Output : $CsvPath"
@@ -308,5 +393,5 @@ if (Test-Path $XlsxPath) {
     Write-Host "Excel Output: $XlsxPath"
 }
 else {
-    Write-Host "Excel Output: Not created. Install ImportExcel module if XLSX is required."
+    Write-Host "Excel Output: Not created (ImportExcel module not installed)."
 }
