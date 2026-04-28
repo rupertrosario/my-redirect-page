@@ -1,0 +1,312 @@
+# =====================================================================
+# Cohesity Source Health Issues - Report Only
+# STRICTLY READ-ONLY: GET only
+# =====================================================================
+
+$ApiKeyPath = "X:\PowerShell\Cohesity_API_Scripts\DO_NOT_Delete\apikey.txt"
+$BaseUrl    = "https://helios.cohesity.com"
+
+$OutputDir  = "X:\PowerShell\Data\Cohesity\SourceHealth"
+$Timestamp  = Get-Date -Format "yyyyMMdd_HHmmss"
+$CsvPath    = Join-Path $OutputDir "Cohesity_Source_Health_Issues_$Timestamp.csv"
+$XlsxPath   = Join-Path $OutputDir "Cohesity_Source_Health_Issues_$Timestamp.xlsx"
+
+if (!(Test-Path $OutputDir)) {
+    New-Item -ItemType Directory -Path $OutputDir -Force | Out-Null
+}
+
+$ApiKey = (Get-Content $ApiKeyPath -Raw).Trim()
+
+$CommonHeaders = @{
+    apiKey = $ApiKey
+}
+
+function Invoke-HeliosGet {
+    param(
+        [Parameter(Mandatory)] [string]$Uri,
+        [Parameter(Mandatory)] [hashtable]$Headers
+    )
+
+    try {
+        $response = Invoke-WebRequest `
+            -Method Get `
+            -Uri $Uri `
+            -Headers $Headers `
+            -UseBasicParsing `
+            -TimeoutSec 60 `
+            -ErrorAction Stop
+
+        return ($response.Content | ConvertFrom-Json)
+    }
+    catch {
+        Write-Warning "GET failed: $Uri | $($_.Exception.Message)"
+        return $null
+    }
+}
+
+function Test-ClusterDns {
+    param(
+        [Parameter(Mandatory)] [string]$SourceName,
+        [Parameter(Mandatory)] [string[]]$DnsServers
+    )
+
+    foreach ($dns in $DnsServers) {
+        try {
+            $result = Resolve-DnsName `
+                -Name $SourceName `
+                -Server $dns `
+                -Type A `
+                -ErrorAction Stop |
+                Where-Object { $_.IPAddress } |
+                Select-Object -First 1
+
+            if ($result) {
+                return [PSCustomObject]@{
+                    DnsStatus     = "Pass"
+                    DnsServerUsed = $dns
+                    ResolvedIP    = $result.IPAddress
+                    DnsMessage    = "Resolved"
+                }
+            }
+        }
+        catch {
+            continue
+        }
+    }
+
+    return [PSCustomObject]@{
+        DnsStatus     = "Fail"
+        DnsServerUsed = "-"
+        ResolvedIP    = "-"
+        DnsMessage    = "Not resolved by cluster DNS servers"
+    }
+}
+
+function Test-SourcePing {
+    param(
+        [Parameter(Mandatory)] [string]$Target
+    )
+
+    try {
+        $ping = Test-Connection `
+            -ComputerName $Target `
+            -Count 2 `
+            -ErrorAction Stop
+
+        $first = $ping | Select-Object -First 1
+
+        return [PSCustomObject]@{
+            PingStatus  = "Pass"
+            PingIP      = $first.Address
+            PingMessage = "Ping successful"
+        }
+    }
+    catch {
+        return [PSCustomObject]@{
+            PingStatus  = "Fail"
+            PingIP      = "-"
+            PingMessage = $_.Exception.Message
+        }
+    }
+}
+
+# ---------------------------------------------------------------------
+# Get Clusters - GET only
+# ---------------------------------------------------------------------
+
+$clustersUrl = "$BaseUrl/v2/mcm/cluster-mgmt/info"
+$clusterJson = Invoke-HeliosGet -Uri $clustersUrl -Headers $CommonHeaders
+
+$clusters = @($clusterJson.cohesityClusters)
+
+if (!$clusters -or $clusters.Count -eq 0) {
+    throw "No clusters returned from Helios."
+}
+
+$Results = @()
+
+foreach ($cluster in $clusters) {
+
+    $ClusterName = $cluster.clusterName
+    $ClusterId   = $cluster.clusterId
+
+    Write-Host "Processing cluster: $ClusterName"
+
+    $ClusterHeaders = @{
+        apiKey          = $ApiKey
+        accessClusterId = $ClusterId
+    }
+
+    # -----------------------------------------------------------------
+    # Get cluster DNS servers - GET only
+    # -----------------------------------------------------------------
+
+    $clusterInfoUrl = "$BaseUrl/irisservices/api/v1/public/cluster"
+    $clusterInfo = Invoke-HeliosGet -Uri $clusterInfoUrl -Headers $ClusterHeaders
+
+    $DnsServers = @($clusterInfo.dnsServerIps) | Where-Object { $_ }
+
+    if (!$DnsServers -or $DnsServers.Count -eq 0) {
+        $DnsServers = @()
+    }
+
+    $DnsServerList = if ($DnsServers.Count -gt 0) {
+        $DnsServers -join ", "
+    }
+    else {
+        "-"
+    }
+
+    # -----------------------------------------------------------------
+    # Get protection source registration info - GET only
+    # -----------------------------------------------------------------
+
+    $sourceUrl = "$BaseUrl/irisservices/api/v1/public/protectionSources/registrationInfo"
+    $sourceJson = Invoke-HeliosGet -Uri $sourceUrl -Headers $ClusterHeaders
+
+    $rootNodes = @($sourceJson.rootNodes)
+
+    foreach ($node in $rootNodes) {
+
+        $SourceName = $node.rootNode.name
+        $Env        = $node.rootNode.environment
+
+        $RegistrationRefreshError = $node.registrationInfo.refreshErrorMessage
+        $RegisteredAppRefreshError = $node.registrationInfo.registeredAppRefreshErrorMessage
+
+        $WarningMessage = ""
+        if ($node.registrationInfo.warningMessages) {
+            $WarningMessage = (@($node.registrationInfo.warningMessages) -join " ; ")
+        }
+
+        # Skip clean sources
+        if ([string]::IsNullOrWhiteSpace($RegistrationRefreshError) -and
+            [string]::IsNullOrWhiteSpace($RegisteredAppRefreshError) -and
+            [string]::IsNullOrWhiteSpace($WarningMessage)) {
+            continue
+        }
+
+        # -------------------------------------------------------------
+        # Classify issue
+        # -------------------------------------------------------------
+
+        $IssueClass = ""
+        $IssueDetails = ""
+
+        if (![string]::IsNullOrWhiteSpace($RegistrationRefreshError)) {
+            $IssueClass = "Refresh"
+            $IssueDetails = $RegistrationRefreshError
+        }
+        elseif (![string]::IsNullOrWhiteSpace($RegisteredAppRefreshError)) {
+            $IssueClass = "Registration"
+            $IssueDetails = $RegisteredAppRefreshError
+        }
+        elseif (![string]::IsNullOrWhiteSpace($WarningMessage)) {
+            $IssueClass = "Warning"
+            $IssueDetails = $WarningMessage
+        }
+
+        # -------------------------------------------------------------
+        # Validation
+        # Refresh = DNS + Ping
+        # Registration / Warning = placeholder for now
+        # -------------------------------------------------------------
+
+        if ($IssueClass -eq "Refresh") {
+
+            $CheckType = "DNS + Ping"
+
+            if ($DnsServers.Count -gt 0 -and ![string]::IsNullOrWhiteSpace($SourceName)) {
+
+                $dnsCheck = Test-ClusterDns -SourceName $SourceName -DnsServers $DnsServers
+
+                if ($dnsCheck.DnsStatus -eq "Pass") {
+                    $pingCheck = Test-SourcePing -Target $dnsCheck.ResolvedIP
+                }
+                else {
+                    $pingCheck = [PSCustomObject]@{
+                        PingStatus  = "Skipped"
+                        PingIP      = "-"
+                        PingMessage = "DNS failed, ping skipped"
+                    }
+                }
+
+                if ($dnsCheck.DnsStatus -eq "Pass" -and $pingCheck.PingStatus -eq "Pass") {
+                    $CheckResult = "Passed"
+                    $Evidence = "DNS $($dnsCheck.DnsServerUsed) -> $($dnsCheck.ResolvedIP); Ping Pass"
+                    $Action = "Eligible For Refresh"
+                }
+                elseif ($dnsCheck.DnsStatus -eq "Fail") {
+                    $CheckResult = "Failed"
+                    $Evidence = "DNS failed using cluster DNS servers: $DnsServerList"
+                    $Action = "Skip"
+                }
+                else {
+                    $CheckResult = "Failed"
+                    $Evidence = "DNS $($dnsCheck.DnsServerUsed) -> $($dnsCheck.ResolvedIP); Ping Fail: $($pingCheck.PingMessage)"
+                    $Action = "Skip"
+                }
+            }
+            else {
+                $CheckResult = "Failed"
+                $Evidence = "No cluster DNS servers found"
+                $Action = "Skip"
+            }
+        }
+        else {
+            $CheckType = "Pending"
+            $CheckResult = "Pending"
+            $Evidence = "Validation not implemented"
+            $Action = "Pending Review"
+        }
+
+        $Results += [PSCustomObject]@{
+            Cluster      = $ClusterName
+            Source       = $SourceName
+            Env          = $Env
+            IssueClass   = $IssueClass
+            IssueDetails = $IssueDetails
+            CheckType    = $CheckType
+            CheckResult  = $CheckResult
+            Evidence     = $Evidence
+            Action       = $Action
+        }
+    }
+}
+
+# ---------------------------------------------------------------------
+# Export
+# ---------------------------------------------------------------------
+
+$Results |
+    Sort-Object Cluster, IssueClass, Source |
+    Export-Csv -Path $CsvPath -NoTypeInformation -Encoding UTF8
+
+if (Get-Module -ListAvailable -Name ImportExcel) {
+    $Results |
+        Sort-Object Cluster, IssueClass, Source |
+        Export-Excel `
+            -Path $XlsxPath `
+            -WorksheetName "Source_Health_Issues" `
+            -AutoSize `
+            -FreezeTopRow `
+            -BoldTopRow
+}
+
+# ---------------------------------------------------------------------
+# Display
+# ---------------------------------------------------------------------
+
+$Results |
+    Sort-Object Cluster, IssueClass, Source |
+    Format-Table -AutoSize -Wrap
+
+Write-Host ""
+Write-Host "CSV Output : $CsvPath"
+
+if (Test-Path $XlsxPath) {
+    Write-Host "Excel Output: $XlsxPath"
+}
+else {
+    Write-Host "Excel Output: Not created. Install ImportExcel module if XLSX is required."
+}
