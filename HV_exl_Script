@@ -1,0 +1,212 @@
+# ==========================================================
+# Cohesity Hyper-V Exclusion Inventory
+# GET ONLY | ALL CLUSTERS
+# Gets Hyper-V PG excludeObjectIds and resolves them to VM names
+# ==========================================================
+
+$ErrorActionPreference = "Stop"
+
+$ExecutedBy = (whoami).Trim()
+
+$BaseDir   = "X:\PowerShell\Data\Cohesity\BackupValidation"
+$TimeStamp = Get-Date -Format "yyyyMMdd_HHmm"
+$OutputTxt = Join-Path $BaseDir "HyperV_ExclusionInventory_$TimeStamp.txt"
+
+$ApiKeyPath = "X:\PowerShell\Cohesity_API_Scripts\DO_NOT_Delete\apikey.txt"
+
+if (-not (Test-Path $BaseDir)) {
+    New-Item -Path $BaseDir -ItemType Directory -Force | Out-Null
+}
+
+if (-not (Test-Path $ApiKeyPath)) {
+    throw "API key file not found: $ApiKeyPath"
+}
+
+$ApiKey = (Get-Content -Path $ApiKeyPath -Raw).Trim()
+
+function Invoke-HeliosJson {
+    param(
+        [Parameter(Mandatory)] [string]$Uri,
+        [Parameter(Mandatory)] [hashtable]$Headers,
+        [int]$TimeoutSec = 20
+    )
+
+    try {
+        $r = Invoke-WebRequest -UseBasicParsing -Method Get -Uri $Uri -Headers $Headers -TimeoutSec $TimeoutSec -ErrorAction Stop
+        if ([string]::IsNullOrWhiteSpace($r.Content)) { return $null }
+        return ($r.Content | ConvertFrom-Json)
+    }
+    catch {
+        return $null
+    }
+}
+
+function Get-ObjectName {
+    param($Object)
+
+    if (-not $Object) { return "" }
+
+    if ($Object.name)        { return "$($Object.name)" }
+    if ($Object.objectName)  { return "$($Object.objectName)" }
+    if ($Object.displayName) { return "$($Object.displayName)" }
+
+    return ""
+}
+
+# -------------------------
+# Get Clusters
+# -------------------------
+$ClusterJson = Invoke-HeliosJson -Uri "https://helios.cohesity.com/v2/mcm/cluster-mgmt/info" -Headers @{
+    accept = "application/json"
+    apiKey = $ApiKey
+}
+
+if (-not $ClusterJson -or -not $ClusterJson.cohesityClusters -or $ClusterJson.cohesityClusters.Count -eq 0) {
+    throw "No clusters returned from Helios."
+}
+
+$Clusters = $ClusterJson.cohesityClusters | Sort-Object -Property clusterName
+
+# -------------------------
+# Build Exclusion Inventory
+# -------------------------
+$ExcludedRows = @()
+
+foreach ($Clu in $Clusters) {
+
+    Write-Host "Reading Hyper-V exclusions from cluster: $($Clu.clusterName)"
+
+    $Headers = @{
+        accept          = "application/json"
+        apiKey          = $ApiKey
+        accessClusterId = "$($Clu.clusterId)"
+    }
+
+    $PgUrl  = "https://helios.cohesity.com/v2/data-protect/protection-groups?environments=kHyperV"
+    $PgJson = Invoke-HeliosJson -Uri $PgUrl -Headers $Headers
+
+    if (-not $PgJson -or -not $PgJson.protectionGroups) {
+        continue
+    }
+
+    foreach ($Pg in $PgJson.protectionGroups) {
+
+        $PgName = $Pg.name
+        if ([string]::IsNullOrWhiteSpace($PgName)) {
+            $PgName = $Pg.protectionGroupName
+        }
+
+        $ExcludeIds = @($Pg.hypervParams.excludeObjectIds)
+
+        if (-not $ExcludeIds -or $ExcludeIds.Count -eq 0) {
+            continue
+        }
+
+        foreach ($ExcludeId in $ExcludeIds) {
+
+            if ([string]::IsNullOrWhiteSpace("$ExcludeId")) {
+                continue
+            }
+
+            $ObjectUrl  = "https://helios.cohesity.com/v2/data-protect/objects?ids=$ExcludeId"
+            $ObjectJson = Invoke-HeliosJson -Uri $ObjectUrl -Headers $Headers
+
+            $VmName = ""
+
+            if ($ObjectJson -and $ObjectJson.objects -and $ObjectJson.objects.Count -gt 0) {
+                $VmName = Get-ObjectName -Object $ObjectJson.objects[0]
+            }
+
+            if ([string]::IsNullOrWhiteSpace($VmName)) {
+                $VmName = "ObjectId:$ExcludeId"
+            }
+
+            $ExcludedRows += [pscustomobject]@{
+                ClusterName     = $Clu.clusterName
+                ProtectionGroup = $PgName
+                ExcludedVMName  = $VmName
+                ObjectId        = "$ExcludeId"
+            }
+        }
+    }
+}
+
+# -------------------------
+# Summary
+# -------------------------
+$TotalExcluded = $ExcludedRows.Count
+$ClusterCount  = ($ExcludedRows | Select-Object -ExpandProperty ClusterName -Unique).Count
+$PgCount       = ($ExcludedRows | Select-Object -ExpandProperty ProtectionGroup -Unique).Count
+
+# -------------------------
+# Build Report
+# -------------------------
+$Report = @()
+$Report += "=========================================================="
+$Report += "Cohesity Hyper-V Exclusion Inventory"
+$Report += "=========================================================="
+$Report += "Executed By        : $ExecutedBy"
+$Report += "Run Date           : $(Get-Date -Format 'dd-MMM-yyyy HH:mm:ss')"
+$Report += ""
+$Report += "Total Exclusions   : $TotalExcluded"
+$Report += "Clusters With Data : $ClusterCount"
+$Report += "PGs With Exclusion : $PgCount"
+$Report += ""
+$Report += "----------------------------------------------------------"
+$Report += "Details"
+$Report += "----------------------------------------------------------"
+$Report += ""
+
+if ($ExcludedRows.Count -gt 0) {
+    $Report += ($ExcludedRows |
+        Sort-Object ClusterName, ProtectionGroup, ExcludedVMName |
+        Format-Table ClusterName, ProtectionGroup, ExcludedVMName, ObjectId -AutoSize |
+        Out-String).TrimEnd()
+}
+else {
+    $Report += "No Hyper-V exclusions found."
+}
+
+$Report += ""
+$Report += "----------------------------------------------------------"
+$Report += "Report Location"
+$Report += "----------------------------------------------------------"
+$Report += $OutputTxt
+$Report += "=========================================================="
+
+$Report | Set-Content -Path $OutputTxt
+
+# -------------------------
+# Display
+# -------------------------
+Write-Host ""
+Write-Host "=========================================================="
+Write-Host "Cohesity Hyper-V Exclusion Inventory"
+Write-Host "=========================================================="
+Write-Host "Executed By        : $ExecutedBy"
+Write-Host "Run Date           : $(Get-Date -Format 'dd-MMM-yyyy HH:mm:ss')"
+Write-Host ""
+Write-Host "Total Exclusions   : $TotalExcluded"
+Write-Host "Clusters With Data : $ClusterCount"
+Write-Host "PGs With Exclusion : $PgCount"
+Write-Host ""
+Write-Host "----------------------------------------------------------"
+Write-Host "Details"
+Write-Host "----------------------------------------------------------"
+Write-Host ""
+
+if ($ExcludedRows.Count -gt 0) {
+    $ExcludedRows |
+        Sort-Object ClusterName, ProtectionGroup, ExcludedVMName |
+        Format-Table ClusterName, ProtectionGroup, ExcludedVMName, ObjectId -AutoSize
+}
+else {
+    Write-Host "No Hyper-V exclusions found."
+}
+
+Write-Host ""
+Write-Host "----------------------------------------------------------"
+Write-Host "Report Location"
+Write-Host "----------------------------------------------------------"
+Write-Host $OutputTxt
+Write-Host "=========================================================="
