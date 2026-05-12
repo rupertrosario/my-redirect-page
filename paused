@@ -19,6 +19,8 @@ export default async function () {
   const vaultId   = "credentials_vault-312312";
   const manualApiKey = "";
 
+  const maxPausedNoteLength = 200;
+
   // ---------------------------
   // Helpers
   // ---------------------------
@@ -38,6 +40,13 @@ export default async function () {
       .replace(/\r?\n/g, "<br>");
   }
 
+  function truncateText(v, maxLen) {
+    const s = norm(v).trim();
+    if (!s) return "";
+    if (s.length <= maxLen) return s;
+    return s.substring(0, maxLen) + "...";
+  }
+
   function nowEtString() {
     return new Date().toLocaleString("en-US", {
       timeZone: "America/New_York",
@@ -53,10 +62,15 @@ export default async function () {
 
   function convertToEtString(usecs) {
     if (!usecs || usecs === 0) return "";
+
     try {
-      const ms = Number(usecs) > 1e13
-        ? Math.round(Number(usecs) / 1000)
-        : Number(usecs);
+      const n = Number(usecs);
+      if (!Number.isFinite(n) || n <= 0) return "";
+
+      const ms = n > 1e13
+        ? Math.round(n / 1000)
+        : n;
+
       return new Date(ms).toLocaleString("en-US", {
         timeZone: "America/New_York",
         year:     "numeric",
@@ -74,64 +88,109 @@ export default async function () {
 
   function getDaysPaused(usecs) {
     if (!usecs || usecs === 0) return null;
-    const ms = Number(usecs) > 1e13
-      ? Math.round(Number(usecs) / 1000)
-      : Number(usecs);
+
+    const n = Number(usecs);
+    if (!Number.isFinite(n) || n <= 0) return null;
+
+    const ms = n > 1e13
+      ? Math.round(n / 1000)
+      : n;
+
     return Math.floor((Date.now() - ms) / (1000 * 60 * 60 * 24));
   }
 
   function getRetentionDays(pgName) {
     const name = (pgName || "").toLowerCase();
+
     if (name.includes("nonprod") || name.includes("non-prod") || name.includes("uat")) return 14;
     if (name.includes("dev")) return 7;
+
     return 35;
   }
 
   function getTier(pgName) {
     const retention = getRetentionDays(pgName);
+
     if (retention === 7)  return "DEV";
     if (retention === 14) return "NONPROD";
+
     return "PROD";
   }
 
   function markdownTable(headers, rows) {
     let out = "";
+
     out += `| ${headers.join(" | ")} |\n`;
     out += `| ${headers.map(() => "---").join(" | ")} |\n`;
+
     for (const row of rows) {
       out += `| ${headers.map(h => mdEscape(row[h] ?? "NA")).join(" | ")} |\n`;
     }
+
     return out;
   }
 
   async function getApiKey() {
     try {
       const resByName = await credentialVaultClient.getCredentialsDetails({ id: vaultName });
+
       if (resByName?.token)    return resByName.token;
       if (resByName?.password) return resByName.password;
       if (resByName?.value)    return resByName.value;
-    } catch (e) { /* fallback */ }
+    } catch (e) {
+      // fallback to vault id
+    }
 
     try {
       const resById = await credentialVaultClient.getCredentialsDetails({ id: vaultId });
+
       if (resById?.token)    return resById.token;
       if (resById?.password) return resById.password;
       if (resById?.value)    return resById.value;
-    } catch (e) { /* fallback */ }
+    } catch (e) {
+      // fallback to manual key
+    }
 
-    if (manualApiKey && manualApiKey.trim() !== "") return manualApiKey.trim();
+    if (manualApiKey && manualApiKey.trim() !== "") {
+      return manualApiKey.trim();
+    }
 
     throw new Error("Unable to read Cohesity API key from credential vault or manual fallback.");
   }
 
   async function heliosGetJson(url, headers) {
-    const response = await fetch(url, { method: "GET", headers });
-    const text = await response.text();
-    if (!response.ok) return { __error: true, status: response.status, body: text };
     try {
-      return JSON.parse(text);
+      const response = await fetch(url, {
+        method: "GET",
+        headers
+      });
+
+      const text = await response.text();
+
+      if (!response.ok) {
+        return {
+          __error: true,
+          status: response.status,
+          body: truncateText(text, 500)
+        };
+      }
+
+      try {
+        return JSON.parse(text);
+      } catch (e) {
+        return {
+          __error: true,
+          status: response.status,
+          body: truncateText(text, 500)
+        };
+      }
+
     } catch (e) {
-      return { __error: true, status: response.status, body: text };
+      return {
+        __error: true,
+        status: "FETCH_ERROR",
+        body: truncateText(e?.message || String(e), 500)
+      };
     }
   }
 
@@ -162,20 +221,17 @@ export default async function () {
   // ---------------------------
   const rows = [];
 
-  for (const cluster of clusters) {
+  const sortedClusters = [...clusters].sort((a, b) => {
+    const an = norm(a?.clusterName || a?.name || "NA");
+    const bn = norm(b?.clusterName || b?.name || "NA");
+    return an.localeCompare(bn);
+  });
+
+  for (const cluster of sortedClusters) {
     const clusterName = cluster?.clusterName || cluster?.name || "NA";
     const clusterId   = cluster?.clusterId   || cluster?.id   || "";
 
     if (!clusterId) {
-      rows.push({
-        "Cluster":      clusterName,
-        "PG Name":      "NA",
-        "Tier":         "NA",
-        "Paused Date":  "NA",
-        "Paused Since": "NA",
-        "Paused By":    "NA",
-        "Paused Note":  "NA"
-      });
       continue;
     }
 
@@ -184,29 +240,30 @@ export default async function () {
       "accessClusterId": String(clusterId)
     };
 
-    const pgUrl  = `${baseUrl}/v2/data-protect/protection-groups?isPaused=true&isDeleted=false`;
+    const pgUrl =
+      `${baseUrl}/v2/data-protect/protection-groups?isPaused=true&isDeleted=false&isActive=true`;
+
     const pgResp = await heliosGetJson(pgUrl, headers);
 
     if (pgResp.__error) {
-      rows.push({
-        "Cluster":      clusterName,
-        "PG Name":      "NA",
-        "Tier":         "NA",
-        "Paused Date":  "NA",
-        "Paused Since": "NA",
-        "Paused By":    "NA",
-        "Paused Note":  "NA"
-      });
       continue;
     }
 
     const groups = pgResp?.protectionGroups || [];
-    if (groups.length === 0) continue;
+
+    if (groups.length === 0) {
+      continue;
+    }
 
     for (const pg of groups) {
+      const pgName      = pg?.name?.trim() || "NA";
       const pausedUsecs = pg?.pauseMetadata?.lastPauseModificationTimeUsecs;
       const daysPaused  = getDaysPaused(pausedUsecs);
-      const pgName      = pg?.name?.trim() || "NA";
+
+      const pausedNoteRaw =
+        pg?.pauseMetadata?.pausedNote?.trim() ||
+        pg?.pauseMetadata?.pauseReason?.trim() ||
+        "";
 
       rows.push({
         "Cluster":      clusterName,
@@ -215,7 +272,7 @@ export default async function () {
         "Paused Date":  convertToEtString(pausedUsecs) || "NA",
         "Paused Since": daysPaused !== null ? `${daysPaused} days` : "NA",
         "Paused By":    pg?.pauseMetadata?.lastPausedByUsername?.trim() || "NA",
-        "Paused Note":  pg?.pauseMetadata?.pausedNote?.trim()           || "NA"
+        "Paused Note":  truncateText(pausedNoteRaw, maxPausedNoteLength) || "NA"
       });
     }
   }
@@ -226,11 +283,12 @@ export default async function () {
   rows.sort((a, b) => {
     const cn = norm(a.Cluster).localeCompare(norm(b.Cluster));
     if (cn !== 0) return cn;
+
     return norm(a["PG Name"]).localeCompare(norm(b["PG Name"]));
   });
 
-  const reportDateEt  = nowEtString();
-  const totalPaused   = rows.filter(r => r["Paused Date"] !== "NA").length;
+  const reportDateEt = nowEtString();
+  const totalPaused  = rows.length;
 
   const tableHeaders = [
     "Cluster",
@@ -243,14 +301,22 @@ export default async function () {
   ];
 
   let markdown = "";
+
   markdown += `# Cohesity Paused Protection Groups\n\n`;
   markdown += `**Report Date ET:** ${reportDateEt}\n\n`;
   markdown += `**Total Paused Groups:** ${totalPaused}\n\n`;
-  markdown += `> 📝 Please update the Paused Note on the Protection Group using the standard format:\n`;
+
+  markdown += `> Please update the Paused Note on the Protection Group using the standard format:\n`;
   markdown += `> \`[TICKET#] | [REASON] | [Resume condition/Date if applicable]\`\n\n`;
+
   markdown += `## Paused Protection Group Details\n\n`;
-  markdown += markdownTable(tableHeaders, rows);
-  markdown += `\n`;
+
+  if (rows.length === 0) {
+    markdown += `No paused Protection Groups found across the clusters queried.\n\n`;
+  } else {
+    markdown += markdownTable(tableHeaders, rows);
+    markdown += `\n`;
+  }
 
   // ---------------------------
   // 4) Return for Dynatrace email step
