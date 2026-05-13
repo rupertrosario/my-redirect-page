@@ -1,16 +1,32 @@
 # =====================================================================
-# Cohesity Policy → Protection Group Alignment Inventory – Multi-Cluster
-# GET-only | PowerShell 5.1 compatible
+# Cohesity Policy -> Protection Group Retention Alignment Inventory
+# Multi-Cluster | Helios | GET-only | PowerShell 5.1 compatible
 #
-# Purpose:
-# - Get all clusters from Helios
-# - Get all policies per cluster
-# - Get all Protection Groups per cluster
-# - Group PGs under their policy
-# - Check if PG names align with Policy name keyword: PROD / DEV / MOD
+# Console:
+# - Policy summary only:
+#   Cluster | Policy Name | Retention Class | PG Count
+# - Exceptions only:
+#   PGs that need naming/policy review
 #
-# Output:
-# Cluster | PolicyName | PolicyID | PGCount | PGsUnderPolicy | NotMatchingPGs | Alignment
+# CSV:
+# - One full-detail CSV only
+#
+# Retention criteria:
+# - 35 days = PROD
+# - 14 days = NONPROD / MOD
+# - 7 days  = DEV
+#
+# Naming criteria:
+# - PROD policy        -> PG should contain PROD
+# - 14-day policy      -> PG should contain MOD, NONPROD, or NON-PROD
+# - DEV policy         -> PG should contain DEV
+# - LogShipping policy -> PG should contain LogShipping, any case/separator
+#
+# Default policies excluded:
+# - Protect Once
+# - Silver
+# - Gold
+# - Bronze
 # =====================================================================
 
 $ErrorActionPreference = "Stop"
@@ -19,11 +35,30 @@ $ErrorActionPreference = "Stop"
 # Folder + API key
 # -------------------------------
 $logDirectory = "X:\PowerShell\Data\Cohesity\PolicyPGAlignment"
+
 if (-not (Test-Path -Path $logDirectory -PathType Container)) {
     New-Item -Path $logDirectory -ItemType Directory | Out-Null
 }
 
+try {
+    $files = Get-ChildItem -Path $logDirectory -File -ErrorAction Stop
+
+    if ($files.Count -gt 50) {
+        $toDelete = $files | Sort-Object CreationTime | Select-Object -First ($files.Count - 50)
+        if ($toDelete) {
+            $toDelete | Remove-Item -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    $threshold = (Get-Date).AddDays(-30)
+    Get-ChildItem -Path $logDirectory -File -ErrorAction SilentlyContinue |
+        Where-Object { $_.LastWriteTime -lt $threshold } |
+        Remove-Item -Force -ErrorAction SilentlyContinue
+}
+catch {}
+
 $apikeypath = "X:\PowerShell\Cohesity_API_Scripts\DO_NOT_Delete\apikey.txt"
+
 if (-not (Test-Path $apikeypath)) {
     throw "API key file not found at $apikeypath"
 }
@@ -31,12 +66,11 @@ if (-not (Test-Path $apikeypath)) {
 $apiKey = (Get-Content -Path $apikeypath -Raw).Trim()
 
 $baseUrl = "https://helios.cohesity.com"
+
 $commonHeaders = @{
     "apiKey" = $apiKey
     "accept" = "application/json"
 }
-
-$keywords = @("PROD", "DEV", "MOD")
 
 # -------------------------------
 # PS 5.1 safe GET wrapper
@@ -49,7 +83,8 @@ function Invoke-HeliosGetJson {
 
     if ($PSVersionTable.PSVersion.Major -lt 6) {
         $resp = Invoke-WebRequest -Uri $Uri -Headers $Headers -Method Get -UseBasicParsing
-    } else {
+    }
+    else {
         $resp = Invoke-WebRequest -Uri $Uri -Headers $Headers -Method Get
     }
 
@@ -72,6 +107,7 @@ function Get-FirstValue {
     foreach ($name in $Names) {
         if ($null -ne $Object.PSObject.Properties[$name]) {
             $value = $Object.$name
+
             if ($null -ne $value -and "$value".Trim() -ne "") {
                 return $value
             }
@@ -89,6 +125,7 @@ function ValueOrNA {
     }
 
     $text = [string]$Value
+
     if ([string]::IsNullOrWhiteSpace($text)) {
         return "N/A"
     }
@@ -96,77 +133,403 @@ function ValueOrNA {
     return $text.Trim()
 }
 
-function Get-ExpectedKeyword {
+function Normalize-Name {
     param([string]$Name)
 
-    $upperName = (ValueOrNA $Name).ToUpper()
-    $found = @()
-
-    foreach ($keyword in $keywords) {
-        if ($upperName.Contains($keyword)) {
-            $found += $keyword
-        }
+    if ([string]::IsNullOrWhiteSpace($Name)) {
+        return ""
     }
 
-    if ($found.Count -eq 0) {
+    $n = $Name.Trim().ToUpper()
+
+    # Normalize LogShipping variants
+    $n = $n -replace "LOG[\s_\-]*SHIPPING", "LOGSHIPPING"
+
+    # Normalize NonProd variants
+    $n = $n -replace "NON[\s_\-]*PROD", "NONPROD"
+
+    return $n
+}
+
+function Has-Marker {
+    param(
+        [string]$Name,
+        [string]$Marker
+    )
+
+    $n = Normalize-Name $Name
+
+    if ([string]::IsNullOrWhiteSpace($n)) {
+        return $false
+    }
+
+    switch ($Marker) {
+        "LOGSHIPPING" {
+            return ($n -match '(^|[^A-Z0-9])LOGSHIPPING([^A-Z0-9]|$)' -or $n.Contains("LOGSHIPPING"))
+        }
+
+        "NONPROD" {
+            return ($n -match '(^|[^A-Z0-9])NONPROD([^A-Z0-9]|$)' -or $n.Contains("NONPROD"))
+        }
+
+        "PROD" {
+            # Prevent NONPROD from being treated as PROD
+            if ($n -match '(^|[^A-Z0-9])NONPROD([^A-Z0-9]|$)' -or $n.Contains("NONPROD")) {
+                return $false
+            }
+
+            return ($n -match '(^|[^A-Z0-9])PROD([^A-Z0-9]|$)' -or $n.Contains("PROD"))
+        }
+
+        "DEV" {
+            return ($n -match '(^|[^A-Z0-9])DEV([^A-Z0-9]|$)' -or $n.Contains("_DEV") -or $n.Contains("-DEV"))
+        }
+
+        "MOD" {
+            return ($n -match '(^|[^A-Z0-9])MOD([^A-Z0-9]|$)' -or $n.Contains("_MOD") -or $n.Contains("-MOD"))
+        }
+
+        default {
+            return $false
+        }
+    }
+}
+
+function Get-PGDetectedMarker {
+    param([string]$PGName)
+
+    $markers = @()
+
+    if (Has-Marker -Name $PGName -Marker "PROD")        { $markers += "PROD" }
+    if (Has-Marker -Name $PGName -Marker "NONPROD")     { $markers += "NONPROD" }
+    if (Has-Marker -Name $PGName -Marker "MOD")         { $markers += "MOD" }
+    if (Has-Marker -Name $PGName -Marker "DEV")         { $markers += "DEV" }
+    if (Has-Marker -Name $PGName -Marker "LOGSHIPPING") { $markers += "LOGSHIPPING" }
+
+    $markers = @($markers | Sort-Object -Unique)
+
+    if ($markers.Count -eq 0) {
         return "UNKNOWN"
     }
 
-    if ($found.Count -gt 1) {
-        return ($found -join ",")
-    }
-
-    return $found[0]
+    return ($markers -join ",")
 }
 
-function Test-PGNameMatchesPolicy {
+function Is-DefaultPolicy {
+    param([string]$PolicyName)
+
+    $n = Normalize-Name $PolicyName
+    $compact = $n -replace '[^A-Z0-9]', ''
+
+    return ($compact -in @(
+        "PROTECTONCE",
+        "SILVER",
+        "GOLD",
+        "BRONZE"
+    ))
+}
+
+function Convert-RetentionToDays {
     param(
-        [string]$PGName,
-        [string]$ExpectedKeyword
+        $Duration,
+        $Unit
     )
 
-    if ([string]::IsNullOrWhiteSpace($PGName)) {
-        return $false
+    if ($null -eq $Duration) {
+        return $null
     }
 
-    if ([string]::IsNullOrWhiteSpace($ExpectedKeyword)) {
-        return $false
+    [double]$d = 0
+
+    if (-not [double]::TryParse([string]$Duration, [ref]$d)) {
+        return $null
     }
 
-    if ($ExpectedKeyword -eq "UNKNOWN") {
-        return $false
+    if ($d -le 0) {
+        return $null
     }
 
-    if ($ExpectedKeyword.Contains(",")) {
-        return $false
+    $u = (ValueOrNA $Unit).ToUpper()
+
+    switch -Regex ($u) {
+        "DAY"    { return [int][math]::Round($d) }
+        "WEEK"   { return [int][math]::Round($d * 7) }
+        "MONTH"  { return [int][math]::Round($d * 30) }
+        "YEAR"   { return [int][math]::Round($d * 365) }
+        "HOUR"   { return [int][math]::Round($d / 24) }
+        "MINUTE" { return [int][math]::Round($d / 1440) }
+        default {
+            if ($d -in @(7, 14, 35)) {
+                return [int]$d
+            }
+        }
     }
 
-    return $PGName.ToUpper().Contains($ExpectedKeyword)
+    return $null
+}
+
+function Get-RetentionDaysFromName {
+    param([string]$PolicyName)
+
+    $n = Normalize-Name $PolicyName
+
+    foreach ($day in @(35, 14, 7)) {
+        $pattern = "(^|[^0-9])$day([\s_\-]*(D|DAY|DAYS))?([^0-9]|$)"
+
+        if ($n -match $pattern) {
+            return $day
+        }
+    }
+
+    return $null
+}
+
+function Get-PolicyRetentionDays {
+    param($Policy)
+
+    $candidates = @()
+
+    try {
+        $r = $Policy.backupPolicy.regular.retention
+
+        if ($r) {
+            $days = Convert-RetentionToDays -Duration $r.duration -Unit $r.unit
+            if ($days) { $candidates += $days }
+        }
+    }
+    catch {}
+
+    try {
+        foreach ($fb in @($Policy.backupPolicy.regular.fullBackups)) {
+            if ($fb.retention) {
+                $days = Convert-RetentionToDays -Duration $fb.retention.duration -Unit $fb.retention.unit
+                if ($days) { $candidates += $days }
+            }
+        }
+    }
+    catch {}
+
+    foreach ($field in @("daysToKeep", "retentionDays", "duration")) {
+        try {
+            if ($null -ne $Policy.PSObject.Properties[$field]) {
+                $days = Convert-RetentionToDays -Duration $Policy.$field -Unit "Days"
+                if ($days) { $candidates += $days }
+            }
+        }
+        catch {}
+    }
+
+    if ($candidates.Count -gt 0) {
+        return ($candidates | Select-Object -First 1)
+    }
+
+    return (Get-RetentionDaysFromName -PolicyName $Policy.name)
+}
+
+function Get-RetentionClass {
+    param($RetentionDays)
+
+    if ($null -eq $RetentionDays -or "$RetentionDays".Trim() -eq "") {
+        return "UNKNOWN"
+    }
+
+    switch ([int]$RetentionDays) {
+        35 { return "PROD" }
+        14 { return "NONPROD/MOD" }
+        7  { return "DEV" }
+        default { return "UNKNOWN" }
+    }
+}
+
+function Test-PGPolicyAlignment {
+    param(
+        [string]$PolicyName,
+        [string]$RetentionClass,
+        [string]$PGName
+    )
+
+    $policyHasLogShipping = Has-Marker -Name $PolicyName -Marker "LOGSHIPPING"
+    $pgHasLogShipping     = Has-Marker -Name $PGName     -Marker "LOGSHIPPING"
+
+    $pgDetectedMarker = Get-PGDetectedMarker -PGName $PGName
+
+    # If policy is LogShipping, PG should also be LogShipping.
+    if ($policyHasLogShipping) {
+        if ($pgHasLogShipping) {
+            return [pscustomobject]@{
+                Alignment        = "OK"
+                Issue            = "N/A"
+                PGDetectedMarker = $pgDetectedMarker
+            }
+        }
+
+        return [pscustomobject]@{
+            Alignment        = "NOT MATCHING"
+            Issue            = "PG missing LogShipping marker for LogShipping policy"
+            PGDetectedMarker = $pgDetectedMarker
+        }
+    }
+
+    if ($RetentionClass -eq "UNKNOWN") {
+        return [pscustomobject]@{
+            Alignment        = "REVIEW"
+            Issue            = "Policy retention not mapped to 35/14/7"
+            PGDetectedMarker = $pgDetectedMarker
+        }
+    }
+
+    $hasProd    = Has-Marker -Name $PGName -Marker "PROD"
+    $hasNonProd = Has-Marker -Name $PGName -Marker "NONPROD"
+    $hasMod     = Has-Marker -Name $PGName -Marker "MOD"
+    $hasDev     = Has-Marker -Name $PGName -Marker "DEV"
+
+    if (-not $hasProd -and -not $hasNonProd -and -not $hasMod -and -not $hasDev) {
+        return [pscustomobject]@{
+            Alignment        = "NOT MATCHING"
+            Issue            = "Missing naming marker"
+            PGDetectedMarker = $pgDetectedMarker
+        }
+    }
+
+    switch ($RetentionClass) {
+        "PROD" {
+            if ($hasProd -and -not $hasNonProd -and -not $hasMod -and -not $hasDev) {
+                return [pscustomobject]@{
+                    Alignment        = "OK"
+                    Issue            = "N/A"
+                    PGDetectedMarker = $pgDetectedMarker
+                }
+            }
+
+            return [pscustomobject]@{
+                Alignment        = "NOT MATCHING"
+                Issue            = "Wrong marker for 35-day PROD policy"
+                PGDetectedMarker = $pgDetectedMarker
+            }
+        }
+
+        "NONPROD/MOD" {
+            if (($hasNonProd -or $hasMod) -and -not $hasProd -and -not $hasDev) {
+                return [pscustomobject]@{
+                    Alignment        = "OK"
+                    Issue            = "N/A"
+                    PGDetectedMarker = $pgDetectedMarker
+                }
+            }
+
+            return [pscustomobject]@{
+                Alignment        = "NOT MATCHING"
+                Issue            = "Wrong marker for 14-day NONPROD/MOD policy"
+                PGDetectedMarker = $pgDetectedMarker
+            }
+        }
+
+        "DEV" {
+            if ($hasDev -and -not $hasProd -and -not $hasNonProd -and -not $hasMod) {
+                return [pscustomobject]@{
+                    Alignment        = "OK"
+                    Issue            = "N/A"
+                    PGDetectedMarker = $pgDetectedMarker
+                }
+            }
+
+            return [pscustomobject]@{
+                Alignment        = "NOT MATCHING"
+                Issue            = "Wrong marker for 7-day DEV policy"
+                PGDetectedMarker = $pgDetectedMarker
+            }
+        }
+
+        default {
+            return [pscustomobject]@{
+                Alignment        = "REVIEW"
+                Issue            = "Retention class not recognized"
+                PGDetectedMarker = $pgDetectedMarker
+            }
+        }
+    }
+}
+
+function Shorten-Text {
+    param(
+        [string]$Text,
+        [int]$Max
+    )
+
+    $v = ValueOrNA $Text
+
+    if ($v.Length -le $Max) {
+        return $v
+    }
+
+    return $v.Substring(0, $Max - 3) + "..."
+}
+
+function Format-FixedLine {
+    param(
+        [object[]]$Values,
+        [int[]]$Widths
+    )
+
+    $out = ""
+
+    for ($i = 0; $i -lt $Values.Count; $i++) {
+        $w = $Widths[$i]
+        $v = Shorten-Text -Text ([string]$Values[$i]) -Max $w
+        $out += $v.PadRight($w)
+    }
+
+    return $out
 }
 
 # -------------------------------
-# Get clusters from Helios
+# Get clusters
 # -------------------------------
 Write-Host "=============================================" -ForegroundColor Cyan
-Write-Host "   COHESITY POLICY → PG ALIGNMENT INVENTORY" -ForegroundColor White
+Write-Host "   COHESITY POLICY -> PG ALIGNMENT INVENTORY" -ForegroundColor White
 Write-Host "=============================================" -ForegroundColor Cyan
+Write-Host "Default policies excluded: Protect Once, Silver, Gold, Bronze" -ForegroundColor Gray
 
 try {
     $cluJson = Invoke-HeliosGetJson -Uri "$baseUrl/v2/mcm/cluster-mgmt/info" -Headers $commonHeaders
-    $json_clu = $cluJson.cohesityClusters
 }
 catch {
     throw "Failed to query Helios clusters: $($_.Exception.Message)"
 }
 
-if (-not $json_clu) {
+$json_clu = @()
+
+if ($cluJson.cohesityClusters) {
+    $json_clu = @($cluJson.cohesityClusters)
+}
+elseif ($cluJson.clusters) {
+    $json_clu = @($cluJson.clusters)
+}
+elseif ($cluJson.clusterInfos) {
+    $json_clu = @($cluJson.clusterInfos)
+}
+elseif ($cluJson.mcmInfo.clusterInfos) {
+    $json_clu = @($cluJson.mcmInfo.clusterInfos)
+}
+
+if (-not $json_clu -or $json_clu.Count -eq 0) {
     throw "No clusters returned from Helios."
 }
+
+$json_clu = @(
+    $json_clu | Sort-Object {
+        $n = Get-FirstValue $_ @("name", "clusterName", "displayName", "ClusterName", "Name")
+        ValueOrNA $n
+    }
+)
 
 # -------------------------------
 # Main collection
 # -------------------------------
-$rows = @()
+$summaryRows = @()
+$detailRows  = @()
+$issueRows   = @()
+$excludedDefaultRows = @()
 
 foreach ($cluster in $json_clu) {
 
@@ -178,87 +541,84 @@ foreach ($cluster in $json_clu) {
     }
 
     if (-not $clusterId) {
-        $rows += [pscustomobject]@{
+        $issueRows += [pscustomobject]@{
             Cluster        = $clusterName
             PolicyName     = "NO_CLUSTER_ID"
-            PolicyID       = "N/A"
-            PGCount        = "N/A"
-            PGsUnderPolicy = "N/A"
-            NotMatchingPGs = "N/A"
-            Alignment      = "NO_DATA"
+            RetentionClass = "N/A"
+            PGName         = "N/A"
+            Issue          = "Cluster ID missing"
         }
+
         continue
     }
 
-    Write-Host "`n🔹 Processing cluster: $clusterName" -ForegroundColor Cyan
+    Write-Host "`nProcessing cluster: $clusterName" -ForegroundColor Cyan
 
     $headers = @{
         "apiKey" = $apiKey
-        "accessClusterId" = $clusterId
+        "accessClusterId" = [string]$clusterId
         "accept" = "application/json"
     }
 
-    # -------------------------------
     # Get policies
-    # -------------------------------
     try {
         $policyJson = Invoke-HeliosGetJson -Uri "$baseUrl/v2/data-protect/policies" -Headers $headers
-        $policies = @($policyJson.policies)
+
+        if ($policyJson.policies) {
+            $policies = @($policyJson.policies)
+        }
+        elseif ($policyJson -is [array]) {
+            $policies = @($policyJson)
+        }
+        else {
+            $policies = @()
+        }
     }
     catch {
-        Write-Host "⚠️ Failed to get policies for $clusterName : $($_.Exception.Message)" -ForegroundColor Yellow
-
-        $rows += [pscustomobject]@{
+        $issueRows += [pscustomobject]@{
             Cluster        = $clusterName
             PolicyName     = "POLICY_FETCH_FAILED"
-            PolicyID       = "N/A"
-            PGCount        = "N/A"
-            PGsUnderPolicy = "N/A"
-            NotMatchingPGs = "N/A"
-            Alignment      = "NO_DATA"
+            RetentionClass = "N/A"
+            PGName         = "N/A"
+            Issue          = $_.Exception.Message
         }
 
+        Write-Host "Policy fetch failed for $clusterName : $($_.Exception.Message)" -ForegroundColor Yellow
         continue
     }
 
-    if (-not $policies) {
-        $policies = @()
-    }
-
-    # -------------------------------
-    # Get Protection Groups
-    # -------------------------------
+    # Get protection groups
     try {
-        $pgJson = Invoke-HeliosGetJson -Uri "$baseUrl/v2/data-protect/protection-groups?isDeleted=false&includeLastRunInfo=false" -Headers $headers
-        $pgs = @($pgJson.protectionGroups)
+        $pgUri = "$baseUrl/v2/data-protect/protection-groups?isDeleted=false&includeLastRunInfo=false"
+        $pgJson = Invoke-HeliosGetJson -Uri $pgUri -Headers $headers
+
+        if ($pgJson.protectionGroups) {
+            $pgs = @($pgJson.protectionGroups)
+        }
+        elseif ($pgJson -is [array]) {
+            $pgs = @($pgJson)
+        }
+        else {
+            $pgs = @()
+        }
     }
     catch {
-        Write-Host "⚠️ Failed to get PGs for $clusterName : $($_.Exception.Message)" -ForegroundColor Yellow
-
-        $rows += [pscustomobject]@{
+        $issueRows += [pscustomobject]@{
             Cluster        = $clusterName
             PolicyName     = "PG_FETCH_FAILED"
-            PolicyID       = "N/A"
-            PGCount        = "N/A"
-            PGsUnderPolicy = "N/A"
-            NotMatchingPGs = "N/A"
-            Alignment      = "NO_DATA"
+            RetentionClass = "N/A"
+            PGName         = "N/A"
+            Issue          = $_.Exception.Message
         }
 
+        Write-Host "PG fetch failed for $clusterName : $($_.Exception.Message)" -ForegroundColor Yellow
         continue
-    }
-
-    if (-not $pgs) {
-        $pgs = @()
     }
 
     $pgs = @($pgs | Where-Object { $_.isDeleted -ne $true })
 
-    Write-Host "Policies: $($policies.Count) | PGs: $($pgs.Count)" -ForegroundColor Gray
+    Write-Host "Policies returned: $($policies.Count) | PGs returned: $($pgs.Count)" -ForegroundColor Gray
 
-    # -------------------------------
-    # Group PGs under each policy
-    # -------------------------------
     foreach ($policy in ($policies | Sort-Object name)) {
 
         $policyName = ValueOrNA $policy.name
@@ -268,107 +628,178 @@ foreach ($cluster in $json_clu) {
             continue
         }
 
-        $expectedKeyword = Get-ExpectedKeyword -Name $policyName
+        if (Is-DefaultPolicy -PolicyName $policyName) {
+            $excludedDefaultRows += [pscustomobject]@{
+                Cluster    = $clusterName
+                PolicyName = $policyName
+            }
 
-        $matchedPGNames = @(
+            continue
+        }
+
+        $retentionDays  = Get-PolicyRetentionDays -Policy $policy
+        $retentionClass = Get-RetentionClass -RetentionDays $retentionDays
+
+        $matchedPGs = @(
             $pgs |
                 Where-Object { (ValueOrNA $_.policyId) -eq $policyId } |
-                Sort-Object name |
-                ForEach-Object { ValueOrNA $_.name }
+                Sort-Object name
         )
 
-        $notMatching = @()
-
-        if ($expectedKeyword -in $keywords) {
-            foreach ($pgName in $matchedPGNames) {
-                if (-not (Test-PGNameMatchesPolicy -PGName $pgName -ExpectedKeyword $expectedKeyword)) {
-                    $notMatching += $pgName
-                }
-            }
-        }
-
-        $alignment = "OK"
-
-        if ($matchedPGNames.Count -eq 0) {
-            $alignment = "NO_PGS"
-        }
-        elseif ($expectedKeyword -eq "UNKNOWN" -or $expectedKeyword.Contains(",")) {
-            $alignment = "REVIEW"
-        }
-        elseif ($notMatching.Count -gt 0) {
-            $alignment = "MISMATCH"
-        }
-
-        $rows += [pscustomobject]@{
+        $summaryRows += [pscustomobject]@{
             Cluster        = $clusterName
             PolicyName     = $policyName
-            PolicyID       = $policyId
-            PGCount        = $matchedPGNames.Count
-            PGsUnderPolicy = if ($matchedPGNames.Count -gt 0) { $matchedPGNames -join "; " } else { "N/A" }
-            NotMatchingPGs = if ($notMatching.Count -gt 0) { $notMatching -join "; " } else { "N/A" }
-            Alignment      = $alignment
+            RetentionDays  = if ($retentionDays) { $retentionDays } else { "N/A" }
+            RetentionClass = $retentionClass
+            PGCount        = $matchedPGs.Count
+        }
+
+        if ($matchedPGs.Count -eq 0) {
+            $detailRows += [pscustomobject]@{
+                Cluster             = $clusterName
+                PolicyName          = $policyName
+                RetentionDays       = if ($retentionDays) { $retentionDays } else { "N/A" }
+                RetentionClass      = $retentionClass
+                PGName              = "N/A"
+                PGDetectedMarker    = "N/A"
+                IsPolicyLogShipping = Has-Marker -Name $policyName -Marker "LOGSHIPPING"
+                IsPGLogShipping     = $false
+                Alignment           = "REVIEW"
+                Issue               = "No PGs assigned to policy"
+            }
+
+            $issueRows += [pscustomobject]@{
+                Cluster        = $clusterName
+                PolicyName     = $policyName
+                RetentionClass = $retentionClass
+                PGName         = "N/A"
+                Issue          = "No PGs assigned to policy"
+            }
+
+            continue
+        }
+
+        foreach ($pg in $matchedPGs) {
+
+            $pgName = ValueOrNA $pg.name
+            $result = Test-PGPolicyAlignment -PolicyName $policyName -RetentionClass $retentionClass -PGName $pgName
+
+            $detailRows += [pscustomobject]@{
+                Cluster             = $clusterName
+                PolicyName          = $policyName
+                RetentionDays       = if ($retentionDays) { $retentionDays } else { "N/A" }
+                RetentionClass      = $retentionClass
+                PGName              = $pgName
+                PGDetectedMarker    = $result.PGDetectedMarker
+                IsPolicyLogShipping = Has-Marker -Name $policyName -Marker "LOGSHIPPING"
+                IsPGLogShipping     = Has-Marker -Name $pgName -Marker "LOGSHIPPING"
+                Alignment           = $result.Alignment
+                Issue               = $result.Issue
+            }
+
+            if ($result.Alignment -ne "OK") {
+                $issueRows += [pscustomobject]@{
+                    Cluster        = $clusterName
+                    PolicyName     = $policyName
+                    RetentionClass = $retentionClass
+                    PGName         = $pgName
+                    Issue          = $result.Issue
+                }
+            }
         }
     }
 }
 
-# -------------------------------
-# Sort output
-# -------------------------------
-$rows = @($rows | Sort-Object Cluster, PolicyName)
+$summaryRows = @($summaryRows | Sort-Object Cluster, PolicyName)
+$detailRows  = @($detailRows  | Sort-Object Cluster, PolicyName, PGName)
+$issueRows   = @($issueRows   | Sort-Object Cluster, PolicyName, PGName)
 
 # -------------------------------
-# Console output
+# Console summary
 # -------------------------------
-Write-Host "`n=============================================" -ForegroundColor Cyan
-Write-Host "   POLICY → PG ALIGNMENT TABLE" -ForegroundColor White
-Write-Host "=============================================" -ForegroundColor Cyan
+Write-Host "`n====================================================================================================" -ForegroundColor Cyan
+Write-Host "POLICY SUMMARY" -ForegroundColor White
+Write-Host "====================================================================================================" -ForegroundColor Cyan
+Write-Host "Default policies excluded from review: Protect Once, Silver, Gold, Bronze" -ForegroundColor Gray
+Write-Host "Excluded default policy count: $($excludedDefaultRows.Count)" -ForegroundColor Gray
+Write-Host ""
 
-$rows |
-    Format-Table Cluster, PolicyName, PolicyID, PGCount, PGsUnderPolicy, NotMatchingPGs, Alignment -AutoSize -Wrap |
-    Out-String -Width 4096 |
-    Write-Host
+$summaryWidths = @(24, 64, 18, 10)
 
-Write-Host "`n=============================================" -ForegroundColor Cyan
-Write-Host "   MISMATCH / REVIEW / NO_PGS ONLY" -ForegroundColor White
-Write-Host "=============================================" -ForegroundColor Cyan
+$summaryHeader = Format-FixedLine `
+    -Values @("Cluster", "Policy Name", "Retention Class", "PG Count") `
+    -Widths $summaryWidths
 
-$issueRows = @($rows | Where-Object { $_.Alignment -ne "OK" })
+Write-Host $summaryHeader -ForegroundColor White
+Write-Host ("-" * 116)
 
-if ($issueRows.Count -gt 0) {
-    $issueRows |
-        Format-Table Cluster, PolicyName, PGCount, NotMatchingPGs, Alignment -AutoSize -Wrap |
-        Out-String -Width 4096 |
-        Write-Host
+foreach ($row in $summaryRows) {
+    $line = Format-FixedLine `
+        -Values @($row.Cluster, $row.PolicyName, $row.RetentionClass, $row.PGCount) `
+        -Widths $summaryWidths
+
+    Write-Host $line
+}
+
+# -------------------------------
+# Console exceptions only
+# -------------------------------
+Write-Host "`n====================================================================================================" -ForegroundColor Cyan
+Write-Host "EXCEPTIONS ONLY - PGs THAT NEED NAMING OR POLICY REVIEW" -ForegroundColor White
+Write-Host "====================================================================================================" -ForegroundColor Cyan
+
+if ($issueRows.Count -eq 0) {
+    Write-Host "No PG naming or policy-retention exceptions found." -ForegroundColor Green
 }
 else {
-    Write-Host "✅ No naming mismatches found." -ForegroundColor Green
+    $issueWidths = @(22, 46, 16, 52, 42)
+
+    $issueHeader = Format-FixedLine `
+        -Values @("Cluster", "Policy Name", "Retention", "PG Name", "Issue") `
+        -Widths $issueWidths
+
+    Write-Host $issueHeader -ForegroundColor White
+    Write-Host ("-" * 178)
+
+    foreach ($row in $issueRows) {
+        $line = Format-FixedLine `
+            -Values @($row.Cluster, $row.PolicyName, $row.RetentionClass, $row.PGName, $row.Issue) `
+            -Widths $issueWidths
+
+        Write-Host $line -ForegroundColor Yellow
+    }
 }
 
 # -------------------------------
-# CSV output
+# Single CSV export
 # -------------------------------
 $timestamp = Get-Date -Format "yyyyMMdd_HHmm"
-$csvPath = Join-Path $logDirectory "Cohesity_Policy_PG_Alignment_$timestamp.csv"
-$rows | Export-Csv -Path $csvPath -NoTypeInformation -Encoding UTF8
+$csvPath = Join-Path $logDirectory "Cohesity_Policy_PG_RetentionAlignment_$timestamp.csv"
 
-Write-Host "`n📂 CSV saved: $csvPath" -ForegroundColor Gray
-
-if ($issueRows.Count -gt 0) {
-    $issueCsvPath = Join-Path $logDirectory "Cohesity_Policy_PG_Alignment_Issues_$timestamp.csv"
-    $issueRows | Export-Csv -Path $issueCsvPath -NoTypeInformation -Encoding UTF8
-    Write-Host "📂 Issue CSV saved: $issueCsvPath" -ForegroundColor Yellow
-}
+$detailRows |
+    Select-Object `
+        Cluster,
+        PolicyName,
+        RetentionDays,
+        RetentionClass,
+        PGName,
+        PGDetectedMarker,
+        IsPolicyLogShipping,
+        IsPGLogShipping,
+        Alignment,
+        Issue |
+    Export-Csv -Path $csvPath -NoTypeInformation -Encoding UTF8
 
 # -------------------------------
-# Summary
+# Final summary
 # -------------------------------
 Write-Host "`n==============================" -ForegroundColor Cyan
-Write-Host "          SUMMARY" -ForegroundColor White
+Write-Host "SUMMARY" -ForegroundColor White
 Write-Host "==============================" -ForegroundColor Cyan
-Write-Host "Total Policies Reviewed : $($rows.Count)"
-Write-Host "OK Policies             : $(($rows | Where-Object { $_.Alignment -eq 'OK' }).Count)"
-Write-Host "Mismatched Policies     : $(($rows | Where-Object { $_.Alignment -eq 'MISMATCH' }).Count)"
-Write-Host "Review Policies         : $(($rows | Where-Object { $_.Alignment -eq 'REVIEW' }).Count)"
-Write-Host "Policies With No PGs    : $(($rows | Where-Object { $_.Alignment -eq 'NO_PGS' }).Count)"
+Write-Host "Policies reviewed          : $($summaryRows.Count)"
+Write-Host "Protection Groups reviewed : $($detailRows.Count)"
+Write-Host "Exceptions found           : $($issueRows.Count)"
+Write-Host "Default policies excluded  : $($excludedDefaultRows.Count)"
+Write-Host "CSV Output                 : $csvPath"
 Write-Host "=============================="
-Write-Host "✅ Processing complete!"
+Write-Host "Processing complete."
