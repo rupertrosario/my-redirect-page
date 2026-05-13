@@ -1,0 +1,374 @@
+# =====================================================================
+# Cohesity Policy → Protection Group Alignment Inventory – Multi-Cluster
+# GET-only | PowerShell 5.1 compatible
+#
+# Purpose:
+# - Get all clusters from Helios
+# - Get all policies per cluster
+# - Get all Protection Groups per cluster
+# - Group PGs under their policy
+# - Check if PG names align with Policy name keyword: PROD / DEV / MOD
+#
+# Output:
+# Cluster | PolicyName | PolicyID | PGCount | PGsUnderPolicy | NotMatchingPGs | Alignment
+# =====================================================================
+
+$ErrorActionPreference = "Stop"
+
+# -------------------------------
+# Folder + API key
+# -------------------------------
+$logDirectory = "X:\PowerShell\Data\Cohesity\PolicyPGAlignment"
+if (-not (Test-Path -Path $logDirectory -PathType Container)) {
+    New-Item -Path $logDirectory -ItemType Directory | Out-Null
+}
+
+$apikeypath = "X:\PowerShell\Cohesity_API_Scripts\DO_NOT_Delete\apikey.txt"
+if (-not (Test-Path $apikeypath)) {
+    throw "API key file not found at $apikeypath"
+}
+
+$apiKey = (Get-Content -Path $apikeypath -Raw).Trim()
+
+$baseUrl = "https://helios.cohesity.com"
+$commonHeaders = @{
+    "apiKey" = $apiKey
+    "accept" = "application/json"
+}
+
+$keywords = @("PROD", "DEV", "MOD")
+
+# -------------------------------
+# PS 5.1 safe GET wrapper
+# -------------------------------
+function Invoke-HeliosGetJson {
+    param(
+        [Parameter(Mandatory)][string]$Uri,
+        [Parameter(Mandatory)][hashtable]$Headers
+    )
+
+    if ($PSVersionTable.PSVersion.Major -lt 6) {
+        $resp = Invoke-WebRequest -Uri $Uri -Headers $Headers -Method Get -UseBasicParsing
+    } else {
+        $resp = Invoke-WebRequest -Uri $Uri -Headers $Headers -Method Get
+    }
+
+    if (-not $resp -or [string]::IsNullOrWhiteSpace($resp.Content)) {
+        return $null
+    }
+
+    return ($resp.Content | ConvertFrom-Json)
+}
+
+# -------------------------------
+# Helpers
+# -------------------------------
+function Get-FirstValue {
+    param(
+        [Parameter(Mandatory)]$Object,
+        [Parameter(Mandatory)][string[]]$Names
+    )
+
+    foreach ($name in $Names) {
+        if ($null -ne $Object.PSObject.Properties[$name]) {
+            $value = $Object.$name
+            if ($null -ne $value -and "$value".Trim() -ne "") {
+                return $value
+            }
+        }
+    }
+
+    return $null
+}
+
+function ValueOrNA {
+    param($Value)
+
+    if ($null -eq $Value) {
+        return "N/A"
+    }
+
+    $text = [string]$Value
+    if ([string]::IsNullOrWhiteSpace($text)) {
+        return "N/A"
+    }
+
+    return $text.Trim()
+}
+
+function Get-ExpectedKeyword {
+    param([string]$Name)
+
+    $upperName = (ValueOrNA $Name).ToUpper()
+    $found = @()
+
+    foreach ($keyword in $keywords) {
+        if ($upperName.Contains($keyword)) {
+            $found += $keyword
+        }
+    }
+
+    if ($found.Count -eq 0) {
+        return "UNKNOWN"
+    }
+
+    if ($found.Count -gt 1) {
+        return ($found -join ",")
+    }
+
+    return $found[0]
+}
+
+function Test-PGNameMatchesPolicy {
+    param(
+        [string]$PGName,
+        [string]$ExpectedKeyword
+    )
+
+    if ([string]::IsNullOrWhiteSpace($PGName)) {
+        return $false
+    }
+
+    if ([string]::IsNullOrWhiteSpace($ExpectedKeyword)) {
+        return $false
+    }
+
+    if ($ExpectedKeyword -eq "UNKNOWN") {
+        return $false
+    }
+
+    if ($ExpectedKeyword.Contains(",")) {
+        return $false
+    }
+
+    return $PGName.ToUpper().Contains($ExpectedKeyword)
+}
+
+# -------------------------------
+# Get clusters from Helios
+# -------------------------------
+Write-Host "=============================================" -ForegroundColor Cyan
+Write-Host "   COHESITY POLICY → PG ALIGNMENT INVENTORY" -ForegroundColor White
+Write-Host "=============================================" -ForegroundColor Cyan
+
+try {
+    $cluJson = Invoke-HeliosGetJson -Uri "$baseUrl/v2/mcm/cluster-mgmt/info" -Headers $commonHeaders
+    $json_clu = $cluJson.cohesityClusters
+}
+catch {
+    throw "Failed to query Helios clusters: $($_.Exception.Message)"
+}
+
+if (-not $json_clu) {
+    throw "No clusters returned from Helios."
+}
+
+# -------------------------------
+# Main collection
+# -------------------------------
+$rows = @()
+
+foreach ($cluster in $json_clu) {
+
+    $clusterName = Get-FirstValue $cluster @("name", "clusterName", "displayName", "ClusterName", "Name")
+    $clusterId   = Get-FirstValue $cluster @("clusterId", "id", "ClusterId", "Id")
+
+    if (-not $clusterName) {
+        $clusterName = "Unknown-$clusterId"
+    }
+
+    if (-not $clusterId) {
+        $rows += [pscustomobject]@{
+            Cluster        = $clusterName
+            PolicyName     = "NO_CLUSTER_ID"
+            PolicyID       = "N/A"
+            PGCount        = "N/A"
+            PGsUnderPolicy = "N/A"
+            NotMatchingPGs = "N/A"
+            Alignment      = "NO_DATA"
+        }
+        continue
+    }
+
+    Write-Host "`n🔹 Processing cluster: $clusterName" -ForegroundColor Cyan
+
+    $headers = @{
+        "apiKey" = $apiKey
+        "accessClusterId" = $clusterId
+        "accept" = "application/json"
+    }
+
+    # -------------------------------
+    # Get policies
+    # -------------------------------
+    try {
+        $policyJson = Invoke-HeliosGetJson -Uri "$baseUrl/v2/data-protect/policies" -Headers $headers
+        $policies = @($policyJson.policies)
+    }
+    catch {
+        Write-Host "⚠️ Failed to get policies for $clusterName : $($_.Exception.Message)" -ForegroundColor Yellow
+
+        $rows += [pscustomobject]@{
+            Cluster        = $clusterName
+            PolicyName     = "POLICY_FETCH_FAILED"
+            PolicyID       = "N/A"
+            PGCount        = "N/A"
+            PGsUnderPolicy = "N/A"
+            NotMatchingPGs = "N/A"
+            Alignment      = "NO_DATA"
+        }
+
+        continue
+    }
+
+    if (-not $policies) {
+        $policies = @()
+    }
+
+    # -------------------------------
+    # Get Protection Groups
+    # -------------------------------
+    try {
+        $pgJson = Invoke-HeliosGetJson -Uri "$baseUrl/v2/data-protect/protection-groups?isDeleted=false&includeLastRunInfo=false" -Headers $headers
+        $pgs = @($pgJson.protectionGroups)
+    }
+    catch {
+        Write-Host "⚠️ Failed to get PGs for $clusterName : $($_.Exception.Message)" -ForegroundColor Yellow
+
+        $rows += [pscustomobject]@{
+            Cluster        = $clusterName
+            PolicyName     = "PG_FETCH_FAILED"
+            PolicyID       = "N/A"
+            PGCount        = "N/A"
+            PGsUnderPolicy = "N/A"
+            NotMatchingPGs = "N/A"
+            Alignment      = "NO_DATA"
+        }
+
+        continue
+    }
+
+    if (-not $pgs) {
+        $pgs = @()
+    }
+
+    $pgs = @($pgs | Where-Object { $_.isDeleted -ne $true })
+
+    Write-Host "Policies: $($policies.Count) | PGs: $($pgs.Count)" -ForegroundColor Gray
+
+    # -------------------------------
+    # Group PGs under each policy
+    # -------------------------------
+    foreach ($policy in ($policies | Sort-Object name)) {
+
+        $policyName = ValueOrNA $policy.name
+        $policyId   = ValueOrNA $policy.id
+
+        if ($policyId -eq "N/A") {
+            continue
+        }
+
+        $expectedKeyword = Get-ExpectedKeyword -Name $policyName
+
+        $matchedPGNames = @(
+            $pgs |
+                Where-Object { (ValueOrNA $_.policyId) -eq $policyId } |
+                Sort-Object name |
+                ForEach-Object { ValueOrNA $_.name }
+        )
+
+        $notMatching = @()
+
+        if ($expectedKeyword -in $keywords) {
+            foreach ($pgName in $matchedPGNames) {
+                if (-not (Test-PGNameMatchesPolicy -PGName $pgName -ExpectedKeyword $expectedKeyword)) {
+                    $notMatching += $pgName
+                }
+            }
+        }
+
+        $alignment = "OK"
+
+        if ($matchedPGNames.Count -eq 0) {
+            $alignment = "NO_PGS"
+        }
+        elseif ($expectedKeyword -eq "UNKNOWN" -or $expectedKeyword.Contains(",")) {
+            $alignment = "REVIEW"
+        }
+        elseif ($notMatching.Count -gt 0) {
+            $alignment = "MISMATCH"
+        }
+
+        $rows += [pscustomobject]@{
+            Cluster        = $clusterName
+            PolicyName     = $policyName
+            PolicyID       = $policyId
+            PGCount        = $matchedPGNames.Count
+            PGsUnderPolicy = if ($matchedPGNames.Count -gt 0) { $matchedPGNames -join "; " } else { "N/A" }
+            NotMatchingPGs = if ($notMatching.Count -gt 0) { $notMatching -join "; " } else { "N/A" }
+            Alignment      = $alignment
+        }
+    }
+}
+
+# -------------------------------
+# Sort output
+# -------------------------------
+$rows = @($rows | Sort-Object Cluster, PolicyName)
+
+# -------------------------------
+# Console output
+# -------------------------------
+Write-Host "`n=============================================" -ForegroundColor Cyan
+Write-Host "   POLICY → PG ALIGNMENT TABLE" -ForegroundColor White
+Write-Host "=============================================" -ForegroundColor Cyan
+
+$rows |
+    Format-Table Cluster, PolicyName, PolicyID, PGCount, PGsUnderPolicy, NotMatchingPGs, Alignment -AutoSize -Wrap |
+    Out-String -Width 4096 |
+    Write-Host
+
+Write-Host "`n=============================================" -ForegroundColor Cyan
+Write-Host "   MISMATCH / REVIEW / NO_PGS ONLY" -ForegroundColor White
+Write-Host "=============================================" -ForegroundColor Cyan
+
+$issueRows = @($rows | Where-Object { $_.Alignment -ne "OK" })
+
+if ($issueRows.Count -gt 0) {
+    $issueRows |
+        Format-Table Cluster, PolicyName, PGCount, NotMatchingPGs, Alignment -AutoSize -Wrap |
+        Out-String -Width 4096 |
+        Write-Host
+}
+else {
+    Write-Host "✅ No naming mismatches found." -ForegroundColor Green
+}
+
+# -------------------------------
+# CSV output
+# -------------------------------
+$timestamp = Get-Date -Format "yyyyMMdd_HHmm"
+$csvPath = Join-Path $logDirectory "Cohesity_Policy_PG_Alignment_$timestamp.csv"
+$rows | Export-Csv -Path $csvPath -NoTypeInformation -Encoding UTF8
+
+Write-Host "`n📂 CSV saved: $csvPath" -ForegroundColor Gray
+
+if ($issueRows.Count -gt 0) {
+    $issueCsvPath = Join-Path $logDirectory "Cohesity_Policy_PG_Alignment_Issues_$timestamp.csv"
+    $issueRows | Export-Csv -Path $issueCsvPath -NoTypeInformation -Encoding UTF8
+    Write-Host "📂 Issue CSV saved: $issueCsvPath" -ForegroundColor Yellow
+}
+
+# -------------------------------
+# Summary
+# -------------------------------
+Write-Host "`n==============================" -ForegroundColor Cyan
+Write-Host "          SUMMARY" -ForegroundColor White
+Write-Host "==============================" -ForegroundColor Cyan
+Write-Host "Total Policies Reviewed : $($rows.Count)"
+Write-Host "OK Policies             : $(($rows | Where-Object { $_.Alignment -eq 'OK' }).Count)"
+Write-Host "Mismatched Policies     : $(($rows | Where-Object { $_.Alignment -eq 'MISMATCH' }).Count)"
+Write-Host "Review Policies         : $(($rows | Where-Object { $_.Alignment -eq 'REVIEW' }).Count)"
+Write-Host "Policies With No PGs    : $(($rows | Where-Object { $_.Alignment -eq 'NO_PGS' }).Count)"
+Write-Host "=============================="
+Write-Host "✅ Processing complete!"
