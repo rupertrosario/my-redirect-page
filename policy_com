@@ -1,0 +1,832 @@
+This uses the policy schema areas you shared: `backupPolicy`, `remoteTargetPolicy`, `blackoutWindow`, `extendedRetention`, `retryOptions`, `dataLock`, and `rpoPolicySettings`. 
+
+```powershell
+# =====================================================================
+# Cohesity Full Policy Inventory Report
+# Multi-Cluster | Helios | GET-only | PowerShell 5.1 compatible
+#
+# Purpose:
+# - Export one CSV row per policy
+# - Include core policy fields for every policy
+# - Dynamically add optional CSV columns only when data exists
+# - Preserve full policy JSON so no policy configuration detail is lost
+#
+# Output:
+# - CSV only
+# - Console shows summary/path only
+# =====================================================================
+
+$ErrorActionPreference = "Stop"
+
+# -------------------------------
+# Config
+# -------------------------------
+$baseUrl = "https://helios.cohesity.com"
+$apikeypath = "X:\PowerShell\Cohesity_API_Scripts\DO_NOT_Delete\apikey.txt"
+$logDirectory = "X:\PowerShell\Data\Cohesity\PolicyInventory"
+
+if (-not (Test-Path -Path $logDirectory -PathType Container)) {
+    New-Item -Path $logDirectory -ItemType Directory -Force | Out-Null
+}
+
+if (-not (Test-Path $apikeypath)) {
+    throw "API key file not found at $apikeypath"
+}
+
+$apiKey = (Get-Content -Path $apikeypath -Raw).Trim()
+
+$commonHeaders = @{
+    "apiKey" = $apiKey
+    "accept" = "application/json"
+}
+
+# -------------------------------
+# Helpers
+# -------------------------------
+function Invoke-HeliosGetJson {
+    param(
+        [Parameter(Mandatory)][string]$Uri,
+        [Parameter(Mandatory)][hashtable]$Headers
+    )
+
+    if ($PSVersionTable.PSVersion.Major -lt 6) {
+        $resp = Invoke-WebRequest -Uri $Uri -Headers $Headers -Method Get -UseBasicParsing -ErrorAction Stop
+    }
+    else {
+        $resp = Invoke-WebRequest -Uri $Uri -Headers $Headers -Method Get -ErrorAction Stop
+    }
+
+    if (-not $resp -or [string]::IsNullOrWhiteSpace($resp.Content)) {
+        return $null
+    }
+
+    return ($resp.Content | ConvertFrom-Json)
+}
+
+function ValueOrNA {
+    param($Value)
+
+    if ($null -eq $Value) {
+        return "N/A"
+    }
+
+    if ($Value -is [array]) {
+        $items = @($Value | Where-Object { $null -ne $_ -and "$_".Trim() -ne "" })
+        if ($items.Count -eq 0) { return "N/A" }
+        return ($items -join "; ")
+    }
+
+    $text = [string]$Value
+    if ([string]::IsNullOrWhiteSpace($text)) {
+        return "N/A"
+    }
+
+    return $text.Trim()
+}
+
+function To-CompactJson {
+    param($Object)
+
+    if ($null -eq $Object) {
+        return "N/A"
+    }
+
+    try {
+        return ($Object | ConvertTo-Json -Depth 80 -Compress)
+    }
+    catch {
+        return "N/A"
+    }
+}
+
+function Has-UsefulValue {
+    param($Value)
+
+    if ($null -eq $Value) { return $false }
+
+    if ($Value -is [array]) {
+        return ($Value.Count -gt 0)
+    }
+
+    if ($Value -is [string]) {
+        return (-not [string]::IsNullOrWhiteSpace($Value) -and $Value -ne "N/A")
+    }
+
+    if ($Value -is [bool]) { return $true }
+    if ($Value -is [int] -or $Value -is [long] -or $Value -is [double]) { return $true }
+
+    try {
+        return ($Value.PSObject.Properties.Count -gt 0)
+    }
+    catch {
+        return $false
+    }
+}
+
+function Normalize-Name {
+    param([string]$Name)
+
+    if ([string]::IsNullOrWhiteSpace($Name)) {
+        return ""
+    }
+
+    $n = $Name.Trim().ToUpper()
+    $n = $n -replace "LOG[\s_\-]*SHIPPING", "LOGSHIPPING"
+    $n = $n -replace "NON[\s_\-]*PROD", "NONPROD"
+    return $n
+}
+
+function Is-DefaultPolicy {
+    param([string]$PolicyName)
+
+    $compact = (Normalize-Name $PolicyName) -replace '[^A-Z0-9]', ''
+
+    return ($compact -in @(
+        "PROTECTONCE",
+        "SILVER",
+        "GOLD",
+        "BRONZE"
+    ))
+}
+
+function Format-Retention {
+    param($Retention)
+
+    if ($null -eq $Retention) {
+        return "N/A"
+    }
+
+    $duration = ValueOrNA $Retention.duration
+    $unit = ValueOrNA $Retention.unit
+
+    if ($duration -eq "N/A" -or $unit -eq "N/A") {
+        return "N/A"
+    }
+
+    return "$duration $unit"
+}
+
+function Format-DataLock {
+    param($Retention)
+
+    if ($null -eq $Retention -or $null -eq $Retention.dataLockConfig) {
+        return "N/A"
+    }
+
+    $dl = $Retention.dataLockConfig
+
+    $mode = ValueOrNA $dl.mode
+    $duration = ValueOrNA $dl.duration
+    $unit = ValueOrNA $dl.unit
+    $worm = ValueOrNA $dl.enableWormOnExternalTarget
+
+    return "Mode=$mode; Duration=$duration $unit; ExternalWorm=$worm"
+}
+
+function Format-Schedule {
+    param($Schedule)
+
+    if ($null -eq $Schedule) {
+        return "N/A"
+    }
+
+    $parts = @()
+
+    if ($Schedule.unit) {
+        $parts += "Unit=$(ValueOrNA $Schedule.unit)"
+    }
+
+    if ($Schedule.minuteSchedule -and $Schedule.minuteSchedule.frequency -ne $null) {
+        $parts += "MinuteFrequency=$(ValueOrNA $Schedule.minuteSchedule.frequency)"
+    }
+
+    if ($Schedule.hourSchedule -and $Schedule.hourSchedule.frequency -ne $null) {
+        $parts += "HourFrequency=$(ValueOrNA $Schedule.hourSchedule.frequency)"
+    }
+
+    if ($Schedule.daySchedule -and $Schedule.daySchedule.frequency -ne $null) {
+        $parts += "DayFrequency=$(ValueOrNA $Schedule.daySchedule.frequency)"
+    }
+
+    if ($Schedule.weekSchedule -and $Schedule.weekSchedule.dayOfWeek) {
+        $parts += "Days=$((@($Schedule.weekSchedule.dayOfWeek) -join ','))"
+    }
+
+    if ($Schedule.monthSchedule) {
+        $m = $Schedule.monthSchedule
+        $monthParts = @()
+        if ($m.dayOfWeek) { $monthParts += "Days=$((@($m.dayOfWeek) -join ','))" }
+        if ($m.weekOfMonth) { $monthParts += "WeekOfMonth=$(ValueOrNA $m.weekOfMonth)" }
+        if ($m.dayOfMonth -ne $null) { $monthParts += "DayOfMonth=$(ValueOrNA $m.dayOfMonth)" }
+        if ($monthParts.Count -gt 0) { $parts += "MonthSchedule=[$($monthParts -join '; ')]" }
+    }
+
+    if ($Schedule.yearSchedule) {
+        $y = $Schedule.yearSchedule
+        $yearParts = @()
+        if ($y.dayOfYear) { $yearParts += "DayOfYear=$(ValueOrNA $y.dayOfYear)" }
+        if ($y.monthDay) {
+            $yearParts += "Month=$(ValueOrNA $y.monthDay.month)"
+            $yearParts += "Day=$(ValueOrNA $y.monthDay.dayOfTheMonth)"
+        }
+        if ($yearParts.Count -gt 0) { $parts += "YearSchedule=[$($yearParts -join '; ')]" }
+    }
+
+    if ($Schedule.frequency -ne $null) {
+        $parts += "Frequency=$(ValueOrNA $Schedule.frequency)"
+    }
+
+    if ($parts.Count -eq 0) {
+        return "N/A"
+    }
+
+    return ($parts -join "; ")
+}
+
+function Format-RunTimeouts {
+    param($RunTimeouts)
+
+    if (-not $RunTimeouts) {
+        return "N/A"
+    }
+
+    $items = @()
+
+    foreach ($rt in @($RunTimeouts)) {
+        $items += "BackupType=$(ValueOrNA $rt.backupType); TimeoutMins=$(ValueOrNA $rt.timeoutMins)"
+    }
+
+    if ($items.Count -eq 0) { return "N/A" }
+    return ($items -join " | ")
+}
+
+function Convert-UsecsToEtString {
+    param($Usecs)
+
+    if ($null -eq $Usecs -or "$Usecs" -eq "0" -or "$Usecs" -eq "") {
+        return "N/A"
+    }
+
+    try {
+        [double]$n = [double]$Usecs
+        if ($n -le 0) { return "N/A" }
+
+        $ms = [math]::Round($n / 1000)
+        $dtUtc = ([DateTime]'1970-01-01T00:00:00Z').AddMilliseconds($ms)
+
+        try {
+            $tz = [System.TimeZoneInfo]::FindSystemTimeZoneById("Eastern Standard Time")
+            return ([System.TimeZoneInfo]::ConvertTimeFromUtc($dtUtc, $tz)).ToString("yyyy-MM-dd HH:mm:ss")
+        }
+        catch {
+            return $dtUtc.ToString("yyyy-MM-dd HH:mm:ss")
+        }
+    }
+    catch {
+        return "N/A"
+    }
+}
+
+function Convert-DaysToRetentionLabel {
+    param([double]$Days)
+
+    if ($Days -ge 34 -and $Days -le 36) { return "35D" }
+    if ($Days -ge 13 -and $Days -le 15) { return "14D" }
+    if ($Days -ge 6 -and $Days -le 8) { return "7D" }
+    if ($Days -ge 179 -and $Days -le 184) { return "6M" }
+    if ($Days -ge 2554 -and $Days -le 2557) { return "7YR" }
+
+    return "$([int][math]::Round($Days))D"
+}
+
+function Convert-RetentionToLabel {
+    param(
+        $Duration,
+        $Unit
+    )
+
+    if ($null -eq $Duration) {
+        return $null
+    }
+
+    [double]$d = 0
+
+    if (-not [double]::TryParse([string]$Duration, [ref]$d)) {
+        return $null
+    }
+
+    if ($d -le 0) {
+        return $null
+    }
+
+    $u = (ValueOrNA $Unit).ToUpper()
+
+    switch -Regex ($u) {
+        "DAY"    { return (Convert-DaysToRetentionLabel -Days $d) }
+        "WEEK"   { return (Convert-DaysToRetentionLabel -Days ($d * 7)) }
+        "MONTH"  {
+            if ($d -eq 6) { return "6M" }
+            if ($d -eq 84) { return "7YR" }
+            return "$([int][math]::Round($d))M"
+        }
+        "YEAR"   {
+            if ($d -eq 7) { return "7YR" }
+            return "$([int][math]::Round($d))YR"
+        }
+        "HOUR"   { return (Convert-DaysToRetentionLabel -Days ($d / 24)) }
+        "MINUTE" { return (Convert-DaysToRetentionLabel -Days ($d / 1440)) }
+        default {
+            if ($d -in @(7, 14, 35)) {
+                return "$([int]$d)D"
+            }
+        }
+    }
+
+    return $null
+}
+
+function Get-RetentionLabelFromName {
+    param([string]$PolicyName)
+
+    $n = Normalize-Name $PolicyName
+
+    if ($n -match '(^|[^0-9])7\s*(Y|YR|YRS|YEAR|YEARS)([^A-Z0-9]|$)') { return "7YR" }
+    if ($n -match '(^|[^0-9])6\s*(M|MO|MOS|MONTH|MONTHS)([^A-Z0-9]|$)') { return "6M" }
+    if ($n -match '(^|[^0-9])35\s*(D|DAY|DAYS)([^A-Z0-9]|$)') { return "35D" }
+    if ($n -match '(^|[^0-9])14\s*(D|DAY|DAYS)([^A-Z0-9]|$)') { return "14D" }
+    if ($n -match '(^|[^0-9])7\s*(D|DAY|DAYS)([^A-Z0-9]|$)') { return "7D" }
+
+    if ($n -match '(^|[^0-9])35([^0-9]|$)') { return "35D" }
+    if ($n -match '(^|[^0-9])14([^0-9]|$)') { return "14D" }
+    if ($n -match '(^|[^0-9])7([^0-9]|$)') { return "7D" }
+
+    return $null
+}
+
+function Get-PolicyRetentionLabel {
+    param($Policy)
+
+    $fromName = Get-RetentionLabelFromName -PolicyName $Policy.name
+    if ($fromName) { return $fromName }
+
+    try {
+        $r = $Policy.backupPolicy.regular.retention
+        if ($r) {
+            $label = Convert-RetentionToLabel -Duration $r.duration -Unit $r.unit
+            if ($label) { return $label }
+        }
+    }
+    catch {}
+
+    try {
+        foreach ($fb in @($Policy.backupPolicy.regular.fullBackups)) {
+            if ($fb.retention) {
+                $label = Convert-RetentionToLabel -Duration $fb.retention.duration -Unit $fb.retention.unit
+                if ($label) { return $label }
+            }
+        }
+    }
+    catch {}
+
+    try {
+        foreach ($er in @($Policy.extendedRetention)) {
+            if ($er.retention) {
+                $label = Convert-RetentionToLabel -Duration $er.retention.duration -Unit $er.retention.unit
+                if ($label) { return $label }
+            }
+        }
+    }
+    catch {}
+
+    foreach ($field in @("daysToKeep", "retentionDays", "duration")) {
+        try {
+            if ($null -ne $Policy.PSObject.Properties[$field]) {
+                $label = Convert-RetentionToLabel -Duration $Policy.$field -Unit "Days"
+                if ($label) { return $label }
+            }
+        }
+        catch {}
+    }
+
+    return "UNKNOWN"
+}
+
+function Get-ExpectedEnvironment {
+    param([string]$PolicyRetention)
+
+    switch ($PolicyRetention) {
+        "35D" { return "PROD" }
+        "6M"  { return "PROD" }
+        "7YR" { return "PROD" }
+        "14D" { return "MOD/NONPROD" }
+        "7D"  { return "DEV" }
+        default { return "UNKNOWN" }
+    }
+}
+
+function Format-ReplicationTargets {
+    param($Targets)
+
+    if (-not $Targets) {
+        return "N/A"
+    }
+
+    $items = @()
+
+    foreach ($t in @($Targets)) {
+        $targetName = ValueOrNA $t.remoteTargetConfig.clusterName
+        if ($targetName -eq "N/A") { $targetName = ValueOrNA $t.awsTargetConfig.name }
+        if ($targetName -eq "N/A") { $targetName = ValueOrNA $t.azureTargetConfig.name }
+
+        $items += "TargetType=$(ValueOrNA $t.targetType); Target=$targetName; Schedule=$(Format-Schedule $t.schedule); Retention=$(Format-Retention $t.retention); LogRetention=$(Format-Retention $t.logRetention); CopyOnRunSuccess=$(ValueOrNA $t.copyOnRunSuccess); BackupRunType=$(ValueOrNA $t.backupRunType); ConfigId=$(ValueOrNA $t.configId); RunTimeouts=$(Format-RunTimeouts $t.runTimeouts)"
+    }
+
+    if ($items.Count -eq 0) { return "N/A" }
+    return ($items -join " | ")
+}
+
+function Format-ArchivalTargets {
+    param($Targets)
+
+    if (-not $Targets) {
+        return "N/A"
+    }
+
+    $items = @()
+
+    foreach ($t in @($Targets)) {
+        $items += "TargetType=$(ValueOrNA $t.targetType); Target=$(ValueOrNA $t.targetName); Schedule=$(Format-Schedule $t.schedule); Retention=$(Format-Retention $t.retention); LogRetention=$(Format-Retention $t.logRetention); CopyOnRunSuccess=$(ValueOrNA $t.copyOnRunSuccess); BackupRunType=$(ValueOrNA $t.backupRunType); ConfigId=$(ValueOrNA $t.configId)"
+    }
+
+    if ($items.Count -eq 0) { return "N/A" }
+    return ($items -join " | ")
+}
+
+function Format-NamedTargets {
+    param(
+        $Targets,
+        [string]$TargetKind
+    )
+
+    if (-not $Targets) {
+        return "N/A"
+    }
+
+    $items = @()
+
+    foreach ($t in @($Targets)) {
+        $targetName = "N/A"
+
+        if ($t.target -and $t.target.name) {
+            $targetName = ValueOrNA $t.target.name
+        }
+        elseif ($t.targetName) {
+            $targetName = ValueOrNA $t.targetName
+        }
+        elseif ($t.clusterName) {
+            $targetName = ValueOrNA $t.clusterName
+        }
+        elseif ($t.regionName) {
+            $targetName = ValueOrNA $t.regionName
+        }
+        elseif ($t.regionId) {
+            $targetName = ValueOrNA $t.regionId
+        }
+
+        $items += "Type=$TargetKind; Target=$targetName; Schedule=$(Format-Schedule $t.schedule); Retention=$(Format-Retention $t.retention); LogRetention=$(Format-Retention $t.logRetention); CopyOnRunSuccess=$(ValueOrNA $t.copyOnRunSuccess); BackupRunType=$(ValueOrNA $t.backupRunType); ConfigId=$(ValueOrNA $t.configId)"
+    }
+
+    if ($items.Count -eq 0) { return "N/A" }
+    return ($items -join " | ")
+}
+
+function Add-Core {
+    param(
+        [ref]$Row,
+        [string]$Name,
+        $Value
+    )
+
+    $Row.Value[$Name] = ValueOrNA $Value
+}
+
+function Add-Optional {
+    param(
+        [ref]$Row,
+        [string]$Name,
+        $Value
+    )
+
+    $v = ValueOrNA $Value
+
+    if ($v -ne "N/A") {
+        $Row.Value[$Name] = $v
+
+        if (-not $script:OptionalHeaders.Contains($Name)) {
+            $script:OptionalHeaders.Add($Name) | Out-Null
+        }
+    }
+}
+
+function Get-FullPolicyById {
+    param(
+        [string]$PolicyId,
+        [hashtable]$Headers,
+        $FallbackPolicy
+    )
+
+    if ([string]::IsNullOrWhiteSpace($PolicyId) -or $PolicyId -eq "N/A") {
+        return $FallbackPolicy
+    }
+
+    try {
+        $encodedId = [System.Uri]::EscapeDataString($PolicyId)
+        $detailUri = "$baseUrl/v2/data-protect/policies/$encodedId"
+        $detailJson = Invoke-HeliosGetJson -Uri $detailUri -Headers $Headers
+
+        if ($detailJson.policy) {
+            return $detailJson.policy
+        }
+
+        if ($detailJson.name -or $detailJson.id) {
+            return $detailJson
+        }
+
+        return $FallbackPolicy
+    }
+    catch {
+        $script:PolicyDetailFetchFailures++
+        return $FallbackPolicy
+    }
+}
+
+# -------------------------------
+# Get Clusters
+# -------------------------------
+Write-Host "=============================================" -ForegroundColor Cyan
+Write-Host "   COHESITY FULL POLICY INVENTORY REPORT" -ForegroundColor White
+Write-Host "=============================================" -ForegroundColor Cyan
+Write-Host "Output: CSV only" -ForegroundColor Gray
+
+try {
+    $cluJson = Invoke-HeliosGetJson -Uri "$baseUrl/v2/mcm/cluster-mgmt/info" -Headers $commonHeaders
+}
+catch {
+    throw "Failed to query Helios clusters: $($_.Exception.Message)"
+}
+
+$json_clu = @()
+
+if ($cluJson.cohesityClusters) {
+    $json_clu = @($cluJson.cohesityClusters)
+}
+elseif ($cluJson.clusters) {
+    $json_clu = @($cluJson.clusters)
+}
+elseif ($cluJson.clusterInfos) {
+    $json_clu = @($cluJson.clusterInfos)
+}
+elseif ($cluJson.mcmInfo.clusterInfos) {
+    $json_clu = @($cluJson.mcmInfo.clusterInfos)
+}
+
+if (-not $json_clu -or $json_clu.Count -eq 0) {
+    throw "No clusters returned from Helios."
+}
+
+$json_clu = @(
+    $json_clu | Sort-Object {
+        $n = ($_.name, $_.clusterName, $_.displayName, $_.ClusterName, $_.Name | Where-Object { $_ } | Select-Object -First 1)
+        ValueOrNA $n
+    }
+)
+
+# -------------------------------
+# Main Collection
+# -------------------------------
+$script:OptionalHeaders = New-Object System.Collections.ArrayList
+$script:PolicyDetailFetchFailures = 0
+
+$rows = @()
+$clusterIssues = @()
+$defaultPolicyCount = 0
+$totalPolicies = 0
+
+$coreHeaders = @(
+    "Cluster",
+    "PolicyName",
+    "PolicyId",
+    "Description",
+    "PolicyRetention",
+    "ExpectedEnvironment",
+    "IsDefaultPolicy",
+    "NumProtectionGroups",
+    "NumProtectedObjects",
+    "IsUsable",
+    "IsReplicated",
+    "DataLock",
+    "Version",
+    "IsCBSEnabled",
+    "LastModifiedET",
+    "LastModificationTimeUsecs"
+)
+
+foreach ($cluster in $json_clu) {
+
+    $clusterName = ($cluster.name, $cluster.clusterName, $cluster.displayName, $cluster.ClusterName, $cluster.Name | Where-Object { $_ } | Select-Object -First 1)
+    $clusterId   = ($cluster.clusterId, $cluster.id, $cluster.ClusterId, $cluster.Id | Where-Object { $_ } | Select-Object -First 1)
+
+    $clusterName = ValueOrNA $clusterName
+
+    if ($clusterName -eq "N/A") {
+        $clusterName = "Unknown"
+    }
+
+    if (-not $clusterId) {
+        $clusterIssues += [pscustomobject]@{
+            Cluster = $clusterName
+            Issue   = "Cluster ID missing"
+        }
+        continue
+    }
+
+    Write-Host "Processing cluster: $clusterName" -ForegroundColor Cyan
+
+    $headers = @{
+        "apiKey" = $apiKey
+        "accessClusterId" = [string]$clusterId
+        "accept" = "application/json"
+    }
+
+    try {
+        $policyListJson = Invoke-HeliosGetJson -Uri "$baseUrl/v2/data-protect/policies" -Headers $headers
+
+        if ($policyListJson.policies) {
+            $policies = @($policyListJson.policies)
+        }
+        elseif ($policyListJson -is [array]) {
+            $policies = @($policyListJson)
+        }
+        else {
+            $policies = @()
+        }
+    }
+    catch {
+        $clusterIssues += [pscustomobject]@{
+            Cluster = $clusterName
+            Issue   = "Policy fetch failed: $($_.Exception.Message)"
+        }
+        continue
+    }
+
+    foreach ($policyItem in ($policies | Sort-Object name)) {
+
+        $policyId = ValueOrNA $policyItem.id
+        $policy = Get-FullPolicyById -PolicyId $policyId -Headers $headers -FallbackPolicy $policyItem
+
+        $policyName = ValueOrNA $policy.name
+        $policyRetention = Get-PolicyRetentionLabel -Policy $policy
+        $expectedEnv = Get-ExpectedEnvironment -PolicyRetention $policyRetention
+        $isDefault = Is-DefaultPolicy -PolicyName $policyName
+
+        if ($isDefault) {
+            $defaultPolicyCount++
+        }
+
+        $totalPolicies++
+
+        $row = [ordered]@{}
+
+        Add-Core ([ref]$row) "Cluster" $clusterName
+        Add-Core ([ref]$row) "PolicyName" $policyName
+        Add-Core ([ref]$row) "PolicyId" $policy.id
+        Add-Core ([ref]$row) "Description" $policy.description
+        Add-Core ([ref]$row) "PolicyRetention" $policyRetention
+        Add-Core ([ref]$row) "ExpectedEnvironment" $expectedEnv
+        Add-Core ([ref]$row) "IsDefaultPolicy" $isDefault
+        Add-Core ([ref]$row) "NumProtectionGroups" $policy.numProtectionGroups
+        Add-Core ([ref]$row) "NumProtectedObjects" $policy.numProtectedObjects
+        Add-Core ([ref]$row) "IsUsable" $policy.isUsable
+        Add-Core ([ref]$row) "IsReplicated" $policy.isReplicated
+        Add-Core ([ref]$row) "DataLock" $policy.dataLock
+        Add-Core ([ref]$row) "Version" $policy.version
+        Add-Core ([ref]$row) "IsCBSEnabled" $policy.isCBSEnabled
+        Add-Core ([ref]$row) "LastModifiedET" (Convert-UsecsToEtString $policy.lastModificationTimeUsecs)
+        Add-Core ([ref]$row) "LastModificationTimeUsecs" $policy.lastModificationTimeUsecs
+
+        # -------------------------------
+        # Optional readable fields
+        # -------------------------------
+        Add-Optional ([ref]$row) "RegularIncrementalSchedule" (Format-Schedule $policy.backupPolicy.regular.incremental.schedule)
+        Add-Optional ([ref]$row) "RegularFullSchedule" (Format-Schedule $policy.backupPolicy.regular.full.schedule)
+        Add-Optional ([ref]$row) "RegularRetention" (Format-Retention $policy.backupPolicy.regular.retention)
+        Add-Optional ([ref]$row) "RegularRetentionDataLock" (Format-DataLock $policy.backupPolicy.regular.retention)
+        Add-Optional ([ref]$row) "RegularFullBackups" (To-CompactJson $policy.backupPolicy.regular.fullBackups)
+        Add-Optional ([ref]$row) "PrimaryBackupTarget" (To-CompactJson $policy.backupPolicy.regular.primaryBackupTarget)
+
+        Add-Optional ([ref]$row) "LogSchedule" (Format-Schedule $policy.backupPolicy.log.schedule)
+        Add-Optional ([ref]$row) "LogRetention" (Format-Retention $policy.backupPolicy.log.retention)
+        Add-Optional ([ref]$row) "LogRetentionDataLock" (Format-DataLock $policy.backupPolicy.log.retention)
+
+        Add-Optional ([ref]$row) "BmrSchedule" (Format-Schedule $policy.backupPolicy.bmr.schedule)
+        Add-Optional ([ref]$row) "BmrRetention" (Format-Retention $policy.backupPolicy.bmr.retention)
+        Add-Optional ([ref]$row) "BmrRetentionDataLock" (Format-DataLock $policy.backupPolicy.bmr.retention)
+
+        Add-Optional ([ref]$row) "CdpRetention" (Format-Retention $policy.backupPolicy.cdp.retention)
+        Add-Optional ([ref]$row) "CdpRetentionDataLock" (Format-DataLock $policy.backupPolicy.cdp.retention)
+
+        Add-Optional ([ref]$row) "StorageArraySnapshotSchedule" (Format-Schedule $policy.backupPolicy.storageArraySnapshot.schedule)
+        Add-Optional ([ref]$row) "StorageArraySnapshotRetention" (Format-Retention $policy.backupPolicy.storageArraySnapshot.retention)
+        Add-Optional ([ref]$row) "StorageArraySnapshotRetentionDataLock" (Format-DataLock $policy.backupPolicy.storageArraySnapshot.retention)
+
+        Add-Optional ([ref]$row) "RunTimeouts" (Format-RunTimeouts $policy.backupPolicy.runTimeouts)
+
+        Add-Optional ([ref]$row) "BlackoutWindow" (To-CompactJson $policy.blackoutWindow)
+        Add-Optional ([ref]$row) "ExtendedRetention" (To-CompactJson $policy.extendedRetention)
+        Add-Optional ([ref]$row) "RetryOptions" (To-CompactJson $policy.retryOptions)
+
+        Add-Optional ([ref]$row) "ReplicationTargets" (Format-ReplicationTargets $policy.remoteTargetPolicy.replicationTargets)
+        Add-Optional ([ref]$row) "ArchivalTargets" (Format-ArchivalTargets $policy.remoteTargetPolicy.archivalTargets)
+        Add-Optional ([ref]$row) "CloudSpinTargets" (Format-NamedTargets $policy.remoteTargetPolicy.cloudSpinTargets "CloudSpin")
+        Add-Optional ([ref]$row) "OnPremDeployTargets" (Format-NamedTargets $policy.remoteTargetPolicy.onpremDeployTargets "OnPremDeploy")
+        Add-Optional ([ref]$row) "RpaasTargets" (Format-NamedTargets $policy.remoteTargetPolicy.rpaasTargets "RPaaS")
+        Add-Optional ([ref]$row) "OnPremVaultTargets" (Format-NamedTargets $policy.remoteTargetPolicy.onpremVaultTargets "OnPremVault")
+        Add-Optional ([ref]$row) "CrossRegionTargets" (Format-NamedTargets $policy.remoteTargetPolicy.crossRegionTargets "CrossRegion")
+        Add-Optional ([ref]$row) "SourceTargets" (To-CompactJson $policy.remoteTargetPolicy.sourceTargets)
+
+        Add-Optional ([ref]$row) "CascadedTargetsConfig" (To-CompactJson $policy.cascadedTargetsConfig)
+
+        Add-Optional ([ref]$row) "RpoStorageDomainId" $policy.rpoPolicySettings.storageDomainId
+        Add-Optional ([ref]$row) "EnvBackupParams" (To-CompactJson $policy.rpoPolicySettings.envBackupParams)
+        Add-Optional ([ref]$row) "IndexingPolicy" (To-CompactJson $policy.rpoPolicySettings.indexingPolicy)
+        Add-Optional ([ref]$row) "AlertingPolicy" (To-CompactJson $policy.rpoPolicySettings.alertingPolicy)
+        Add-Optional ([ref]$row) "BackupQosPrincipal" $policy.rpoPolicySettings.backupQosPrincipal
+
+        Add-Optional ([ref]$row) "SkipIntervalMins" $policy.skipIntervalMins
+        Add-Optional ([ref]$row) "EnableSmartLocalRetentionAdjustment" $policy.enableSmartLocalRetentionAdjustment
+        Add-Optional ([ref]$row) "TemplateId" $policy.templateId
+
+        # -------------------------------
+        # JSON preservation fields
+        # -------------------------------
+        Add-Optional ([ref]$row) "BackupPolicyJson" (To-CompactJson $policy.backupPolicy)
+        Add-Optional ([ref]$row) "RemoteTargetPolicyJson" (To-CompactJson $policy.remoteTargetPolicy)
+        Add-Optional ([ref]$row) "RpoPolicySettingsJson" (To-CompactJson $policy.rpoPolicySettings)
+        Add-Optional ([ref]$row) "RawPolicyJson" (To-CompactJson $policy)
+
+        $rows += [pscustomobject]$row
+    }
+}
+
+# -------------------------------
+# Final CSV with dynamic headers
+# -------------------------------
+$allHeaders = @()
+$allHeaders += $coreHeaders
+$allHeaders += @($script:OptionalHeaders)
+
+$finalRows = @()
+
+foreach ($r in $rows) {
+    $out = [ordered]@{}
+
+    foreach ($h in $allHeaders) {
+        if ($null -ne $r.PSObject.Properties[$h]) {
+            $out[$h] = ValueOrNA $r.$h
+        }
+        else {
+            $out[$h] = "N/A"
+        }
+    }
+
+    $finalRows += [pscustomobject]$out
+}
+
+$timestamp = Get-Date -Format "yyyyMMdd_HHmm"
+$csvPath = Join-Path $logDirectory "Cohesity_Policy_Inventory_$timestamp.csv"
+
+$finalRows | Export-Csv -Path $csvPath -NoTypeInformation -Encoding UTF8
+
+# -------------------------------
+# Console Summary Only
+# -------------------------------
+Write-Host "`n==============================" -ForegroundColor Cyan
+Write-Host "POLICY INVENTORY SUMMARY" -ForegroundColor White
+Write-Host "==============================" -ForegroundColor Cyan
+Write-Host "Clusters discovered        : $($json_clu.Count)"
+Write-Host "Policies exported          : $totalPolicies"
+Write-Host "Default policies included  : $defaultPolicyCount"
+Write-Host "Dynamic columns included   : $($script:OptionalHeaders.Count)"
+Write-Host "Policy detail fetch issues : $script:PolicyDetailFetchFailures"
+
+if ($clusterIssues.Count -gt 0) {
+    Write-Host "Cluster fetch issues       : $($clusterIssues.Count)" -ForegroundColor Yellow
+    foreach ($ci in $clusterIssues) {
+        Write-Host (" - {0}: {1}" -f $ci.Cluster, $ci.Issue) -ForegroundColor Yellow
+    }
+}
+
+Write-Host "CSV output                 : $csvPath"
+Write-Host "=============================="
+Write-Host "Processing complete."
+```
