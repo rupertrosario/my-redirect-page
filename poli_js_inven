@@ -1,0 +1,557 @@
+// ------------------------------------------------------------
+// Dynatrace JS | Cohesity Policy Summary
+// - Uses Dynatrace classic credential vault
+// - Helios GET-only
+// - Gets all clusters, policies, and protection groups
+// - Excludes default policies: Protect Once, Silver, Gold, Bronze
+// - Email output: Summary + policy details as Markdown table
+// - No CSV attachment dependency
+// ------------------------------------------------------------
+
+import { credentialVaultClient } from "@dynatrace-sdk/client-classic-environment-v2";
+
+export default async function () {
+  const baseUrl = "https://helios.cohesity.com";
+
+  const vaultName = "Cohesity_API_Key";
+  const vaultId = "credentials_vault-312312";
+  const manualApiKey = "";
+
+  const defaultPolicies = ["PROTECTONCE", "SILVER", "GOLD", "BRONZE"];
+
+  function norm(v) {
+    if (v === null || v === undefined) return "";
+    if (Array.isArray(v)) {
+      return v
+        .filter(x => x !== null && x !== undefined && String(x).trim() !== "")
+        .join(", ");
+    }
+    return String(v);
+  }
+
+  function valueOrNA(v) {
+    const s = norm(v).trim();
+    return s === "" ? "N/A" : s;
+  }
+
+  function mdEscape(v) {
+    return valueOrNA(v)
+      .replace(/\|/g, "\\|")
+      .replace(/\r?\n/g, "<br>");
+  }
+
+  function markdownTable(headers, rows) {
+    let out = "";
+    out += `| ${headers.join(" | ")} |\n`;
+    out += `| ${headers.map(() => "---").join(" | ")} |\n`;
+
+    for (const row of rows) {
+      out += `| ${headers.map(h => mdEscape(row[h])).join(" | ")} |\n`;
+    }
+
+    return out;
+  }
+
+  function nowEtString() {
+    return new Date().toLocaleString("en-US", {
+      timeZone: "America/New_York",
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+      hour12: false
+    }).replace(",", "");
+  }
+
+  function normalizeName(name) {
+    let n = valueOrNA(name).toUpperCase();
+    n = n.replace(/LOG[\s_-]*SHIPPING/g, "LOGSHIPPING");
+    n = n.replace(/NON[\s_-]*PROD/g, "NONPROD");
+    return n;
+  }
+
+  function compactName(name) {
+    return normalizeName(name).replace(/[^A-Z0-9]/g, "");
+  }
+
+  function isDefaultPolicy(policyName) {
+    return defaultPolicies.includes(compactName(policyName));
+  }
+
+  function firstValue(obj, names) {
+    if (!obj) return "N/A";
+
+    for (const name of names) {
+      if (obj[name] !== null && obj[name] !== undefined && String(obj[name]).trim() !== "") {
+        return obj[name];
+      }
+    }
+
+    return "N/A";
+  }
+
+  function getPolicyId(policy) {
+    return valueOrNA(firstValue(policy, ["id", "policyId", "uid"]));
+  }
+
+  function getPgPolicyId(pg) {
+    return valueOrNA(firstValue(pg, ["policyId", "protectionPolicyId"]));
+  }
+
+  function formatDuration(duration, unit) {
+    const dRaw = valueOrNA(duration);
+    const uRaw = valueOrNA(unit);
+
+    if (dRaw === "N/A" || uRaw === "N/A" || dRaw === "0") return "N/A";
+
+    const d = Number(dRaw);
+    if (!Number.isFinite(d)) return `${dRaw} ${uRaw}`;
+
+    const u = uRaw.toLowerCase();
+
+    if (u.includes("minute")) {
+      if (d >= 60 && d % 60 === 0) {
+        const h = d / 60;
+        return h === 1 ? "1 hour" : `${h} hours`;
+      }
+      return d === 1 ? "1 minute" : `${d} minutes`;
+    }
+
+    if (u.includes("hour")) return d === 1 ? "1 hour" : `${d} hours`;
+
+    if (u.includes("day")) {
+      if (d <= 28 && d % 7 === 0) {
+        const w = d / 7;
+        return w === 1 ? "1 week" : `${w} weeks`;
+      }
+      return d === 1 ? "1 day" : `${d} days`;
+    }
+
+    if (u.includes("week")) return d === 1 ? "1 week" : `${d} weeks`;
+    if (u.includes("month")) return d === 1 ? "1 month" : `${d} months`;
+    if (u.includes("year")) return d === 1 ? "1 year" : `${d} years`;
+    if (u.includes("run")) return d === 1 ? "1 run" : `${d} runs`;
+
+    return `${dRaw} ${uRaw}`;
+  }
+
+  function formatRetention(retention) {
+    if (!retention) return "N/A";
+
+    const mainRetention = formatDuration(retention?.duration, retention?.unit);
+    const parts = [];
+
+    if (mainRetention !== "N/A") {
+      parts.push(mainRetention);
+    }
+
+    const dl = retention?.dataLockConfig;
+
+    if (dl) {
+      const dlDuration = formatDuration(dl?.duration, dl?.unit);
+      const dlMode = valueOrNA(dl?.mode);
+      const worm = valueOrNA(dl?.enableWormOnExternalTarget);
+
+      if (dlDuration !== "N/A") {
+        parts.push(`DataLock ${dlDuration}`);
+      } else if (dlMode !== "N/A") {
+        parts.push(`DataLock ${dlMode}`);
+      }
+
+      if (worm === "true" || worm === "True") {
+        parts.push("External WORM");
+      }
+    }
+
+    return parts.length === 0 ? "N/A" : parts.join("; ");
+  }
+
+  function formatSchedule(schedule) {
+    if (!schedule) return "N/A";
+
+    if (schedule?.minuteSchedule?.frequency && Number(schedule.minuteSchedule.frequency) !== 0) {
+      return `Every ${formatDuration(schedule.minuteSchedule.frequency, "Minutes")}`;
+    }
+
+    if (schedule?.hourSchedule?.frequency && Number(schedule.hourSchedule.frequency) !== 0) {
+      return `Every ${formatDuration(schedule.hourSchedule.frequency, "Hours")}`;
+    }
+
+    if (schedule?.daySchedule?.frequency && Number(schedule.daySchedule.frequency) !== 0) {
+      const f = Number(schedule.daySchedule.frequency);
+      return f === 1 ? "Every day" : `Every ${f} days`;
+    }
+
+    if (schedule?.weekSchedule?.dayOfWeek?.length) {
+      const days = schedule.weekSchedule.dayOfWeek;
+      return days.length === 7 ? "Every week on Sun-Sat" : `Every week on ${days.join(", ")}`;
+    }
+
+    if (schedule?.monthSchedule) {
+      const m = schedule.monthSchedule;
+
+      if (m?.dayOfMonth && Number(m.dayOfMonth) !== 0) {
+        return `Every month on day ${m.dayOfMonth}`;
+      }
+
+      if (m?.weekOfMonth && m?.dayOfWeek?.length) {
+        return `Every month on ${m.weekOfMonth} ${m.dayOfWeek.join(", ")}`;
+      }
+    }
+
+    if (schedule?.yearSchedule) {
+      const y = schedule.yearSchedule;
+
+      if (y?.monthDay?.month && y?.monthDay?.dayOfTheMonth) {
+        return `Every year on Month=${y.monthDay.month}, Day=${y.monthDay.dayOfTheMonth}`;
+      }
+
+      if (y?.dayOfYear) {
+        return `Every year ${y.dayOfYear}`;
+      }
+    }
+
+    if (schedule?.frequency && Number(schedule.frequency) !== 0) {
+      const unit = valueOrNA(schedule?.unit);
+
+      if (unit === "Runs") {
+        return Number(schedule.frequency) === 1 ? "Every run" : `Every ${schedule.frequency} runs`;
+      }
+
+      if (unit !== "N/A") {
+        return `Every ${schedule.frequency} ${unit}`;
+      }
+    }
+
+    const unitOnly = valueOrNA(schedule?.unit);
+    return unitOnly !== "N/A" ? `Unit=${unitOnly}` : "N/A";
+  }
+
+  function formatBackup(policy) {
+    const schedule = formatSchedule(policy?.backupPolicy?.regular?.incremental?.schedule);
+    const retention = formatRetention(policy?.backupPolicy?.regular?.retention);
+
+    const parts = [];
+    if (schedule !== "N/A") parts.push(schedule);
+    if (retention !== "N/A") parts.push(`Retain ${retention}`);
+
+    return parts.length === 0 ? "N/A" : parts.join("; ");
+  }
+
+  function formatPeriodicFullBackup(policy) {
+    const items = [];
+
+    const fullSchedule = formatSchedule(policy?.backupPolicy?.regular?.full?.schedule);
+    if (fullSchedule !== "N/A") items.push(fullSchedule);
+
+    const fullBackups = policy?.backupPolicy?.regular?.fullBackups || [];
+
+    for (const fb of fullBackups) {
+      const schedule = formatSchedule(fb?.schedule);
+      const retention = formatRetention(fb?.retention);
+      const parts = [];
+
+      if (schedule !== "N/A") parts.push(schedule);
+      if (retention !== "N/A") parts.push(`Retain ${retention}`);
+
+      if (parts.length > 0) items.push(parts.join("; "));
+    }
+
+    return items.length === 0 ? "N/A" : items.join(" | ");
+  }
+
+  function formatQuietTimes(blackoutWindow) {
+    if (!Array.isArray(blackoutWindow) || blackoutWindow.length === 0) return "N/A";
+
+    const items = [];
+
+    for (const b of blackoutWindow) {
+      const day = valueOrNA(b?.day);
+      let start = "N/A";
+      let end = "N/A";
+
+      if (b?.startTime?.hour !== undefined && b?.startTime?.minute !== undefined) {
+        start = `${Number(b.startTime.hour)}:${String(Number(b.startTime.minute)).padStart(2, "0")}`;
+      }
+
+      if (b?.endTime?.hour !== undefined && b?.endTime?.minute !== undefined) {
+        end = `${Number(b.endTime.hour)}:${String(Number(b.endTime.minute)).padStart(2, "0")}`;
+      }
+
+      const parts = [];
+      if (start !== "N/A" && end !== "N/A") parts.push(`${start}-${end}`);
+      if (day !== "N/A") parts.push(day);
+
+      if (parts.length > 0) items.push(parts.join(" "));
+    }
+
+    return items.length === 0 ? "N/A" : items.join(" | ");
+  }
+
+  function formatRetryOptions(retryOptions) {
+    if (!retryOptions) return "N/A";
+
+    const retries = valueOrNA(retryOptions?.retries);
+    const interval = valueOrNA(retryOptions?.retryIntervalMins);
+
+    if ((retries === "N/A" || retries === "0") && (interval === "N/A" || interval === "0")) {
+      return "Do not retry on error";
+    }
+
+    const parts = [];
+
+    if (retries !== "N/A" && retries !== "0") {
+      parts.push(`Retry ${retries} times`);
+    }
+
+    if (interval !== "N/A" && interval !== "0") {
+      parts.push(`${interval} minutes apart`);
+    }
+
+    return parts.length === 0 ? "Do not retry on error" : parts.join("; ");
+  }
+
+  function formatLogBackup(policy) {
+    const schedule = formatSchedule(policy?.backupPolicy?.log?.schedule);
+    const retention = formatRetention(policy?.backupPolicy?.log?.retention);
+
+    const parts = [];
+    if (schedule !== "N/A") parts.push(schedule);
+    if (retention !== "N/A") parts.push(`Retain ${retention}`);
+
+    return parts.length === 0 ? "N/A" : parts.join("; ");
+  }
+
+  function formatReplicationTargets(targets) {
+    if (!Array.isArray(targets) || targets.length === 0) return "N/A";
+
+    const items = [];
+
+    for (const t of targets) {
+      let targetName = valueOrNA(t?.remoteTargetConfig?.clusterName);
+
+      if (targetName === "N/A") targetName = valueOrNA(t?.awsTargetConfig?.name);
+      if (targetName === "N/A") targetName = valueOrNA(t?.azureTargetConfig?.name);
+
+      const schedule = formatSchedule(t?.schedule);
+      const repRetention = formatRetention(t?.retention);
+      const logRetention = formatRetention(t?.logRetention);
+
+      const parts = [];
+
+      if (targetName !== "N/A") parts.push(`Replicate to ${targetName}`);
+      if (schedule !== "N/A") parts.push(schedule);
+      if (repRetention !== "N/A") parts.push(`Retain ${repRetention}`);
+      if (logRetention !== "N/A") parts.push(`Log Retain ${logRetention}`);
+
+      if (parts.length > 0) items.push(parts.join("; "));
+    }
+
+    return items.length === 0 ? "N/A" : items.join(" | ");
+  }
+
+  async function getApiKey() {
+    try {
+      const resByName = await credentialVaultClient.getCredentialsDetails({ id: vaultName });
+
+      if (resByName?.token) return resByName.token;
+      if (resByName?.password) return resByName.password;
+      if (resByName?.value) return resByName.value;
+    } catch (e) {}
+
+    try {
+      const resById = await credentialVaultClient.getCredentialsDetails({ id: vaultId });
+
+      if (resById?.token) return resById.token;
+      if (resById?.password) return resById.password;
+      if (resById?.value) return resById.value;
+    } catch (e) {}
+
+    if (manualApiKey && manualApiKey.trim() !== "") return manualApiKey.trim();
+
+    throw new Error("Unable to read Cohesity API key from credential vault or manual fallback.");
+  }
+
+  async function heliosGetJson(url, headers) {
+    const response = await fetch(url, {
+      method: "GET",
+      headers
+    });
+
+    const text = await response.text();
+
+    if (!response.ok) {
+      return { __error: true, status: response.status, body: text };
+    }
+
+    try {
+      return JSON.parse(text);
+    } catch (e) {
+      return { __error: true, status: response.status, body: text };
+    }
+  }
+
+  async function collectCluster(cluster, commonHeaders) {
+    const clusterName = valueOrNA(firstValue(cluster, ["name", "clusterName", "displayName", "ClusterName", "Name"]));
+    const clusterId = valueOrNA(firstValue(cluster, ["clusterId", "id", "ClusterId", "Id"]));
+
+    const rows = [];
+    const issues = [];
+    let defaultPoliciesExcluded = 0;
+
+    if (clusterId === "N/A") {
+      issues.push({ Cluster: clusterName, Issue: "Cluster ID missing" });
+      return { rows, issues, defaultPoliciesExcluded };
+    }
+
+    const headers = {
+      ...commonHeaders,
+      "accessClusterId": String(clusterId)
+    };
+
+    const [policyResp, pgResp] = await Promise.all([
+      heliosGetJson(`${baseUrl}/v2/data-protect/policies`, headers),
+      heliosGetJson(`${baseUrl}/v2/data-protect/protection-groups?isDeleted=false&includeLastRunInfo=false`, headers)
+    ]);
+
+    if (policyResp.__error) {
+      issues.push({ Cluster: clusterName, Issue: `Policy fetch failed HTTP ${policyResp.status}` });
+      return { rows, issues, defaultPoliciesExcluded };
+    }
+
+    if (pgResp.__error) {
+      issues.push({ Cluster: clusterName, Issue: `PG fetch failed HTTP ${pgResp.status}` });
+    }
+
+    const policies = policyResp?.policies || [];
+    const pgs = (pgResp?.protectionGroups || []).filter(pg => pg?.isDeleted !== true);
+
+    const pgCountByPolicyId = new Map();
+
+    for (const pg of pgs) {
+      const pid = getPgPolicyId(pg);
+
+      if (pid !== "N/A") {
+        pgCountByPolicyId.set(pid, (pgCountByPolicyId.get(pid) || 0) + 1);
+      }
+    }
+
+    for (const policy of policies.sort((a, b) => valueOrNA(a?.name).localeCompare(valueOrNA(b?.name)))) {
+      const policyName = valueOrNA(policy?.name);
+
+      if (isDefaultPolicy(policyName)) {
+        defaultPoliciesExcluded++;
+        continue;
+      }
+
+      const policyId = getPolicyId(policy);
+      const pgCount = policyId !== "N/A" ? (pgCountByPolicyId.get(policyId) || 0) : 0;
+
+      rows.push({
+        Cluster: clusterName,
+        PolicyName: policyName,
+        Backup: formatBackup(policy),
+        PeriodicFullBackup: formatPeriodicFullBackup(policy),
+        QuietTimes: formatQuietTimes(policy?.blackoutWindow),
+        RetryOptions: formatRetryOptions(policy?.retryOptions),
+        LogBackup: formatLogBackup(policy),
+        ReplicationTargets: formatReplicationTargets(policy?.remoteTargetPolicy?.replicationTargets),
+        PGCount: pgCount
+      });
+    }
+
+    return { rows, issues, defaultPoliciesExcluded };
+  }
+
+  const apiKey = await getApiKey();
+
+  const commonHeaders = {
+    "apiKey": apiKey,
+    "Accept": "application/json"
+  };
+
+  const clustersResp = await heliosGetJson(`${baseUrl}/v2/mcm/cluster-mgmt/info`, commonHeaders);
+
+  if (clustersResp.__error) {
+    throw new Error(`Failed to get clusters. HTTP ${clustersResp.status}. ${clustersResp.body}`);
+  }
+
+  const clusters =
+    clustersResp?.cohesityClusters ||
+    clustersResp?.clusters ||
+    clustersResp?.clusterInfos ||
+    clustersResp?.mcmInfo?.clusterInfos ||
+    [];
+
+  const clusterResults = await Promise.all(
+    clusters.map(cluster => collectCluster(cluster, commonHeaders))
+  );
+
+  const rows = [];
+  const clusterIssues = [];
+  let defaultPoliciesExcluded = 0;
+
+  for (const result of clusterResults) {
+    rows.push(...result.rows);
+    clusterIssues.push(...result.issues);
+    defaultPoliciesExcluded += result.defaultPoliciesExcluded;
+  }
+
+  rows.sort((a, b) =>
+    valueOrNA(a.Cluster).localeCompare(valueOrNA(b.Cluster)) ||
+    valueOrNA(a.PolicyName).localeCompare(valueOrNA(b.PolicyName))
+  );
+
+  const headers = [
+    "Cluster",
+    "PolicyName",
+    "Backup",
+    "PeriodicFullBackup",
+    "QuietTimes",
+    "RetryOptions",
+    "LogBackup",
+    "ReplicationTargets",
+    "PGCount"
+  ];
+
+  const summaryRows = [
+    { Metric: "Clusters discovered", Count: clusters.length },
+    { Metric: "Policies exported", Count: rows.length },
+    { Metric: "Default policies excluded", Count: defaultPoliciesExcluded }
+  ];
+
+  let markdown = "";
+  markdown += `# Cohesity Policy Summary\n\n`;
+  markdown += `**Report Date ET:** ${nowEtString()}\n\n`;
+  markdown += `**Default policies excluded:** Protect Once, Silver, Gold, Bronze\n\n`;
+
+  markdown += `## Summary\n\n`;
+  markdown += markdownTable(["Metric", "Count"], summaryRows);
+  markdown += `\n`;
+
+  if (clusterIssues.length > 0) {
+    markdown += `## Cluster Fetch Issues\n\n`;
+    markdown += markdownTable(["Cluster", "Issue"], clusterIssues);
+    markdown += `\n`;
+  }
+
+  markdown += `## Policy Summary\n\n`;
+
+  if (rows.length === 0) {
+    markdown += `No policies found.\n\n`;
+  } else {
+    markdown += markdownTable(headers, rows);
+    markdown += `\n`;
+  }
+
+  return {
+    reportDateEt: nowEtString(),
+    markdown: markdown,
+    rows: rows,
+    clusterIssues: clusterIssues,
+    policiesExported: rows.length,
+    defaultPoliciesExcluded: defaultPoliciesExcluded
+  };
+}
