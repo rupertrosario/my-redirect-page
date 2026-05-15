@@ -1,0 +1,508 @@
+// ==========================================================
+// Dynatrace JS Task
+// Decommission DTSK -> Cohesity Latest Backup Validation
+// Previous task name expected: snow_results
+//
+// Previous task output expected:
+// number,short_description,state,assignment_group.name,
+// assigned_to.name,decom_request.number,decom_request.ci_name.name
+//
+// Optional but recommended for SLA:
+// sys_created_on
+//
+// Cohesity calls only: GET
+// ==========================================================
+
+export default async function () {
+
+  // ========================================================
+  // INPUT FROM PREVIOUS STEP - WORKING wf.result STYLE
+  // ========================================================
+  const decomRows =
+    (wf.result("snow_results") &&
+     wf.result("snow_results").results) || [];
+
+  // ========================================================
+  // CONFIG
+  // ========================================================
+  const HELIOS_BASE_URL = "https://helios.cohesity.com";
+  const COHESITY_API_KEY = "YOUR_COHESITY_API_KEY";
+
+  const OUTPUT_TIME_ZONE = "America/New_York";
+  const SLA_DAYS = 2;
+
+  // ========================================================
+  // HELPERS
+  // ========================================================
+  async function getJson(url, headers) {
+    try {
+      const response = await fetch(url, {
+        method: "GET",
+        headers
+      });
+
+      if (!response.ok) {
+        return {
+          __error: true,
+          status: response.status,
+          statusText: response.statusText,
+          url
+        };
+      }
+
+      return await response.json();
+    } catch (err) {
+      return {
+        __error: true,
+        status: "FETCH_ERROR",
+        statusText: err.message,
+        url
+      };
+    }
+  }
+
+  function getField(row, fieldName) {
+    const value = row?.[fieldName];
+
+    if (value === null || value === undefined) return "";
+
+    if (typeof value === "string") return value.trim();
+
+    if (typeof value === "number" || typeof value === "boolean") {
+      return String(value).trim();
+    }
+
+    if (typeof value === "object") {
+      return String(
+        value.display_value ||
+        value.name ||
+        value.value ||
+        ""
+      ).trim();
+    }
+
+    return "";
+  }
+
+  function isBadCiName(value) {
+    const ci = String(value || "").trim();
+
+    if (!ci) return true;
+    if (ci.toUpperCase() === "N/A") return true;
+    if (/^https?:\/\//i.test(ci)) return true;
+    if (/^[0-9a-f]{32}$/i.test(ci)) return true;
+
+    return false;
+  }
+
+  function escapeMd(value) {
+    return String(value ?? "N/A")
+      .replace(/\|/g, "\\|")
+      .replace(/\r?\n/g, " ")
+      .trim() || "N/A";
+  }
+
+  function firstValue(value) {
+    if (!value) return null;
+
+    if (Array.isArray(value)) {
+      return value.find(v => v !== null && v !== undefined) || null;
+    }
+
+    return value;
+  }
+
+  function parseDateUtc(value) {
+    const raw = String(value || "").trim();
+
+    if (!raw || raw.toUpperCase() === "N/A") return null;
+
+    // ServiceNow date usually comes as yyyy-MM-dd HH:mm:ss.
+    // Treat as UTC unless timezone is already included.
+    if (/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(raw)) {
+      return new Date(raw.replace(" ", "T") + "Z");
+    }
+
+    const dt = new Date(raw);
+    if (Number.isNaN(dt.getTime())) return null;
+
+    return dt;
+  }
+
+  function formatDate(dateObj) {
+    if (!dateObj || Number.isNaN(dateObj.getTime())) return "N/A";
+
+    return new Intl.DateTimeFormat("en-GB", {
+      timeZone: OUTPUT_TIME_ZONE,
+      day: "2-digit",
+      month: "short",
+      year: "numeric",
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+      hour12: false
+    }).format(dateObj).replace(",", "") + " ET";
+  }
+
+  function formatUsecs(usecs) {
+    const value = firstValue(usecs);
+
+    if (!value) return "N/A";
+
+    const millis = Math.floor(Number(value) / 1000);
+
+    if (!Number.isFinite(millis)) return "N/A";
+
+    return formatDate(new Date(millis));
+  }
+
+  function getSlaInfo(createdOnRaw) {
+    const createdDate = parseDateUtc(createdOnRaw);
+
+    if (!createdDate) {
+      return {
+        createdOn: "N/A",
+        slaDue: "N/A",
+        slaStatus: "Created Date Missing"
+      };
+    }
+
+    const dueDate = new Date(createdDate.getTime() + SLA_DAYS * 24 * 60 * 60 * 1000);
+    const now = new Date();
+
+    if (now > dueDate) {
+      return {
+        createdOn: formatDate(createdDate),
+        slaDue: formatDate(dueDate),
+        slaStatus: "Breached"
+      };
+    }
+
+    const hoursLeft = Math.ceil((dueDate.getTime() - now.getTime()) / (60 * 60 * 1000));
+
+    return {
+      createdOn: formatDate(createdDate),
+      slaDue: formatDate(dueDate),
+      slaStatus: `Within SLA - ${hoursLeft}h left`
+    };
+  }
+
+  function getSnapshotInfo(object) {
+    if (object?.latestSnapshotInfo) return object.latestSnapshotInfo;
+    if (object?.latestSnapshotsInfo) return object.latestSnapshotsInfo;
+    return null;
+  }
+
+  function getProtectionGroupName(object, snapshot) {
+    return (
+      snapshot?.protectionGroupName ||
+      snapshot?.protectionGroup?.name ||
+      object?.protectionGroupName ||
+      object?.protectionGroup?.name ||
+      "N/A"
+    );
+  }
+
+  function getLatestBackupStatus(object, snapshot) {
+    return (
+      snapshot?.status ||
+      snapshot?.protectionRunStatus ||
+      snapshot?.lastRunStatus ||
+      snapshot?.backupRunStatus ||
+      snapshot?.runStatus ||
+      object?.status ||
+      object?.protectionStatus ||
+      object?.lastRunStatus ||
+      object?.backupStatus ||
+      "StatusNotReturnedBySearchApi"
+    );
+  }
+
+  function getLatestBackupUsecs(snapshot) {
+    return firstValue(
+      snapshot?.localBackupInfo?.[0]?.endTimeUsecs ||
+      snapshot?.localBackupInfo?.[0]?.startTimeUsecs ||
+      snapshot?.protectionRunEndTimeUsecs ||
+      snapshot?.protectionRunStartTimeUsecs ||
+      snapshot?.runEndTimeUsecs ||
+      snapshot?.runStartTimeUsecs ||
+      snapshot?.snapshotCreationTimeUsecs ||
+      snapshot?.creationTimeUsecs ||
+      snapshot?.startTimeUsecs
+    );
+  }
+
+  function chooseBestObject(objects, ciName) {
+    if (!Array.isArray(objects) || objects.length === 0) return null;
+
+    const ciLower = ciName.toLowerCase();
+
+    const exact = objects.find(obj => {
+      const names = [
+        obj?.name,
+        obj?.objectName,
+        obj?.hostName,
+        obj?.displayName,
+        obj?.sourceName,
+        obj?.entity?.displayName,
+        obj?.entity?.name
+      ]
+        .filter(Boolean)
+        .map(v => String(v).toLowerCase());
+
+      return names.includes(ciLower);
+    });
+
+    if (exact) return exact;
+
+    const contains = objects.find(obj => {
+      const names = [
+        obj?.name,
+        obj?.objectName,
+        obj?.hostName,
+        obj?.displayName,
+        obj?.sourceName,
+        obj?.entity?.displayName,
+        obj?.entity?.name
+      ]
+        .filter(Boolean)
+        .map(v => String(v).toLowerCase());
+
+      return names.some(v => v.includes(ciLower) || ciLower.includes(v));
+    });
+
+    return contains || objects[0];
+  }
+
+  // ========================================================
+  // COHESITY GET CALLS
+  // ========================================================
+  async function getClusters() {
+    const url = `${HELIOS_BASE_URL}/v2/mcm/cluster-mgmt/info`;
+
+    const json = await getJson(url, {
+      accept: "application/json",
+      apiKey: COHESITY_API_KEY
+    });
+
+    if (json.__error) {
+      throw new Error(`Unable to fetch Cohesity clusters: ${json.status} ${json.statusText}`);
+    }
+
+    return json?.cohesityClusters || [];
+  }
+
+  async function searchProtectedObjects(ciName, cluster) {
+    const url =
+      `${HELIOS_BASE_URL}/v2/data-protect/search/protected-objects` +
+      `?searchString=${encodeURIComponent(ciName)}`;
+
+    return await getJson(url, {
+      accept: "application/json",
+      apiKey: COHESITY_API_KEY,
+      accessClusterId: cluster.clusterId
+    });
+  }
+
+  async function getLatestBackupForCi(ciName, clusters) {
+    for (const cluster of clusters) {
+      const json = await searchProtectedObjects(ciName, cluster);
+
+      if (json.__error) {
+        continue;
+      }
+
+      const objects = json?.objects || [];
+
+      if (!objects.length) {
+        continue;
+      }
+
+      const object = chooseBestObject(objects, ciName);
+
+      if (!object) {
+        continue;
+      }
+
+      const snapshot = getSnapshotInfo(object);
+
+      if (!snapshot) {
+        return {
+          cluster: cluster.clusterName || cluster.name || "N/A",
+          protectionGroup: "N/A",
+          latestBackupStatus: "NoBackup",
+          latestBackupDate: "N/A",
+          result: "Object Found / No Backup Snapshot"
+        };
+      }
+
+      const backupUsecs = getLatestBackupUsecs(snapshot);
+      const latestBackupDate = formatUsecs(backupUsecs);
+      const latestBackupStatus = getLatestBackupStatus(object, snapshot);
+      const protectionGroup = getProtectionGroupName(object, snapshot);
+
+      if (latestBackupDate === "N/A") {
+        return {
+          cluster: cluster.clusterName || cluster.name || "N/A",
+          protectionGroup,
+          latestBackupStatus: "BackupTimeNotReturnedBySearchApi",
+          latestBackupDate: "N/A",
+          result: "Object Found / Backup Time Not Available"
+        };
+      }
+
+      if (latestBackupStatus === "StatusNotReturnedBySearchApi") {
+        return {
+          cluster: cluster.clusterName || cluster.name || "N/A",
+          protectionGroup,
+          latestBackupStatus,
+          latestBackupDate,
+          result: "Backup Date Found / Status Not Available"
+        };
+      }
+
+      return {
+        cluster: cluster.clusterName || cluster.name || "N/A",
+        protectionGroup,
+        latestBackupStatus,
+        latestBackupDate,
+        result: "Latest Backup Found"
+      };
+    }
+
+    return {
+      cluster: "N/A",
+      protectionGroup: "N/A",
+      latestBackupStatus: "NoObject",
+      latestBackupDate: "N/A",
+      result: "No Cohesity Object Found"
+    };
+  }
+
+  // ========================================================
+  // NO DTSK OUTPUT
+  // ========================================================
+  if (!Array.isArray(decomRows) || decomRows.length === 0) {
+    const markdown =
+      "| Status | Message |\n" +
+      "|---|---|\n" +
+      "| No DTSK | No active decommission DTSKs assigned to the team for this run. |";
+
+    console.log(markdown);
+
+    return {
+      markdown,
+      rows: [],
+      summary: {
+        total: 0,
+        message: "No active decommission DTSKs assigned to the team for this run."
+      }
+    };
+  }
+
+  // ========================================================
+  // MAIN
+  // ========================================================
+  const clusters = await getClusters();
+  const results = [];
+
+  for (const row of decomRows) {
+    const dtskNumber = getField(row, "number") || "N/A";
+
+    const assignedToRaw = getField(row, "assigned_to.name");
+    const assignedTo = assignedToRaw || "N/A";
+    const assignmentAction = assignedToRaw ? "Assigned" : "Please assign";
+
+    const createdOnRaw =
+      getField(row, "sys_created_on") ||
+      getField(row, "opened_at") ||
+      "";
+
+    const sla = getSlaInfo(createdOnRaw);
+
+    const decomRequest = getField(row, "decom_request.number") || "N/A";
+    const ciName = getField(row, "decom_request.ci_name.name") || "N/A";
+
+    if (isBadCiName(ciName)) {
+      results.push({
+        dtsk: dtskNumber,
+        assignedTo,
+        assignmentAction,
+        createdOn: sla.createdOn,
+        slaDue: sla.slaDue,
+        slaStatus: sla.slaStatus,
+        decomRequest,
+        ciName,
+        cluster: "N/A",
+        protectionGroup: "N/A",
+        latestBackupStatus: "CI_NOT_AVAILABLE",
+        latestBackupDate: "N/A",
+        result: "Cannot Validate"
+      });
+
+      continue;
+    }
+
+    const backup = await getLatestBackupForCi(ciName, clusters);
+
+    results.push({
+      dtsk: dtskNumber,
+      assignedTo,
+      assignmentAction,
+      createdOn: sla.createdOn,
+      slaDue: sla.slaDue,
+      slaStatus: sla.slaStatus,
+      decomRequest,
+      ciName,
+      cluster: backup.cluster,
+      protectionGroup: backup.protectionGroup,
+      latestBackupStatus: backup.latestBackupStatus,
+      latestBackupDate: backup.latestBackupDate,
+      result: backup.result
+    });
+  }
+
+  // ========================================================
+  // MARKDOWN OUTPUT
+  // ========================================================
+  let markdown = "";
+
+  markdown += "| DTSK | Assigned To | Assignment Action | Created On | SLA Due | SLA Status | Decom Request | CI Name | Cluster | Protection Group | Latest Backup Status | Latest Backup Date | Result |\n";
+  markdown += "|---|---|---|---|---|---|---|---|---|---|---|---|---|\n";
+
+  for (const r of results) {
+    markdown +=
+      `| ${escapeMd(r.dtsk)} ` +
+      `| ${escapeMd(r.assignedTo)} ` +
+      `| ${escapeMd(r.assignmentAction)} ` +
+      `| ${escapeMd(r.createdOn)} ` +
+      `| ${escapeMd(r.slaDue)} ` +
+      `| ${escapeMd(r.slaStatus)} ` +
+      `| ${escapeMd(r.decomRequest)} ` +
+      `| ${escapeMd(r.ciName)} ` +
+      `| ${escapeMd(r.cluster)} ` +
+      `| ${escapeMd(r.protectionGroup)} ` +
+      `| ${escapeMd(r.latestBackupStatus)} ` +
+      `| ${escapeMd(r.latestBackupDate)} ` +
+      `| ${escapeMd(r.result)} |\n`;
+  }
+
+  console.log(markdown);
+
+  return {
+    markdown,
+    rows: results,
+    summary: {
+      total: results.length,
+      assigned: results.filter(r => r.assignmentAction === "Assigned").length,
+      needsAssignment: results.filter(r => r.assignmentAction === "Please assign").length,
+      slaBreached: results.filter(r => r.slaStatus === "Breached").length,
+      createdDateMissing: results.filter(r => r.slaStatus === "Created Date Missing").length,
+      latestBackupFound: results.filter(r => r.result === "Latest Backup Found").length,
+      backupStatusNotAvailable: results.filter(r => r.result === "Backup Date Found / Status Not Available").length,
+      noBackup: results.filter(r => r.latestBackupStatus === "NoBackup").length,
+      noObject: results.filter(r => r.latestBackupStatus === "NoObject").length,
+      cannotValidate: results.filter(r => r.result === "Cannot Validate").length
+    }
+  };
+}
