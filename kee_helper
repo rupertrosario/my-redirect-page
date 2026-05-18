@@ -1,67 +1,83 @@
 function Convert-SecureStringToPlainText {
-    param(
-        [Parameter(Mandatory)]
-        [SecureString]$SecureString
-    )
+    param([Parameter(Mandatory)][SecureString]$SecureString)
 
     $ptr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($SecureString)
-
     try {
-        return [Runtime.InteropServices.Marshal]::PtrToStringBSTR($ptr)
+        [Runtime.InteropServices.Marshal]::PtrToStringBSTR($ptr)
     }
     finally {
         [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($ptr)
     }
 }
 
-function Get-CohesityApiKeyFromKeePass {
+function New-AesKeyFromPassword {
     param(
-        [string]$KeePassDbPath = "\\NAS\Cohesity\Secure\CohesityVault.kdbx",
-        [string]$KPScriptPath  = "C:\Program Files (x86)\KeePass2x\KPScript.exe",
-        [string]$EntryTitle    = "CohesityApiKey"
+        [Parameter(Mandatory)][SecureString]$Password,
+        [Parameter(Mandatory)][byte[]]$Salt,
+        [int]$Iterations = 300000
     )
 
-    if (-not (Test-Path $KeePassDbPath)) {
-        throw "KeePass database not found: $KeePassDbPath"
-    }
-
-    if (-not (Test-Path $KPScriptPath)) {
-        throw "KPScript.exe not found: $KPScriptPath"
-    }
-
-    $securePassword = Read-Host "Enter KeePass master password" -AsSecureString
-    $plainPassword  = Convert-SecureStringToPlainText -SecureString $securePassword
+    $plainPassword = Convert-SecureStringToPlainText $Password
+    $derive = New-Object System.Security.Cryptography.Rfc2898DeriveBytes($plainPassword, $Salt, $Iterations)
 
     try {
-        $$output = & $KPScriptPath `
-        "-c:GetEntryString" `
-        "$KeePassDbPath" `
-        "-pw:$plainPassword" `
-        "-Field:Password" `
-        "-ref-Title:$EntryTitle" `
-        "-FailIfNoEntry" 2>&1
-
-    if ($LASTEXITCODE -ne 0) {
-        $safeOutput = ($output -join ' ') -replace '-pw:[^\s]+', '-pw:[REDACTED]'
-        throw "KPScript failed. ExitCode=$LASTEXITCODE. Output=$safeOutput"
-        }
-
-        $apiKey = $output |
-            Where-Object {
-                $_ -and
-                $_ -notmatch "^OK:" -and
-                $_ -notmatch "^E:" -and
-                $_ -notmatch "Operation completed"
-            } |
-            Select-Object -First 1
-
-        if ([string]::IsNullOrWhiteSpace($apiKey)) {
-            throw "API key not returned from KeePass entry: $EntryTitle"
-        }
-
-        return $apiKey.Trim()
+        $derive.GetBytes(32)
     }
     finally {
+        $derive.Dispose()
         $plainPassword = $null
     }
+}
+
+function New-CohesityEncryptedApiKey {
+    param(
+        [string]$EncryptedFile = "\\NAS\Cohesity\Secure\cohesity_apikey.enc"
+    )
+
+    $apiKey = Read-Host "Paste Cohesity API key" -AsSecureString
+    $password1 = Read-Host "Create API key password" -AsSecureString
+    $password2 = Read-Host "Confirm API key password" -AsSecureString
+
+    if ((Convert-SecureStringToPlainText $password1) -ne (Convert-SecureStringToPlainText $password2)) {
+        throw "Passwords do not match."
+    }
+
+    $salt = New-Object byte[] 32
+    [System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($salt)
+
+    $key = New-AesKeyFromPassword -Password $password1 -Salt $salt
+    $encryptedApiKey = $apiKey | ConvertFrom-SecureString -Key $key
+
+    [pscustomobject]@{
+        Version    = 1
+        Iterations = 300000
+        Salt       = [Convert]::ToBase64String($salt)
+        ApiKey     = $encryptedApiKey
+    } | ConvertTo-Json | Set-Content -Path $EncryptedFile -Encoding UTF8
+
+    Write-Host "Encrypted API key created: $EncryptedFile" -ForegroundColor Green
+}
+
+function Get-CohesityApiKeyFromAes {
+    param(
+        [string]$EncryptedFile = "\\NAS\Cohesity\Secure\cohesity_apikey.enc"
+    )
+
+    if (-not (Test-Path $EncryptedFile)) {
+        throw "Encrypted API key file not found: $EncryptedFile"
+    }
+
+    $vaultPassword = Read-Host "Enter Cohesity API key password" -AsSecureString
+
+    $data = Get-Content -Path $EncryptedFile -Raw | ConvertFrom-Json
+    $salt = [Convert]::FromBase64String($data.Salt)
+
+    $key = New-AesKeyFromPassword `
+        -Password $vaultPassword `
+        -Salt $salt `
+        -Iterations $data.Iterations
+
+    $secureApiKey = $data.ApiKey | ConvertTo-SecureString -Key $key
+
+    Convert-SecureStringToPlainText $secureApiKey
 }
