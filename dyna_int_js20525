@@ -1,14 +1,6 @@
 // ------------------------------------------------------------
 // Dynatrace JS2 | Cohesity Helios Interface DOWN validator + SNOW payloads (GET only)
-// Sanity-checked for: "credentialVaultClient already declared" => uses alias import `vault`
-//
-// Reads alerts from workflow step: "get_alerts"
-// Calls Helios interface API (GET) per cluster
-// Matches by IP from alerts vs nodeIp from interface API
-// Builds SNOW payloads (simple):
-//   teamIncident (one) + dcIncidents (one per allowlisted location)
-//
-// DC allowlist: Ashburn, San Antonio, Carrollton, Detroit
+// Duplicate-safe version (prevents double push)
 // ------------------------------------------------------------
 
 import { credentialVaultClient as vault } from "@dynatrace-sdk/client-classic-environment-v2";
@@ -19,42 +11,41 @@ export default async function () {
   const PREDECESSOR_TASK = "get_alerts";
 
   // DC allowlist
-  const DC_ALLOWLIST_ENABLED = true; // later: set false to process ALL locations
+  const DC_ALLOWLIST_ENABLED = true;
   const DC_ALLOWLIST = ["Ashburn", "San Antonio", "Carrollton", "Detroit"];
 
-// Trigger codes
-const TRIGGER_EXACT_1105  = "CE030601105";
-const TRIGGER_NUM_1105    = "1105";
-
-const TRIGGER_EXACT_13023 = "CE02513023";
-const TRIGGER_NUM_13023   = "13023";
-
-function isTrigger(code) {
-  code = norm(code);
-  if (!code) return false;
-
-  if (code === TRIGGER_EXACT_1105) return true;
-  if (code === TRIGGER_EXACT_13023) return true;
-
-  if (code === TRIGGER_NUM_1105) return true;
-  if (code === TRIGGER_NUM_13023) return true;
-
-  if (code.includes(TRIGGER_NUM_1105)) return true;
-  if (code.includes(TRIGGER_NUM_13023)) return true;
-
-  return false;
-}
+  // Trigger codes
+  const TRIGGER_EXACT_1105  = "CE030601105";
+  const TRIGGER_NUM_1105    = "1105";
+  const TRIGGER_EXACT_13023 = "CE02513023";
+  const TRIGGER_NUM_13023   = "13023";
 
   // Vault
   const vaultName = "Cohesity_API_Key";
   const vaultId = "credentials_vault-312312";
 
   // ------------------------------
-  // small helpers
+  // Helpers
   // ------------------------------
   const norm = (v) => (v === null || v === undefined) ? "" : String(v).trim();
   const normLoc = (s) => norm(s).toLowerCase().replace(/\s+/g, " ");
   const slug = (s) => norm(s).toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "");
+
+  function isTrigger(code) {
+    code = norm(code);
+    if (!code) return false;
+
+    if (code === TRIGGER_EXACT_1105) return true;
+    if (code === TRIGGER_EXACT_13023) return true;
+
+    if (code === TRIGGER_NUM_1105) return true;
+    if (code === TRIGGER_NUM_13023) return true;
+
+    if (code.includes(TRIGGER_NUM_1105)) return true;
+    if (code.includes(TRIGGER_NUM_13023)) return true;
+
+    return false;
+  }
 
   function pickIP(r) {
     return norm(r?.IP || r?.ip || r?.NodeIP || r?.nodeIp || r?.node_ip);
@@ -62,17 +53,14 @@ function isTrigger(code) {
 
   function toArray(v) {
     if (Array.isArray(v)) return v;
-    if (v && Array.isArray(v.results)) return v.results;
-    if (v && v.result && Array.isArray(v.result.results)) return v.result.results;
+    if (v?.results) return v.results;
+    if (v?.result?.results) return v.result.results;
     return [];
   }
 
   async function getJson(url, headers) {
     const resp = await fetch(url, { method: "GET", headers });
-    if (!resp.ok) {
-      const txt = await resp.text().catch(() => "");
-      throw new Error(`HTTP ${resp.status} ${txt}`);
-    }
+    if (!resp.ok) return null;
     return resp.json();
   }
 
@@ -91,26 +79,13 @@ function isTrigger(code) {
   }
 
   // ------------------------------
-  // 0) Read JS1 output from workflow context
+  // 0) Read JS1 results
   // ------------------------------
-  let upstream;
-  try {
-    upstream = await wfResult(PREDECESSOR_TASK);
-  } catch (e) {
-    return {
-      ok: false,
-      error: `Cannot read result("${PREDECESSOR_TASK}")`,
-      details: norm(e?.message || e),
-      teamIncident: null,
-      dcIncidents: []
-    };
-  }
+  const upstream = await wfResult(PREDECESSOR_TASK);
+  const alertRows = upstream?.results || [];
 
-  const alertRows = toArray(upstream?.results ?? upstream);
-
-  // Build targets + map of AlertCause by (ClusterId|IP)
   const interfaceTargets = [];
-  const alertCauseByKey = {}; // key: clusterId|ip -> AlertCause
+  const alertCauseByKey = {};
 
   for (const r of alertRows) {
     const alertCode = norm(r?.AlertCode || r?.alertCode);
@@ -120,7 +95,7 @@ function isTrigger(code) {
     const ip = pickIP(r);
     if (!clusterId || !ip) continue;
 
-    const clusterName = norm(r?.ClusterName || r?.clusterName) || `cluster-${clusterId}`;
+    const clusterName = norm(r?.ClusterName || r?.clusterName);
     const location = norm(r?.Location || r?.location);
     const alertCause = norm(r?.AlertCause || r?.alertCause);
 
@@ -131,8 +106,7 @@ function isTrigger(code) {
       IP: ip
     });
 
-    const key = `${clusterId}|${ip}`;
-    if (alertCause && !alertCauseByKey[key]) alertCauseByKey[key] = alertCause;
+    alertCauseByKey[`${clusterId}|${ip}`] = alertCause;
   }
 
   if (!interfaceTargets.length) {
@@ -145,67 +119,38 @@ function isTrigger(code) {
   }
 
   // ------------------------------
-  // 1) Group targets by cluster -> IP set + meta
+  // Group by cluster
   // ------------------------------
   const byCluster = {};
   for (const t of interfaceTargets) {
-    const cid = t.ClusterId;
-    if (!byCluster[cid]) {
-      byCluster[cid] = {
-        ClusterId: cid,
+    if (!byCluster[t.ClusterId]) {
+      byCluster[t.ClusterId] = {
+        ClusterId: t.ClusterId,
         ClusterName: t.ClusterName,
         Location: t.Location,
         Ips: {}
       };
     }
-    byCluster[cid].Ips[t.IP] = true;
-    if (!byCluster[cid].ClusterName && t.ClusterName) byCluster[cid].ClusterName = t.ClusterName;
-    if (!byCluster[cid].Location && t.Location) byCluster[cid].Location = t.Location;
+    byCluster[t.ClusterId].Ips[t.IP] = true;
   }
 
   const clusterIds = Object.keys(byCluster);
 
   // ------------------------------
-  // 2) Helios API key (vault-name -> vault-id -> manual)
+  // API Key
   // ------------------------------
   let apiKey = null;
-  let authMode = "vault-name";
-
-  async function getKeyByName(name) {
-    const all = await vault.getCredentials();
-    const creds = (all && all.credentials) ? all.credentials : [];
-    const found = creds.find(c => c && c.name === name);
-    if (!found) return null;
-    const detail = await vault.getCredentialsDetails({ id: found.id });
-    return (detail && (detail.token || detail.password)) || null;
-  }
-
   try {
-    apiKey = await getKeyByName(vaultName);
-    if (!apiKey) throw new Error("not-found");
+    const all = await vault.getCredentials();
+    const found = all.credentials.find(c => c.name === vaultName);
+    const detail = await vault.getCredentialsDetails({ id: found.id });
+    apiKey = detail.token || detail.password;
   } catch {
-    try {
-      const d2 = await vault.getCredentialsDetails({ id: vaultId });
-      apiKey = (d2 && (d2.token || d2.password)) || null;
-      authMode = "vault-id";
-    } catch {
-      authMode = "manual";
-      apiKey = "PASTE_YOUR_API_KEY_HERE";
-    }
-  }
-
-  if (!apiKey || apiKey === "PASTE_YOUR_API_KEY_HERE") {
-    return {
-      ok: false,
-      error: "No valid Helios API key available.",
-      authMode,
-      teamIncident: null,
-      dcIncidents: []
-    };
+    return { ok: false, error: "No valid Helios API key available." };
   }
 
   // ------------------------------
-  // 3) Call interface API per cluster and confirm DOWN slaves
+  // Interface validation
   // ------------------------------
   const ifaceUrl =
     baseUrl +
@@ -215,51 +160,49 @@ function isTrigger(code) {
     "&includeUplinkSwitchInfo=true" +
     "&includeBondSlaveDetails=true";
 
-  // Keep only what you asked for:
-  // ClusterName, IP, Serial, MAC, AlertCause, Location (for DC grouping)
   const downRows = [];
 
   for (const cid of clusterIds) {
     const entry = byCluster[cid];
 
-    let data;
-    try {
-      data = await getJson(ifaceUrl, {
-        accept: "application/json",
-        apiKey,
-        accessClusterId: String(cid)
-      });
-    } catch {
-      continue;
-    }
+    const data = await getJson(ifaceUrl, {
+      accept: "application/json",
+      apiKey,
+      accessClusterId: String(cid)
+    });
 
-    const nodes = Array.isArray(data) ? data : (data ? [data] : []);
+    if (!data) continue;
+
+    const nodes = Array.isArray(data) ? data : [data];
+
     for (const node of nodes) {
-      const nodeIp = norm(node?.nodeIp || node?.ip);
-      if (!nodeIp) continue;
-
-      // ✅ IP match here (alerts IP set vs nodeIp)
+      const nodeIp = norm(node?.nodeIp);
       if (!entry.Ips[nodeIp]) continue;
 
       const serial = norm(node?.chassisSerial);
 
-      const ifaces = Array.isArray(node?.interfaces) ? node.interfaces : (node?.interfaces ? [node.interfaces] : []);
+      const ifaces = Array.isArray(node?.interfaces) ? node.interfaces : [];
+
       for (const bond of ifaces) {
-        const slaves = Array.isArray(bond?.bondSlaves) ? bond.bondSlaves : (bond?.bondSlaves ? [bond.bondSlaves] : []);
-        const dmap = indexDetails(bond?.bondSlavesDetails);
+        const details = Array.isArray(bond?.bondSlavesDetails)
+          ? bond.bondSlavesDetails
+          : [];
 
-        for (const s of slaves) {
-          const slaveName = norm(typeof s === "string" ? s : (s?.name || s?.["@name"]));
-          if (!slaveName) continue;
-
-          const d = dmap[slaveName] || {};
-          const linkState = norm(d.linkState || d.state || d.status);
+        for (const d of details) {
+          const linkState = norm(d?.linkState || d?.state || d?.status);
           if (!looksDown(linkState)) continue;
 
-          const mac = norm(d.macAddr || d.mac || d.mac_address);
+          const mac = norm(d?.macAddr || d?.mac || d?.mac_address);
 
           const causeKey = `${cid}|${nodeIp}`;
-          const alertCause = alertCauseByKey[causeKey] || norm(alertCauseByKey[`${cid}|${pickIP({ IP: nodeIp })}`]) || "";
+          const alertCause = alertCauseByKey[causeKey] || "";
+
+          // 🔥 Prevent duplicate push
+          const exists = downRows.some(r =>
+            r.ClusterId === String(cid) &&
+            r.IP === nodeIp
+          );
+          if (exists) continue;
 
           downRows.push({
             Location: entry.Location,
@@ -275,22 +218,9 @@ function isTrigger(code) {
     }
   }
 
-// ------------------------------
-// Deduplicate by ClusterId + IP
-// ------------------------------
-const uniqueMap2 = {};
-for (const r of downRows) {
-  const key = `${norm(r.ClusterId)}|${norm(r.IP)}`;
-  uniqueMap2[key] = r;
-}
-
-downRows.length = 0;
-downRows.push(...Object.values(uniqueMap2));
-
   if (!downRows.length) {
     return {
       ok: true,
-      authMode,
       message: "No confirmed DOWN interfaces found.",
       downRows: [],
       teamIncident: null,
@@ -301,7 +231,7 @@ downRows.push(...Object.values(uniqueMap2));
   }
 
   // ------------------------------
-  // 4) Build SNOW payloads (simple, no counts, no extras)
+  // Build SNOW payload
   // ------------------------------
   function shortLine(r) {
     return `Cohesity Interface DOWN on Cluster: ${r.ClusterName}  IP: ${r.IP}  Serial NO: ${r.Serial}  Mac: ${r.MAC}`;
@@ -312,17 +242,7 @@ downRows.push(...Object.values(uniqueMap2));
     return `${shortLine(r)}${cause}`;
   }
 
-  // Team: short from first row; description lists all
-      // Deduplicate by ClusterId + IP
-    const uniqueMap = {};
-    for (const r of downRows) {
-      const key = r.ClusterId + "|" + r.IP;
-      uniqueMap[key] = r;
-    }
-    downRows.length = 0;
-    downRows.push(...Object.values(uniqueMap));
-    
-    const first = downRows[0];
+  const first = downRows[0];
 
   const teamIncident = {
     correlation_id: "cohesity_ifdown_team",
@@ -330,7 +250,6 @@ downRows.push(...Object.values(uniqueMap2));
     description: downRows.map(fullLine).join("\n")
   };
 
-  // DC: group by location, apply allowlist
   const allowSet = new Set(DC_ALLOWLIST.map(normLoc));
   const dcByLoc = {};
 
@@ -358,7 +277,6 @@ downRows.push(...Object.values(uniqueMap2));
 
   return {
     ok: true,
-    authMode,
     downRows,
     teamIncident,
     dcIncidents,
