@@ -1,0 +1,270 @@
+// ------------------------------------------------------------
+// Dynatrace JS | Cohesity Helios Alerts (GET only)
+// Mirrors your PowerShell logic, plus adds Cluster Location from cluster-mgmt/info
+// ------------------------------------------------------------
+
+import { credentialVaultClient } from "@dynatrace-sdk/client-classic-environment-v2";
+
+export default async function () {
+  var baseUrl = "https://helios.cohesity.com";
+
+  var vaultName = "Cohesity_API_Key";
+  var vaultId   = "credentials_vault-312312";
+
+  var AlertTypes      = ["11001", "1105"];
+  var AlertStates     = ["kOpen"];
+  var AlertCategories = [];
+  var MaxAlerts       = 200;
+
+  var NodeIds = [];
+
+  var apiKey = null;
+  var authMode = "vault-name";
+
+  async function getKeyByName(name) {
+    var all = await credentialVaultClient.getCredentials();
+    var creds = (all && all.credentials) ? all.credentials : [];
+    var found = null;
+
+    for (var i = 0; i < creds.length; i++) {
+      if (creds[i] && creds[i].name === name) { found = creds[i]; break; }
+    }
+    if (!found) return null;
+
+    var detail = await credentialVaultClient.getCredentialsDetails({ id: found.id });
+    return (detail && (detail.token || detail.password)) || null;
+  }
+
+  try {
+    apiKey = await getKeyByName(vaultName);
+    if (!apiKey) throw new Error("not-found");
+  } catch (e) {
+    try {
+      var d2 = await credentialVaultClient.getCredentialsDetails({ id: vaultId });
+      apiKey = (d2 && (d2.token || d2.password)) || null;
+      authMode = "vault-id";
+    } catch (e2) {
+      authMode = "manual";
+      apiKey = "PASTE_YOUR_API_KEY_HERE";
+    }
+  }
+
+  if (!apiKey) throw new Error("No Helios API key available.");
+
+  function norm(v) {
+    if (v === null || v === undefined) return "";
+    return String(v).trim();
+  }
+
+  function toArrayMaybe(v) {
+    if (!v) return [];
+    return Array.isArray(v) ? v : [v];
+  }
+
+  function buildQuery(params) {
+    var usp = new URLSearchParams();
+    for (var k in params) {
+      if (!Object.prototype.hasOwnProperty.call(params, k)) continue;
+      var v = params[k];
+      if (v === undefined || v === null) continue;
+
+      if (Array.isArray(v)) {
+        for (var i = 0; i < v.length; i++) {
+          var s = String(v[i]).trim();
+          if (!s) continue;
+          usp.append(k, s);
+        }
+      } else {
+        var sv = String(v).trim();
+        if (!sv) continue;
+        usp.append(k, sv);
+      }
+    }
+    return usp.toString();
+  }
+
+  async function getJson(url, headers) {
+    var resp = await fetch(url, { method: "GET", headers: headers });
+    if (!resp.ok) {
+      var txt = "";
+      try { txt = await resp.text(); } catch (e) {}
+      throw new Error("GET " + url + " -> HTTP " + resp.status + " " + txt);
+    }
+    return resp.json();
+  }
+
+  function getProp(plist, keys) {
+    var pl = toArrayMaybe(plist);
+    for (var k = 0; k < keys.length; k++) {
+      var wanted = keys[k];
+      for (var i = 0; i < pl.length; i++) {
+        var p = pl[i] || {};
+        if (norm(p.key) !== wanted) continue;
+
+        var v = p.value;
+        if (!v) v = p.values;
+        if (Array.isArray(v)) return v.length ? norm(v[0]) : "";
+        return norm(v);
+      }
+    }
+    return "";
+  }
+
+  function usecsToEtString(usecs) {
+    if (!usecs) return "";
+    var ms = Number(usecs) / 1000;
+    if (!Number.isFinite(ms)) return "";
+
+    var dtf = new Intl.DateTimeFormat("en-US", {
+      timeZone: "America/New_York",
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+      hour12: false
+    });
+
+    var parts = dtf.formatToParts(new Date(ms));
+    function pick(t) {
+      for (var i = 0; i < parts.length; i++) {
+        if (parts[i].type === t) return parts[i].value;
+      }
+      return "";
+    }
+
+    return pick("year") + "-" + pick("month") + "-" + pick("day") + " " +
+           pick("hour") + ":" + pick("minute") + ":" + pick("second");
+  }
+
+  var nowMs = Date.now();
+  var startMs = nowMs - (24 * 60 * 60 * 1000);
+  var startUsecs = startMs * 1000;
+  var endUsecs   = nowMs * 1000;
+
+  var commonHeaders = { accept: "application/json", apiKey: apiKey };
+
+  var clusterUrl = baseUrl + "/v2/mcm/cluster-mgmt/info";
+  var clusterData = await getJson(clusterUrl, commonHeaders);
+  var clusters = toArrayMaybe(clusterData && clusterData.cohesityClusters);
+
+  var clusterMeta = {};
+  for (var ci0 = 0; ci0 < clusters.length; ci0++) {
+    var c0 = clusters[ci0] || {};
+    var cid0 = norm(c0.clusterId);
+    if (!cid0) continue;
+    clusterMeta[cid0] = {
+      ClusterName: norm(c0.clusterName),
+      Location: norm(c0.location)
+    };
+  }
+
+  var params = {
+    maxAlerts: MaxAlerts,
+    alertTypes: AlertTypes,
+    startDateUsecs: String(startUsecs),
+    endDateUsecs: String(endUsecs)
+  };
+  if (AlertStates && AlertStates.length) params.alertStates = AlertStates;
+  if (AlertCategories && AlertCategories.length) params.alertCategories = AlertCategories;
+
+  var alertsUrl = baseUrl + "/v2/alerts?" + buildQuery(params);
+
+  var raw = [];
+  var alertsFetched = 0;
+
+  for (var ci = 0; ci < clusters.length; ci++) {
+    var clus = clusters[ci] || {};
+    var clusterId = norm(clus.clusterId);
+    if (!clusterId) continue;
+
+    var meta = clusterMeta[clusterId] || {};
+    var clusterName = meta.ClusterName || norm(clus.clusterName);
+    var location = meta.Location || norm(clus.location);
+
+    var headers = {
+      accept: "application/json",
+      apiKey: apiKey,
+      accessClusterId: clusterId
+    };
+
+    var json;
+    try {
+      json = await getJson(alertsUrl, headers);
+    } catch (e) {
+      continue;
+    }
+
+    var alerts = toArrayMaybe(json && json.alerts);
+    alertsFetched += alerts.length;
+
+    for (var ai = 0; ai < alerts.length; ai++) {
+      var alt = alerts[ai] || {};
+      var latestUsecs = Number(alt.latestTimestampUsecs || 0);
+      if (!latestUsecs) continue;
+      if (latestUsecs < startUsecs || latestUsecs > endUsecs) continue;
+
+      var nodeId = getProp(alt.propertyList, ["node_id", "nodeId"]);
+      var ip = getProp(alt.propertyList, [
+        "node_ip","ip","ipAddress","host_ip",
+        "source_ip","sourceIp","remote_ip","remoteIp"
+      ]);
+
+      raw.push({
+        Location: location,
+        ClusterName: clusterName,
+        ClusterId: clusterId,
+        ClusterNodeId: nodeId,
+        IP: ip,
+        AlertCode: norm(alt.alertCode),
+        Severity: norm(alt.severity),
+        AlertState: norm(alt.alertState),
+        AlertCause: "",
+        LatestTimeET: usecsToEtString(latestUsecs),
+        LatestUsecs: latestUsecs
+      });
+    }
+  }
+
+  // ✅ UPDATED DEDUP KEY (Cluster + NodeId + IP)
+  var latestMap = {};
+  for (var i = 0; i < raw.length; i++) {
+    var r = raw[i];
+    if (!r.ClusterId || !r.ClusterNodeId) continue;
+
+    var key = r.ClusterId + "|" + String(r.ClusterNodeId) + "|" + String(r.IP);
+
+    if (!latestMap[key] || (r.LatestUsecs > latestMap[key].LatestUsecs)) {
+      latestMap[key] = r;
+    }
+  }
+
+  var results = Object.keys(latestMap).map(function (k) { return latestMap[k]; });
+  results.sort(function (a, b) { return (b.LatestUsecs || 0) - (a.LatestUsecs || 0); });
+
+  function toMarkdownTable(rows) {
+    if (!rows || rows.length === 0) {
+      return "✅ No alerts in the last 24 hours.";
+    }
+
+    var cols = ["Location","ClusterName","ClusterId","ClusterNodeId","IP","AlertCode","Severity","AlertState","LatestTimeET"];
+    var header = "| " + cols.join(" | ") + " |";
+    var sep = "| " + cols.map(function () { return "---"; }).join(" | ") + " |";
+
+    var body = rows.map(function (r) {
+      return "| " + cols.map(function (c) { return norm(r[c]); }).join(" | ") + " |";
+    });
+
+    return [header, sep].concat(body).join("\n");
+  }
+
+  return {
+    authMode: authMode,
+    alertsFetched: alertsFetched,
+    rowsAfterWindow: raw.length,
+    resultsCount: results.length,
+    results: results,
+    markdownTable: toMarkdownTable(results)
+  };
+}
