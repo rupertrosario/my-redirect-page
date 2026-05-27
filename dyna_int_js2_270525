@@ -1,0 +1,754 @@
+// ------------------------------------------------------------
+// Dynatrace JS2 | Cohesity Helios Interface DOWN validator
+// GET ONLY | SNOW payload ready
+// TEAM  = ONE INCIDENT PER CLUSTER
+// DC    = ONE INCIDENT PER LOCATION + CLUSTER
+// ------------------------------------------------------------
+
+import { credentialVaultClient as vault } from "@dynatrace-sdk/client-classic-environment-v2";
+import { result as wfResult } from "@dynatrace-sdk/automation-utils";
+
+export default async function () {
+
+  const baseUrl = "https://helios.cohesity.com";
+  const PREDECESSOR_TASK = "get_alerts";
+
+  // ------------------------------------------------
+  // DC Allowlist
+  // ------------------------------------------------
+  const DC_ALLOWLIST_ENABLED = true;
+
+  const DC_ALLOWLIST = [
+    "San Antonio",
+    "Carrollton",
+    "Detroit",
+    "Ashburn"
+  ];
+
+  // ------------------------------------------------
+  // Trigger Codes
+  // ------------------------------------------------
+  const TRIGGER_EXACT_1105  = "CE030601105";
+  const TRIGGER_NUM_1105    = "1105";
+
+  const TRIGGER_EXACT_13023 = "CE02513023";
+  const TRIGGER_NUM_13023   = "13023";
+
+  // ------------------------------------------------
+  // Vault
+  // ------------------------------------------------
+  const vaultName = "Cohesity_API_Key";
+  const vaultId   = "credentials_vault-312312";
+
+  // ------------------------------------------------
+  // Helpers
+  // ------------------------------------------------
+  const norm = (v) =>
+    (v === null || v === undefined)
+      ? ""
+      : String(v).trim();
+
+  const normLoc = (s) =>
+    norm(s).toLowerCase().replace(/\s+/g, " ");
+
+  const slug = (s) =>
+    norm(s)
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, "_")
+      .replace(/^_+|_+$/g, "");
+
+  function isTrigger(code) {
+
+    code = norm(code);
+
+    if (!code) return false;
+
+    if (code === TRIGGER_EXACT_1105)  return true;
+    if (code === TRIGGER_EXACT_13023) return true;
+
+    if (code === TRIGGER_NUM_1105)  return true;
+    if (code === TRIGGER_NUM_13023) return true;
+
+    if (code.includes(TRIGGER_NUM_1105))  return true;
+    if (code.includes(TRIGGER_NUM_13023)) return true;
+
+    return false;
+  }
+
+  function pickIP(r) {
+
+    return norm(
+      r?.IP ||
+      r?.ip ||
+      r?.NodeIP ||
+      r?.nodeIp ||
+      r?.node_ip
+    );
+  }
+
+  function toArray(v) {
+
+    if (Array.isArray(v)) return v;
+
+    if (v?.results) return v.results;
+
+    if (v?.result?.results) return v.result.results;
+
+    return [];
+  }
+
+  async function getJson(url, headers) {
+
+    const resp = await fetch(url, {
+      method: "GET",
+      headers
+    });
+
+    if (!resp.ok) {
+      return null;
+    }
+
+    return resp.json();
+  }
+
+  function indexDetails(details) {
+
+    const map = {};
+
+    const arr = Array.isArray(details)
+      ? details
+      : (details ? [details] : []);
+
+    for (const d of arr) {
+
+      const name = norm(
+        d?.name ||
+        d?.["@name"] ||
+        d?.ifaceName ||
+        d?.interfaceName
+      );
+
+      if (name) {
+        map[name] = d;
+      }
+    }
+
+    return map;
+  }
+
+  function looksDown(v) {
+
+    return norm(v)
+      .toLowerCase()
+      .includes("down");
+  }
+
+  // ------------------------------------------------
+  // Read JS1 Results
+  // ------------------------------------------------
+  let upstream;
+
+  try {
+
+    upstream =
+      await wfResult(PREDECESSOR_TASK);
+
+  } catch (e) {
+
+    return {
+      ok: false,
+      error:
+        `Cannot read result("${PREDECESSOR_TASK}")`,
+      teamIncidents: [],
+      dcIncidents: []
+    };
+  }
+
+  const alertRows =
+    toArray(upstream?.results ?? upstream);
+
+  const interfaceTargets = [];
+
+  const alertCauseByKey = {};
+
+  for (const r of alertRows) {
+
+    const alertCode =
+      norm(r?.AlertCode || r?.alertCode);
+
+    if (!isTrigger(alertCode)) {
+      continue;
+    }
+
+    const clusterId =
+      norm(r?.ClusterId || r?.clusterId);
+
+    const ip =
+      pickIP(r);
+
+    if (!clusterId || !ip) {
+      continue;
+    }
+
+    const clusterName =
+      norm(r?.ClusterName || r?.clusterName);
+
+    const location =
+      norm(r?.Location || r?.location);
+
+    const alertCause =
+      norm(r?.AlertCause || r?.alertCause);
+
+    interfaceTargets.push({
+      ClusterId: clusterId,
+      ClusterName: clusterName,
+      Location: location,
+      IP: ip
+    });
+
+    const key =
+      `${clusterId}|${ip}`;
+
+    if (
+      alertCause &&
+      !alertCauseByKey[key]
+    ) {
+
+      alertCauseByKey[key] =
+        alertCause;
+    }
+  }
+
+  // ------------------------------------------------
+  // No Alerts
+  // ------------------------------------------------
+  if (!interfaceTargets.length) {
+
+    return {
+      ok: true,
+      message:
+        "No trigger alerts found.",
+      downRows: [],
+      teamIncidents: [],
+      dcIncidents: []
+    };
+  }
+
+  // ------------------------------------------------
+  // Group By Cluster
+  // ------------------------------------------------
+  const byCluster = {};
+
+  for (const t of interfaceTargets) {
+
+    const cid =
+      t.ClusterId;
+
+    if (!byCluster[cid]) {
+
+      byCluster[cid] = {
+        ClusterId: cid,
+        ClusterName: t.ClusterName,
+        Location: t.Location,
+        Ips: {}
+      };
+    }
+
+    byCluster[cid]
+      .Ips[t.IP] = true;
+  }
+
+  const clusterIds =
+    Object.keys(byCluster);
+
+  // ------------------------------------------------
+  // API Key
+  // ------------------------------------------------
+  let apiKey = null;
+
+  async function getKeyByName(name) {
+
+    const all =
+      await vault.getCredentials();
+
+    const creds =
+      (all && all.credentials)
+        ? all.credentials
+        : [];
+
+    const found =
+      creds.find(c =>
+        c && c.name === name
+      );
+
+    if (!found) return null;
+
+    const detail =
+      await vault.getCredentialsDetails({
+        id: found.id
+      });
+
+    return (
+      detail &&
+      (detail.token || detail.password)
+    ) || null;
+  }
+
+  try {
+
+    apiKey =
+      await getKeyByName(vaultName);
+
+    if (!apiKey) {
+      throw new Error("not-found");
+    }
+
+  } catch {
+
+    try {
+
+      const d2 =
+        await vault.getCredentialsDetails({
+          id: vaultId
+        });
+
+      apiKey =
+        (d2 &&
+          (
+            d2.token ||
+            d2.password
+          )
+        ) || null;
+
+    } catch {
+
+      return {
+        ok: false,
+        error:
+          "No valid Helios API key available.",
+        teamIncidents: [],
+        dcIncidents: []
+      };
+    }
+  }
+
+  // ------------------------------------------------
+  // Interface API
+  // ------------------------------------------------
+  const ifaceUrl =
+    baseUrl +
+    "/irisservices/api/v1/public/interface" +
+    "?bondInterfaceOnly=true" +
+    "&ifaceGroupAssignedOnly=true" +
+    "&includeUplinkSwitchInfo=true" +
+    "&includeBondSlaveDetails=true";
+
+  const downRows = [];
+
+  // ------------------------------------------------
+  // Validate Interfaces
+  // ------------------------------------------------
+  for (const cid of clusterIds) {
+
+    const entry =
+      byCluster[cid];
+
+    let data;
+
+    try {
+
+      data =
+        await getJson(
+          ifaceUrl,
+          {
+            accept:
+              "application/json",
+            apiKey,
+            accessClusterId:
+              String(cid)
+          }
+        );
+
+    } catch {
+
+      continue;
+    }
+
+    if (!data) continue;
+
+    const nodes =
+      Array.isArray(data)
+        ? data
+        : [data];
+
+    for (const node of nodes) {
+
+      const nodeIp =
+        norm(node?.nodeIp);
+
+      if (!entry.Ips[nodeIp]) {
+        continue;
+      }
+
+      const serial =
+        norm(node?.chassisSerial);
+
+      const ifaces =
+        Array.isArray(node?.interfaces)
+          ? node.interfaces
+          : [];
+
+      for (const bond of ifaces) {
+
+        const slaves =
+          Array.isArray(bond?.bondSlaves)
+            ? bond.bondSlaves
+            : (
+                bond?.bondSlaves
+                  ? [bond.bondSlaves]
+                  : []
+              );
+
+        const dmap =
+          indexDetails(
+            bond?.bondSlavesDetails
+          );
+
+        for (const s of slaves) {
+
+          const slaveName = norm(
+            typeof s === "string"
+              ? s
+              : (
+                  s?.name ||
+                  s?.["@name"]
+                )
+          );
+
+          if (!slaveName) {
+            continue;
+          }
+
+          const d =
+            dmap[slaveName] || {};
+
+          const linkState =
+            norm(
+              d.linkState ||
+              d.state ||
+              d.status
+            );
+
+          if (!looksDown(linkState)) {
+            continue;
+          }
+
+          const mac =
+            norm(
+              d.macAddr ||
+              d.mac ||
+              d.mac_address
+            );
+
+          const causeKey =
+            `${cid}|${nodeIp}`;
+
+          const alertCause =
+            alertCauseByKey[causeKey] || "";
+
+          if (
+            downRows.some(r =>
+              r.ClusterId === String(cid) &&
+              r.IP === nodeIp &&
+              r.BondSlave === slaveName
+            )
+          ) {
+            continue;
+          }
+
+          downRows.push({
+
+            Location:
+              entry.Location,
+
+            ClusterName:
+              entry.ClusterName,
+
+            ClusterId:
+              String(cid),
+
+            IP:
+              nodeIp,
+
+            Serial:
+              serial,
+
+            MAC:
+              mac,
+
+            BondSlave:
+              slaveName,
+
+            AlertCause:
+              alertCause
+          });
+        }
+      }
+    }
+  }
+
+  // ------------------------------------------------
+  // No Down Interfaces
+  // ------------------------------------------------
+  if (!downRows.length) {
+
+    return {
+      ok: true,
+      message:
+        "No confirmed DOWN interfaces found.",
+      downRows: [],
+      teamIncidents: [],
+      dcIncidents: []
+    };
+  }
+
+  // ------------------------------------------------
+  // SNOW Formatting
+  // ------------------------------------------------
+  function shortLine(r) {
+
+    return (
+      "Cohesity Interface DOWN | " +
+      r.ClusterName +
+      " | IP: " + r.IP +
+      " | Interface: " + r.BondSlave
+    );
+  }
+
+  function fullLine(r) {
+
+    const lines = [];
+
+    lines.push(
+      "Cluster Name : " +
+      r.ClusterName
+    );
+
+    lines.push(
+      "Cluster ID   : " +
+      r.ClusterId
+    );
+
+    lines.push(
+      "Node IP      : " +
+      r.IP
+    );
+
+    lines.push(
+      "Interface    : " +
+      r.BondSlave
+    );
+
+    lines.push(
+      "MAC Address  : " +
+      r.MAC
+    );
+
+    lines.push(
+      "Serial No    : " +
+      r.Serial
+    );
+
+    if (r.Location) {
+
+      lines.push(
+        "Location     : " +
+        r.Location
+      );
+    }
+
+    if (r.AlertCause) {
+
+      lines.push(
+        "Alert Summary: " +
+        r.AlertCause
+      );
+    }
+
+    return lines.join("\n");
+  }
+
+  // ------------------------------------------------
+  // TEAM INCIDENTS
+  // ------------------------------------------------
+  const teamClusterMap = {};
+
+  for (const r of downRows) {
+
+    const cluster =
+      r.ClusterName || "Unknown";
+
+    if (!teamClusterMap[cluster]) {
+
+      teamClusterMap[cluster] = [];
+    }
+
+    teamClusterMap[cluster].push(r);
+  }
+
+  const teamIncidents = [];
+
+  for (const clusterName of Object.keys(teamClusterMap)) {
+
+    const rows =
+      teamClusterMap[clusterName];
+
+    const first =
+      rows[0];
+
+    const fingerprint =
+      rows
+        .map(r =>
+          r.IP + "|" + r.BondSlave
+        )
+        .sort()
+        .join(",");
+
+    teamIncidents.push({
+
+      cluster:
+        clusterName,
+
+      correlation_id:
+        "cohesity_ifdown|" +
+        "Cluster: " +
+        clusterName,
+
+      fingerprint:
+        fingerprint,
+
+      short_description:
+        shortLine(first),
+
+      description:
+        rows
+          .map(fullLine)
+          .join(
+            "\n\n--------------------------------\n\n"
+          ) +
+        "\n\nFingerprint:\n" +
+        fingerprint
+    });
+  }
+
+  // ------------------------------------------------
+  // DC INCIDENTS
+  // ------------------------------------------------
+  const allowSet =
+    new Set(
+      DC_ALLOWLIST.map(normLoc)
+    );
+
+  const dcByLocCluster = {};
+
+  for (const r of downRows) {
+
+    const loc =
+      norm(r.Location) || "Unknown";
+
+    const cluster =
+      norm(r.ClusterName) || "Unknown";
+
+    const allowed =
+      !DC_ALLOWLIST_ENABLED ||
+      allowSet.has(normLoc(loc));
+
+    if (!allowed) {
+      continue;
+    }
+
+    const key =
+      loc + "|" + cluster;
+
+    if (!dcByLocCluster[key]) {
+
+      dcByLocCluster[key] = [];
+    }
+
+    dcByLocCluster[key].push(r);
+  }
+
+  const dcIncidents = [];
+
+  for (const key of Object.keys(dcByLocCluster)) {
+
+    const rows =
+      dcByLocCluster[key];
+
+    const first =
+      rows[0];
+
+    const loc =
+      first.Location;
+
+    const cluster =
+      first.ClusterName;
+
+    const fingerprint =
+      rows
+        .map(r =>
+          r.IP + "|" + r.BondSlave
+        )
+        .sort()
+        .join(",");
+
+    dcIncidents.push({
+
+      location:
+        loc,
+
+      cluster:
+        cluster,
+
+      correlation_id:
+        "cohesity_ifdown_dc|" +
+        "Location: " + loc + "|" +
+        "Cluster: " + cluster,
+
+      fingerprint:
+        fingerprint,
+
+      short_description:
+        shortLine(first),
+
+      description:
+        rows
+          .map(fullLine)
+          .join(
+            "\n\n--------------------------------\n\n"
+          ) +
+        "\n\nFingerprint:\n" +
+        fingerprint
+    });
+  }
+
+  // ------------------------------------------------
+  // Return
+  // ------------------------------------------------
+  return {
+
+    ok: true,
+
+    downRows,
+
+    teamIncidents,
+
+    dcIncidents,
+
+    dcAllowlistEnabled:
+      DC_ALLOWLIST_ENABLED,
+
+    dcAllowlist:
+      DC_ALLOWLIST
+  };
+}
