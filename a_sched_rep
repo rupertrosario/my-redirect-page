@@ -11,7 +11,537 @@ $ErrorActionPreference = "Stop"
 $BaseUrl    = "https://helios.cohesity.com/heliosreporting/api/v1"
 $ApiKeyFile = "X:\PowerShell\Cohesity_API_Scripts\DO_NOT_Delete\apikey.txt"
 
+$OutputDir  = "X:\PowerShell\Data\Cohesity\Reports\Schedules"# =====================================================================
+# Cohesity Helios Reporting - Scheduled Reports Inventory
+# GET ONLY
+# =====================================================================
+
+$ErrorActionPreference = "Stop"
+
+# -----------------------------
+# Config
+# -----------------------------
+$BaseUrl    = "https://helios.cohesity.com/heliosreporting/api/v1"
+$ApiKeyFile = "X:\PowerShell\Cohesity_API_Scripts\DO_NOT_Delete\apikey.txt"
+
 $OutputDir  = "X:\PowerShell\Data\Cohesity\Reports\Schedules"
+$TimeStamp  = Get-Date -Format "yyyyMMdd_HHmmss"
+
+$CsvOutput  = Join-Path $OutputDir "Helios_Report_Schedules_$TimeStamp.csv"
+$JsonOutput = Join-Path $OutputDir "Helios_Report_Schedules_RAW_$TimeStamp.json"
+
+# Optional filters
+$State = ""                       # Active / Inactive / blank for all
+$IncludeLatestTaskInfo = $true
+
+$ScheduleIds = @()
+$ReportIds   = @()
+$EmailIds    = @()
+
+$DisplayTimeZoneId = "Eastern Standard Time"
+
+# -----------------------------
+# TLS
+# -----------------------------
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
+# -----------------------------
+# Helpers
+# -----------------------------
+function Join-Values {
+    param(
+        [object]$Value,
+        [string]$Separator = ","
+    )
+
+    if ($null -eq $Value) { return "" }
+
+    $items = @($Value) | Where-Object {
+        $null -ne $_ -and "$_".Trim() -ne ""
+    } | ForEach-Object {
+        "$_".Trim()
+    }
+
+    return ($items -join $Separator)
+}
+
+function Get-ArrayCount {
+    param([object]$Value)
+
+    if ($null -eq $Value) { return 0 }
+
+    return @($Value).Count
+}
+
+function Convert-UsecsToDisplayTime {
+    param(
+        [object]$Usecs,
+        [string]$TimeZoneId
+    )
+
+    if ($null -eq $Usecs -or "$Usecs".Trim() -eq "") { return "" }
+
+    [int64]$u = 0
+    if (-not [int64]::TryParse("$Usecs", [ref]$u)) { return "" }
+    if ($u -le 0) { return "" }
+
+    try {
+        $epochUtc = [datetime]::SpecifyKind(
+            [datetime]"1970-01-01T00:00:00Z",
+            [System.DateTimeKind]::Utc
+        )
+
+        $utcTime = $epochUtc.AddMilliseconds([double]$u / 1000)
+
+        try {
+            $tz = [System.TimeZoneInfo]::FindSystemTimeZoneById($TimeZoneId)
+            $localTime = [System.TimeZoneInfo]::ConvertTimeFromUtc($utcTime, $tz)
+            return $localTime.ToString("yyyy-MM-dd HH:mm:ss")
+        }
+        catch {
+            return $utcTime.ToString("yyyy-MM-dd HH:mm:ss")
+        }
+    }
+    catch {
+        return ""
+    }
+}
+
+function Get-ScheduleTime {
+    param([object]$ScheduleTime)
+
+    if ($null -eq $ScheduleTime -or $null -eq $ScheduleTime.minutesOfDay) {
+        return ""
+    }
+
+    $minutes = @($ScheduleTime.minutesOfDay)[0]
+
+    if ($null -eq $minutes) {
+        return ""
+    }
+
+    [int]$m = $minutes
+    $hour = [math]::Floor($m / 60)
+    $min  = $m % 60
+
+    return ("{0:00}:{1:00}" -f $hour, $min)
+}
+
+function Get-DaysOfWeekText {
+    param([object]$DaysOfWeek)
+
+    if ($null -eq $DaysOfWeek) { return "" }
+
+    $map = @{
+        0 = "Sun"
+        1 = "Mon"
+        2 = "Tue"
+        3 = "Wed"
+        4 = "Thu"
+        5 = "Fri"
+        6 = "Sat"
+    }
+
+    $result = foreach ($d in @($DaysOfWeek)) {
+        [int]$i = $d
+
+        if ($map.ContainsKey($i)) {
+            $map[$i]
+        }
+        else {
+            "$d"
+        }
+    }
+
+    return ($result -join ",")
+}
+
+function Get-DaysOfMonthText {
+    param([object]$DaysOfMonth)
+
+    if ($null -eq $DaysOfMonth) { return "" }
+
+    $result = foreach ($d in @($DaysOfMonth)) {
+        if ([int]$d -eq -1) {
+            "LastDay"
+        }
+        else {
+            "$d"
+        }
+    }
+
+    return ($result -join ",")
+}
+
+function Get-Frequency {
+    param([object]$ScheduleTime)
+
+    if ($null -eq $ScheduleTime) { return "Unknown" }
+
+    $dow = @($ScheduleTime.daysOfWeek  | Where-Object { $null -ne $_ })
+    $dom = @($ScheduleTime.daysOfMonth | Where-Object { $null -ne $_ })
+
+    if ($dow.Count -eq 0 -and $dom.Count -eq 0) {
+        return "Daily"
+    }
+
+    if ($dow.Count -gt 0 -and $dom.Count -eq 0) {
+        return "Weekly"
+    }
+
+    if ($dom.Count -gt 0 -and $dow.Count -eq 0) {
+        return "Monthly"
+    }
+
+    return "Custom"
+}
+
+function Get-Timezone {
+    param([object]$ScheduleTime)
+
+    if ($null -eq $ScheduleTime) { return "" }
+
+    if (-not [string]::IsNullOrWhiteSpace("$($ScheduleTime.userTimezone)")) {
+        return "$($ScheduleTime.userTimezone)"
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace("$($ScheduleTime.timezone)")) {
+        return "$($ScheduleTime.timezone)"
+    }
+
+    return "UTC"
+}
+
+function Get-FilterLabelsOnly {
+    param([object]$Filters)
+
+    if ($null -eq $Filters) { return "" }
+
+    $labels = foreach ($f in @($Filters)) {
+        if ($null -eq $f) { continue }
+
+        if ($f.inFilterParams -and $f.inFilterParams.attributeLabels) {
+            @($f.inFilterParams.attributeLabels) | Where-Object {
+                $null -ne $_ -and "$_".Trim() -ne ""
+            }
+        }
+
+        if ($f.systemsFilterParams -and $f.systemsFilterParams.systemNames) {
+            @($f.systemsFilterParams.systemNames) | Where-Object {
+                $null -ne $_ -and "$_".Trim() -ne ""
+            }
+        }
+
+        if ($f.tenantsFilterParams -and $f.tenantsFilterParams.tenantNames) {
+            @($f.tenantsFilterParams.tenantNames) | Where-Object {
+                $null -ne $_ -and "$_".Trim() -ne ""
+            }
+        }
+    }
+
+    $uniqueLabels = @($labels | Sort-Object -Unique)
+
+    return ($uniqueLabels -join ",")
+}
+
+function Add-QueryParam {
+    param(
+        [System.Collections.Generic.List[string]]$QueryParts,
+        [string]$Name,
+        [object]$Value
+    )
+
+    if ($null -eq $Value) { return }
+
+    if ($Value -is [array]) {
+        if ($Value.Count -eq 0) { return }
+
+        $encodedItems = foreach ($item in $Value) {
+            [uri]::EscapeDataString("$item")
+        }
+
+        $encodedValue = ($encodedItems -join ",")
+    }
+    else {
+        if ([string]::IsNullOrWhiteSpace("$Value")) { return }
+
+        $encodedValue = [uri]::EscapeDataString("$Value")
+    }
+
+    $QueryParts.Add("$Name=$encodedValue")
+}
+
+function Get-HttpErrorBody {
+    param([object]$ErrorRecord)
+
+    try {
+        if ($ErrorRecord.Exception.Response) {
+            $stream = $ErrorRecord.Exception.Response.GetResponseStream()
+            if ($stream) {
+                $reader = New-Object System.IO.StreamReader($stream)
+                return $reader.ReadToEnd()
+            }
+        }
+    }
+    catch {
+        return ""
+    }
+
+    return ""
+}
+
+function Get-HttpStatusCode {
+    param([object]$ErrorRecord)
+
+    try {
+        if ($ErrorRecord.Exception.Response) {
+            return [int]$ErrorRecord.Exception.Response.StatusCode
+        }
+    }
+    catch {
+        return ""
+    }
+
+    return ""
+}
+
+# -----------------------------
+# Validate API Key
+# -----------------------------
+if (-not (Test-Path $ApiKeyFile)) {
+    throw "API key file not found: $ApiKeyFile"
+}
+
+try {
+    $ApiKey = (Get-Content -Path $ApiKeyFile -Raw).Trim()
+}
+catch {
+    throw "Unable to read API key file: $ApiKeyFile. Error: $($_.Exception.Message)"
+}
+
+if ([string]::IsNullOrWhiteSpace($ApiKey)) {
+    throw "API key file is empty: $ApiKeyFile"
+}
+
+# -----------------------------
+# Prepare Output Folder
+# -----------------------------
+try {
+    if (-not (Test-Path $OutputDir)) {
+        New-Item -Path $OutputDir -ItemType Directory -Force | Out-Null
+    }
+}
+catch {
+    throw "Unable to create or access output folder: $OutputDir. Error: $($_.Exception.Message)"
+}
+
+# -----------------------------
+# Build GET URL
+# -----------------------------
+$queryParts = New-Object "System.Collections.Generic.List[string]"
+
+Add-QueryParam -QueryParts $queryParts -Name "includeLatestTaskInfo" -Value ($IncludeLatestTaskInfo.ToString().ToLower())
+
+if (-not [string]::IsNullOrWhiteSpace($State)) {
+    Add-QueryParam -QueryParts $queryParts -Name "state" -Value $State
+}
+
+Add-QueryParam -QueryParts $queryParts -Name "ids"       -Value $ScheduleIds
+Add-QueryParam -QueryParts $queryParts -Name "reportIds" -Value $ReportIds
+Add-QueryParam -QueryParts $queryParts -Name "emailIds"  -Value $EmailIds
+
+$Uri = "$BaseUrl/public/schedules"
+
+if ($queryParts.Count -gt 0) {
+    $Uri = "$Uri`?$($queryParts -join '&')"
+}
+
+$Headers = @{
+    "accept" = "application/json"
+    "apiKey" = $ApiKey
+}
+
+# -----------------------------
+# API Call - GET ONLY
+# -----------------------------
+Write-Host ""
+Write-Host "Calling Helios Reporting schedules API..." -ForegroundColor Cyan
+Write-Host "Method : GET"
+Write-Host "URI    : $Uri"
+Write-Host ""
+
+try {
+    $response = Invoke-WebRequest `
+        -Method Get `
+        -Uri $Uri `
+        -Headers $Headers `
+        -UseBasicParsing
+
+    if ($null -eq $response -or [string]::IsNullOrWhiteSpace($response.Content)) {
+        throw "API returned an empty response."
+    }
+
+    $rawJson = $response.Content
+}
+catch {
+    $statusCode = Get-HttpStatusCode -ErrorRecord $_
+    $body       = Get-HttpErrorBody -ErrorRecord $_
+
+    Write-Host ""
+    Write-Host "API call failed." -ForegroundColor Red
+    Write-Host "Method : GET" -ForegroundColor Red
+    Write-Host "URI    : $Uri" -ForegroundColor Red
+
+    if ($statusCode) {
+        Write-Host "Status : $statusCode" -ForegroundColor Red
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($body)) {
+        Write-Host ""
+        Write-Host "Response Body:" -ForegroundColor Red
+        Write-Host $body -ForegroundColor Red
+    }
+    else {
+        Write-Host "Error  : $($_.Exception.Message)" -ForegroundColor Red
+    }
+
+    throw
+}
+
+# -----------------------------
+# Parse JSON
+# -----------------------------
+try {
+    $json = $rawJson | ConvertFrom-Json
+}
+catch {
+    Write-Host ""
+    Write-Host "JSON parse failed. Raw response saved for review." -ForegroundColor Red
+
+    try {
+        $rawJson | Out-File -FilePath $JsonOutput -Encoding UTF8
+        Write-Host "Raw JSON Output: $JsonOutput" -ForegroundColor Yellow
+    }
+    catch {
+        Write-Host "Unable to save raw response: $($_.Exception.Message)" -ForegroundColor Red
+    }
+
+    throw "Unable to parse API response as JSON. Error: $($_.Exception.Message)"
+}
+
+# -----------------------------
+# Validate Response Shape
+# -----------------------------
+if ($null -eq $json.schedules) {
+    Write-Host ""
+    Write-Host "API response does not contain 'schedules'. Raw JSON will be saved." -ForegroundColor Yellow
+}
+
+# -----------------------------
+# Save Raw JSON After Successful Parse
+# -----------------------------
+try {
+    $rawJson | Out-File -FilePath $JsonOutput -Encoding UTF8
+}
+catch {
+    throw "Unable to write raw JSON output: $JsonOutput. Error: $($_.Exception.Message)"
+}
+
+# -----------------------------
+# Flatten Response
+# -----------------------------
+$schedules = @($json.schedules | Where-Object { $null -ne $_ })
+
+$rows = foreach ($s in $schedules) {
+
+    $task = $s.latestTask
+
+    [pscustomobject]@{
+        Name             = "$($s.name)"
+        State            = "$($s.state)"
+        Frequency        = Get-Frequency -ScheduleTime $s.scheduleTime
+        ScheduleTime     = Get-ScheduleTime -ScheduleTime $s.scheduleTime
+        DaysOfWeek       = Get-DaysOfWeekText -DaysOfWeek $s.scheduleTime.daysOfWeek
+        DaysOfMonth      = Get-DaysOfMonthText -DaysOfMonth $s.scheduleTime.daysOfMonth
+        Timezone         = Get-Timezone -ScheduleTime $s.scheduleTime
+
+        ReportFormat     = Join-Values $s.reportFormat
+        RecipientCount   = Get-ArrayCount $s.emailIds
+        EmailIds         = Join-Values $s.emailIds
+        EmailSubject     = "$($s.emailSubject)"
+
+        LatestTaskStatus = "$($task.status)"
+
+        LastQueuedET     = Convert-UsecsToDisplayTime -Usecs $s.lastQueuedTimeUsecs -TimeZoneId $DisplayTimeZoneId
+        CreatedET        = Convert-UsecsToDisplayTime -Usecs $s.createdTimeUsecs    -TimeZoneId $DisplayTimeZoneId
+        UpdatedET        = Convert-UsecsToDisplayTime -Usecs $s.updatedTimeUsecs    -TimeZoneId $DisplayTimeZoneId
+
+        ReportId         = "$($s.reportId)"
+        Filters          = Get-FilterLabelsOnly -Filters $s.filters
+    }
+}
+
+$rows = @($rows | Sort-Object State, Name)
+
+# -----------------------------
+# Export CSV
+# -----------------------------
+try {
+    $rows | Export-Csv -Path $CsvOutput -NoTypeInformation -Encoding UTF8
+}
+catch {
+    throw "CSV export failed: $CsvOutput. Error: $($_.Exception.Message)"
+}
+
+# -----------------------------
+# Screen Output
+# -----------------------------
+$runTimeEt = Convert-UsecsToDisplayTime `
+    -Usecs ([int64](([DateTimeOffset](Get-Date)).ToUnixTimeMilliseconds() * 1000)) `
+    -TimeZoneId $DisplayTimeZoneId
+
+$activeCount   = @($rows | Where-Object { $_.State -eq "Active" }).Count
+$inactiveCount = @($rows | Where-Object { $_.State -eq "Inactive" }).Count
+
+Write-Host ""
+Write-Host "Cohesity Helios Reporting Schedules" -ForegroundColor Cyan
+Write-Host "API      : GET $BaseUrl/public/schedules"
+Write-Host "Run Time : $runTimeEt ET"
+Write-Host "Latest Task Included : $IncludeLatestTaskInfo"
+Write-Host ""
+
+Write-Host "Total Schedules : $($rows.Count)"
+Write-Host "Active          : $activeCount"
+Write-Host "Inactive        : $inactiveCount"
+Write-Host ""
+
+if ($rows.Count -eq 0) {
+    Write-Host "No schedules found." -ForegroundColor Yellow
+}
+else {
+    $rows |
+        Select-Object `
+            Name,
+            State,
+            Frequency,
+            ScheduleTime,
+            Timezone,
+            ReportFormat,
+            RecipientCount,
+            LatestTaskStatus,
+            LastQueuedET,
+            Filters |
+        Format-Table -AutoSize
+}
+
+Write-Host ""
+Write-Host "CSV Output:" -ForegroundColor Green
+Write-Host $CsvOutput
+
+Write-Host ""
+Write-Host "Raw JSON Output:" -ForegroundColor Green
+Write-Host $JsonOutput
+Write-Host ""
 $TimeStamp  = Get-Date -Format "yyyyMMdd_HHmmss"
 
 $CsvOutput  = Join-Path $OutputDir "Helios_Report_Schedules_$TimeStamp.csv"
