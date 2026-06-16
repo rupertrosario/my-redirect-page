@@ -3,22 +3,16 @@
 // Task name: dtsk_bkp_status
 // Previous task name: dtsk_snow_search
 //
-// Purpose:
-// - Read DTSKs from ServiceNow search output
-// - Use global Cohesity object search to identify the clusterId
-// - Use old protected-objects search only against that cluster
-// - Avoid searching all clusters
-// - Use protected-objects result for reliable backup date/time evidence
-// - Return rowsToUpdate only where backup evidence is found
+// Logic:
+// 1. Read DTSKs from dtsk_snow_search
+// 2. Use /v2/data-protect/search/objects?count=1 to identify clusterId
+// 3. Use /v2/data-protect/search/protected-objects only on that cluster
+// 4. Use protected-objects result for backup snapshot/date evidence
+// 5. Normalize backup status: Done / Succeeded / kSucceeded => Succeeded
+// 6. Do not show Selected Cluster or Cluster ID in email/work_notes
+// 7. Do not use server/object name as Protection Group fallback
 //
 // Cohesity calls: GET only
-//
-// Step 1:
-// GET /v2/data-protect/search/objects?searchString=<CI_NAME>&includeTenants=true&count=1
-//
-// Step 2:
-// GET /v2/data-protect/search/protected-objects?searchString=<CI_NAME>
-// Header: accessClusterId=<clusterId from Step 1>
 // ==========================================================
 
 import { result } from "@dynatrace-sdk/automation-utils";
@@ -271,6 +265,55 @@ export default async function () {
     return formatDate(new Date(millis));
   }
 
+  function normalizeBackupStatus(status) {
+    const s = String(status || "").trim();
+
+    if (!s) return "N/A";
+
+    const lower = s.toLowerCase().replace(/\s+/g, "");
+
+    if (
+      lower === "done" ||
+      lower === "success" ||
+      lower === "succeeded" ||
+      lower === "ksuccess" ||
+      lower === "ksucceeded"
+    ) {
+      return "Succeeded";
+    }
+
+    if (
+      lower === "failed" ||
+      lower === "failure" ||
+      lower === "kfailed" ||
+      lower === "kfailure"
+    ) {
+      return "Failed";
+    }
+
+    if (
+      lower === "running" ||
+      lower === "krunning" ||
+      lower === "inprogress" ||
+      lower === "in_progress"
+    ) {
+      return "Running";
+    }
+
+    if (
+      lower === "warning" ||
+      lower === "kwarning" ||
+      lower === "succeededwithwarning" ||
+      lower === "succeededwithwarnings" ||
+      lower === "ksucceededwithwarning" ||
+      lower === "ksucceededwithwarnings"
+    ) {
+      return "SucceededWithWarning";
+    }
+
+    return s.replace(/^k/, "");
+  }
+
   function getSlaInfo(createdOnRaw) {
     const createdDate = parseDateUtc(createdOnRaw);
 
@@ -320,8 +363,6 @@ export default async function () {
       };
     }
 
-    // PowerShell equivalent:
-    // $object = $json.objects | Select-Object -First 1
     const object = firstOrSelf(json.objects);
 
     if (!object) {
@@ -332,8 +373,6 @@ export default async function () {
       };
     }
 
-    // PowerShell equivalent:
-    // $protectionInfo = $object.objectProtectionInfos | Select-Object -First 1
     const protectionInfo = firstOrSelf(object.objectProtectionInfos);
 
     if (!protectionInfo) {
@@ -344,8 +383,6 @@ export default async function () {
       };
     }
 
-    // PowerShell equivalent:
-    // $protectionGroup = $protectionInfo.protectionGroups | Select-Object -First 1
     const protectionGroup = firstOrSelf(protectionInfo.protectionGroups);
 
     return {
@@ -406,22 +443,23 @@ export default async function () {
     ) || "N/A";
   }
 
-  function getProtectionGroupNameFromGlobalSearch(object, protectionGroup) {
+  function getProtectionGroupNameFromGlobalSearch(protectionGroup) {
     return firstNonBlank(
       protectionGroup?.name,
       protectionGroup?.protectionGroupName,
-      protectionGroup?.policyName,
-      object?.name
+      protectionGroup?.policyName
     ) || "N/A";
   }
 
   function getBackupRunStatusFromGlobalSearch(protectionGroup) {
-    return firstNonBlank(
+    const rawStatus = firstNonBlank(
       protectionGroup?.lastBackupRunStatus,
       protectionGroup?.backupRunStatus,
       protectionGroup?.lastRunStatus,
       protectionGroup?.status
     ) || "N/A";
+
+    return normalizeBackupStatus(rawStatus);
   }
 
   // ========================================================
@@ -536,7 +574,7 @@ export default async function () {
   }
 
   function getProtectedBackupStatus(object, snapshot, backupUsecs, fallbackStatus) {
-    return firstNonBlank(
+    const rawStatus = firstNonBlank(
       snapshot?.status,
       snapshot?.runStatus,
       snapshot?.protectionRunStatus,
@@ -546,8 +584,10 @@ export default async function () {
       object?.lastRunStatus,
       object?.backupStatus,
       fallbackStatus,
-      backupUsecs ? "BackedUp" : ""
+      backupUsecs ? "Succeeded" : ""
     ) || "N/A";
+
+    return normalizeBackupStatus(rawStatus);
   }
 
   // ========================================================
@@ -558,8 +598,6 @@ export default async function () {
       "Cohesity backup validation completed.\n" +
       "CI Name: " + row.ciName + "\n" +
       "Protection Group: " + row.protectionGroup + "\n" +
-      "Selected Cluster: " + row.cluster + "\n" +
-      "Cluster ID: " + row.clusterId + "\n" +
       "Backup Status: " + row.latestBackupStatus + "\n" +
       "Latest Backup Date: " + row.latestBackupDate + "\n" +
       "Validation Result: " + row.result
@@ -636,7 +674,6 @@ export default async function () {
     );
 
     const fallbackPgName = getProtectionGroupNameFromGlobalSearch(
-      globalDetail.object,
       globalDetail.protectionGroup
     );
 
@@ -653,13 +690,7 @@ export default async function () {
       clusterId: clusterId || "N/A",
       clusterName: clusterName || "N/A",
       fallbackPgName,
-      fallbackStatus,
-      objectProtectionInfosKeys: globalDetail.protectionInfo
-        ? Object.keys(globalDetail.protectionInfo)
-        : [],
-      protectionGroupKeys: globalDetail.protectionGroup
-        ? Object.keys(globalDetail.protectionGroup)
-        : []
+      fallbackStatus
     }, null, 2));
 
     if (!globalDetail.object) {
@@ -687,7 +718,7 @@ export default async function () {
     }
 
     // ------------------------------------------------------
-    // STEP 2: Use old protected-objects endpoint on identified cluster only
+    // STEP 2: Use protected-objects endpoint on identified cluster only
     // ------------------------------------------------------
     const protectedJson = await searchProtectedObjectsInCluster(ciName, clusterId);
 
@@ -971,8 +1002,8 @@ export default async function () {
   markdown += "\n";
 
   markdown += "## Decommission DTSK Backup Validation - Task Status and Backup Evidence\n\n";
-  markdown += "| Decom Request | DTSK | CI Name | Assigned To | Assignment Action | Created On | SLA Due | SLA Status | Selected Cluster | Cluster ID | Protection Group | Backup Status | Latest Backup Date | Result |\n";
-  markdown += "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|\n";
+  markdown += "| Decom Request | DTSK | CI Name | Assigned To | Assignment Action | Created On | SLA Due | SLA Status | Protection Group | Backup Status | Latest Backup Date | Result |\n";
+  markdown += "|---|---|---|---|---|---|---|---|---|---|---|---|\n";
 
   for (const r of results) {
     markdown +=
@@ -984,8 +1015,6 @@ export default async function () {
       `| ${escapeMd(r.createdOn)} ` +
       `| ${escapeMd(r.slaDue)} ` +
       `| ${escapeMd(r.slaStatus)} ` +
-      `| ${escapeMd(r.cluster)} ` +
-      `| ${escapeMd(r.clusterId)} ` +
       `| ${escapeMd(r.protectionGroup)} ` +
       `| ${escapeMd(r.latestBackupStatus)} ` +
       `| ${escapeMd(r.latestBackupDate)} ` +
@@ -1000,7 +1029,6 @@ export default async function () {
   markdown += "| Cluster Identified / No Protected Object Found | ClusterId was found, but protected-objects did not return the CI in that cluster. |\n";
   markdown += "| Protected Object Found / No Backup Snapshot | Protected object exists, but no latest snapshot timestamp was returned. |\n";
   markdown += "| NoObject | CI was not found in Cohesity global object search. |\n";
-  markdown += "| Selected Cluster | Cluster/source identified from global search before running protected-objects. |\n";
   markdown += "| Please assign | DTSK has no assigned_to value. |\n";
   markdown += "| SLA Breached | DTSK age is greater than 2 days from created date. |\n";
 
