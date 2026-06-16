@@ -5,17 +5,20 @@
 //
 // Purpose:
 // - Read DTSKs from ServiceNow search output
-// - Search each DTSK CI in Cohesity using global Helios object search
-// - Use count=1 to reduce search result size
-// - Handle objects / objectProtectionInfos / protectionGroups as object OR array
-// - Use first available object/protectionInfo/protectionGroup only
-// - Use lastSuccessfulRunStartTimeUsecs as backup evidence
-// - Build email markdown report
-// - Return rowsToUpdate only for DTSKs where successful backup is found
+// - Use global Cohesity object search to identify the clusterId
+// - Use old protected-objects search only against that cluster
+// - Avoid searching all clusters
+// - Use protected-objects result for reliable backup date/time evidence
+// - Return rowsToUpdate only where backup evidence is found
 //
 // Cohesity calls: GET only
-// Endpoint:
+//
+// Step 1:
 // GET /v2/data-protect/search/objects?searchString=<CI_NAME>&includeTenants=true&count=1
+//
+// Step 2:
+// GET /v2/data-protect/search/protected-objects?searchString=<CI_NAME>
+// Header: accessClusterId=<clusterId from Step 1>
 // ==========================================================
 
 import { result } from "@dynatrace-sdk/automation-utils";
@@ -122,25 +125,42 @@ export default async function () {
     }
   }
 
-  function normalizeValue(value) {
+  function toText(value) {
     if (value === null || value === undefined) return "";
 
-    if (typeof value === "string") return value.trim();
-
-    if (typeof value === "number" || typeof value === "boolean") {
-      return String(value).trim();
+    if (Array.isArray(value)) {
+      for (const item of value) {
+        const text = toText(item);
+        if (text) return text;
+      }
+      return "";
     }
 
     if (typeof value === "object") {
-      return String(
-        value.display_value ||
-        value.name ||
-        value.value ||
-        ""
-      ).trim();
+      const candidates = [
+        value.id,
+        value.clusterId,
+        value.clusterID,
+        value.intId,
+        value.value,
+        value.name,
+        value.displayName,
+        value.display_value
+      ];
+
+      for (const c of candidates) {
+        const text = toText(c);
+        if (text) return text;
+      }
+
+      return "";
     }
 
-    return "";
+    return String(value).trim();
+  }
+
+  function normalizeValue(value) {
+    return toText(value);
   }
 
   function getField(row, fieldName) {
@@ -163,29 +183,11 @@ export default async function () {
 
   function firstNonBlank(...values) {
     for (const v of values) {
-      const s = String(v || "").trim();
+      const s = toText(v);
       if (s) return s;
     }
 
     return "";
-  }
-
-  function isBadCiName(value) {
-    const ci = String(value || "").trim();
-
-    if (!ci) return true;
-    if (ci.toUpperCase() === "N/A") return true;
-    if (/^https?:\/\//i.test(ci)) return true;
-    if (/^[0-9a-f]{32}$/i.test(ci)) return true;
-
-    return false;
-  }
-
-  function escapeMd(value) {
-    return String(value ?? "N/A")
-      .replace(/\|/g, "\\|")
-      .replace(/\r?\n/g, " ")
-      .trim() || "N/A";
   }
 
   function firstValue(value) {
@@ -206,6 +208,24 @@ export default async function () {
     }
 
     return value;
+  }
+
+  function isBadCiName(value) {
+    const ci = String(value || "").trim();
+
+    if (!ci) return true;
+    if (ci.toUpperCase() === "N/A") return true;
+    if (/^https?:\/\//i.test(ci)) return true;
+    if (/^[0-9a-f]{32}$/i.test(ci)) return true;
+
+    return false;
+  }
+
+  function escapeMd(value) {
+    return String(value ?? "N/A")
+      .replace(/\|/g, "\\|")
+      .replace(/\r?\n/g, " ")
+      .trim() || "N/A";
   }
 
   function parseDateUtc(value) {
@@ -289,9 +309,9 @@ export default async function () {
   }
 
   // ========================================================
-  // COHESITY RESPONSE HELPERS
+  // STEP 1: GLOBAL OBJECT SEARCH HELPERS
   // ========================================================
-  function getStrictFirstBackupDetail(json) {
+  function getFirstGlobalSearchDetail(json) {
     if (!json || json.__error) {
       return {
         object: null,
@@ -300,9 +320,8 @@ export default async function () {
       };
     }
 
-    // count=1 may still return:
-    // json.objects as object
-    // OR json.objects as array with one object
+    // PowerShell equivalent:
+    // $object = $json.objects | Select-Object -First 1
     const object = firstOrSelf(json.objects);
 
     if (!object) {
@@ -313,7 +332,8 @@ export default async function () {
       };
     }
 
-    // objectProtectionInfos may be object OR array
+    // PowerShell equivalent:
+    // $protectionInfo = $object.objectProtectionInfos | Select-Object -First 1
     const protectionInfo = firstOrSelf(object.objectProtectionInfos);
 
     if (!protectionInfo) {
@@ -324,7 +344,8 @@ export default async function () {
       };
     }
 
-    // protectionGroups may be object OR array
+    // PowerShell equivalent:
+    // $protectionGroup = $protectionInfo.protectionGroups | Select-Object -First 1
     const protectionGroup = firstOrSelf(protectionInfo.protectionGroups);
 
     return {
@@ -334,63 +355,211 @@ export default async function () {
     };
   }
 
-  function getProtectionGroupName(object, protectionGroup) {
-    return (
-      protectionGroup?.name ||
-      protectionGroup?.policyName ||
-      protectionGroup?.protectionGroupName ||
-      object?.name ||
-      "N/A"
+  function getClusterIdFromGlobalSearch(object, protectionInfo, protectionGroup) {
+    return firstNonBlank(
+      protectionInfo?.clusterId,
+      protectionInfo?.clusterID,
+      protectionInfo?.cluster?.id,
+      protectionInfo?.cluster?.clusterId,
+      protectionInfo?.cluster?.clusterID,
+      protectionInfo?.clusterInfo?.id,
+      protectionInfo?.clusterInfo?.clusterId,
+      protectionInfo?.clusterInfo?.clusterID,
+
+      protectionGroup?.clusterId,
+      protectionGroup?.clusterID,
+      protectionGroup?.cluster?.id,
+      protectionGroup?.cluster?.clusterId,
+      protectionGroup?.cluster?.clusterID,
+      protectionGroup?.clusterInfo?.id,
+      protectionGroup?.clusterInfo?.clusterId,
+      protectionGroup?.clusterInfo?.clusterID,
+
+      object?.clusterId,
+      object?.clusterID,
+      object?.cluster?.id,
+      object?.cluster?.clusterId,
+      object?.cluster?.clusterID,
+      object?.clusterInfo?.id,
+      object?.clusterInfo?.clusterId,
+      object?.clusterInfo?.clusterID,
+      object?.sourceClusterId
     );
   }
 
-  function getSuccessfulBackupUsecs(protectionGroup) {
+  function getClusterNameFromGlobalSearch(object, protectionInfo, protectionGroup, clusterId) {
+    return firstNonBlank(
+      protectionGroup?.clusterName,
+      protectionGroup?.cluster?.name,
+      protectionGroup?.clusterInfo?.name,
+
+      protectionInfo?.clusterName,
+      protectionInfo?.cluster?.name,
+      protectionInfo?.clusterInfo?.name,
+
+      object?.clusterName,
+      object?.cluster?.name,
+      object?.clusterInfo?.name,
+      object?.sourceName,
+
+      clusterId
+    ) || "N/A";
+  }
+
+  function getProtectionGroupNameFromGlobalSearch(object, protectionGroup) {
+    return firstNonBlank(
+      protectionGroup?.name,
+      protectionGroup?.protectionGroupName,
+      protectionGroup?.policyName,
+      object?.name
+    ) || "N/A";
+  }
+
+  function getBackupRunStatusFromGlobalSearch(protectionGroup) {
+    return firstNonBlank(
+      protectionGroup?.lastBackupRunStatus,
+      protectionGroup?.backupRunStatus,
+      protectionGroup?.lastRunStatus,
+      protectionGroup?.status
+    ) || "N/A";
+  }
+
+  // ========================================================
+  // STEP 2: PROTECTED-OBJECT SEARCH HELPERS
+  // ========================================================
+  function extractProtectedObjects(json) {
+    if (!json || json.__error) return [];
+
+    if (Array.isArray(json.objects)) return json.objects;
+    if (Array.isArray(json.results)) return json.results;
+    if (Array.isArray(json.entities)) return json.entities;
+    if (Array.isArray(json.data)) return json.data;
+    if (Array.isArray(json.items)) return json.items;
+    if (Array.isArray(json)) return json;
+
+    return [];
+  }
+
+  function getObjectNames(object) {
+    return [
+      object?.name,
+      object?.objectName,
+      object?.hostName,
+      object?.displayName,
+      object?.sourceName,
+      object?.entity?.displayName,
+      object?.entity?.name,
+      object?.object?.name,
+      object?.object?.displayName
+    ]
+      .filter(Boolean)
+      .map(v => String(v).toLowerCase());
+  }
+
+  function objectMatchesCi(object, ciName) {
+    const ciLower = String(ciName || "").toLowerCase();
+    const names = getObjectNames(object);
+
+    if (!names.length) return false;
+
+    return names.some(n =>
+      n === ciLower ||
+      n.includes(ciLower) ||
+      ciLower.includes(n)
+    );
+  }
+
+  function normalizeSnapshots(object) {
+    const snap =
+      object?.latestSnapshotInfo ||
+      object?.latestSnapshotsInfo ||
+      object?.latestSnapshots ||
+      object?.latestSnapshot ||
+      object?.snapshotInfo ||
+      object?.backupInfo ||
+      null;
+
+    if (!snap) return [];
+
+    if (Array.isArray(snap)) {
+      return snap.filter(s => s && Object.keys(s).length > 0);
+    }
+
+    if (typeof snap === "object") return [snap];
+
+    return [];
+  }
+
+  function getLatestProtectedBackupUsecs(snapshot) {
     return firstValue(
-      protectionGroup?.lastSuccessfulRunStartTimeUsecs ||
-      protectionGroup?.lastSuccessfulRunEndTimeUsecs
+      snapshot?.protectionRunStartTimeUsecs ||
+      snapshot?.protectionRunEndTimeUsecs ||
+      snapshot?.runStartTimeUsecs ||
+      snapshot?.runEndTimeUsecs ||
+      snapshot?.snapshotCreationTimeUsecs ||
+      snapshot?.creationTimeUsecs ||
+      snapshot?.startTimeUsecs ||
+      snapshot?.endTimeUsecs ||
+      snapshot?.localBackupInfo?.[0]?.startTimeUsecs ||
+      snapshot?.localBackupInfo?.[0]?.endTimeUsecs
     );
   }
 
-  function getAnyRunUsecs(protectionGroup) {
-    return firstValue(
-      protectionGroup?.lastRunStartTimeUsecs ||
-      protectionGroup?.lastRunEndTimeUsecs ||
-      protectionGroup?.lastReplicationRunStartTimeUsecs
-    );
+  function getBestProtectedSnapshot(object) {
+    const snapshots = normalizeSnapshots(object);
+
+    if (!snapshots.length) return null;
+
+    snapshots.sort((a, b) => {
+      const aUsecs = Number(getLatestProtectedBackupUsecs(a) || 0);
+      const bUsecs = Number(getLatestProtectedBackupUsecs(b) || 0);
+      return bUsecs - aUsecs;
+    });
+
+    return snapshots[0];
   }
 
-  function getBackupStatus(successfulUsecs, anyRunUsecs) {
-    if (successfulUsecs) return "BackedUp";
-    if (anyRunUsecs) return "BackupRunFound";
-
-    return "NoBackup";
+  function getProtectedProtectionGroupName(object, snapshot, fallbackPgName) {
+    return firstNonBlank(
+      snapshot?.protectionGroupName,
+      snapshot?.protectionGroup?.name,
+      snapshot?.protectionGroup?.displayName,
+      snapshot?.protectionGroupInfo?.name,
+      snapshot?.protectionGroupInfo?.displayName,
+      object?.protectionGroupName,
+      object?.protectionGroup?.name,
+      object?.protectionGroup?.displayName,
+      object?.protectionGroupInfo?.name,
+      object?.protectionGroupInfo?.displayName,
+      fallbackPgName
+    ) || "N/A";
   }
 
-  function getClusterNameFromObject(object, protectionGroup) {
-    return (
-      protectionGroup?.clusterName ||
-      protectionGroup?.cluster?.name ||
-      protectionGroup?.clusterInfo?.name ||
-      object?.clusterName ||
-      object?.cluster?.name ||
-      object?.cluster?.clusterName ||
-      object?.clusterInfo?.name ||
-      object?.clusterInfo?.clusterName ||
-      object?.registeredSource?.clusterName ||
-      object?.sourceInfo?.clusterName ||
-      object?.storageDomain?.clusterName ||
-      object?.sourceName ||
-      "N/A"
-    );
+  function getProtectedBackupStatus(object, snapshot, backupUsecs, fallbackStatus) {
+    return firstNonBlank(
+      snapshot?.status,
+      snapshot?.runStatus,
+      snapshot?.protectionRunStatus,
+      snapshot?.backupStatus,
+      object?.status,
+      object?.protectionStatus,
+      object?.lastRunStatus,
+      object?.backupStatus,
+      fallbackStatus,
+      backupUsecs ? "BackedUp" : ""
+    ) || "N/A";
   }
 
+  // ========================================================
+  // WORK NOTES
+  // ========================================================
   function buildWorkNotesText(row) {
     return (
       "Cohesity backup validation completed.\n" +
       "CI Name: " + row.ciName + "\n" +
       "Protection Group: " + row.protectionGroup + "\n" +
       "Selected Cluster: " + row.cluster + "\n" +
-      "Matched Clusters: " + row.matchedClusters + "\n" +
+      "Cluster ID: " + row.clusterId + "\n" +
       "Backup Status: " + row.latestBackupStatus + "\n" +
       "Latest Backup Date: " + row.latestBackupDate + "\n" +
       "Validation Result: " + row.result
@@ -398,7 +567,7 @@ export default async function () {
   }
 
   // ========================================================
-  // COHESITY GLOBAL SEARCH CALL
+  // COHESITY API CALLS
   // ========================================================
   async function searchObjectsGlobal(ciName) {
     const url =
@@ -413,89 +582,198 @@ export default async function () {
     });
   }
 
-  async function getLatestBackupForCi(ciName) {
-    const json = await searchObjectsGlobal(ciName);
+  async function searchProtectedObjectsInCluster(ciName, clusterId) {
+    const url =
+      `${HELIOS_BASE_URL}/v2/data-protect/search/protected-objects` +
+      `?searchString=${encodeURIComponent(ciName)}`;
 
-    if (json.__error) {
+    return await getJson(url, {
+      accept: "application/json",
+      apiKey: COHESITY_API_KEY,
+      accessClusterId: String(clusterId)
+    });
+  }
+
+  // ========================================================
+  // MAIN COHESITY VALIDATION LOGIC
+  // ========================================================
+  async function getLatestBackupForCi(ciName) {
+
+    // ------------------------------------------------------
+    // STEP 1: Find cluster using global search
+    // ------------------------------------------------------
+    const globalJson = await searchObjectsGlobal(ciName);
+
+    if (globalJson.__error) {
       console.log(
-        `Global object search failed for CI ${ciName}: ${json.status} ${json.statusText}`
+        `Global object search failed for CI ${ciName}: ${globalJson.status} ${globalJson.statusText}`
       );
 
       return {
         cluster: "N/A",
-        matchedClusters: "N/A",
+        clusterId: "N/A",
         protectionGroup: "N/A",
         latestBackupStatus: "SearchFailed",
         latestBackupDate: "N/A",
-        result: "Cohesity Search Failed"
+        result: "Global Cohesity Search Failed",
+        backupEvidenceFound: false
       };
     }
 
-    const detail = getStrictFirstBackupDetail(json);
+    const globalDetail = getFirstGlobalSearchDetail(globalJson);
 
-    console.log("==== FIRST COHESITY DETAIL ====");
+    const clusterId = getClusterIdFromGlobalSearch(
+      globalDetail.object,
+      globalDetail.protectionInfo,
+      globalDetail.protectionGroup
+    );
+
+    const clusterName = getClusterNameFromGlobalSearch(
+      globalDetail.object,
+      globalDetail.protectionInfo,
+      globalDetail.protectionGroup,
+      clusterId
+    );
+
+    const fallbackPgName = getProtectionGroupNameFromGlobalSearch(
+      globalDetail.object,
+      globalDetail.protectionGroup
+    );
+
+    const fallbackStatus = getBackupRunStatusFromGlobalSearch(
+      globalDetail.protectionGroup
+    );
+
+    console.log("==== GLOBAL SEARCH CLUSTER DETAIL ====");
     console.log(JSON.stringify({
-      searchCount: json?.count,
-      objectsIsArray: Array.isArray(json?.objects),
-      objectName: detail.object?.name || "N/A",
-      objectProtectionInfosIsArray: Array.isArray(detail.object?.objectProtectionInfos),
-      protectionGroupsIsArray: Array.isArray(detail.protectionInfo?.protectionGroups),
-      protectionGroupName: detail.protectionGroup?.name || "N/A",
-      policyName: detail.protectionGroup?.policyName || "N/A",
-      lastSuccessfulRunStartTimeUsecs: detail.protectionGroup?.lastSuccessfulRunStartTimeUsecs || "N/A",
-      lastRunStartTimeUsecs: detail.protectionGroup?.lastRunStartTimeUsecs || "N/A",
-      lastReplicationRunStartTimeUsecs: detail.protectionGroup?.lastReplicationRunStartTimeUsecs || "N/A"
+      ciName,
+      searchCount: globalJson?.count,
+      objectName: globalDetail.object?.name || "N/A",
+      sourceName: globalDetail.object?.sourceName || "N/A",
+      clusterId: clusterId || "N/A",
+      clusterName: clusterName || "N/A",
+      fallbackPgName,
+      fallbackStatus,
+      objectProtectionInfosKeys: globalDetail.protectionInfo
+        ? Object.keys(globalDetail.protectionInfo)
+        : [],
+      protectionGroupKeys: globalDetail.protectionGroup
+        ? Object.keys(globalDetail.protectionGroup)
+        : []
     }, null, 2));
 
-    if (!detail.object) {
+    if (!globalDetail.object) {
       return {
         cluster: "N/A",
-        matchedClusters: "N/A",
+        clusterId: "N/A",
         protectionGroup: "N/A",
         latestBackupStatus: "NoObject",
         latestBackupDate: "N/A",
-        result: "No Cohesity Object Found"
+        result: "No Cohesity Object Found",
+        backupEvidenceFound: false
       };
     }
 
-    const clusterName = getClusterNameFromObject(detail.object, detail.protectionGroup);
-
-    if (!detail.protectionGroup) {
+    if (!clusterId) {
       return {
         cluster: clusterName,
-        matchedClusters: clusterName,
-        protectionGroup: "N/A",
-        latestBackupStatus: "NoBackup",
+        clusterId: "N/A",
+        protectionGroup: fallbackPgName,
+        latestBackupStatus: fallbackStatus,
         latestBackupDate: "N/A",
-        result: "Object Found / No Protection Group"
+        result: "Object Found / Cluster ID Missing",
+        backupEvidenceFound: false
       };
     }
 
-    const successfulUsecs = getSuccessfulBackupUsecs(detail.protectionGroup);
-    const anyRunUsecs = getAnyRunUsecs(detail.protectionGroup);
+    // ------------------------------------------------------
+    // STEP 2: Use old protected-objects endpoint on identified cluster only
+    // ------------------------------------------------------
+    const protectedJson = await searchProtectedObjectsInCluster(ciName, clusterId);
 
-    const latestBackupDate = successfulUsecs
-      ? formatUsecs(successfulUsecs)
-      : "N/A";
+    if (protectedJson.__error) {
+      console.log(
+        `Protected-object search failed for CI ${ciName} on cluster ${clusterId}: ${protectedJson.status} ${protectedJson.statusText}`
+      );
 
-    const latestBackupStatus = getBackupStatus(successfulUsecs, anyRunUsecs);
+      return {
+        cluster: clusterName,
+        clusterId,
+        protectionGroup: fallbackPgName,
+        latestBackupStatus: fallbackStatus,
+        latestBackupDate: "N/A",
+        result: "Protected Object Search Failed",
+        backupEvidenceFound: false
+      };
+    }
 
-    const protectionGroupName = getProtectionGroupName(
-      detail.object,
-      detail.protectionGroup
-    );
+    const protectedObjects = extractProtectedObjects(protectedJson);
 
-    return {
+    if (!protectedObjects.length) {
+      return {
+        cluster: clusterName,
+        clusterId,
+        protectionGroup: fallbackPgName,
+        latestBackupStatus: fallbackStatus,
+        latestBackupDate: "N/A",
+        result: "Cluster Identified / No Protected Object Found",
+        backupEvidenceFound: false
+      };
+    }
+
+    const matchingObjects = protectedObjects.filter(obj => objectMatchesCi(obj, ciName));
+    const objectsToCheck = matchingObjects.length ? matchingObjects : protectedObjects;
+
+    let bestCandidate = null;
+
+    for (const object of objectsToCheck) {
+      const snapshot = getBestProtectedSnapshot(object);
+      const backupUsecs = snapshot ? getLatestProtectedBackupUsecs(snapshot) : null;
+      const latestBackupDate = backupUsecs ? formatUsecs(backupUsecs) : "N/A";
+
+      const protectionGroup = getProtectedProtectionGroupName(
+        object,
+        snapshot,
+        fallbackPgName
+      );
+
+      const latestBackupStatus = getProtectedBackupStatus(
+        object,
+        snapshot,
+        backupUsecs,
+        fallbackStatus
+      );
+
+      const candidate = {
+        cluster: clusterName,
+        clusterId,
+        protectionGroup,
+        latestBackupStatus,
+        latestBackupDate,
+        backupUsecs: backupUsecs ? Number(backupUsecs) : 0,
+        result: snapshot && backupUsecs
+          ? "Latest Backup Found"
+          : "Protected Object Found / No Backup Snapshot",
+        backupEvidenceFound: Boolean(snapshot && backupUsecs)
+      };
+
+      if (!bestCandidate) {
+        bestCandidate = candidate;
+      }
+
+      if (candidate.backupEvidenceFound) {
+        return candidate;
+      }
+    }
+
+    return bestCandidate || {
       cluster: clusterName,
-      matchedClusters: clusterName,
-      protectionGroup: protectionGroupName,
-      latestBackupStatus,
-      latestBackupDate,
-      result: successfulUsecs
-        ? "Latest Backup Found"
-        : anyRunUsecs
-          ? "Backup Run Found / No Successful Backup Timestamp"
-          : "Object Found / No Backup Timestamp"
+      clusterId,
+      protectionGroup: fallbackPgName,
+      latestBackupStatus: fallbackStatus,
+      latestBackupDate: "N/A",
+      result: "Protected Object Found / No Backup Snapshot",
+      backupEvidenceFound: false
     };
   }
 
@@ -594,11 +872,12 @@ export default async function () {
         slaDue: sla.slaDue,
         slaStatus: sla.slaStatus,
         cluster: "N/A",
-        matchedClusters: "N/A",
+        clusterId: "N/A",
         protectionGroup: "N/A",
         latestBackupStatus: "CI_NOT_AVAILABLE",
         latestBackupDate: "N/A",
         result: "Cannot Validate",
+        backupEvidenceFound: false,
         updatedDtsk: "No",
         dtskUpdateReason: "CI not available / cannot validate",
         workNotesText: ""
@@ -618,12 +897,10 @@ export default async function () {
       backupCache.set(cacheKey, backup);
     }
 
-    const backupFound =
-      backup.result === "Latest Backup Found" &&
-      backup.latestBackupDate !== "N/A";
-
-    const sysIdFound = sysId !== "N/A";
-    const shouldUpdateDtsk = backupFound && sysIdFound;
+    const shouldUpdateDtsk =
+      backup.backupEvidenceFound === true &&
+      backup.latestBackupDate !== "N/A" &&
+      sysId !== "N/A";
 
     const resultRow = {
       sysId,
@@ -636,19 +913,18 @@ export default async function () {
       slaDue: sla.slaDue,
       slaStatus: sla.slaStatus,
       cluster: backup.cluster,
-      matchedClusters: backup.matchedClusters,
+      clusterId: backup.clusterId,
       protectionGroup: backup.protectionGroup,
       latestBackupStatus: backup.latestBackupStatus,
       latestBackupDate: backup.latestBackupDate,
       result: backup.result,
+      backupEvidenceFound: backup.backupEvidenceFound,
 
       // Internal only. Not shown in email.
       updatedDtsk: shouldUpdateDtsk ? "Yes" : "No",
       dtskUpdateReason: shouldUpdateDtsk
-        ? "Backup evidence found"
-        : backupFound && !sysIdFound
-          ? "Backup found but sys_id missing"
-          : "Backup evidence not found / not eligible",
+        ? "Backup evidence found from protected-objects endpoint"
+        : "Backup evidence not found / not eligible",
 
       workNotesText: ""
     };
@@ -695,7 +971,7 @@ export default async function () {
   markdown += "\n";
 
   markdown += "## Decommission DTSK Backup Validation - Task Status and Backup Evidence\n\n";
-  markdown += "| Decom Request | DTSK | CI Name | Assigned To | Assignment Action | Created On | SLA Due | SLA Status | Selected Cluster | Matched Clusters | Protection Group | Backup Status | Latest Backup Date | Result |\n";
+  markdown += "| Decom Request | DTSK | CI Name | Assigned To | Assignment Action | Created On | SLA Due | SLA Status | Selected Cluster | Cluster ID | Protection Group | Backup Status | Latest Backup Date | Result |\n";
   markdown += "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|\n";
 
   for (const r of results) {
@@ -709,7 +985,7 @@ export default async function () {
       `| ${escapeMd(r.slaDue)} ` +
       `| ${escapeMd(r.slaStatus)} ` +
       `| ${escapeMd(r.cluster)} ` +
-      `| ${escapeMd(r.matchedClusters)} ` +
+      `| ${escapeMd(r.clusterId)} ` +
       `| ${escapeMd(r.protectionGroup)} ` +
       `| ${escapeMd(r.latestBackupStatus)} ` +
       `| ${escapeMd(r.latestBackupDate)} ` +
@@ -719,11 +995,12 @@ export default async function () {
   markdown += "\n## Legend\n\n";
   markdown += "| Status | Meaning |\n";
   markdown += "|---|---|\n";
-  markdown += "| BackedUp | lastSuccessfulRunStartTimeUsecs or lastSuccessfulRunEndTimeUsecs was found under the first returned Cohesity object. |\n";
-  markdown += "| BackupRunFound | lastRunStartTimeUsecs / lastRunEndTimeUsecs / lastReplicationRunStartTimeUsecs was found, but successful backup timestamp was not returned. |\n";
-  markdown += "| NoBackup | First object exists but no backup timestamp was returned. |\n";
-  markdown += "| NoObject | CI was not found in Cohesity object search. |\n";
-  markdown += "| Selected Cluster | Cluster/source from the first returned Cohesity object. |\n";
+  markdown += "| Latest Backup Found | Cluster was identified using global object search, then backup evidence was found using protected-objects on that cluster only. |\n";
+  markdown += "| Object Found / Cluster ID Missing | CI was found globally, but clusterId was not returned from objectProtectionInfos/protectionGroups. |\n";
+  markdown += "| Cluster Identified / No Protected Object Found | ClusterId was found, but protected-objects did not return the CI in that cluster. |\n";
+  markdown += "| Protected Object Found / No Backup Snapshot | Protected object exists, but no latest snapshot timestamp was returned. |\n";
+  markdown += "| NoObject | CI was not found in Cohesity global object search. |\n";
+  markdown += "| Selected Cluster | Cluster/source identified from global search before running protected-objects. |\n";
   markdown += "| Please assign | DTSK has no assigned_to value. |\n";
   markdown += "| SLA Breached | DTSK age is greater than 2 days from created date. |\n";
 
