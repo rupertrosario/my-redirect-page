@@ -3,14 +3,22 @@
 // Task name: dtsk_bkp_status
 // Previous task name: dtsk_snow_search
 //
-// Cohesity search:
-// GET /v2/data-protect/search/objects?searchString=<CI_NAME>&includeTenants=true&count=5
+// Purpose:
+// - Read DTSKs from ServiceNow search output
+// - Search each DTSK CI in Cohesity using global Helios object search
+// - Use only first object returned by Cohesity search: json.objects[0]
+// - From that first object, use first objectProtectionInfos[0]
+// - From that first protection info, use first protectionGroups[0]
+// - Use protectionGroups[0].lastSuccessfulRunStartTimeUsecs as backup evidence
+// - Build email markdown report
+// - Return rowsToUpdate only for DTSKs where backup is found
+// - Work notes text contains only plain backup details
 //
-// Logic:
-// - Take only first object from json.objects
-// - From first object, expand objectProtectionInfos.protectionGroups
-// - Take first protectionGroup returned from that expanded list
-// - Return rowsToUpdate only when backup evidence is found
+// Cohesity calls: GET only
+// API key source: Dynatrace Credential Vault Token
+//
+// Search endpoint:
+// GET /v2/data-protect/search/objects?searchString=<CI_NAME>&includeTenants=true&count=5
 // ==========================================================
 
 import { result } from "@dynatrace-sdk/automation-utils";
@@ -53,23 +61,8 @@ export default async function () {
   }
 
   // ========================================================
-  // BASIC HELPERS
+  // GENERIC HELPERS
   // ========================================================
-  function arr(value) {
-    if (value === null || value === undefined) return [];
-    return Array.isArray(value) ? value : [value];
-  }
-
-  function firstValue(value) {
-    if (value === null || value === undefined) return null;
-
-    if (Array.isArray(value)) {
-      return value.find(v => v !== null && v !== undefined) || null;
-    }
-
-    return value;
-  }
-
   function extractRows(payload) {
     if (!payload) return [];
 
@@ -197,6 +190,16 @@ export default async function () {
       .trim() || "N/A";
   }
 
+  function firstValue(value) {
+    if (!value) return null;
+
+    if (Array.isArray(value)) {
+      return value.find(v => v !== null && v !== undefined) || null;
+    }
+
+    return value;
+  }
+
   function parseDateUtc(value) {
     const raw = String(value || "").trim();
 
@@ -207,6 +210,7 @@ export default async function () {
     }
 
     const dt = new Date(raw);
+
     if (Number.isNaN(dt.getTime())) return null;
 
     return dt;
@@ -254,7 +258,9 @@ export default async function () {
     const now = new Date();
 
     if (now > dueDate) {
-      const hoursOverdue = Math.ceil((now.getTime() - dueDate.getTime()) / (60 * 60 * 1000));
+      const hoursOverdue = Math.ceil(
+        (now.getTime() - dueDate.getTime()) / (60 * 60 * 1000)
+      );
 
       return {
         createdOn: formatDate(createdDate),
@@ -263,7 +269,9 @@ export default async function () {
       };
     }
 
-    const hoursLeft = Math.ceil((dueDate.getTime() - now.getTime()) / (60 * 60 * 1000));
+    const hoursLeft = Math.ceil(
+      (dueDate.getTime() - now.getTime()) / (60 * 60 * 1000)
+    );
 
     return {
       createdOn: formatDate(createdDate),
@@ -276,49 +284,57 @@ export default async function () {
   // COHESITY RESPONSE HELPERS
   // ========================================================
   function getFirstObject(json) {
-    return arr(json?.objects)[0] || null;
+    if (!json || json.__error) return null;
+
+    const objects = Array.isArray(json.objects) ? json.objects : [];
+
+    if (!objects.length) return null;
+
+    // IMPORTANT:
+    // Use only the first object returned by /search/objects.
+    // Do not loop through all returned objects.
+    return objects[0];
   }
 
-  function getProtectionGroupBundleFromObject(object) {
-    if (!object) {
-      return {
-        protectionInfo: null,
-        protectionGroup: null
-      };
+  function getFirstProtectionInfo(object) {
+    if (!object || typeof object !== "object") return null;
+
+    const objectProtectionInfos = object?.objectProtectionInfos;
+
+    if (!objectProtectionInfos) return null;
+
+    if (Array.isArray(objectProtectionInfos)) {
+      return objectProtectionInfos[0] || null;
     }
 
-    // PowerShell equivalent:
-    // $firstObject.objectProtectionInfos.protectionGroups | Select-Object -First 1
-    //
-    // This does NOT force objectProtectionInfos[0].
-    // It expands all objectProtectionInfos for the first object, then takes first protectionGroup found.
-    for (const info of arr(object.objectProtectionInfos)) {
-      const groups = arr(info?.protectionGroups);
-
-      if (groups.length > 0) {
-        return {
-          protectionInfo: info,
-          protectionGroup: groups[0]
-        };
-      }
-    }
-
-    return {
-      protectionInfo: arr(object.objectProtectionInfos)[0] || null,
-      protectionGroup: null
-    };
+    return objectProtectionInfos;
   }
 
-  function getProtectionGroupName(object, protectionInfo, protectionGroup) {
+  function getFirstProtectionGroup(object) {
+    const firstProtectionInfo = getFirstProtectionInfo(object);
+
+    if (!firstProtectionInfo) return null;
+
+    const protectionGroups = firstProtectionInfo?.protectionGroups;
+
+    if (!protectionGroups) return null;
+
+    if (Array.isArray(protectionGroups)) {
+      return protectionGroups[0] || null;
+    }
+
+    return protectionGroups;
+  }
+
+  function getProtectionGroupName(object, protectionGroup) {
     return (
       protectionGroup?.name ||
       protectionGroup?.protectionGroupName ||
+      protectionGroup?.policyName ||
       protectionGroup?.protectionGroup?.name ||
       protectionGroup?.protectionGroup?.displayName ||
       protectionGroup?.protectionGroupInfo?.name ||
       protectionGroup?.protectionGroupInfo?.displayName ||
-      protectionInfo?.protectionGroupName ||
-      protectionInfo?.name ||
       object?.protectionGroupName ||
       object?.protectionGroup?.name ||
       object?.protectionGroup?.displayName ||
@@ -328,18 +344,20 @@ export default async function () {
     );
   }
 
-  function getLatestBackupUsecs(protectionInfo, protectionGroup) {
+  function getLatestBackupUsecs(protectionGroup) {
     return firstValue(
-      protectionGroup?.protectionRunStartTimeUsecs ||
-      protectionGroup?.protectionRunEndTimeUsecs ||
-      protectionGroup?.runStartTimeUsecs ||
-      protectionGroup?.runEndTimeUsecs ||
+      protectionGroup?.lastSuccessfulRunStartTimeUsecs ||
+      protectionGroup?.lastSuccessfulRunEndTimeUsecs ||
       protectionGroup?.lastRunStartTimeUsecs ||
       protectionGroup?.lastRunEndTimeUsecs ||
       protectionGroup?.lastBackupRunStartTimeUsecs ||
       protectionGroup?.lastBackupRunEndTimeUsecs ||
       protectionGroup?.latestRunStartTimeUsecs ||
       protectionGroup?.latestRunEndTimeUsecs ||
+      protectionGroup?.protectionRunStartTimeUsecs ||
+      protectionGroup?.protectionRunEndTimeUsecs ||
+      protectionGroup?.runStartTimeUsecs ||
+      protectionGroup?.runEndTimeUsecs ||
       protectionGroup?.snapshotCreationTimeUsecs ||
       protectionGroup?.creationTimeUsecs ||
       protectionGroup?.startTimeUsecs ||
@@ -353,35 +371,23 @@ export default async function () {
       protectionGroup?.lastSuccessfulRun?.startTimeUsecs ||
       protectionGroup?.lastSuccessfulRun?.endTimeUsecs ||
       protectionGroup?.localBackupInfo?.[0]?.startTimeUsecs ||
-      protectionGroup?.localBackupInfo?.[0]?.endTimeUsecs ||
-
-      // Fallback to parent objectProtectionInfo if Cohesity stores latest run there
-      protectionInfo?.protectionRunStartTimeUsecs ||
-      protectionInfo?.protectionRunEndTimeUsecs ||
-      protectionInfo?.runStartTimeUsecs ||
-      protectionInfo?.runEndTimeUsecs ||
-      protectionInfo?.lastRunStartTimeUsecs ||
-      protectionInfo?.lastRunEndTimeUsecs ||
-      protectionInfo?.lastBackupRunStartTimeUsecs ||
-      protectionInfo?.lastBackupRunEndTimeUsecs ||
-      protectionInfo?.latestRunStartTimeUsecs ||
-      protectionInfo?.latestRunEndTimeUsecs ||
-      protectionInfo?.snapshotCreationTimeUsecs ||
-      protectionInfo?.creationTimeUsecs ||
-      protectionInfo?.startTimeUsecs ||
-      protectionInfo?.endTimeUsecs ||
-      protectionInfo?.lastRun?.startTimeUsecs ||
-      protectionInfo?.lastRun?.endTimeUsecs ||
-      protectionInfo?.latestRun?.startTimeUsecs ||
-      protectionInfo?.latestRun?.endTimeUsecs ||
-      protectionInfo?.lastRunInfo?.startTimeUsecs ||
-      protectionInfo?.lastRunInfo?.endTimeUsecs ||
-      protectionInfo?.lastSuccessfulRun?.startTimeUsecs ||
-      protectionInfo?.lastSuccessfulRun?.endTimeUsecs
+      protectionGroup?.localBackupInfo?.[0]?.endTimeUsecs
     );
   }
 
-  function getBackupStatus(object, protectionInfo, protectionGroup, backupUsecs) {
+  function getBackupStatus(object, protectionGroup, backupUsecs) {
+    if (protectionGroup?.lastSuccessfulRunStartTimeUsecs) {
+      return "BackedUp";
+    }
+
+    if (protectionGroup?.lastSuccessfulRunEndTimeUsecs) {
+      return "BackedUp";
+    }
+
+    if (protectionGroup?.lastRunStartTimeUsecs) {
+      return "BackupRunFound";
+    }
+
     return (
       protectionGroup?.status ||
       protectionGroup?.runStatus ||
@@ -394,19 +400,6 @@ export default async function () {
       protectionGroup?.latestRun?.status ||
       protectionGroup?.lastRunInfo?.status ||
       protectionGroup?.lastSuccessfulRun?.status ||
-
-      protectionInfo?.status ||
-      protectionInfo?.runStatus ||
-      protectionInfo?.lastRunStatus ||
-      protectionInfo?.latestRunStatus ||
-      protectionInfo?.protectionRunStatus ||
-      protectionInfo?.backupStatus ||
-      protectionInfo?.lastBackupStatus ||
-      protectionInfo?.lastRun?.status ||
-      protectionInfo?.latestRun?.status ||
-      protectionInfo?.lastRunInfo?.status ||
-      protectionInfo?.lastSuccessfulRun?.status ||
-
       object?.status ||
       object?.protectionStatus ||
       object?.lastRunStatus ||
@@ -415,14 +408,11 @@ export default async function () {
     );
   }
 
-  function getClusterNameFromObject(object, protectionInfo, protectionGroup) {
+  function getClusterNameFromObject(object, protectionGroup) {
     return (
       protectionGroup?.clusterName ||
       protectionGroup?.cluster?.name ||
       protectionGroup?.clusterInfo?.name ||
-      protectionInfo?.clusterName ||
-      protectionInfo?.cluster?.name ||
-      protectionInfo?.clusterInfo?.name ||
       object?.clusterName ||
       object?.cluster?.name ||
       object?.cluster?.clusterName ||
@@ -458,8 +448,6 @@ export default async function () {
       `?searchString=${encodeURIComponent(ciName)}` +
       `&includeTenants=true` +
       `&count=5`;
-
-    console.log(`Cohesity search URL for CI ${ciName}: ${url}`);
 
     return await getJson(url, {
       accept: "application/json",
@@ -498,17 +486,10 @@ export default async function () {
       };
     }
 
-    const bundle = getProtectionGroupBundleFromObject(object);
-    const protectionInfo = bundle.protectionInfo;
-    const protectionGroup = bundle.protectionGroup;
+    const protectionGroup = getFirstProtectionGroup(object);
+    const clusterFromObject = getClusterNameFromObject(object, protectionGroup);
 
     if (!protectionGroup) {
-      console.log("First object found but protectionGroups was not found.");
-      console.log("First object:");
-      console.log(JSON.stringify(object, null, 2));
-
-      const clusterFromObject = getClusterNameFromObject(object, protectionInfo, null);
-
       return {
         cluster: clusterFromObject,
         matchedClusters: clusterFromObject,
@@ -519,14 +500,10 @@ export default async function () {
       };
     }
 
-    console.log("==== FIRST PROTECTION GROUP USED ====");
-    console.log(JSON.stringify(protectionGroup, null, 2));
-
-    const backupUsecs = getLatestBackupUsecs(protectionInfo, protectionGroup);
+    const backupUsecs = getLatestBackupUsecs(protectionGroup);
     const latestBackupDate = backupUsecs ? formatUsecs(backupUsecs) : "N/A";
-    const protectionGroupName = getProtectionGroupName(object, protectionInfo, protectionGroup);
-    const latestBackupStatus = getBackupStatus(object, protectionInfo, protectionGroup, backupUsecs);
-    const clusterFromObject = getClusterNameFromObject(object, protectionInfo, protectionGroup);
+    const protectionGroupName = getProtectionGroupName(object, protectionGroup);
+    const latestBackupStatus = getBackupStatus(object, protectionGroup, backupUsecs);
 
     return {
       cluster: clusterFromObject,
@@ -760,10 +737,11 @@ export default async function () {
   markdown += "\n## Legend\n\n";
   markdown += "| Status | Meaning |\n";
   markdown += "|---|---|\n";
-  markdown += "| BackedUp | Cohesity protection group has latest backup time. |\n";
-  markdown += "| NoBackup | Object exists but no latest backup time was returned. |\n";
+  markdown += "| BackedUp | latest successful backup timestamp was found under protectionGroups[0]. |\n";
+  markdown += "| BackupRunFound | latest run timestamp was found, but latest successful run timestamp was not returned. |\n";
+  markdown += "| NoBackup | Object exists but no backup timestamp was returned. |\n";
   markdown += "| NoObject | CI was not found in Cohesity object search. |\n";
-  markdown += "| Selected Cluster | Cluster/source value from the first object returned by Cohesity search. |\n";
+  markdown += "| Selected Cluster | Cluster/source from the first object returned by the Cohesity search endpoint. |\n";
   markdown += "| Please assign | DTSK has no assigned_to value. |\n";
   markdown += "| SLA Breached | DTSK age is greater than 2 days from created date. |\n";
 
