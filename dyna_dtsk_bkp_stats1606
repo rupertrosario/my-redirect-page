@@ -1,0 +1,836 @@
+// ==========================================================
+// Dynatrace JS Task
+// Task name: dtsk_bkp_status
+// Previous task name: dtsk_snow_search
+//
+// Purpose:
+// - Read DTSKs from ServiceNow search output
+// - Search each DTSK CI in Cohesity using global Helios object search
+// - Take only the first matching backup/object detail returned
+// - Build email markdown report
+// - Return rowsToUpdate only for DTSKs where backup is found
+// - Work notes text contains only plain backup details
+//
+// Cohesity calls: GET only
+// API key source: Dynatrace Credential Vault Token
+// Search endpoint:
+// GET /v2/data-protect/search/objects?searchString=<CI_NAME>
+// ==========================================================
+
+import { result } from "@dynatrace-sdk/automation-utils";
+import { credentialVaultClient } from "@dynatrace-sdk/client-classic-environment-v2";
+
+export default async function () {
+
+  // ========================================================
+  // INPUT FROM PREVIOUS TASK
+  // ========================================================
+  const snowResult = await result("dtsk_snow_search");
+
+  console.log("==== RAW dtsk_snow_search OUTPUT ====");
+  console.log(JSON.stringify(snowResult, null, 2));
+
+  const decomRows = extractRows(snowResult);
+
+  console.log("==== DTSK ROWS DETECTED ====");
+  console.log(JSON.stringify(decomRows, null, 2));
+
+  // ========================================================
+  // CONFIG
+  // ========================================================
+  const HELIOS_BASE_URL = "https://helios.cohesity.com";
+
+  // Change this only if your Dynatrace Credential Vault ID is different
+  const COHESITY_API_KEY_CREDENTIAL_ID = "credentials_vault-312312";
+
+  const OUTPUT_TIME_ZONE = "America/New_York";
+  const SLA_DAYS = 2;
+
+  // ========================================================
+  // GET COHESITY API KEY FROM DYNATRACE CREDENTIAL VAULT
+  // ========================================================
+  const cohesityCred = await credentialVaultClient.getCredentialsDetails({
+    id: COHESITY_API_KEY_CREDENTIAL_ID
+  });
+
+  const COHESITY_API_KEY = cohesityCred?.token;
+
+  if (!COHESITY_API_KEY) {
+    throw new Error("Cohesity API key token was not returned from Dynatrace Credential Vault.");
+  }
+
+  // ========================================================
+  // HELPERS
+  // ========================================================
+  function extractRows(payload) {
+    if (!payload) return [];
+
+    let body = payload.body;
+
+    if (typeof body === "string") {
+      try {
+        body = JSON.parse(body);
+      } catch {
+        body = null;
+      }
+    }
+
+    if (Array.isArray(payload)) return payload;
+    if (Array.isArray(payload.results)) return payload.results;
+    if (Array.isArray(payload.result)) return payload.result;
+    if (Array.isArray(payload.records)) return payload.records;
+    if (Array.isArray(payload.data)) return payload.data;
+
+    if (payload.number) return [payload];
+    if (payload.result?.number) return [payload.result];
+
+    if (Array.isArray(body)) return body;
+    if (Array.isArray(body?.results)) return body.results;
+    if (Array.isArray(body?.result)) return body.result;
+    if (Array.isArray(body?.records)) return body.records;
+    if (Array.isArray(body?.data)) return body.data;
+
+    if (body?.number) return [body];
+    if (body?.result?.number) return [body.result];
+
+    return [];
+  }
+
+  async function getJson(url, headers) {
+    try {
+      const response = await fetch(url, {
+        method: "GET",
+        headers
+      });
+
+      if (!response.ok) {
+        return {
+          __error: true,
+          status: response.status,
+          statusText: response.statusText,
+          url
+        };
+      }
+
+      return await response.json();
+
+    } catch (err) {
+      return {
+        __error: true,
+        status: "FETCH_ERROR",
+        statusText: err.message,
+        url
+      };
+    }
+  }
+
+  function normalizeValue(value) {
+    if (value === null || value === undefined) return "";
+
+    if (typeof value === "string") return value.trim();
+
+    if (typeof value === "number" || typeof value === "boolean") {
+      return String(value).trim();
+    }
+
+    if (typeof value === "object") {
+      return String(
+        value.display_value ||
+        value.name ||
+        value.value ||
+        ""
+      ).trim();
+    }
+
+    return "";
+  }
+
+  function getField(row, fieldName) {
+    if (!row || !fieldName) return "";
+
+    if (Object.prototype.hasOwnProperty.call(row, fieldName)) {
+      return normalizeValue(row[fieldName]);
+    }
+
+    const parts = fieldName.split(".");
+    let current = row;
+
+    for (const part of parts) {
+      if (current === null || current === undefined) return "";
+      current = current[part];
+    }
+
+    return normalizeValue(current);
+  }
+
+  function firstNonBlank(...values) {
+    for (const v of values) {
+      const s = String(v || "").trim();
+      if (s) return s;
+    }
+    return "";
+  }
+
+  function isBadCiName(value) {
+    const ci = String(value || "").trim();
+
+    if (!ci) return true;
+    if (ci.toUpperCase() === "N/A") return true;
+    if (/^https?:\/\//i.test(ci)) return true;
+    if (/^[0-9a-f]{32}$/i.test(ci)) return true;
+
+    return false;
+  }
+
+  function escapeMd(value) {
+    return String(value ?? "N/A")
+      .replace(/\|/g, "\\|")
+      .replace(/\r?\n/g, " ")
+      .trim() || "N/A";
+  }
+
+  function firstValue(value) {
+    if (!value) return null;
+
+    if (Array.isArray(value)) {
+      return value.find(v => v !== null && v !== undefined) || null;
+    }
+
+    return value;
+  }
+
+  function parseDateUtc(value) {
+    const raw = String(value || "").trim();
+
+    if (!raw || raw.toUpperCase() === "N/A") return null;
+
+    if (/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(raw)) {
+      return new Date(raw.replace(" ", "T") + "Z");
+    }
+
+    const dt = new Date(raw);
+    if (Number.isNaN(dt.getTime())) return null;
+
+    return dt;
+  }
+
+  function formatDate(dateObj) {
+    if (!dateObj || Number.isNaN(dateObj.getTime())) return "N/A";
+
+    return new Intl.DateTimeFormat("en-GB", {
+      timeZone: OUTPUT_TIME_ZONE,
+      day: "2-digit",
+      month: "short",
+      year: "numeric",
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+      hour12: false
+    }).format(dateObj).replace(",", "") + " ET";
+  }
+
+  function formatUsecs(usecs) {
+    const value = firstValue(usecs);
+
+    if (!value) return "N/A";
+
+    const millis = Math.floor(Number(value) / 1000);
+
+    if (!Number.isFinite(millis)) return "N/A";
+
+    return formatDate(new Date(millis));
+  }
+
+  function getSlaInfo(createdOnRaw) {
+    const createdDate = parseDateUtc(createdOnRaw);
+
+    if (!createdDate) {
+      return {
+        createdOn: "N/A",
+        slaDue: "N/A",
+        slaStatus: "Created Date Missing"
+      };
+    }
+
+    const dueDate = new Date(createdDate.getTime() + SLA_DAYS * 24 * 60 * 60 * 1000);
+    const now = new Date();
+
+    if (now > dueDate) {
+      const hoursOverdue = Math.ceil((now.getTime() - dueDate.getTime()) / (60 * 60 * 1000));
+
+      return {
+        createdOn: formatDate(createdDate),
+        slaDue: formatDate(dueDate),
+        slaStatus: `Breached - ${hoursOverdue}h overdue`
+      };
+    }
+
+    const hoursLeft = Math.ceil((dueDate.getTime() - now.getTime()) / (60 * 60 * 1000));
+
+    return {
+      createdOn: formatDate(createdDate),
+      slaDue: formatDate(dueDate),
+      slaStatus: `Within SLA - ${hoursLeft}h left`
+    };
+  }
+
+  function objectHasSnapshotLikeFields(object) {
+    if (!object || typeof object !== "object") return false;
+
+    return Boolean(
+      object?.protectionRunStartTimeUsecs ||
+      object?.protectionRunEndTimeUsecs ||
+      object?.runStartTimeUsecs ||
+      object?.runEndTimeUsecs ||
+      object?.snapshotCreationTimeUsecs ||
+      object?.creationTimeUsecs ||
+      object?.startTimeUsecs ||
+      object?.endTimeUsecs ||
+      object?.protectionGroupName ||
+      object?.protectionGroup ||
+      object?.protectionGroupInfo ||
+      object?.backupStatus ||
+      object?.lastRunStatus ||
+      object?.protectionStatus
+    );
+  }
+
+  function normalizeSnapshots(object) {
+    const snap =
+      object?.latestSnapshotInfo ||
+      object?.latestSnapshotsInfo ||
+      object?.latestSnapshots ||
+      object?.latestSnapshot ||
+      object?.snapshotInfo ||
+      object?.backupInfo ||
+      object?.backupDetails ||
+      object?.backups ||
+      null;
+
+    if (snap) {
+      if (Array.isArray(snap)) {
+        return snap.filter(s => s && Object.keys(s).length > 0);
+      }
+
+      if (typeof snap === "object") {
+        return [snap];
+      }
+    }
+
+    if (objectHasSnapshotLikeFields(object)) {
+      return [object];
+    }
+
+    return [];
+  }
+
+  function getLatestBackupUsecs(snapshot) {
+    return firstValue(
+      snapshot?.protectionRunStartTimeUsecs ||
+      snapshot?.protectionRunEndTimeUsecs ||
+      snapshot?.runStartTimeUsecs ||
+      snapshot?.runEndTimeUsecs ||
+      snapshot?.snapshotCreationTimeUsecs ||
+      snapshot?.creationTimeUsecs ||
+      snapshot?.startTimeUsecs ||
+      snapshot?.endTimeUsecs ||
+      snapshot?.localBackupInfo?.[0]?.startTimeUsecs ||
+      snapshot?.localBackupInfo?.[0]?.endTimeUsecs
+    );
+  }
+
+  function getBestSnapshot(object) {
+    const snapshots = normalizeSnapshots(object);
+
+    if (!snapshots.length) return null;
+
+    // Same CI/server may return multiple backup details.
+    // Take only the first backup/snapshot detail returned by the endpoint.
+    return snapshots[0];
+  }
+
+  function getProtectionGroupName(object, snapshot) {
+    return (
+      snapshot?.protectionGroupName ||
+      snapshot?.protectionGroup?.name ||
+      snapshot?.protectionGroup?.displayName ||
+      snapshot?.protectionGroupInfo?.name ||
+      snapshot?.protectionGroupInfo?.displayName ||
+      object?.protectionGroupName ||
+      object?.protectionGroup?.name ||
+      object?.protectionGroup?.displayName ||
+      object?.protectionGroupInfo?.name ||
+      object?.protectionGroupInfo?.displayName ||
+      object?.protectionGroup?.policyName ||
+      "N/A"
+    );
+  }
+
+  function getBackupStatus(object, snapshot, backupUsecs) {
+    return (
+      snapshot?.status ||
+      snapshot?.runStatus ||
+      snapshot?.protectionRunStatus ||
+      snapshot?.backupStatus ||
+      object?.status ||
+      object?.protectionStatus ||
+      object?.lastRunStatus ||
+      object?.backupStatus ||
+      (backupUsecs ? "BackedUp" : "NoBackup")
+    );
+  }
+
+  function getObjectNames(object) {
+    return [
+      object?.name,
+      object?.objectName,
+      object?.hostName,
+      object?.displayName,
+      object?.sourceName,
+      object?.entity?.displayName,
+      object?.entity?.name,
+      object?.object?.name,
+      object?.object?.displayName
+    ]
+      .filter(Boolean)
+      .map(v => String(v).toLowerCase());
+  }
+
+  function objectMatchesCi(object, ciName) {
+    const ciLower = String(ciName || "").toLowerCase();
+    const names = getObjectNames(object);
+
+    if (!names.length) return false;
+
+    return names.some(n =>
+      n === ciLower ||
+      n.includes(ciLower) ||
+      ciLower.includes(n)
+    );
+  }
+
+  function getClusterNameFromObject(object, snapshot) {
+    return (
+      object?.clusterName ||
+      object?.cluster?.name ||
+      object?.cluster?.clusterName ||
+      object?.clusterInfo?.name ||
+      object?.clusterInfo?.clusterName ||
+      object?.registeredSource?.clusterName ||
+      object?.sourceInfo?.clusterName ||
+      object?.storageDomain?.clusterName ||
+      snapshot?.clusterName ||
+      snapshot?.cluster?.name ||
+      snapshot?.clusterInfo?.name ||
+      "N/A"
+    );
+  }
+
+  function buildWorkNotesText(row) {
+    return (
+      "Cohesity backup validation completed.\n" +
+      "CI Name: " + row.ciName + "\n" +
+      "Protection Group: " + row.protectionGroup + "\n" +
+      "Selected Cluster: " + row.cluster + "\n" +
+      "Matched Clusters: " + row.matchedClusters + "\n" +
+      "Backup Status: " + row.latestBackupStatus + "\n" +
+      "Latest Backup Date: " + row.latestBackupDate + "\n" +
+      "Validation Result: " + row.result
+    );
+  }
+
+  // ========================================================
+  // COHESITY GLOBAL SEARCH CALL
+  // ========================================================
+  async function searchObjectsGlobal(ciName) {
+    const url =
+      `${HELIOS_BASE_URL}/v2/data-protect/search/objects` +
+      `?searchString=${encodeURIComponent(ciName)}`;
+
+    return await getJson(url, {
+      accept: "application/json",
+      apiKey: COHESITY_API_KEY
+    });
+  }
+
+  function extractSearchObjects(json) {
+    if (!json || json.__error) return [];
+
+    if (Array.isArray(json)) return json;
+
+    if (Array.isArray(json.objects)) return json.objects;
+    if (Array.isArray(json.results)) return json.results;
+    if (Array.isArray(json.entities)) return json.entities;
+    if (Array.isArray(json.data)) return json.data;
+    if (Array.isArray(json.items)) return json.items;
+    if (Array.isArray(json.searchResults)) return json.searchResults;
+
+    if (json.result && typeof json.result === "object") {
+      if (Array.isArray(json.result.objects)) return json.result.objects;
+      if (Array.isArray(json.result.results)) return json.result.results;
+      if (Array.isArray(json.result.entities)) return json.result.entities;
+      if (Array.isArray(json.result.data)) return json.result.data;
+      if (Array.isArray(json.result.items)) return json.result.items;
+      if (Array.isArray(json.result.searchResults)) return json.result.searchResults;
+    }
+
+    return [];
+  }
+
+  async function getLatestBackupForCi(ciName) {
+    const json = await searchObjectsGlobal(ciName);
+
+    if (json.__error) {
+      console.log(
+        `Global object search failed for CI ${ciName}: ${json.status} ${json.statusText}`
+      );
+
+      return {
+        cluster: "N/A",
+        matchedClusters: "N/A",
+        protectionGroup: "N/A",
+        latestBackupStatus: "SearchFailed",
+        latestBackupDate: "N/A",
+        result: "Cohesity Search Failed"
+      };
+    }
+
+    const objects = extractSearchObjects(json);
+
+    if (!objects.length) {
+      return {
+        cluster: "N/A",
+        matchedClusters: "N/A",
+        protectionGroup: "N/A",
+        latestBackupStatus: "NoObject",
+        latestBackupDate: "N/A",
+        result: "No Cohesity Object Found"
+      };
+    }
+
+    const matchingObjects = objects.filter(obj => objectMatchesCi(obj, ciName));
+    const objectsToCheck = matchingObjects.length ? matchingObjects : objects;
+
+    // Take only the first matching object/detail returned by the endpoint.
+    const object = objectsToCheck[0];
+
+    if (!object) {
+      return {
+        cluster: "N/A",
+        matchedClusters: "N/A",
+        protectionGroup: "N/A",
+        latestBackupStatus: "NoObject",
+        latestBackupDate: "N/A",
+        result: "No Cohesity Object Found"
+      };
+    }
+
+    const snapshot = getBestSnapshot(object);
+    const backupUsecs = snapshot ? getLatestBackupUsecs(snapshot) : null;
+    const latestBackupDate = backupUsecs ? formatUsecs(backupUsecs) : "N/A";
+    const protectionGroup = snapshot ? getProtectionGroupName(object, snapshot) : "N/A";
+    const latestBackupStatus = getBackupStatus(object, snapshot, backupUsecs);
+    const clusterName = getClusterNameFromObject(object, snapshot);
+
+    return {
+      cluster: clusterName,
+      matchedClusters: clusterName,
+      protectionGroup,
+      latestBackupStatus,
+      latestBackupDate,
+      result: snapshot && backupUsecs
+        ? "Latest Backup Found"
+        : "Object Found / No Backup Snapshot"
+    };
+  }
+
+  // ========================================================
+  // NO DTSK OUTPUT
+  // ========================================================
+  if (!Array.isArray(decomRows) || decomRows.length === 0) {
+    let markdown = "";
+
+    markdown += "## Decommission DTSK Backup Validation Summary\n\n";
+    markdown += "| Metric | Count |\n";
+    markdown += "|---|---:|\n";
+    markdown += "| Total DTSKs | 0 |\n";
+    markdown += "| Assigned | 0 |\n";
+    markdown += "| Not Assigned | 0 |\n";
+    markdown += "| Within 2-Day SLA | 0 |\n";
+    markdown += "| SLA Breached | 0 |\n";
+    markdown += "| Created Date Missing | 0 |\n";
+
+    // Commented because ServiceNow work_notes update is not queried back for verification.
+    // markdown += "| DTSKs Eligible For Update | 0 |\n";
+    // markdown += "| DTSKs Not Updated | 0 |\n";
+
+    markdown += "\n";
+
+    markdown += "## Decommission DTSK Backup Validation - Task Status and Backup Evidence\n\n";
+    markdown += "| Status | Message |\n";
+    markdown += "|---|---|\n";
+    markdown += "| No DTSK | No active decommission DTSKs assigned to the team for this run. |\n\n";
+
+    markdown += "## Legend\n\n";
+    markdown += "| Status | Meaning |\n";
+    markdown += "|---|---|\n";
+    markdown += "| No DTSK | No active decommission tasks were returned by the previous search step. |";
+
+    console.log(markdown);
+
+    return {
+      markdown,
+      rows: [],
+      rowsToUpdate: [],
+      summary: {
+        total: 0,
+        assigned: 0,
+        notAssigned: 0,
+        withinSla: 0,
+        breached: 0,
+        createdDateMissing: 0,
+
+        // Internal only. Not shown in email.
+        dtskEligibleForUpdate: 0,
+        dtskNotUpdated: 0,
+
+        message: "No active decommission DTSKs assigned to the team for this run."
+      }
+    };
+  }
+
+  // ========================================================
+  // MAIN
+  // ========================================================
+  const results = [];
+
+  // Cache each CI result to avoid duplicate Cohesity checks
+  const backupCache = new Map();
+
+  for (const row of decomRows) {
+
+    // sysId is required for update_record_1 / work_notes update.
+    // It is NOT shown in the email.
+    const sysId = getField(row, "sys_id") || "N/A";
+    const dtskNumber = getField(row, "number") || "N/A";
+
+    const assignedToRaw = firstNonBlank(
+      getField(row, "assigned_to.name"),
+      getField(row, "assigned_to_name")
+    );
+
+    const assignedTo = assignedToRaw || "N/A";
+    const assignmentAction = assignedToRaw ? "Assigned" : "Please assign";
+
+    const createdOnRaw = firstNonBlank(
+      getField(row, "sys_created_on"),
+      getField(row, "opened_at")
+    );
+
+    const sla = getSlaInfo(createdOnRaw);
+
+    const decomRequest = firstNonBlank(
+      getField(row, "decom_request.number"),
+      getField(row, "decom_request_number")
+    ) || "N/A";
+
+    const ciName = firstNonBlank(
+      getField(row, "decom_request.ci_name.name"),
+      getField(row, "decom_request_ci_name_name")
+    ) || "N/A";
+
+    if (isBadCiName(ciName)) {
+      results.push({
+        sysId,
+        decomRequest,
+        dtsk: dtskNumber,
+        ciName,
+        assignedTo,
+        assignmentAction,
+        createdOn: sla.createdOn,
+        slaDue: sla.slaDue,
+        slaStatus: sla.slaStatus,
+        cluster: "N/A",
+        matchedClusters: "N/A",
+        protectionGroup: "N/A",
+        latestBackupStatus: "CI_NOT_AVAILABLE",
+        latestBackupDate: "N/A",
+        result: "Cannot Validate",
+
+        // Internal only. Not shown in email.
+        updatedDtsk: "No",
+        dtskUpdateReason: "CI not available / cannot validate",
+
+        workNotesText: ""
+      });
+
+      continue;
+    }
+
+    // ======================================================
+    // Cohesity backup validation with CI cache
+    // ======================================================
+    const cacheKey = ciName.toLowerCase();
+
+    let backup;
+
+    if (backupCache.has(cacheKey)) {
+      backup = backupCache.get(cacheKey);
+      console.log(`Backup cache hit for CI: ${ciName}`);
+    } else {
+      backup = await getLatestBackupForCi(ciName);
+      backupCache.set(cacheKey, backup);
+    }
+
+    const backupFound =
+      String(backup.result || "").startsWith("Latest Backup Found") &&
+      backup.latestBackupDate !== "N/A";
+
+    const sysIdFound = sysId !== "N/A";
+
+    const shouldUpdateDtsk = backupFound && sysIdFound;
+
+    const resultRow = {
+      sysId,
+      decomRequest,
+      dtsk: dtskNumber,
+      ciName,
+      assignedTo,
+      assignmentAction,
+      createdOn: sla.createdOn,
+      slaDue: sla.slaDue,
+      slaStatus: sla.slaStatus,
+      cluster: backup.cluster,
+      matchedClusters: backup.matchedClusters,
+      protectionGroup: backup.protectionGroup,
+      latestBackupStatus: backup.latestBackupStatus,
+      latestBackupDate: backup.latestBackupDate,
+      result: backup.result,
+
+      // Internal only. Not shown in email because work_notes is not queried back for verification.
+      updatedDtsk: shouldUpdateDtsk ? "Yes" : "No",
+      dtskUpdateReason: shouldUpdateDtsk
+        ? "Backup evidence found"
+        : backupFound && !sysIdFound
+          ? "Backup found but sys_id missing"
+          : "Backup evidence not found / not eligible",
+
+      // Used by update_record_1 payload field: work_notes
+      workNotesText: ""
+    };
+
+    if (shouldUpdateDtsk) {
+      resultRow.workNotesText = buildWorkNotesText(resultRow);
+    }
+
+    results.push(resultRow);
+  }
+
+  // ========================================================
+  // DTSK UPDATE ROWS
+  // Only backup-found DTSKs with sys_id go to update_record_1
+  // ========================================================
+  const rowsToUpdate = results.filter(r => r.updatedDtsk === "Yes");
+
+  // ========================================================
+  // SUMMARY COUNTS
+  // ========================================================
+  const total = results.length;
+  const assigned = results.filter(r => r.assignmentAction === "Assigned").length;
+  const notAssigned = results.filter(r => r.assignmentAction === "Please assign").length;
+  const withinSla = results.filter(r => String(r.slaStatus).startsWith("Within SLA")).length;
+  const breached = results.filter(r => String(r.slaStatus).startsWith("Breached")).length;
+  const createdDateMissing = results.filter(r => r.slaStatus === "Created Date Missing").length;
+
+  // Internal only. Not shown in email because work_notes is not queried back for verification.
+  const dtskEligibleForUpdate = rowsToUpdate.length;
+  const dtskNotUpdated = results.filter(r => r.updatedDtsk === "No").length;
+
+  // ========================================================
+  // MARKDOWN EMAIL OUTPUT
+  // ========================================================
+  let markdown = "";
+
+  markdown += "## Decommission DTSK Backup Validation Summary\n\n";
+  markdown += "| Metric | Count |\n";
+  markdown += "|---|---:|\n";
+  markdown += `| Total DTSKs | ${total} |\n`;
+  markdown += `| Assigned | ${assigned} |\n`;
+  markdown += `| Not Assigned | ${notAssigned} |\n`;
+  markdown += `| Within 2-Day SLA | ${withinSla} |\n`;
+  markdown += `| SLA Breached | ${breached} |\n`;
+  markdown += `| Created Date Missing | ${createdDateMissing} |\n`;
+
+  // Commented because ServiceNow work_notes update is not queried back for verification.
+  // markdown += `| DTSKs Eligible For Update | ${dtskEligibleForUpdate} |\n`;
+  // markdown += `| DTSKs Not Updated | ${dtskNotUpdated} |\n`;
+
+  markdown += "\n";
+
+  markdown += "## Decommission DTSK Backup Validation - Task Status and Backup Evidence\n\n";
+
+  // Commented because ServiceNow work_notes update is not queried back for verification.
+  // markdown += "| Decom Request | DTSK | CI Name | Assigned To | Assignment Action | Created On | SLA Due | SLA Status | Selected Cluster | Matched Clusters | Protection Group | Backup Status | Latest Backup Date | Result | Updated DTSK | DTSK Update Reason |\n";
+  // markdown += "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|\n";
+
+  markdown += "| Decom Request | DTSK | CI Name | Assigned To | Assignment Action | Created On | SLA Due | SLA Status | Selected Cluster | Matched Clusters | Protection Group | Backup Status | Latest Backup Date | Result |\n";
+  markdown += "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|\n";
+
+  for (const r of results) {
+    markdown +=
+      `| ${escapeMd(r.decomRequest)} ` +
+      `| ${escapeMd(r.dtsk)} ` +
+      `| ${escapeMd(r.ciName)} ` +
+      `| ${escapeMd(r.assignedTo)} ` +
+      `| ${escapeMd(r.assignmentAction)} ` +
+      `| ${escapeMd(r.createdOn)} ` +
+      `| ${escapeMd(r.slaDue)} ` +
+      `| ${escapeMd(r.slaStatus)} ` +
+      `| ${escapeMd(r.cluster)} ` +
+      `| ${escapeMd(r.matchedClusters)} ` +
+      `| ${escapeMd(r.protectionGroup)} ` +
+      `| ${escapeMd(r.latestBackupStatus)} ` +
+      `| ${escapeMd(r.latestBackupDate)} ` +
+      `| ${escapeMd(r.result)} |\n`;
+
+    // Commented because ServiceNow work_notes update is not queried back for verification.
+    // Previous row ending:
+    // `| ${escapeMd(r.result)} ` +
+    // `| ${escapeMd(r.updatedDtsk)} ` +
+    // `| ${escapeMd(r.dtskUpdateReason)} |\n`;
+  }
+
+  markdown += "\n## Legend\n\n";
+  markdown += "| Status | Meaning |\n";
+  markdown += "|---|---|\n";
+  markdown += "| BackedUp | Cohesity object has latest snapshot time. |\n";
+  markdown += "| NoBackup | Object exists but no latest snapshot was returned. |\n";
+  markdown += "| NoObject | CI was not found in Cohesity object search. |\n";
+  markdown += "| Selected Cluster | Cluster from the first matching backup detail returned by the Cohesity search endpoint. |\n";
+  markdown += "| Please assign | DTSK has no assigned_to value. |\n";
+  markdown += "| SLA Breached | DTSK age is greater than 2 days from created date. |\n";
+
+  // Commented because ServiceNow work_notes update is not queried back for verification.
+  // markdown += "| Updated DTSK = Yes | Backup evidence was found and sys_id is available. This row is included in rowsToUpdate for work_notes update. |\n";
+  // markdown += "| Updated DTSK = No | DTSK is not updated because backup evidence was not found, CI cannot be validated, or sys_id is missing. |\n";
+
+  console.log(markdown);
+
+  return {
+    markdown,
+    rows: results,
+    rowsToUpdate,
+    summary: {
+      total,
+      assigned,
+      notAssigned,
+      withinSla,
+      breached,
+      createdDateMissing,
+
+      // Internal only. Not shown in email.
+      dtskEligibleForUpdate,
+      dtskNotUpdated
+    }
+  };
+}
