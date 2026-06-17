@@ -10,12 +10,15 @@
 # - LatestReplicationEndTimeET
 #
 # Excluded:
-# - PGID
+# - PGID in final report
 # - DB ID
 # - HostIds
 # - RunType
 # - RunStatus
 # - Collection Summary
+#
+# Added:
+# - Error exception capture and display
 # =====================================================================
 
 $ErrorActionPreference = "Stop"
@@ -30,6 +33,9 @@ $apikeypath = "X:\PowerShell\Cohesity_API_Scripts\DO_NOT_Delete\apikey.txt"
 $baseUrl    = "https://helios.cohesity.com"
 
 $MaxRunPagesPerPG = 10
+
+# Error collection
+$script:ErrorRows = @()
 
 # -------------------------------
 # Output folder
@@ -53,6 +59,38 @@ $commonHeaders = @{
 }
 
 # =====================================================================
+# Error helper
+# =====================================================================
+function Add-ErrorRow {
+    param(
+        [string]$Stage,
+        [string]$Cluster,
+        [string]$PGName,
+        [string]$PGID,
+        [string]$Uri,
+        [object]$ErrorObject
+    )
+
+    $message = ""
+
+    try {
+        $message = $ErrorObject.Exception.Message
+    }
+    catch {
+        $message = "$ErrorObject"
+    }
+
+    $script:ErrorRows += [PSCustomObject]@{
+        Stage        = $Stage
+        Cluster      = $Cluster
+        PGName       = $PGName
+        PGID         = $PGID
+        Uri          = $Uri
+        ErrorMessage = $message
+    }
+}
+
+# =====================================================================
 # GET wrapper
 # =====================================================================
 function Invoke-HeliosGetJson {
@@ -61,18 +99,37 @@ function Invoke-HeliosGetJson {
         [Parameter(Mandatory)][hashtable]$Headers
     )
 
-    if ($PSVersionTable.PSVersion.Major -lt 6) {
-        $resp = Invoke-WebRequest -Uri $Uri -Headers $Headers -Method Get -UseBasicParsing
-    }
-    else {
-        $resp = Invoke-WebRequest -Uri $Uri -Headers $Headers -Method Get
-    }
+    try {
+        if ($PSVersionTable.PSVersion.Major -lt 6) {
+            $resp = Invoke-WebRequest -Uri $Uri -Headers $Headers -Method Get -UseBasicParsing
+        }
+        else {
+            $resp = Invoke-WebRequest -Uri $Uri -Headers $Headers -Method Get
+        }
 
-    if (-not $resp -or [string]::IsNullOrWhiteSpace($resp.Content)) {
-        return $null
-    }
+        if (-not $resp -or [string]::IsNullOrWhiteSpace($resp.Content)) {
+            return $null
+        }
 
-    return ($resp.Content | ConvertFrom-Json)
+        return ($resp.Content | ConvertFrom-Json)
+    }
+    catch {
+        $msg = $_.Exception.Message
+
+        try {
+            if ($_.Exception.Response -and $_.Exception.Response.GetResponseStream()) {
+                $reader = New-Object System.IO.StreamReader($_.Exception.Response.GetResponseStream())
+                $body = $reader.ReadToEnd()
+
+                if (-not [string]::IsNullOrWhiteSpace($body)) {
+                    $msg = "$msg | ResponseBody: $body"
+                }
+            }
+        }
+        catch {}
+
+        throw "GET failed: $Uri | $msg"
+    }
 }
 
 # =====================================================================
@@ -365,7 +422,9 @@ function Get-ReplicationEndUsecs {
 function Get-LatestPgRunDates {
     param(
         [Parameter(Mandatory)][string]$PgId,
-        [Parameter(Mandatory)][hashtable]$Headers
+        [Parameter(Mandatory)][hashtable]$Headers,
+        [string]$ClusterName = "",
+        [string]$PGName = ""
     )
 
     $info = [PSCustomObject]@{
@@ -398,6 +457,14 @@ function Get-LatestPgRunDates {
             $runsJson = Invoke-HeliosGetJson -Uri $runsUri -Headers $Headers
         }
         catch {
+            Add-ErrorRow `
+                -Stage "RunsLookup" `
+                -Cluster $ClusterName `
+                -PGName $PGName `
+                -PGID $PgId `
+                -Uri $runsUri `
+                -ErrorObject $_
+
             break
         }
 
@@ -583,13 +650,26 @@ foreach ($cluster in $clustersAvailable) {
             "?environments=kOracle&includeEmbeddedApplication=true&includeApplicationTreeInfo=true" +
             "&allUnderHierarchy=true&includeData=true"
 
-    $json1 = Invoke-HeliosGetJson -Uri $uri1 -Headers $headers
+    try {
+        $json1 = Invoke-HeliosGetJson -Uri $uri1 -Headers $headers
+    }
+    catch {
+        Add-ErrorRow `
+            -Stage "RegistrationInfo" `
+            -Cluster $cluster_name `
+            -PGName "" `
+            -PGID "" `
+            -Uri $uri1 `
+            -ErrorObject $_
+
+        $json1 = $null
+    }
 
     $db_nodes = @()
 
-    foreach ($root in ($json1.rootNodes | Where-Object { $_ })) {
-        foreach ($app in ($root.applications | Where-Object { $_ })) {
-            foreach ($ati in ($app.applicationTreeInfo | Where-Object { $_ })) {
+    foreach ($root in (@($json1.rootNodes) | Where-Object { $_ })) {
+        foreach ($app in (@($root.applications) | Where-Object { $_ })) {
+            foreach ($ati in (@($app.applicationTreeInfo) | Where-Object { $_ })) {
                 $ora = $ati.protectionSource.oracleProtectionSource
 
                 if ($ora) {
@@ -638,10 +718,24 @@ foreach ($cluster in $clustersAvailable) {
     # -----------------------------
     # Oracle PG details + latest PG run dates
     # -----------------------------
-    $uri2  = "$baseUrl/v2/data-protect/protection-groups?environments=kOracle&isDeleted=false&isActive=true&includeLastRunInfo=true"
-    $json2 = Invoke-HeliosGetJson -Uri $uri2 -Headers $headers
+    $uri2 = "$baseUrl/v2/data-protect/protection-groups?environments=kOracle&isDeleted=false&isActive=true&includeLastRunInfo=true"
 
-    foreach ($dbd in ($json2.protectionGroups | Where-Object { $_ })) {
+    try {
+        $json2 = Invoke-HeliosGetJson -Uri $uri2 -Headers $headers
+    }
+    catch {
+        Add-ErrorRow `
+            -Stage "ProtectionGroups" `
+            -Cluster $cluster_name `
+            -PGName "" `
+            -PGID "" `
+            -Uri $uri2 `
+            -ErrorObject $_
+
+        continue
+    }
+
+    foreach ($dbd in (@($json2.protectionGroups) | Where-Object { $_ })) {
 
         $pgId = Get-PgIdFromProtectionGroup -Pg $dbd
 
@@ -655,10 +749,10 @@ foreach ($cluster in $clustersAvailable) {
                 $policyName = $policyCache[$pk]
             }
             else {
+                $policyUri = "$baseUrl/v2/data-protect/policies?ids=$($dbd.policyId)"
+
                 try {
-                    $pJson = Invoke-HeliosGetJson `
-                        -Uri "$baseUrl/v2/data-protect/policies?ids=$($dbd.policyId)" `
-                        -Headers $headers
+                    $pJson = Invoke-HeliosGetJson -Uri $policyUri -Headers $headers
 
                     $policyName = (
                         $pJson.policies |
@@ -667,6 +761,14 @@ foreach ($cluster in $clustersAvailable) {
                     )
                 }
                 catch {
+                    Add-ErrorRow `
+                        -Stage "PolicyLookup" `
+                        -Cluster $cluster_name `
+                        -PGName $dbd.name `
+                        -PGID $pgId `
+                        -Uri $policyUri `
+                        -ErrorObject $_
+
                     $policyName = ""
                 }
 
@@ -689,7 +791,12 @@ foreach ($cluster in $clustersAvailable) {
                 $pgRunInfo = $runCache[$rk]
             }
             else {
-                $pgRunInfo = Get-LatestPgRunDates -PgId $pgId -Headers $headers
+                $pgRunInfo = Get-LatestPgRunDates `
+                    -PgId $pgId `
+                    -Headers $headers `
+                    -ClusterName $cluster_name `
+                    -PGName $dbd.name
+
                 $runCache[$rk] = $pgRunInfo
             }
         }
@@ -845,6 +952,8 @@ foreach ($cluster in $clustersAvailable) {
                     )
 
                     foreach ($hostId in $hostIds) {
+                        $ipApiUrl = "$baseUrl/v2/data-protect/objects/$hostId"
+
                         try {
                             $hk = "$cluster_id|$hostId"
 
@@ -852,7 +961,6 @@ foreach ($cluster in $clustersAvailable) {
                                 $hostNames += $hostCache[$hk]
                             }
                             else {
-                                $ipApiUrl = "$baseUrl/v2/data-protect/objects/$hostId"
                                 $ipJson = Invoke-HeliosGetJson -Uri $ipApiUrl -Headers $headers
                                 $ip = $ipJson.name
 
@@ -861,7 +969,15 @@ foreach ($cluster in $clustersAvailable) {
                                 $hostNames += $resolved
                             }
                         }
-                        catch {}
+                        catch {
+                            Add-ErrorRow `
+                                -Stage "HostLookup" `
+                                -Cluster $cluster_name `
+                                -PGName $dbd.name `
+                                -PGID $pgId `
+                                -Uri $ipApiUrl `
+                                -ErrorObject $_
+                        }
                     }
 
                     $pgRows += [PSCustomObject]@{
@@ -1060,7 +1176,6 @@ $cols = @(
 
 try {
     $raw = $Host.UI.RawUI
-
     $targetWidth = 10000
 
     if ($raw.BufferSize.Width -lt $targetWidth) {
@@ -1086,3 +1201,28 @@ $final |
     Export-Csv -Path $csvPath -NoTypeInformation -Encoding utf8
 
 Write-Host "CSV exported: $csvPath" -ForegroundColor Gray
+
+# =====================================================================
+# 5) Error exception output
+# =====================================================================
+if ($script:ErrorRows.Count -gt 0) {
+
+    Write-Host ""
+    Write-Host "Error Exceptions" -ForegroundColor Yellow
+
+    $script:ErrorRows |
+        Select-Object Stage, Cluster, PGName, PGID, ErrorMessage |
+        Format-Table -AutoSize -Wrap |
+        Out-String -Width 10000 |
+        Write-Host
+
+    $errPath = Join-Path $outDir "oracle_DB_combined_errors_$stamp.csv"
+
+    $script:ErrorRows |
+        Export-Csv -Path $errPath -NoTypeInformation -Encoding utf8
+
+    Write-Host "Error CSV exported: $errPath" -ForegroundColor DarkYellow
+}
+else {
+    Write-Host "No API exceptions captured." -ForegroundColor Green
+}
