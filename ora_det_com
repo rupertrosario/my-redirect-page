@@ -1,41 +1,18 @@
 # =====================================================================
-# Cohesity Helios — Oracle DB Inventory + Latest DB Backup Dates
+# Cohesity Helios — Oracle DB Inventory + Latest Backup Dates
 # STRICTLY READ-ONLY (GET-only)
 #
-# Menu:
-# 1) Select Cluster: [0] ALL or [1..N] single
-#
-# Output:
-# - Console table
-# - ONE timestamped CSV
-#
-# Adds:
-# - LatestDataBackupET
-# - LatestDataRunType
-# - LatestDataStatus
+# Adds only:
+# - LatestRegularBackupET
 # - LatestLogBackupET
-# - LatestLogRunType
-# - LatestLogStatus
-# - LatestReplicationTarget
-# - LatestReplicationStatus
+# - ReplicationTargetCluster
 # - LatestReplicationEndTimeET
 #
 # Latest backup logic:
-# - Run type comes from:
-#   runs[].localBackupInfo.runType
-#
-# - DB/object-level backup date/status comes from:
-#   runs[].objects[].object.name
-#   runs[].objects[].localSnapshotInfo.snapshotInfo.status
-#   runs[].objects[].localSnapshotInfo.snapshotInfo.endTimeUsecs
-#
-# Read-only APIs used:
-# - GET /v2/mcm/cluster-mgmt/info
-# - GET /irisservices/api/v1/public/protectionSources/registrationInfo
-# - GET /v2/data-protect/protection-groups
-# - GET /v2/data-protect/protection-groups/{id}/runs
-# - GET /v2/data-protect/policies
-# - GET /v2/data-protect/objects/{id}
+# - runs[].localBackupInfo.runType
+# - runs[].objects[].object.name
+# - runs[].objects[].localSnapshotInfo.snapshotInfo.status
+# - runs[].objects[].localSnapshotInfo.snapshotInfo.endTimeUsecs
 # =====================================================================
 
 $ErrorActionPreference = "Stop"
@@ -69,10 +46,9 @@ $commonHeaders = @{
     accept = "application/json"
 }
 
-# How many run-history pages to read per PG.
-# Default endpoint page is usually recent runs first.
-# Increase if full/regular backup is older than many log runs.
-$MaxRunPagesPerPG = 10
+# Number of recent PG runs to inspect.
+# Increase if latest regular backup is older than many log runs.
+$MaxRunsToInspectPerPG = 10
 
 # =====================================================================
 # GET wrapper - PS 5.1 safe
@@ -216,7 +192,6 @@ function Get-DbMatchKeys {
 
     $keys = @($n)
 
-    # Allows DB.DOMAIN style to match DB style
     if ($n -match '\.') {
         $keys += ($n -split '\.')[0]
     }
@@ -295,19 +270,14 @@ function Get-DataGuardRole {
 
 function New-BlankRunInfo {
     return [PSCustomObject]@{
-        LatestDataUsecs             = 0
-        LatestDataBackupET          = ""
-        LatestDataRunType           = ""
-        LatestDataStatus            = ""
+        LatestRegularUsecs          = 0
+        LatestRegularBackupET       = ""
 
         LatestLogUsecs              = 0
         LatestLogBackupET           = ""
-        LatestLogRunType            = ""
-        LatestLogStatus             = ""
 
         LatestReplicationUsecs      = 0
-        LatestReplicationTarget     = ""
-        LatestReplicationStatus     = ""
+        ReplicationTargetCluster    = ""
         LatestReplicationEndTimeET  = ""
     }
 }
@@ -328,12 +298,14 @@ function Ensure-RunInfoKey {
 function Get-RunInfoForDb {
     param(
         [hashtable]$Index,
-        [string]$DbName
+        [object[]]$Names
     )
 
-    foreach ($key in (Get-DbMatchKeys -Name $DbName)) {
-        if ($Index.ContainsKey($key)) {
-            return $Index[$key]
+    foreach ($name in @($Names)) {
+        foreach ($key in (Get-DbMatchKeys -Name $name)) {
+            if ($Index.ContainsKey($key)) {
+                return $Index[$key]
+            }
         }
     }
 
@@ -348,14 +320,12 @@ function Get-ReplicationCandidates {
 
     $items = @()
 
-    # Object-level replication info
     $items += @($Obj.replicationInfo.replicationTargetResults)
 
     foreach ($rr in @($Obj.replicationRuns | Where-Object { $_ })) {
         $items += @($rr.replicationTargetResults)
     }
 
-    # Run-level replication info
     $items += @($Run.replicationInfo.replicationTargetResults)
 
     foreach ($rr in @($Run.replicationRuns | Where-Object { $_ })) {
@@ -373,12 +343,6 @@ function Get-ReplicationCandidates {
             $item.name
         )
 
-        $status = Get-FirstNonEmpty -Values @(
-            $item.status,
-            $item.replicationStatus,
-            $item.state
-        )
-
         $endUsecs = Get-FirstNonEmpty -Values @(
             $item.endTimeUsecs,
             $item.endTimeInUsecs,
@@ -392,7 +356,6 @@ function Get-ReplicationCandidates {
 
             $out += [PSCustomObject]@{
                 Target   = $target
-                Status   = $status
                 EndUsecs = $endUsecs
             }
         }
@@ -413,118 +376,99 @@ function Get-LatestDbRunIndex {
         return $index
     }
 
-    $page = 0
-    $cookie = ""
+    $runsUri = "$baseUrl/v2/data-protect/protection-groups/$PgId/runs"
 
-    do {
-        $page++
+    try {
+        $runsJson = Invoke-HeliosGetJson -Uri $runsUri -Headers $Headers
+    }
+    catch {
+        return $index
+    }
 
-        $runsUri = "$baseUrl/v2/data-protect/protection-groups/$PgId/runs"
+    $runs = @($runsJson.runs | Where-Object { $_ }) |
+        Sort-Object {
+            To-UsecNumber -Usecs (Get-FirstNonEmpty -Values @($_.localBackupInfo.endTimeUsecs))
+        } -Descending |
+        Select-Object -First $MaxRunsToInspectPerPG
 
-        if (-not [string]::IsNullOrWhiteSpace($cookie)) {
-            $escapedCookie = [uri]::EscapeDataString($cookie)
-            $runsUri = "$runsUri`?paginationCookie=$escapedCookie"
-        }
+    foreach ($run in $runs) {
 
-        try {
-            $runsJson = Invoke-HeliosGetJson -Uri $runsUri -Headers $Headers
-        }
-        catch {
-            break
-        }
+        # Run type comes from run-level localBackupInfo
+        $runType = Get-FirstNonEmpty -Values @(
+            $run.localBackupInfo.runType
+        )
 
-        foreach ($run in ($runsJson.runs | Where-Object { $_ })) {
+        $isLogRun = Test-LogRunType -RunType $runType
 
-            # Run type is run-level
-            $runType = Get-FirstNonEmpty -Values @(
-                $run.localBackupInfo.runType
+        foreach ($obj in ($run.objects | Where-Object { $_ })) {
+
+            # DB name comes from object.name
+            $objectName = Get-FirstNonEmpty -Values @(
+                $obj.object.name
             )
 
-            $isLogRun = Test-LogRunType -RunType $runType
+            if ([string]::IsNullOrWhiteSpace($objectName)) {
+                continue
+            }
 
-            foreach ($obj in ($run.objects | Where-Object { $_ })) {
+            # DB-level status/date comes from localSnapshotInfo.snapshotInfo
+            $objStatus = Get-FirstNonEmpty -Values @(
+                $obj.localSnapshotInfo.snapshotInfo.status
+            )
 
-                # DB name is object-level
-                $objectName = Get-FirstNonEmpty -Values @(
-                    $obj.object.name
-                )
+            $objEndUsecs = Get-FirstNonEmpty -Values @(
+                $obj.localSnapshotInfo.snapshotInfo.endTimeUsecs,
+                $obj.localSnapshotInfo.snapshotInfo.snapshotCreationTimeUsecs
+            )
 
-                if ([string]::IsNullOrWhiteSpace($objectName)) {
+            $objEndNum = To-UsecNumber -Usecs $objEndUsecs
+
+            foreach ($key in (Get-DbMatchKeys -Name $objectName)) {
+
+                if ([string]::IsNullOrWhiteSpace($key)) {
                     continue
                 }
 
-                # DB backup status and date are object-level
-                $objStatus = Get-FirstNonEmpty -Values @(
-                    $obj.localSnapshotInfo.snapshotInfo.status
-                )
+                $entry = Ensure-RunInfoKey -Index $index -Key $key
 
-                $objEndUsecs = Get-FirstNonEmpty -Values @(
-                    $obj.localSnapshotInfo.snapshotInfo.endTimeUsecs,
-                    $obj.localSnapshotInfo.snapshotInfo.snapshotCreationTimeUsecs
-                )
+                if ((Test-SuccessStatus -Status $objStatus) -and $objEndNum -gt 0) {
 
-                $objEndNum = To-UsecNumber -Usecs $objEndUsecs
-
-                foreach ($key in (Get-DbMatchKeys -Name $objectName)) {
-
-                    if ([string]::IsNullOrWhiteSpace($key)) {
-                        continue
-                    }
-
-                    $entry = Ensure-RunInfoKey -Index $index -Key $key
-
-                    if ((Test-SuccessStatus -Status $objStatus) -and $objEndNum -gt 0) {
-
-                        if ($isLogRun) {
-                            if ($objEndNum -gt [double]$entry.LatestLogUsecs) {
-                                $entry.LatestLogUsecs     = $objEndNum
-                                $entry.LatestLogBackupET  = Convert-UsecsToET -Usecs $objEndUsecs
-                                $entry.LatestLogRunType   = $runType
-                                $entry.LatestLogStatus    = $objStatus
-                            }
-                        }
-                        else {
-                            if ($objEndNum -gt [double]$entry.LatestDataUsecs) {
-                                $entry.LatestDataUsecs    = $objEndNum
-                                $entry.LatestDataBackupET = Convert-UsecsToET -Usecs $objEndUsecs
-                                $entry.LatestDataRunType  = $runType
-                                $entry.LatestDataStatus   = $objStatus
-                            }
+                    if ($isLogRun) {
+                        if ($objEndNum -gt [double]$entry.LatestLogUsecs) {
+                            $entry.LatestLogUsecs    = $objEndNum
+                            $entry.LatestLogBackupET = Convert-UsecsToET -Usecs $objEndUsecs
                         }
                     }
-
-                    # Replication details if present in payload
-                    $repCandidates = Get-ReplicationCandidates -Run $run -Obj $obj
-
-                    foreach ($rep in ($repCandidates | Where-Object { $_ })) {
-
-                        $repEndNum = To-UsecNumber -Usecs $rep.EndUsecs
-
-                        if ($repEndNum -gt 0) {
-                            if ($repEndNum -gt [double]$entry.LatestReplicationUsecs) {
-                                $entry.LatestReplicationUsecs     = $repEndNum
-                                $entry.LatestReplicationTarget    = $rep.Target
-                                $entry.LatestReplicationStatus    = $rep.Status
-                                $entry.LatestReplicationEndTimeET = Convert-UsecsToET -Usecs $rep.EndUsecs
-                            }
+                    else {
+                        if ($objEndNum -gt [double]$entry.LatestRegularUsecs) {
+                            $entry.LatestRegularUsecs    = $objEndNum
+                            $entry.LatestRegularBackupET = Convert-UsecsToET -Usecs $objEndUsecs
                         }
-                        elseif ([string]::IsNullOrWhiteSpace($entry.LatestReplicationTarget) -and
-                                -not [string]::IsNullOrWhiteSpace($rep.Target)) {
-                            $entry.LatestReplicationTarget = $rep.Target
-                            $entry.LatestReplicationStatus = $rep.Status
+                    }
+                }
+
+                # Replication target/date if present
+                $repCandidates = Get-ReplicationCandidates -Run $run -Obj $obj
+
+                foreach ($rep in ($repCandidates | Where-Object { $_ })) {
+
+                    $repEndNum = To-UsecNumber -Usecs $rep.EndUsecs
+
+                    if ($repEndNum -gt 0) {
+                        if ($repEndNum -gt [double]$entry.LatestReplicationUsecs) {
+                            $entry.LatestReplicationUsecs     = $repEndNum
+                            $entry.ReplicationTargetCluster   = $rep.Target
+                            $entry.LatestReplicationEndTimeET = Convert-UsecsToET -Usecs $rep.EndUsecs
                         }
+                    }
+                    elseif ([string]::IsNullOrWhiteSpace($entry.ReplicationTargetCluster) -and
+                            -not [string]::IsNullOrWhiteSpace($rep.Target)) {
+                        $entry.ReplicationTargetCluster = $rep.Target
                     }
                 }
             }
         }
-
-        $cookie = Get-FirstNonEmpty -Values @($runsJson.paginationCookie)
-
-        if ($runsJson.isResponseTruncated -ne $true) {
-            break
-        }
-
-    } while (-not [string]::IsNullOrWhiteSpace($cookie) -and $page -lt $MaxRunPagesPerPG)
+    }
 
     return $index
 }
@@ -540,20 +484,20 @@ if (-not $json_clu -or $json_clu.Count -eq 0) {
 }
 
 $clusters = $json_clu | ForEach-Object {
-    $name = (
+    $name = @(
         $_.name,
         $_.clusterName,
-        $_.displayName |
-        Where-Object { $_ -and $_.Trim() } |
+        $_.displayName
+    ) |
+        Where-Object { $_ -and "$_".Trim() -ne "" } |
         Select-Object -First 1
-    )
 
-    $cid = (
+    $cid = @(
         $_.clusterId,
-        $_.id |
+        $_.id
+    ) |
         Where-Object { $_ } |
         Select-Object -First 1
-    )
 
     if (-not $name) {
         $name = "Unknown-$cid"
@@ -692,7 +636,7 @@ foreach ($cluster in $clustersAvailable) {
         }
     }
 
-    # ----------------------------- Script 2: PG/Policy/Host + Latest DB Backup Dates -----------------------------
+    # ----------------------------- Script 2: PG/Policy/Host + Latest Dates -----------------------------
     $uri2  = "$baseUrl/v2/data-protect/protection-groups?environments=kOracle&isDeleted=false&isActive=true&includeLastRunInfo=true"
     $json2 = Invoke-HeliosGetJson -Uri $uri2 -Headers $headers
 
@@ -703,9 +647,7 @@ foreach ($cluster in $clustersAvailable) {
             $dbd.protectionGroupId
         )
 
-        # -----------------------------
         # PolicyName cached once per PG
-        # -----------------------------
         $policyName = ""
 
         if ($dbd.policyId) {
@@ -734,9 +676,7 @@ foreach ($cluster in $clustersAvailable) {
             }
         }
 
-        # -----------------------------
-        # Latest backup dates per DB for this PG
-        # -----------------------------
+        # Latest run dates per DB for this PG
         $pgRunIndex = New-Object System.Collections.Hashtable ([StringComparer]::OrdinalIgnoreCase)
 
         if (-not [string]::IsNullOrWhiteSpace($pgId)) {
@@ -763,8 +703,6 @@ foreach ($cluster in $clustersAvailable) {
 
         foreach ($obj in ($dbd.oracleParams.objects | Where-Object { $_ })) {
 
-            # Correct Oracle PG shape:
-            # oracleParams.objects[] -> dbParams[] -> dbChannels[] -> databaseNodeList[]
             $dbParams = @()
 
             if ($obj.dbParams) {
@@ -775,9 +713,6 @@ foreach ($cluster in $clustersAvailable) {
 
                 $dbChannels = @()
 
-                # Support both possible shapes:
-                # 1) dbChannels[]
-                # 2) dbChannels.dbChannel[]
                 if ($dbParam.dbChannels.dbChannel) {
                     $dbChannels += @($dbParam.dbChannels.dbChannel)
                 }
@@ -816,7 +751,7 @@ foreach ($cluster in $clustersAvailable) {
                         $channel.databaseNodeList.port
                     )
 
-                    # Resolve all hostIds under databaseNodeList
+                    # Resolve all hostIds
                     $hostNames = @()
 
                     $hostIds = @()
@@ -850,11 +785,16 @@ foreach ($cluster in $clustersAvailable) {
                         catch {}
                     }
 
-                    $runInfo = Get-RunInfoForDb -Index $pgRunIndex -DbName $dbName
+                    $runInfo = Get-RunInfoForDb -Index $pgRunIndex -Names @(
+                        $dbName,
+                        $channel.databaseUniqueName,
+                        $dbParam.databaseName,
+                        $obj.databaseUniqueName,
+                        $obj.name
+                    )
 
                     $pgRows += [PSCustomObject]@{
                         Cluster                    = $cluster_name
-                        PGId                       = $pgId
                         PGName                     = $dbd.name
                         Replicated_To_Cluster      = $replicatedTo
                         PolicyName                 = $policyName
@@ -866,16 +806,9 @@ foreach ($cluster in $clustersAvailable) {
                         Port                       = $port
                         HostName                   = (To-FlatString $hostNames)
 
-                        LatestDataBackupET         = $runInfo.LatestDataBackupET
-                        LatestDataRunType          = $runInfo.LatestDataRunType
-                        LatestDataStatus           = $runInfo.LatestDataStatus
-
+                        LatestRegularBackupET      = $runInfo.LatestRegularBackupET
                         LatestLogBackupET          = $runInfo.LatestLogBackupET
-                        LatestLogRunType           = $runInfo.LatestLogRunType
-                        LatestLogStatus            = $runInfo.LatestLogStatus
-
-                        LatestReplicationTarget    = $runInfo.LatestReplicationTarget
-                        LatestReplicationStatus    = $runInfo.LatestReplicationStatus
+                        ReplicationTargetCluster   = $runInfo.ReplicationTargetCluster
                         LatestReplicationEndTimeET = $runInfo.LatestReplicationEndTimeET
                     }
                 }
@@ -918,28 +851,20 @@ foreach ($a in $regRows) {
         Cluster                    = $a.Cluster
         DBName                     = $a.DBName
 
-        HostName                   = $(if ($sb) { $sb.HostName } else { "" })
-        PGId                       = $(if ($sb) { $sb.PGId } else { "" })
-        PGName                     = $(if ($sb) { $sb.PGName } else { "" })
-        Replicated_To_Cluster      = $(if ($sb) { $sb.Replicated_To_Cluster } else { "" })
-        PolicyName                 = $(if ($sb) { $sb.PolicyName } else { "" })
-        SourceName                 = $(if ($sb) { $sb.SourceName } else { "" })
-        PersistMountPoints         = $(if ($sb) { $sb.PersistMountPoints } else { "" })
-        LogRetentionDays           = $(if ($sb) { $sb.LogRetentionDays } else { "" })
-        ChannelCount               = $(if ($sb) { $sb.ChannelCount } else { "" })
-        Port                       = $(if ($sb) { $sb.Port } else { "" })
+        HostName                   = if ($sb) { $sb.HostName } else { "" }
+        PGName                     = if ($sb) { $sb.PGName } else { "" }
+        Replicated_To_Cluster      = if ($sb) { $sb.Replicated_To_Cluster } else { "" }
+        PolicyName                 = if ($sb) { $sb.PolicyName } else { "" }
+        SourceName                 = if ($sb) { $sb.SourceName } else { "" }
+        PersistMountPoints         = if ($sb) { $sb.PersistMountPoints } else { "" }
+        LogRetentionDays           = if ($sb) { $sb.LogRetentionDays } else { "" }
+        ChannelCount               = if ($sb) { $sb.ChannelCount } else { "" }
+        Port                       = if ($sb) { $sb.Port } else { "" }
 
-        LatestDataBackupET         = $(if ($sb) { $sb.LatestDataBackupET } else { "" })
-        LatestDataRunType          = $(if ($sb) { $sb.LatestDataRunType } else { "" })
-        LatestDataStatus           = $(if ($sb) { $sb.LatestDataStatus } else { "" })
-
-        LatestLogBackupET          = $(if ($sb) { $sb.LatestLogBackupET } else { "" })
-        LatestLogRunType           = $(if ($sb) { $sb.LatestLogRunType } else { "" })
-        LatestLogStatus            = $(if ($sb) { $sb.LatestLogStatus } else { "" })
-
-        LatestReplicationTarget    = $(if ($sb) { $sb.LatestReplicationTarget } else { "" })
-        LatestReplicationStatus    = $(if ($sb) { $sb.LatestReplicationStatus } else { "" })
-        LatestReplicationEndTimeET = $(if ($sb) { $sb.LatestReplicationEndTimeET } else { "" })
+        LatestRegularBackupET      = if ($sb) { $sb.LatestRegularBackupET } else { "" }
+        LatestLogBackupET          = if ($sb) { $sb.LatestLogBackupET } else { "" }
+        ReplicationTargetCluster   = if ($sb) { $sb.ReplicationTargetCluster } else { "" }
+        LatestReplicationEndTimeET = if ($sb) { $sb.LatestReplicationEndTimeET } else { "" }
 
         DBVersion                  = $a.DBVersion
         ArchiveLog_Enabled         = $a.ArchiveLog_Enabled
@@ -968,7 +893,6 @@ $colsDef = @(
     @{Label='Replicated_To_Cluster';      Expression = { $_.Replicated_To_Cluster } },
     @{Label='DBName';                     Expression = { $_.DBName } },
     @{Label='HostName';                   Expression = { $_.HostName } },
-    @{Label='PGId';                       Expression = { $_.PGId } },
     @{Label='PGName';                     Expression = { $_.PGName } },
     @{Label='PolicyName';                 Expression = { $_.PolicyName } },
     @{Label='SourceName';                 Expression = { $_.SourceName } },
@@ -977,16 +901,9 @@ $colsDef = @(
     @{Label='ChannelCount';               Expression = { $_.ChannelCount } },
     @{Label='Port';                       Expression = { $_.Port } },
 
-    @{Label='LatestDataBackupET';         Expression = { $_.LatestDataBackupET } },
-    @{Label='LatestDataRunType';          Expression = { $_.LatestDataRunType } },
-    @{Label='LatestDataStatus';           Expression = { $_.LatestDataStatus } },
-
+    @{Label='LatestRegularBackupET';      Expression = { $_.LatestRegularBackupET } },
     @{Label='LatestLogBackupET';          Expression = { $_.LatestLogBackupET } },
-    @{Label='LatestLogRunType';           Expression = { $_.LatestLogRunType } },
-    @{Label='LatestLogStatus';            Expression = { $_.LatestLogStatus } },
-
-    @{Label='LatestReplicationTarget';    Expression = { $_.LatestReplicationTarget } },
-    @{Label='LatestReplicationStatus';    Expression = { $_.LatestReplicationStatus } },
+    @{Label='ReplicationTargetCluster';   Expression = { $_.ReplicationTargetCluster } },
     @{Label='LatestReplicationEndTimeET'; Expression = { $_.LatestReplicationEndTimeET } },
 
     @{Label='DataGuardRole';              Expression = { $_.DataGuardRole } },
@@ -1017,6 +934,7 @@ Write-Host "Collection Summary" -ForegroundColor Cyan
 Write-Host "Registration rows : $($regRows.Count)"
 Write-Host "PG rows           : $($pgRows.Count)"
 Write-Host "Final rows        : $($final.Count)"
+Write-Host "Runs inspected per PG: $MaxRunsToInspectPerPG"
 
 $txt = $final |
     Format-Table -Property $colsDef -AutoSize |
@@ -1025,7 +943,7 @@ $txt = $final |
 $txt
 
 $stamp   = Get-Date -Format "yyyy-MM-dd_HHmm"
-$csvPath = Join-Path $outDir "oracle_DB_combined_with_latest_backup_dates_$stamp.csv"
+$csvPath = Join-Path $outDir "oracle_DB_combined_latest_dates_$stamp.csv"
 
 $final |
     Select-Object ($colsDef | ForEach-Object { $_.Label }) |
