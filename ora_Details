@@ -2,13 +2,15 @@
 # Cohesity Oracle DB Details - PG-First Multi-Cluster Helios
 #
 # Logic:
-# 1) Get active kOracle Protection Groups first.
-# 2) Create one row per protected DB/channel inside each PG.
-# 3) Resolve hostId to HostName.
-# 4) Enrich each protected DB with registration attributes.
-# 5) Export:
-#    - Main CSV: active PG Oracle DB details
-#    - Optional CSV: registered DBs not found in active Oracle PGs
+# 1) Get all ACTIVE kOracle PGs.
+# 2) Always list every returned PG.
+# 3) For each PG, parse DB/channel rows when available.
+# 4) Resolve hostId to HostName.
+# 5) Enrich protected DB rows from Oracle registration details.
+# 6) Export:
+#    - Main CSV: PG-first Oracle DB/PG details
+#    - PG inventory CSV: all active Oracle PGs returned
+#    - Registration-only CSV: DBs discovered but not found in active Oracle PGs
 #
 # STRICTLY READ-ONLY against Cohesity / Helios: GET-only API calls
 # =====================================================================
@@ -185,7 +187,6 @@ function Get-DbKeys {
 
     $keys = @($db)
 
-    # Also allow DB.DOMAIN style to match DB style
     if ($db -match '\.') {
         $keys += ($db -split '\.')[0]
     }
@@ -405,14 +406,19 @@ $clusters = $json_clu | ForEach-Object {
 } | Sort-Object ClusterName
 
 # =====================================================================
-# Collect registration rows and PG-first rows
+# Collection arrays
 # =====================================================================
 
-$regRows = @()
-$pgRows  = @()
+$regRows         = @()
+$pgRows          = @()
+$pgInventoryRows = @()
 
 $policyCache = @{}
 $hostCache   = @{}
+
+# =====================================================================
+# Collect data per cluster
+# =====================================================================
 
 foreach ($cluster in $clusters) {
 
@@ -496,7 +502,7 @@ foreach ($cluster in $clusters) {
     }
 
     # -----------------------------------------------------------------
-    # 2) Active Oracle PGs are the primary source
+    # 2) Active Oracle PGs - primary source
     # -----------------------------------------------------------------
 
     try {
@@ -519,56 +525,59 @@ foreach ($cluster in $clusters) {
             -Headers $headers `
             -Cache $policyCache
 
-        foreach ($oracleObject in ($pg.oracleParams.objects | Where-Object { $_ })) {
+        $oracleObjects = @($pg.oracleParams.objects | Where-Object { $_ })
+        $pgObjectCount = $oracleObjects.Count
+        $pgChannelCount = 0
+
+        $replicationTargets = Join-Value -Value @(
+            $pg.lastRun.replicationInfo.replicationTargetResults.ClusterName,
+            $pg.lastRun.replicationInfo.replicationTargetResults.clusterName
+        )
+
+        $persistMountPoints = Join-Value -Value $pg.oracleParams.persistMountPoints
+
+        # ------------------------------------------------------------
+        # PG inventory row - guarantees every active Oracle PG is listed
+        # ------------------------------------------------------------
+
+        $pgInventoryRows += [PSCustomObject]@{
+            Cluster               = $clusterName
+            PGName                = $pg.name
+            PolicyName            = $policyName
+            IsActive              = $pg.isActive
+            IsDeleted             = $pg.isDeleted
+            OracleObjectCount     = $pgObjectCount
+            ParsedDbChannelCount  = 0
+            Replicated_To_Cluster = $replicationTargets
+            PersistMountPoints    = $persistMountPoints
+        }
+
+        foreach ($oracleObject in $oracleObjects) {
 
             $channels = @()
 
             if ($oracleObject.dbParams.dbChannels.dbChannel) {
                 $channels = @($oracleObject.dbParams.dbChannels.dbChannel)
             }
-            elseif ($oracleObject.dbParams.dbChannels) {
-                $channels = @($oracleObject.dbParams.dbChannels)
-            }
-            else {
-                $channels = @($oracleObject)
-            }
 
             foreach ($channel in ($channels | Where-Object { $_ })) {
 
+                $pgChannelCount++
+
                 $pgDbName = Get-FirstValue -Value @(
                     $channel.databaseUniqueName,
-                    $channel.dbUniqueName,
-                    $channel.name,
-                    $oracleObject.databaseUniqueName,
-                    $oracleObject.dbUniqueName,
-                    $oracleObject.name
+                    $oracleObject.databaseUniqueName
                 )
 
-                $hostIds = @()
-
-                $hostIds += @($channel.databaseNodeList.hostId)
-                $hostIds += @($channel.databaseNodeList.id)
-                $hostIds += @($oracleObject.databaseNodeList.hostId)
-                $hostIds += @($oracleObject.databaseNodeList.id)
-
-                $hostIds = @(
-                    $hostIds |
-                        Where-Object { $_ -and "$_".Trim() -ne "" } |
-                        Select-Object -Unique
+                $hostId = Get-FirstValue -Value @(
+                    $channel.databaseNodeList.hostId,
+                    $oracleObject.databaseNodeList.hostId
                 )
 
-                $hostNames = @()
-
-                foreach ($hostId in $hostIds) {
-                    $resolvedHost = Resolve-HostName `
-                        -HostId $hostId `
-                        -Headers $headers `
-                        -Cache $hostCache
-
-                    if (-not [string]::IsNullOrWhiteSpace($resolvedHost)) {
-                        $hostNames += $resolvedHost
-                    }
-                }
+                $hostName = Resolve-HostName `
+                    -HostId $hostId `
+                    -Headers $headers `
+                    -Cache $hostCache
 
                 $pgRows += [PSCustomObject]@{
                     ClusterId             = $clusterId
@@ -577,37 +586,54 @@ foreach ($cluster in $clusters) {
                     PolicyName            = $policyName
                     SourceName            = Get-FirstValue -Value @($oracleObject.SourceName, $oracleObject.sourceName)
                     DBName                = $pgDbName
-                    HostName              = Join-Value -Value $hostNames
-                    Replicated_To_Cluster = Join-Value -Value @(
-                                                $pg.lastRun.replicationInfo.replicationTargetResults.ClusterName,
-                                                $pg.lastRun.replicationInfo.replicationTargetResults.clusterName
-                                             )
-                    PersistMountPoints    = Join-Value -Value $pg.oracleParams.persistMountPoints
+                    HostName              = $hostName
+                    Replicated_To_Cluster = $replicationTargets
+                    PersistMountPoints    = $persistMountPoints
                     LogRetentionDays      = Get-FirstValue -Value @(
                                                 $channel.archiveVolRetentionDays,
-                                                $channel.archiveLogRetentionDays,
-                                                $oracleObject.archiveVolRetentionDays,
-                                                $oracleObject.archiveLogRetentionDays
+                                                $channel.archiveLogRetentionDays
                                              )
-                    ChannelCount          = Join-Value -Value @(
+                    ChannelCount          = Get-FirstValue -Value @(
                                                 $channel.databaseNodeList.ChannelCount,
-                                                $channel.databaseNodeList.channelCount,
-                                                $oracleObject.databaseNodeList.ChannelCount,
-                                                $oracleObject.databaseNodeList.channelCount
+                                                $channel.databaseNodeList.channelCount
                                              )
-                    Port                  = Join-Value -Value @(
-                                                $channel.databaseNodeList.port,
-                                                $oracleObject.databaseNodeList.port
-                                             )
+                    Port                  = Get-FirstValue -Value $channel.databaseNodeList.port
+                    PG_Row_Status         = "DB channel parsed"
                 }
+            }
+        }
+
+        # Update parsed count in PG inventory
+        $pgInventoryRows[-1].ParsedDbChannelCount = $pgChannelCount
+
+        # ------------------------------------------------------------
+        # Fallback row - PG exists, but no DB channel was parsed
+        # ------------------------------------------------------------
+
+        if ($pgChannelCount -eq 0) {
+            $pgRows += [PSCustomObject]@{
+                ClusterId             = $clusterId
+                Cluster               = $clusterName
+                PGName                = $pg.name
+                PolicyName            = $policyName
+                SourceName            = ""
+                DBName                = ""
+                HostName              = ""
+                Replicated_To_Cluster = $replicationTargets
+                PersistMountPoints    = $persistMountPoints
+                LogRetentionDays      = ""
+                ChannelCount          = ""
+                Port                  = ""
+                PG_Row_Status         = "PG returned but no dbChannel parsed"
             }
         }
     }
 
     $regCount = @($regRows | Where-Object { $_.ClusterId -eq $clusterId }).Count
-    $pgCount  = @($pgRows  | Where-Object { $_.ClusterId -eq $clusterId }).Count
+    $pgInvCount = @($pgInventoryRows | Where-Object { $_.Cluster -eq $clusterName }).Count
+    $pgRowCount = @($pgRows | Where-Object { $_.ClusterId -eq $clusterId }).Count
 
-    Write-Host "Cluster done: $clusterName | RegistrationRows=$regCount | ActiveOraclePGRows=$pgCount" -ForegroundColor DarkCyan
+    Write-Host "Cluster done: $clusterName | RegistrationRows=$regCount | ActiveOraclePGs=$pgInvCount | PGOutputRows=$pgRowCount" -ForegroundColor DarkCyan
 }
 
 # =====================================================================
@@ -661,6 +687,7 @@ foreach ($pgRow in $pgRows) {
         LogRetentionDays       = $pgRow.LogRetentionDays
         ChannelCount           = $pgRow.ChannelCount
         Port                   = $pgRow.Port
+        PG_Row_Status          = $pgRow.PG_Row_Status
 
         Registration_Match     = if ($matchedReg) { "Matched" } else { "No registration match" }
         Registration_DBName    = if ($matchedReg) { $matchedReg.Registration_DBName } else { "" }
@@ -689,7 +716,7 @@ foreach ($pgRow in $pgRows) {
 
 $pgKeySet = New-Object 'System.Collections.Hashtable' ([StringComparer]::OrdinalIgnoreCase)
 
-foreach ($pgRow in $pgRows) {
+foreach ($pgRow in $pgRows | Where-Object { -not [string]::IsNullOrWhiteSpace($_.DBName) }) {
     foreach ($key in (Get-JoinKeys -ClusterId $pgRow.ClusterId -DBName $pgRow.DBName)) {
         if (-not [string]::IsNullOrWhiteSpace($key)) {
             $pgKeySet[$key] = $true
@@ -749,6 +776,7 @@ $columns = @(
     "LogRetentionDays",
     "ChannelCount",
     "Port",
+    "PG_Row_Status",
     "Registration_Match",
     "Registration_DBName",
     "DataGuardRole",
@@ -768,11 +796,13 @@ $columns = @(
 )
 
 $final = @($final | Sort-Object Cluster, PGName, DBName, HostName)
+$pgInventoryRows = @($pgInventoryRows | Sort-Object Cluster, PGName)
 $registrationOnly = @($registrationOnly | Sort-Object Cluster, DBName)
 
 Write-Host "`nCollection Summary" -ForegroundColor Cyan
 Write-Host "Registration rows              : $($regRows.Count)"
-Write-Host "Active Oracle PG DB rows        : $($pgRows.Count)"
+Write-Host "Active Oracle PG inventory rows : $($pgInventoryRows.Count)"
+Write-Host "PG DB/fallback output rows      : $($pgRows.Count)"
 Write-Host "Final PG-first rows             : $($final.Count)"
 Write-Host "Registration-only non-PG rows   : $($registrationOnly.Count)"
 
@@ -784,6 +814,7 @@ catch {}
 
 $timestamp = Get-Date -Format "yyyyMMdd_HHmm"
 
+# Main output
 if ($final.Count -eq 0) {
     Write-Host "`nNo active Oracle PG DB details found." -ForegroundColor Yellow
 }
@@ -805,6 +836,15 @@ else {
     Write-Host "`nMain CSV saved: $csvPath" -ForegroundColor Gray
 }
 
+# PG inventory output
+$pgInventoryPath = Join-Path $logDirectory "Oracle_PG_Inventory_AllActivePGs_$timestamp.csv"
+
+$pgInventoryRows |
+    Export-Csv -Path $pgInventoryPath -NoTypeInformation -Encoding utf8
+
+Write-Host "PG inventory CSV saved: $pgInventoryPath" -ForegroundColor Gray
+
+# Registration-only output
 if ($registrationOnly.Count -gt 0) {
     $registrationOnlyPath = Join-Path $logDirectory "Oracle_DB_RegistrationOnly_NoActivePG_$timestamp.csv"
 
