@@ -1,32 +1,27 @@
 # =====================================================================
-# Cohesity Oracle One Cluster / One PGID Run Debug
+# Cohesity Oracle - One Cluster / One PGID Latest Backup Test
 # STRICTLY READ-ONLY GET-only
 #
-# Purpose:
-# - Work only on ONE cluster and ONE PGID
-# - Directly call:
-#   /v2/data-protect/protection-groups/{PGID}/runs
+# Source:
+# - /v2/data-protect/protection-groups/{PGID}/runs
 #
-# Checks:
+# Uses:
 # - runs[].localBackupInfo.runType
+# - runs[].localBackupInfo.status
 # - runs[].localBackupInfo.endTimeUsecs
-# - runs[].objects[].object.name
-# - runs[].objects[].localSnapshotInfo.snapshotInfo.status
-# - runs[].objects[].localSnapshotInfo.snapshotInfo.endTimeUsecs
-# - runs[].objects[].localSnapshotInfo.snapshotInfo.snapshotCreationTimeUsecs
 #
 # Output:
-# - Console table
-# - Raw JSON file
-# - Flattened CSV
+# - LatestRegularBackupET
+# - LatestLogBackupET
+# - ReplicationTargetCluster
+# - LatestReplicationEndTimeET
 # =====================================================================
 
 $ErrorActionPreference = "Stop"
-$FormatEnumerationLimit = -1
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
 # -------------------------------
-# Fill these two
+# Fill these
 # -------------------------------
 $ClusterId = "PASTE_CLUSTER_ID_HERE"
 $PgId      = "PASTE_PGID_HERE"
@@ -38,7 +33,7 @@ $baseUrl    = "https://helios.cohesity.com"
 $apikeypath = "X:\PowerShell\Cohesity_API_Scripts\DO_NOT_Delete\apikey.txt"
 $outDir     = "H:\Cohesity_API\Logs"
 
-$MaxPages = 5
+$MaxRunPages = 10
 
 if (-not (Test-Path $outDir)) {
     New-Item -Path $outDir -ItemType Directory | Out-Null
@@ -128,6 +123,16 @@ function Convert-UsecsToET {
     }
 }
 
+function Test-SuccessStatus {
+    param([string]$Status)
+
+    if ([string]::IsNullOrWhiteSpace($Status)) {
+        return $false
+    }
+
+    return ($Status -match '(?i)success|succeed|succeededwithwarning|warning')
+}
+
 function Test-LogRunType {
     param([string]$RunType)
 
@@ -138,13 +143,44 @@ function Test-LogRunType {
     return ($RunType -match '(?i)log|archive')
 }
 
-# =====================================================================
-# Call /runs for this PGID
-# =====================================================================
-Write-Host ""
-Write-Host "ClusterId : $ClusterId" -ForegroundColor Cyan
-Write-Host "PGID      : $PgId" -ForegroundColor Cyan
+function Get-ReplicationTarget {
+    param([object]$Run)
 
+    return Get-FirstNonEmpty -Values @(
+        $Run.replicationInfo.replicationTargetResults.clusterName,
+        $Run.replicationInfo.replicationTargetResults.ClusterName,
+        $Run.replicationInfo.replicationTargetResults.targetClusterName,
+        $Run.replicationInfo.replicationTargetResults.targetName,
+        $Run.localBackupInfo.replicationInfo.replicationTargetResults.clusterName,
+        $Run.localBackupInfo.replicationInfo.replicationTargetResults.ClusterName,
+        $Run.localBackupInfo.replicationInfo.replicationTargetResults.targetClusterName,
+        $Run.localBackupInfo.replicationInfo.replicationTargetResults.targetName
+    )
+}
+
+function Get-ReplicationEndUsecs {
+    param([object]$Run)
+
+    return Get-FirstNonEmpty -Values @(
+        $Run.replicationInfo.replicationTargetResults.endTimeUsecs,
+        $Run.replicationInfo.replicationTargetResults.endTimeInUsecs,
+        $Run.replicationInfo.replicationTargetResults.replicationEndTimeUsecs,
+        $Run.replicationInfo.replicationTargetResults.finishTimeUsecs,
+        $Run.replicationInfo.replicationTargetResults.completedTimeUsecs,
+        $Run.replicationInfo.replicationTargetResults.completionTimeUsecs,
+
+        $Run.localBackupInfo.replicationInfo.replicationTargetResults.endTimeUsecs,
+        $Run.localBackupInfo.replicationInfo.replicationTargetResults.endTimeInUsecs,
+        $Run.localBackupInfo.replicationInfo.replicationTargetResults.replicationEndTimeUsecs,
+        $Run.localBackupInfo.replicationInfo.replicationTargetResults.finishTimeUsecs,
+        $Run.localBackupInfo.replicationInfo.replicationTargetResults.completedTimeUsecs,
+        $Run.localBackupInfo.replicationInfo.replicationTargetResults.completionTimeUsecs
+    )
+}
+
+# =====================================================================
+# Get runs
+# =====================================================================
 $allRuns = @()
 $page = 0
 $cookie = ""
@@ -159,7 +195,7 @@ do {
     }
 
     Write-Host ""
-    Write-Host "Calling page $page :" -ForegroundColor Yellow
+    Write-Host "Calling page $page" -ForegroundColor Yellow
     Write-Host $runsUri
 
     $runsJson = Invoke-HeliosGetJson -Uri $runsUri -Headers $headers
@@ -167,7 +203,7 @@ do {
     $runsThisPage = @($runsJson.runs | Where-Object { $_ })
     $allRuns += $runsThisPage
 
-    Write-Host "Runs returned on page $page : $($runsThisPage.Count)" -ForegroundColor Yellow
+    Write-Host "Runs returned: $($runsThisPage.Count)" -ForegroundColor Cyan
 
     $cookie = Get-FirstNonEmpty -Values @($runsJson.paginationCookie)
 
@@ -175,32 +211,14 @@ do {
         break
     }
 
-} while (-not [string]::IsNullOrWhiteSpace($cookie) -and $page -lt $MaxPages)
+} while (-not [string]::IsNullOrWhiteSpace($cookie) -and $page -lt $MaxRunPages)
 
 # =====================================================================
-# Save raw JSON
+# Flatten run-level data only
 # =====================================================================
-$stamp = Get-Date -Format "yyyy-MM-dd_HHmmss"
-
-$rawJsonPath = Join-Path $outDir "one_pg_runs_raw_$stamp.json"
-
-[PSCustomObject]@{
-    ClusterId = $ClusterId
-    PGID      = $PgId
-    Runs      = $allRuns
-} |
-ConvertTo-Json -Depth 100 |
-Out-File -FilePath $rawJsonPath -Encoding utf8
-
-# =====================================================================
-# Flatten run/object rows
-# =====================================================================
-$rows = @()
-$runIndex = 0
+$runRows = @()
 
 foreach ($run in $allRuns) {
-
-    $runIndex++
 
     $runType = Get-FirstNonEmpty -Values @(
         $run.localBackupInfo.runType,
@@ -220,212 +238,110 @@ foreach ($run in $allRuns) {
         $run.endTimeUsecs
     )
 
-    $runStartUsecs = Get-FirstNonEmpty -Values @(
-        $run.localBackupInfo.startTimeUsecs,
-        $run.originalBackupInfo.startTimeUsecs,
-        $run.startTimeUsecs
-    )
+    $repTarget = Get-ReplicationTarget -Run $run
+    $repEndUsecs = Get-ReplicationEndUsecs -Run $run
 
-    $objects = @($run.objects | Where-Object { $_ })
-
-    if ($objects.Count -eq 0) {
-        $rows += [PSCustomObject]@{
-            RunIndex              = $runIndex
-            ObjectIndex           = ""
-            RunType               = $runType
-            IsLogRun              = Test-LogRunType -RunType $runType
-            RunStatus             = $runStatus
-            RunStartUsecs         = $runStartUsecs
-            RunStartET            = Convert-UsecsToET -Usecs $runStartUsecs
-            RunEndUsecs           = $runEndUsecs
-            RunEndET              = Convert-UsecsToET -Usecs $runEndUsecs
-
-            DBName                = ""
-            ObjectId              = ""
-            ObjectSourceName      = ""
-
-            SnapshotStatus        = ""
-            ObjEndUsecs           = ""
-            ObjEndET              = ""
-            SnapshotCreateUsecs   = ""
-            SnapshotCreateET      = ""
-
-            EffectiveBackupUsecs  = $runEndUsecs
-            EffectiveBackupET     = Convert-UsecsToET -Usecs $runEndUsecs
-
-            HasObject             = "No"
-            HasObjectEndTime      = "No"
-        }
-
-        continue
-    }
-
-    $objectIndex = 0
-
-    foreach ($obj in $objects) {
-
-        $objectIndex++
-
-        $dbName = Get-FirstNonEmpty -Values @(
-            $obj.object.name,
-            $obj.name
-        )
-
-        $objectId = Get-FirstNonEmpty -Values @(
-            $obj.object.id
-        )
-
-        $objectSourceName = Get-FirstNonEmpty -Values @(
-            $obj.object.sourceName
-        )
-
-        $snapshotStatus = Get-FirstNonEmpty -Values @(
-            $obj.localSnapshotInfo.snapshotInfo.status,
-            $obj.originalBackupInfo.snapshotInfo.status
-        )
-
-        $objEndUsecs = Get-FirstNonEmpty -Values @(
-            $obj.localSnapshotInfo.snapshotInfo.endTimeUsecs,
-            $obj.originalBackupInfo.snapshotInfo.endTimeUsecs
-        )
-
-        $snapshotCreateUsecs = Get-FirstNonEmpty -Values @(
-            $obj.localSnapshotInfo.snapshotInfo.snapshotCreationTimeUsecs,
-            $obj.originalBackupInfo.snapshotInfo.snapshotCreationTimeUsecs
-        )
-
-        # Effective backup time: object end first, snapshot creation second, run end third.
-        $effectiveUsecs = Get-FirstNonEmpty -Values @(
-            $objEndUsecs,
-            $snapshotCreateUsecs,
-            $runEndUsecs
-        )
-
-        $rows += [PSCustomObject]@{
-            RunIndex              = $runIndex
-            ObjectIndex           = $objectIndex
-            RunType               = $runType
-            IsLogRun              = Test-LogRunType -RunType $runType
-            RunStatus             = $runStatus
-            RunStartUsecs         = $runStartUsecs
-            RunStartET            = Convert-UsecsToET -Usecs $runStartUsecs
-            RunEndUsecs           = $runEndUsecs
-            RunEndET              = Convert-UsecsToET -Usecs $runEndUsecs
-
-            DBName                = $dbName
-            ObjectId              = $objectId
-            ObjectSourceName      = $objectSourceName
-
-            SnapshotStatus        = $snapshotStatus
-            ObjEndUsecs           = $objEndUsecs
-            ObjEndET              = Convert-UsecsToET -Usecs $objEndUsecs
-            SnapshotCreateUsecs   = $snapshotCreateUsecs
-            SnapshotCreateET      = Convert-UsecsToET -Usecs $snapshotCreateUsecs
-
-            EffectiveBackupUsecs  = $effectiveUsecs
-            EffectiveBackupET     = Convert-UsecsToET -Usecs $effectiveUsecs
-
-            HasObject             = "Yes"
-            HasObjectEndTime      = if ($objEndUsecs) { "Yes" } else { "No" }
-        }
+    $runRows += [PSCustomObject]@{
+        RunType                  = $runType
+        IsLogRun                 = Test-LogRunType -RunType $runType
+        Status                   = $runStatus
+        IsSuccess                = Test-SuccessStatus -Status $runStatus
+        RunEndUsecs              = $runEndUsecs
+        RunEndET                 = Convert-UsecsToET -Usecs $runEndUsecs
+        ReplicationTargetCluster = $repTarget
+        ReplicationEndUsecs      = $repEndUsecs
+        ReplicationEndTimeET     = Convert-UsecsToET -Usecs $repEndUsecs
     }
 }
 
 # =====================================================================
-# Latest summary from this one PG
+# Latest calculation
 # =====================================================================
-$latestIndex = @{}
+$latestRegularUsecs = 0
+$latestRegularET = ""
 
-foreach ($r in $rows) {
+$latestLogUsecs = 0
+$latestLogET = ""
 
-    if ([string]::IsNullOrWhiteSpace($r.DBName)) {
+$latestReplicationUsecs = 0
+$latestReplicationET = ""
+$latestReplicationTarget = ""
+
+foreach ($r in $runRows) {
+
+    if ($r.IsSuccess -ne $true) {
         continue
     }
 
-    $key = $r.DBName.Trim().ToUpper()
+    $runEndNum = To-Number -Value $r.RunEndUsecs
 
-    if (-not $latestIndex.ContainsKey($key)) {
-        $latestIndex[$key] = [PSCustomObject]@{
-            DBName                    = $r.DBName
-            LatestRegularBackupUsecs  = 0
-            LatestRegularBackupET     = ""
-            LatestLogBackupUsecs      = 0
-            LatestLogBackupET         = ""
+    if ($runEndNum -gt 0) {
+        if ($r.IsLogRun -eq $true) {
+            if ($runEndNum -gt $latestLogUsecs) {
+                $latestLogUsecs = $runEndNum
+                $latestLogET = $r.RunEndET
+            }
+        }
+        else {
+            if ($runEndNum -gt $latestRegularUsecs) {
+                $latestRegularUsecs = $runEndNum
+                $latestRegularET = $r.RunEndET
+            }
         }
     }
 
-    $entry = $latestIndex[$key]
-    $backupNum = To-Number -Value $r.EffectiveBackupUsecs
+    $repEndNum = To-Number -Value $r.ReplicationEndUsecs
 
-    if ($backupNum -le 0) {
-        continue
-    }
-
-    if ($r.IsLogRun -eq $true) {
-        if ($backupNum -gt [double]$entry.LatestLogBackupUsecs) {
-            $entry.LatestLogBackupUsecs = $backupNum
-            $entry.LatestLogBackupET    = $r.EffectiveBackupET
+    if ($repEndNum -gt 0) {
+        if ($repEndNum -gt $latestReplicationUsecs) {
+            $latestReplicationUsecs = $repEndNum
+            $latestReplicationET = $r.ReplicationEndTimeET
+            $latestReplicationTarget = $r.ReplicationTargetCluster
         }
     }
-    else {
-        if ($backupNum -gt [double]$entry.LatestRegularBackupUsecs) {
-            $entry.LatestRegularBackupUsecs = $backupNum
-            $entry.LatestRegularBackupET    = $r.EffectiveBackupET
-        }
+    elseif ([string]::IsNullOrWhiteSpace($latestReplicationTarget) -and
+            -not [string]::IsNullOrWhiteSpace($r.ReplicationTargetCluster)) {
+        $latestReplicationTarget = $r.ReplicationTargetCluster
     }
 }
 
-$latestRows = $latestIndex.Values |
-    Select-Object DBName, LatestRegularBackupET, LatestLogBackupET |
-    Sort-Object DBName
+$summary = [PSCustomObject]@{
+    ClusterId                  = $ClusterId
+    PGID                       = $PgId
+    LatestRegularBackupET      = $latestRegularET
+    LatestLogBackupET          = $latestLogET
+    ReplicationTargetCluster   = $latestReplicationTarget
+    LatestReplicationEndTimeET = $latestReplicationET
+}
 
 # =====================================================================
 # Output
 # =====================================================================
-$rawCsvPath    = Join-Path $outDir "one_pg_runs_flattened_$stamp.csv"
-$latestCsvPath = Join-Path $outDir "one_pg_latest_backup_$stamp.csv"
+$stamp = Get-Date -Format "yyyy-MM-dd_HHmmss"
 
-$rows |
-    Export-Csv -Path $rawCsvPath -NoTypeInformation -Encoding utf8
+$runCsv = Join-Path $outDir "one_pg_run_level_test_$stamp.csv"
+$summaryCsv = Join-Path $outDir "one_pg_latest_summary_$stamp.csv"
 
-$latestRows |
-    Export-Csv -Path $latestCsvPath -NoTypeInformation -Encoding utf8
+$runRows |
+    Sort-Object RunEndUsecs -Descending |
+    Export-Csv -Path $runCsv -NoTypeInformation -Encoding utf8
 
-Write-Host ""
-Write-Host "Summary" -ForegroundColor Cyan
-Write-Host "Total runs              : $($allRuns.Count)"
-Write-Host "Flattened rows          : $($rows.Count)"
-Write-Host "Rows with objects       : $(@($rows | Where-Object { $_.HasObject -eq 'Yes' }).Count)"
-Write-Host "Rows with DBName        : $(@($rows | Where-Object { $_.DBName }).Count)"
-Write-Host "Rows with ObjEndET      : $(@($rows | Where-Object { $_.ObjEndET }).Count)"
-Write-Host "Rows with Effective ET  : $(@($rows | Where-Object { $_.EffectiveBackupET }).Count)"
-Write-Host "Latest DB rows          : $($latestRows.Count)"
+$summary |
+    Export-Csv -Path $summaryCsv -NoTypeInformation -Encoding utf8
 
 Write-Host ""
-Write-Host "Raw JSON       : $rawJsonPath" -ForegroundColor Green
-Write-Host "Flattened CSV  : $rawCsvPath" -ForegroundColor Green
-Write-Host "Latest CSV     : $latestCsvPath" -ForegroundColor Green
+Write-Host "Run-level rows:" -ForegroundColor Cyan
 
-Write-Host ""
-Write-Host "First 30 flattened rows:" -ForegroundColor Cyan
-
-$rows |
-    Select-Object -First 30 `
-        RunIndex,
-        ObjectIndex,
-        RunType,
-        IsLogRun,
-        RunStatus,
-        DBName,
-        SnapshotStatus,
-        ObjEndET,
-        SnapshotCreateET,
-        RunEndET,
-        EffectiveBackupET |
+$runRows |
+    Sort-Object RunEndUsecs -Descending |
+    Select-Object RunType, IsLogRun, Status, IsSuccess, RunEndET, ReplicationTargetCluster, ReplicationEndTimeET |
     Format-Table -AutoSize
 
 Write-Host ""
-Write-Host "Latest backup summary:" -ForegroundColor Cyan
+Write-Host "Latest summary:" -ForegroundColor Cyan
 
-$latestRows |
-    Format-Table -AutoSize
+$summary | Format-List
+
+Write-Host ""
+Write-Host "Run CSV     : $runCsv" -ForegroundColor Green
+Write-Host "Summary CSV : $summaryCsv" -ForegroundColor Green
