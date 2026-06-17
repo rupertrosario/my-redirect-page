@@ -1,0 +1,370 @@
+Copy this into a `.ps1` file:
+
+```powershell
+# =====================================================================
+# Cohesity Oracle DB Details - Multi-Cluster Helios
+# Collects Oracle DB registration attributes + Protection Group/Policy/Host info
+# Exports one combined CSV for all Helios clusters.
+# =====================================================================
+
+$ErrorActionPreference = "Stop"
+
+$logDirectory = "X:\PowerShell\Data\Cohesity\OracleDetails"
+if (-not (Test-Path -Path $logDirectory -PathType Container)) {
+    New-Item -Path $logDirectory -ItemType Directory | Out-Null
+}
+
+try {
+    $files = Get-ChildItem -Path $logDirectory -File -ErrorAction Stop
+    if ($files.Count -gt 50) {
+        $toDelete = $files | Sort-Object CreationTime | Select-Object -First ($files.Count - 50)
+        $count = ($toDelete | Measure-Object).Count
+        if ($count -gt 0) { $toDelete | Remove-Item -Force -ErrorAction SilentlyContinue }
+        Write-Host "Removed $count old files to keep last 50."
+    }
+}
+catch {}
+
+try {
+    $threshold = (Get-Date).AddDays(-30)
+    $older = Get-ChildItem -Path $logDirectory -File -ErrorAction SilentlyContinue |
+             Where-Object { $_.LastWriteTime -lt $threshold }
+    $oldCount = ($older | Measure-Object).Count
+    if ($oldCount -gt 0) {
+        $older | Remove-Item -Force -ErrorAction SilentlyContinue
+        Write-Host "Deleted $oldCount files older than 30 days."
+    }
+}
+catch {}
+
+. "X:\PowerShell\Cohesity_API_Scripts\Common\ApiKeyAesHelper.ps1"
+
+$apiKey = Get-CohesityApiKeyFromAes `
+    -EncryptedFile "X:\PowerShell\Cohesity_API_Scripts\Common\secure\cohesity_apikey.enc"
+
+if ([string]::IsNullOrWhiteSpace($apiKey)) {
+    throw "API key was not returned by Get-CohesityApiKeyFromAes."
+}
+
+$baseUrl = "https://helios.cohesity.com"
+$commonHeaders = @{ apiKey = $apiKey; accept = "application/json" }
+$oneGiB = 1073741824
+
+function Invoke-HeliosGetJson {
+    param(
+        [Parameter(Mandatory)][string]$Uri,
+        [Parameter(Mandatory)][hashtable]$Headers
+    )
+
+    if ($PSVersionTable.PSVersion.Major -lt 6) {
+        $resp = Invoke-WebRequest -Uri $Uri -Headers $Headers -Method Get -UseBasicParsing
+    }
+    else {
+        $resp = Invoke-WebRequest -Uri $Uri -Headers $Headers -Method Get
+    }
+
+    if (-not $resp -or [string]::IsNullOrWhiteSpace($resp.Content)) { return $null }
+    return ($resp.Content | ConvertFrom-Json)
+}
+
+function Join-Value {
+    param(
+        [Parameter(ValueFromPipeline = $true)]
+        $Value,
+
+        [string]$Default = ""
+    )
+
+    $joined = @($Value | Where-Object { $null -ne $_ -and "$_".Trim() -ne "" }) -join ","
+    if ([string]::IsNullOrWhiteSpace($joined)) { return $Default }
+    return $joined
+}
+
+function Get-FirstValue {
+    param($Value)
+
+    if ($null -eq $Value) { return $null }
+    return @($Value | Where-Object { $null -ne $_ }) | Select-Object -First 1
+}
+
+function Convert-BytesToGiB {
+    param($Value)
+
+    $number = Get-FirstValue $Value
+    if ($null -eq $number -or "$number".Trim() -eq "") { return "" }
+    return [math]::Round(([double]$number / $oneGiB), 4)
+}
+
+function Resolve-HostName {
+    param(
+        [string]$HostId,
+        [hashtable]$Headers
+    )
+
+    if ([string]::IsNullOrWhiteSpace($HostId)) { return "" }
+
+    try {
+        $hostJson = Invoke-HeliosGetJson -Uri "$baseUrl/v2/data-protect/objects/$HostId" -Headers $Headers
+        $ipOrName = $hostJson.name
+
+        if ([string]::IsNullOrWhiteSpace($ipOrName)) { return "" }
+
+        try {
+            return ([System.Net.Dns]::GetHostEntry($ipOrName)).HostName
+        }
+        catch {
+            return $ipOrName
+        }
+    }
+    catch {
+        return ""
+    }
+}
+
+function Get-PolicyName {
+    param(
+        [string]$PolicyId,
+        [hashtable]$Headers
+    )
+
+    if ([string]::IsNullOrWhiteSpace($PolicyId)) { return "" }
+
+    try {
+        $policyJson = Invoke-HeliosGetJson -Uri "$baseUrl/v2/data-protect/policies?ids=$PolicyId" -Headers $Headers
+        return (
+            $policyJson.policies |
+            Where-Object { $_.id -eq $PolicyId } |
+            Select-Object -ExpandProperty name -First 1
+        )
+    }
+    catch {
+        return ""
+    }
+}
+
+try {
+    $cluJson = Invoke-HeliosGetJson -Uri "$baseUrl/v2/mcm/cluster-mgmt/info" -Headers $commonHeaders
+    $json_clu = $cluJson.cohesityClusters
+}
+catch {
+    throw "Failed to query Helios clusters: $($_.Exception.Message)"
+}
+
+if (-not $json_clu) { throw "No clusters returned from Helios." }
+
+$regRows = @()
+$pgRows = @()
+
+foreach ($cluster in $json_clu) {
+    $clusterId = $cluster.clusterId
+    $clusterName = (
+        $cluster.name,
+        $cluster.clusterName,
+        $cluster.displayName |
+        Where-Object { $_ -and $_.Trim() } |
+        Select-Object -First 1
+    )
+
+    if (-not $clusterName) { $clusterName = "Unknown-$clusterId" }
+
+    $headers = @{
+        apiKey = $apiKey
+        accessClusterId = $clusterId
+        accept = "application/json"
+    }
+
+    Write-Host "`nProcessing cluster: $clusterName" -ForegroundColor Cyan
+
+    try {
+        $registrationUri = "$baseUrl/irisservices/api/v1/public/protectionSources/registrationInfo" +
+                           "?environments=kOracle&includeDbApplicationInfo=true&includeApplicationsTreeInfo=true" +
+                           "&allUnderHierarchy=true&includeData=true"
+
+        $json1 = Invoke-HeliosGetJson -Uri $registrationUri -Headers $headers
+    }
+    catch {
+        Write-Host "Failed to collect registration details for $clusterName`: $($_.Exception.Message)" -ForegroundColor Yellow
+        $json1 = $null
+    }
+
+    $dbNodes = @()
+    foreach ($root in ($json1.rootNodes | Where-Object { $_ })) {
+        foreach ($app in ($root.applications | Where-Object { $_ })) {
+            foreach ($ati in ($app.applicationTreeInfo | Where-Object { $_ })) {
+                $ora = $ati.protectionSource.oracleProtectionSource
+                if ($ora) { $dbNodes += $ora }
+            }
+        }
+    }
+
+    foreach ($node in $dbNodes) {
+        $regRows += [PSCustomObject]@{
+            Cluster             = $clusterName
+            DBName              = $node.databaseUniqueName
+            DBVersion           = $node.version
+            ArchiveLog_Enabled  = $node.archiveLogEnabled
+            BCT_Enabled         = $node.bctEnabled
+            DB_Type             = $node.dbType
+            DB_Size_in_GB       = Convert-BytesToGiB $node.size
+            DB_Instances        = $node.hosts.sessions.systemIdentifier | Join-Value
+            CPU_Count           = $node.hosts.cpuCount | Join-Value -Default "N/A"
+            DB_Home             = $node.hosts.sessions.location | Join-Value -Default "N/A"
+            SharedPool_Size     = $node.sgaTargetSize
+            Fragment_Size       = $node.shardPoolSize
+            FRA_Size_in_GB      = Convert-BytesToGiB $node.fraSize
+        }
+    }
+
+    try {
+        $pgUri = "$baseUrl/v2/data-protect/protection-groups" +
+                 "?environments=kOracle&isDeleted=false&isActive=true&includeLastRunInfo=true"
+
+        $json2 = Invoke-HeliosGetJson -Uri $pgUri -Headers $headers
+    }
+    catch {
+        Write-Host "Failed to collect protection group details for $clusterName`: $($_.Exception.Message)" -ForegroundColor Yellow
+        $json2 = $null
+    }
+
+    foreach ($dbd in ($json2.protectionGroups | Where-Object { $_ })) {
+        $policyName = Get-PolicyName -PolicyId $dbd.policyId -Headers $headers
+
+        foreach ($channel in ($dbd.oracleParams.objects | Where-Object { $_ })) {
+            foreach ($dbChannel in ($channel.dbParams.dbChannels | Where-Object { $_ })) {
+                $hostName = Resolve-HostName -HostId $channel.databaseNodeList.hostId -Headers $headers
+
+                $pgRows += [PSCustomObject]@{
+                    Cluster                = $clusterName
+                    PGName                 = $dbd.name
+                    Replicated_To_Cluster  = $dbd.lastRun.replicationInfo.replicationTargetResults.clusterName | Join-Value
+                    PolicyName             = $policyName
+                    SourceName             = $channel.sourceName
+                    DBName                 = $channel.databaseUniqueName
+                    PersistMountPoints     = $dbd.oracleParams.persistMountPoints | Join-Value
+                    LogRetentionDays       = $channel.archiveLogRetentionDays
+                    ChannelCount           = $channel.databaseNodeList.channelCount
+                    Port                   = $channel.databaseNodeList.port
+                    HostName               = $hostName
+                }
+            }
+        }
+    }
+}
+
+$pgIndex = New-Object 'System.Collections.Hashtable' ([StringComparer]::OrdinalIgnoreCase)
+foreach ($row in $pgRows) {
+    if (-not [string]::IsNullOrWhiteSpace($row.DBName)) {
+        $pgIndex["$($row.Cluster)|$($row.DBName)"] = $row
+    }
+}
+
+$final = @()
+
+foreach ($a in $regRows) {
+    $b = $pgIndex["$($a.Cluster)|$($a.DBName)"]
+
+    $final += [PSCustomObject]@{
+        Cluster                = $a.Cluster
+        Replicated_To_Cluster  = if ($b) { $b.Replicated_To_Cluster } else { "" }
+        DBName                 = $a.DBName
+        HostName               = if ($b) { $b.HostName } else { "" }
+        PGName                 = if ($b) { $b.PGName } else { "" }
+        PolicyName             = if ($b) { $b.PolicyName } else { "" }
+        SourceName             = if ($b) { $b.SourceName } else { "" }
+        PersistMountPoints     = if ($b) { $b.PersistMountPoints } else { "" }
+        LogRetentionDays       = if ($b) { $b.LogRetentionDays } else { "" }
+        ChannelCount           = if ($b) { $b.ChannelCount } else { "" }
+        Port                   = if ($b) { $b.Port } else { "" }
+        DBVersion              = $a.DBVersion
+        ArchiveLog_Enabled     = $a.ArchiveLog_Enabled
+        BCT_Enabled            = $a.BCT_Enabled
+        DB_Type                = $a.DB_Type
+        DB_Size_in_GB          = $a.DB_Size_in_GB
+        DB_Instances           = $a.DB_Instances
+        CPU_Count              = $a.CPU_Count
+        DB_Home                = $a.DB_Home
+        SharedPool_Size        = $a.SharedPool_Size
+        Fragment_Size          = $a.Fragment_Size
+        FRA_Size_in_GB         = $a.FRA_Size_in_GB
+    }
+}
+
+$regKeys = @($regRows | ForEach-Object { "$($_.Cluster)|$($_.DBName)" })
+$onlyInPg = $pgRows | Where-Object { $regKeys -notcontains "$($_.Cluster)|$($_.DBName)" }
+
+foreach ($b in $onlyInPg) {
+    $final += [PSCustomObject]@{
+        Cluster                = $b.Cluster
+        Replicated_To_Cluster  = $b.Replicated_To_Cluster
+        DBName                 = $b.DBName
+        HostName               = $b.HostName
+        PGName                 = $b.PGName
+        PolicyName             = $b.PolicyName
+        SourceName             = $b.SourceName
+        PersistMountPoints     = $b.PersistMountPoints
+        LogRetentionDays       = $b.LogRetentionDays
+        ChannelCount           = $b.ChannelCount
+        Port                   = $b.Port
+        DBVersion              = ""
+        ArchiveLog_Enabled     = ""
+        BCT_Enabled            = ""
+        DB_Type                = ""
+        DB_Size_in_GB          = ""
+        DB_Instances           = ""
+        CPU_Count              = ""
+        DB_Home                = ""
+        SharedPool_Size        = ""
+        Fragment_Size          = ""
+        FRA_Size_in_GB         = ""
+    }
+}
+
+$columns = @(
+    "Cluster",
+    "Replicated_To_Cluster",
+    "DBName",
+    "HostName",
+    "PGName",
+    "PolicyName",
+    "SourceName",
+    "PersistMountPoints",
+    "LogRetentionDays",
+    "ChannelCount",
+    "Port",
+    "DBVersion",
+    "ArchiveLog_Enabled",
+    "BCT_Enabled",
+    "DB_Type",
+    "DB_Size_in_GB",
+    "DB_Instances",
+    "CPU_Count",
+    "DB_Home",
+    "SharedPool_Size",
+    "Fragment_Size",
+    "FRA_Size_in_GB"
+)
+
+$final = $final | Sort-Object Cluster, DBName
+
+try {
+    $raw = $Host.UI.RawUI
+    $raw.BufferSize = New-Object Management.Automation.Host.Size(10000, $raw.BufferSize.Height)
+}
+catch {}
+
+if ($final.Count -eq 0) {
+    Write-Host "`nNo Oracle DB details found." -ForegroundColor Yellow
+}
+else {
+    Write-Host "`nOracle DB Details - All Clusters" -ForegroundColor Cyan
+    $final | Format-Table -Property $columns -AutoSize | Out-String -Width 10000
+
+    $timestamp = Get-Date -Format "yyyyMMdd_HHmm"
+    $csvPath = Join-Path $logDirectory "Oracle_DB_Combined_AllClusters_$timestamp.csv"
+    $final | Select-Object $columns | Export-Csv -Path $csvPath -NoTypeInformation -Encoding utf8
+
+    Write-Host "`nCSV saved: $csvPath" -ForegroundColor Gray
+}
+
+Write-Host "`nProcessing complete!"
+```
