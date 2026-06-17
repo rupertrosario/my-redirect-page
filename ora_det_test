@@ -1,16 +1,26 @@
 # =====================================================================
-# Cohesity Oracle - One Cluster / One PGID Latest Backup Test
+# Cohesity Oracle - One Cluster / One PGID DB List + Latest PG Run Dates
 # STRICTLY READ-ONLY GET-only
 #
-# Source:
-# - /v2/data-protect/protection-groups/{PGID}/runs
+# Purpose:
+# - List DBs inside ONE Oracle PG
+# - Get latest Regular backup end time from /runs
+# - Get latest Log backup end time from /runs
+# - Get replication target + replication end time if present
 #
-# Uses:
+# DB list source:
+# - /v2/data-protect/protection-groups
+# - protectionGroups[].oracleParams.objects[].dbParams[]
+#
+# Backup date source:
+# - /v2/data-protect/protection-groups/{PGID}/runs
 # - runs[].localBackupInfo.runType
 # - runs[].localBackupInfo.status
 # - runs[].localBackupInfo.endTimeUsecs
 #
 # Output:
+# - PGName
+# - DBName
 # - LatestRegularBackupET
 # - LatestLogBackupET
 # - ReplicationTargetCluster
@@ -21,7 +31,7 @@ $ErrorActionPreference = "Stop"
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
 # -------------------------------
-# Fill these
+# Fill these two
 # -------------------------------
 $ClusterId = "PASTE_CLUSTER_ID_HERE"
 $PgId      = "PASTE_PGID_HERE"
@@ -81,6 +91,24 @@ function Get-FirstNonEmpty {
     }
 
     return ""
+}
+
+function To-FlatString {
+    param([object]$Value)
+
+    if ($null -eq $Value) {
+        return ""
+    }
+
+    $items = @()
+
+    foreach ($item in @($Value)) {
+        if ($null -ne $item -and "$item".Trim() -ne "") {
+            $items += "$item"
+        }
+    }
+
+    return (($items | Select-Object -Unique) -join ";")
 }
 
 function To-Number {
@@ -143,6 +171,132 @@ function Test-LogRunType {
     return ($RunType -match '(?i)log|archive')
 }
 
+function Get-PgIdCandidates {
+    param([object]$Pg)
+
+    $ids = @()
+
+    $ids += @($Pg.id)
+    $ids += @($Pg.protectionGroupId)
+    $ids += @($Pg.lastRun.protectionGroupId)
+    $ids += @($Pg.lastRun.originProtectionGroupId)
+    $ids += @($Pg.runs.protectionGroupId)
+    $ids += @($Pg.runs.originProtectionGroupId)
+
+    return @(
+        $ids |
+        Where-Object { $_ -and "$_".Trim() -ne "" } |
+        Select-Object -Unique
+    )
+}
+
+function Test-PgMatchesInput {
+    param(
+        [object]$Pg,
+        [string]$InputPgId
+    )
+
+    $ids = Get-PgIdCandidates -Pg $Pg
+
+    foreach ($id in $ids) {
+        if ("$id" -eq "$InputPgId") {
+            return $true
+        }
+    }
+
+    return $false
+}
+
+function Get-OracleDbsFromPg {
+    param([object]$Pg)
+
+    $rows = @()
+
+    foreach ($obj in @($Pg.oracleParams.objects | Where-Object { $_ })) {
+
+        foreach ($dbParam in @($obj.dbParams | Where-Object { $_ })) {
+
+            $dbChannels = @()
+
+            if ($dbParam.dbChannels.dbChannel) {
+                $dbChannels += @($dbParam.dbChannels.dbChannel)
+            }
+            elseif ($dbParam.dbChannels) {
+                $dbChannels += @($dbParam.dbChannels)
+            }
+
+            # If channels exist, use them.
+            if ($dbChannels.Count -gt 0) {
+
+                foreach ($channel in ($dbChannels | Where-Object { $_ })) {
+
+                    $dbName = Get-FirstNonEmpty -Values @(
+                        $channel.databaseUniqueName,
+                        $channel.databaseName,
+                        $dbParam.databaseName,
+                        $dbParam.databaseUniqueName,
+                        $obj.databaseUniqueName,
+                        $obj.dbUniqueName,
+                        $obj.name
+                    )
+
+                    $dbId = Get-FirstNonEmpty -Values @(
+                        $channel.databaseUuid,
+                        $channel.databaseId,
+                        $dbParam.databaseId,
+                        $dbParam.databaseUuid,
+                        $obj.databaseId,
+                        $obj.id
+                    )
+
+                    $hostIds = @()
+                    $hostIds += @($channel.databaseNodeList.hostId)
+                    $hostIds += @($channel.databaseNodeList.id)
+
+                    $hostIdFlat = To-FlatString $hostIds
+
+                    $rows += [PSCustomObject]@{
+                        PGName     = $Pg.name
+                        DBName     = $dbName
+                        DatabaseId = $dbId
+                        HostIds    = $hostIdFlat
+                    }
+                }
+            }
+            else {
+                # Fallback if no dbChannels are present.
+                $dbName = Get-FirstNonEmpty -Values @(
+                    $dbParam.databaseName,
+                    $dbParam.databaseUniqueName,
+                    $obj.databaseUniqueName,
+                    $obj.dbUniqueName,
+                    $obj.name
+                )
+
+                $dbId = Get-FirstNonEmpty -Values @(
+                    $dbParam.databaseId,
+                    $dbParam.databaseUuid,
+                    $obj.databaseId,
+                    $obj.id
+                )
+
+                $rows += [PSCustomObject]@{
+                    PGName     = $Pg.name
+                    DBName     = $dbName
+                    DatabaseId = $dbId
+                    HostIds    = ""
+                }
+            }
+        }
+    }
+
+    return @(
+        $rows |
+        Where-Object { -not [string]::IsNullOrWhiteSpace($_.DBName) } |
+        Sort-Object DBName -Unique
+    )
+}
+
 function Get-ReplicationTarget {
     param([object]$Run)
 
@@ -179,7 +333,55 @@ function Get-ReplicationEndUsecs {
 }
 
 # =====================================================================
-# Get runs
+# 1) Get the Oracle PG and list DBs
+# =====================================================================
+Write-Host ""
+Write-Host "ClusterId : $ClusterId" -ForegroundColor Cyan
+Write-Host "Input PGID: $PgId" -ForegroundColor Cyan
+
+$pgUri = "$baseUrl/v2/data-protect/protection-groups?environments=kOracle&isDeleted=false&isActive=true&includeLastRunInfo=true"
+$pgJson = Invoke-HeliosGetJson -Uri $pgUri -Headers $headers
+
+$allOraclePgs = @($pgJson.protectionGroups | Where-Object { $_ })
+
+Write-Host ""
+Write-Host "Oracle PGs returned: $($allOraclePgs.Count)" -ForegroundColor Yellow
+
+$pg = $allOraclePgs | Where-Object {
+    Test-PgMatchesInput -Pg $_ -InputPgId $PgId
+} | Select-Object -First 1
+
+if (-not $pg) {
+    Write-Host ""
+    Write-Host "PGID not found in protection-groups response. Showing PG ID candidates:" -ForegroundColor Red
+
+    $allOraclePgs |
+        Select-Object `
+            @{n="PGName";e={$_.name}},
+            @{n="id";e={$_.id}},
+            @{n="protectionGroupId";e={$_.protectionGroupId}},
+            @{n="lastRun.protectionGroupId";e={$_.lastRun.protectionGroupId}},
+            @{n="runs.protectionGroupId";e={To-FlatString $_.runs.protectionGroupId}} |
+        Format-Table -AutoSize
+
+    return
+}
+
+$pgIds = To-FlatString (Get-PgIdCandidates -Pg $pg)
+
+Write-Host ""
+Write-Host "Matched PG: $($pg.name)" -ForegroundColor Green
+Write-Host "PG ID candidates: $pgIds"
+
+$dbRows = Get-OracleDbsFromPg -Pg $pg
+
+Write-Host ""
+Write-Host "DBs found in PG config: $($dbRows.Count)" -ForegroundColor Cyan
+
+$dbRows | Format-Table -AutoSize
+
+# =====================================================================
+# 2) Get runs and calculate PG-level latest dates
 # =====================================================================
 $allRuns = @()
 $page = 0
@@ -195,7 +397,7 @@ do {
     }
 
     Write-Host ""
-    Write-Host "Calling page $page" -ForegroundColor Yellow
+    Write-Host "Calling runs page $page" -ForegroundColor Yellow
     Write-Host $runsUri
 
     $runsJson = Invoke-HeliosGetJson -Uri $runsUri -Headers $headers
@@ -213,9 +415,6 @@ do {
 
 } while (-not [string]::IsNullOrWhiteSpace($cookie) -and $page -lt $MaxRunPages)
 
-# =====================================================================
-# Flatten run-level data only
-# =====================================================================
 $runRows = @()
 
 foreach ($run in $allRuns) {
@@ -254,9 +453,6 @@ foreach ($run in $allRuns) {
     }
 }
 
-# =====================================================================
-# Latest calculation
-# =====================================================================
 $latestRegularUsecs = 0
 $latestRegularET = ""
 
@@ -305,29 +501,34 @@ foreach ($r in $runRows) {
     }
 }
 
-$summary = [PSCustomObject]@{
-    ClusterId                  = $ClusterId
-    PGID                       = $PgId
-    LatestRegularBackupET      = $latestRegularET
-    LatestLogBackupET          = $latestLogET
-    ReplicationTargetCluster   = $latestReplicationTarget
-    LatestReplicationEndTimeET = $latestReplicationET
+# =====================================================================
+# 3) Build one row per DB in the PG
+# =====================================================================
+$finalRows = @()
+
+foreach ($db in $dbRows) {
+    $finalRows += [PSCustomObject]@{
+        PGName                     = $db.PGName
+        DBName                     = $db.DBName
+        DatabaseId                 = $db.DatabaseId
+        HostIds                    = $db.HostIds
+        LatestRegularBackupET      = $latestRegularET
+        LatestLogBackupET          = $latestLogET
+        ReplicationTargetCluster   = $latestReplicationTarget
+        LatestReplicationEndTimeET = $latestReplicationET
+    }
 }
 
 # =====================================================================
-# Output
+# 4) Output
 # =====================================================================
 $stamp = Get-Date -Format "yyyy-MM-dd_HHmmss"
 
-$runCsv = Join-Path $outDir "one_pg_run_level_test_$stamp.csv"
-$summaryCsv = Join-Path $outDir "one_pg_latest_summary_$stamp.csv"
+$dbCsv      = Join-Path $outDir "one_pg_db_list_with_latest_dates_$stamp.csv"
+$runCsv     = Join-Path $outDir "one_pg_run_rows_$stamp.csv"
 
-$runRows |
-    Sort-Object RunEndUsecs -Descending |
-    Export-Csv -Path $runCsv -NoTypeInformation -Encoding utf8
-
-$summary |
-    Export-Csv -Path $summaryCsv -NoTypeInformation -Encoding utf8
+$finalRows | Export-Csv -Path $dbCsv -NoTypeInformation -Encoding utf8
+$runRows   | Export-Csv -Path $runCsv -NoTypeInformation -Encoding utf8
 
 Write-Host ""
 Write-Host "Run-level rows:" -ForegroundColor Cyan
@@ -338,10 +539,19 @@ $runRows |
     Format-Table -AutoSize
 
 Write-Host ""
-Write-Host "Latest summary:" -ForegroundColor Cyan
+Write-Host "Final DB rows:" -ForegroundColor Cyan
 
-$summary | Format-List
+$finalRows | Format-Table -AutoSize
 
 Write-Host ""
-Write-Host "Run CSV     : $runCsv" -ForegroundColor Green
-Write-Host "Summary CSV : $summaryCsv" -ForegroundColor Green
+Write-Host "Summary" -ForegroundColor Cyan
+Write-Host "DB rows in PG       : $($dbRows.Count)"
+Write-Host "Runs checked        : $($runRows.Count)"
+Write-Host "Latest Regular ET   : $latestRegularET"
+Write-Host "Latest Log ET       : $latestLogET"
+Write-Host "Replication Target  : $latestReplicationTarget"
+Write-Host "Replication End ET  : $latestReplicationET"
+
+Write-Host ""
+Write-Host "DB CSV  : $dbCsv" -ForegroundColor Green
+Write-Host "Run CSV : $runCsv" -ForegroundColor Green
