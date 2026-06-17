@@ -141,7 +141,7 @@ function Get-FirstValue {
 function Convert-BytesToGiB {
     param($Value)
 
-    $number = Get-FirstValue $Value
+    $number = Get-FirstValue -Value $Value
 
     if ($null -eq $number -or "$number".Trim() -eq "") {
         return ""
@@ -160,7 +160,14 @@ function Get-JoinKey {
         return ""
     }
 
-    return ("{0}|{1}" -f $Cluster.Trim(), $DBName.Trim())
+    $db = $DBName.Trim().ToUpper()
+
+    # Normalize common Oracle DB naming difference: DB.DOMAIN -> DB
+    if ($db -match '\.') {
+        $db = ($db -split '\.')[0]
+    }
+
+    return ("{0}|{1}" -f $Cluster.Trim().ToUpper(), $db)
 }
 
 function Resolve-HostName {
@@ -273,7 +280,7 @@ if (-not $json_clu -or $json_clu.Count -eq 0) {
 }
 
 $clusters = $json_clu | ForEach-Object {
-    $clusterId = Get-FirstValue @($_.clusterId, $_.id)
+    $clusterId = Get-FirstValue -Value @($_.clusterId, $_.id)
 
     $clusterName = @(
         $_.name,
@@ -362,13 +369,13 @@ foreach ($cluster in $clusters) {
             ArchiveLog_Enabled  = $node.archivelogEnabled
             BCT_Enabled         = $node.bctEnabled
             DB_Type             = $node.dbType
-            DB_Size_in_GB       = Convert-BytesToGiB $node.size
+            DB_Size_in_GB       = Convert-BytesToGiB -Value $node.size
             DB_Instances        = Join-Value -Value $node.hosts.sessions.systemIdentifier
             CPU_Count           = Join-Value -Value $node.hosts.cpuCount -Default "N/A"
             DB_Home             = Join-Value -Value $node.hosts.sessions.location -Default "N/A"
             SharedPool_Size     = $node.sgaTargetSize
             Fragment_Size       = $node.sharedPoolSize
-            FRA_Size_in_GB      = Convert-BytesToGiB $node.frasize
+            FRA_Size_in_GB      = Convert-BytesToGiB -Value $node.frasize
         }
     }
 
@@ -398,34 +405,65 @@ foreach ($cluster in $clusters) {
 
         foreach ($oracleObject in ($dbd.oracleParams.objects | Where-Object { $_ })) {
 
-            # IMPORTANT:
-            # Correct traversal is dbParams.dbChannels.dbChannel.
-            # Using dbParams.dbChannels directly causes DBName/Host fields not to combine properly.
-            foreach ($dbChannel in ($oracleObject.dbParams.dbChannels.dbChannel | Where-Object { $_ })) {
+            $channels = @()
 
-                $hostIds = @($dbChannel.databaseNodeList.hostId | Where-Object {
-                    $_ -and "$_".Trim() -ne ""
-                })
+            if ($oracleObject.dbParams.dbChannels.dbChannel) {
+                $channels += @($oracleObject.dbParams.dbChannels.dbChannel)
+            }
+            elseif ($oracleObject.dbParams.dbChannels) {
+                $channels += @($oracleObject.dbParams.dbChannels)
+            }
+
+            foreach ($dbChannel in ($channels | Where-Object { $_ })) {
+
+                $dbName = Get-FirstValue -Value @(
+                    $dbChannel.databaseUniqueName,
+                    $oracleObject.databaseUniqueName,
+                    $oracleObject.dbUniqueName,
+                    $oracleObject.name
+                )
+
+                $hostIds = @(
+                    $dbChannel.databaseNodeList.hostId,
+                    $oracleObject.databaseNodeList.hostId
+                ) |
+                    Where-Object { $_ -and "$_".Trim() -ne "" } |
+                    Select-Object -Unique
 
                 $hostNames = @()
 
                 foreach ($hostId in $hostIds) {
-                    $hostNames += Resolve-HostName `
+                    $resolvedHost = Resolve-HostName `
                         -HostId $hostId `
                         -Headers $headers `
                         -Cache $hostCache
+
+                    if (-not [string]::IsNullOrWhiteSpace($resolvedHost)) {
+                        $hostNames += $resolvedHost
+                    }
                 }
 
                 $pgRows += [PSCustomObject]@{
                     Cluster                = $clusterName
                     PGName                 = $dbd.name
-                    Replicated_To_Cluster  = Join-Value -Value $dbd.lastRun.replicationInfo.replicationTargetResults.ClusterName
+                    Replicated_To_Cluster  = Join-Value -Value @(
+                                                $dbd.lastRun.replicationInfo.replicationTargetResults.ClusterName,
+                                                $dbd.lastRun.replicationInfo.replicationTargetResults.clusterName
+                                              )
                     PolicyName             = $policyName
-                    SourceName             = Get-FirstValue @($oracleObject.SourceName, $oracleObject.sourceName)
-                    DBName                 = $dbChannel.databaseUniqueName
+                    SourceName             = Get-FirstValue -Value @($oracleObject.SourceName, $oracleObject.sourceName)
+                    DBName                 = $dbName
                     PersistMountPoints     = Join-Value -Value $dbd.oracleParams.persistMountPoints
-                    LogRetentionDays       = Get-FirstValue @($dbChannel.archiveVolRetentionDays, $dbChannel.archiveLogRetentionDays)
-                    ChannelCount           = Join-Value -Value $dbChannel.databaseNodeList.ChannelCount
+                    LogRetentionDays       = Get-FirstValue -Value @(
+                                                $dbChannel.archiveVolRetentionDays,
+                                                $dbChannel.archiveLogRetentionDays,
+                                                $oracleObject.archiveVolRetentionDays,
+                                                $oracleObject.archiveLogRetentionDays
+                                              )
+                    ChannelCount           = Join-Value -Value @(
+                                                $dbChannel.databaseNodeList.ChannelCount,
+                                                $dbChannel.databaseNodeList.channelCount
+                                              )
                     Port                   = Join-Value -Value $dbChannel.databaseNodeList.port
                     HostName               = Join-Value -Value $hostNames
                 }
@@ -437,10 +475,17 @@ foreach ($cluster in $clusters) {
     $pgCount  = @($pgRows  | Where-Object { $_.Cluster -eq $clusterName }).Count
 
     Write-Host "Cluster done: $clusterName | RegistrationRows=$regCount | PGRows=$pgCount" -ForegroundColor DarkCyan
+
+    Write-Host "PG sample for $clusterName" -ForegroundColor Yellow
+    $pgRows |
+        Where-Object { $_.Cluster -eq $clusterName } |
+        Select-Object Cluster, DBName, PGName, PolicyName, HostName |
+        Select-Object -First 5 |
+        Format-Table -AutoSize
 }
 
 # =====================================================================
-# Validate before join
+# Collection summary
 # =====================================================================
 
 Write-Host "`nCollection Summary" -ForegroundColor Cyan
@@ -448,7 +493,7 @@ Write-Host "Registration rows : $($regRows.Count)"
 Write-Host "PG rows           : $($pgRows.Count)"
 
 # =====================================================================
-# Join registration + PG info by Cluster + DBName
+# Join registration + PG info by normalized Cluster + DBName
 # =====================================================================
 
 $pgIndex = New-Object 'System.Collections.Hashtable' ([StringComparer]::OrdinalIgnoreCase)
@@ -577,6 +622,14 @@ $columns = @(
 )
 
 $final = @($final | Sort-Object Cluster, DBName)
+
+$matchedCount = @($final | Where-Object {
+    -not [string]::IsNullOrWhiteSpace($_.PGName)
+}).Count
+
+Write-Host "`nJoin Summary" -ForegroundColor Cyan
+Write-Host "Final rows        : $($final.Count)"
+Write-Host "Rows with PG info : $matchedCount"
 
 try {
     $raw = $Host.UI.RawUI
