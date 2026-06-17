@@ -1,37 +1,24 @@
 # =====================================================================
-# Cohesity Helios — Oracle DB Inventory (Registration + PG/Policy/Host)
-# STRICTLY READ-ONLY (GET-only)
+# Cohesity Helios — Oracle DB Inventory + Latest Backup Dates
+# STRICTLY READ-ONLY / GET-only
 #
-# Menu:
-# 1) Select Cluster: [0] ALL or [1..N] single
-#
-# Output:
-# - Console table
-# - ONE timestamped CSV
-#
-# Existing PG details retained:
-# - PGName
-# - Replicated_To_Cluster
-# - PolicyName
-# - SourceName
-# - PersistMountPoints
-# - LogRetentionDays
-# - ChannelCount
-# - Port
-# - HostName
-#
-# Added only:
+# Included:
+# - Original Oracle inventory columns
 # - LatestRegularBackupET
 # - LatestLogBackupET
 # - ReplicationTargetCluster
 # - LatestReplicationEndTimeET
 #
-# Not added:
-# - PGID in final output
+# Excluded:
+# - PGID in final report
 # - DB ID
 # - HostIds
 # - RunType
 # - RunStatus
+# - Collection Summary
+#
+# Added:
+# - Error exception capture and display
 # =====================================================================
 
 $ErrorActionPreference = "Stop"
@@ -39,9 +26,20 @@ $FormatEnumerationLimit = -1
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
 # -------------------------------
+# Settings
+# -------------------------------
+$outDir     = "H:\Cohesity_API\Logs"
+$apikeypath = "X:\PowerShell\Cohesity_API_Scripts\DO_NOT_Delete\apikey.txt"
+$baseUrl    = "https://helios.cohesity.com"
+
+$MaxRunPagesPerPG = 10
+
+# Error collection
+$script:ErrorRows = @()
+
+# -------------------------------
 # Output folder
 # -------------------------------
-$outDir = "H:\Cohesity_API\Logs"
 if (-not (Test-Path -Path $outDir -PathType Container)) {
     New-Item -Path $outDir -ItemType Directory | Out-Null
 }
@@ -49,25 +47,20 @@ if (-not (Test-Path -Path $outDir -PathType Container)) {
 # -------------------------------
 # API key
 # -------------------------------
-$apikeypath = "X:\PowerShell\Cohesity_API_Scripts\DO_NOT_Delete\apikey.txt"
 if (-not (Test-Path $apikeypath)) {
     throw "API key file not found at $apikeypath"
 }
 
 $apiKey = (Get-Content -Path $apikeypath -Raw).Trim()
 
-$baseUrl = "https://helios.cohesity.com"
 $commonHeaders = @{
-    "apiKey" = $apiKey
-    "accept" = "application/json"
+    apiKey = $apiKey
+    accept = "application/json"
 }
 
-$MaxRunPagesPerPG = 10
-$script:ErrorRows = @()
-
-# -------------------------------
+# =====================================================================
 # Error helper
-# -------------------------------
+# =====================================================================
 function Add-ErrorRow {
     param(
         [string]$Stage,
@@ -97,9 +90,9 @@ function Add-ErrorRow {
     }
 }
 
-# -------------------------------
-# GET wrapper (PS 5.1 safe)
-# -------------------------------
+# =====================================================================
+# GET wrapper
+# =====================================================================
 function Invoke-HeliosGetJson {
     param(
         [Parameter(Mandatory)][string]$Uri,
@@ -139,21 +132,39 @@ function Invoke-HeliosGetJson {
     }
 }
 
-# -------------------------------
+# =====================================================================
 # Helpers
-# -------------------------------
-function To-FlatString {
-    param([object]$v)
+# =====================================================================
+function As-Array {
+    param([object]$Value)
 
-    if ($null -eq $v) {
+    if ($null -eq $Value) {
+        return @()
+    }
+
+    return @($Value)
+}
+
+function To-FlatString {
+    param([object]$Value)
+
+    if ($null -eq $Value) {
         return ""
     }
 
-    if ($v -is [System.Array]) {
-        return (($v | Where-Object { $_ -ne $null -and "$_".Trim() -ne "" }) -join ";")
+    $items = @()
+
+    foreach ($item in @($Value)) {
+        if ($null -ne $item -and "$item".Trim() -ne "") {
+            $items += "$item"
+        }
     }
 
-    return "$v"
+    if ($items.Count -eq 0) {
+        return ""
+    }
+
+    return (($items | Select-Object -Unique) -join ";")
 }
 
 function Get-FirstNonEmpty {
@@ -170,19 +181,68 @@ function Get-FirstNonEmpty {
     return ""
 }
 
-function To-Number {
-    param($Value)
+function Normalize-Key {
+    param([string]$Value)
 
-    if ($null -eq $Value -or "$Value".Trim() -eq "") {
-        return 0
+    if ([string]::IsNullOrWhiteSpace($Value)) {
+        return ""
     }
 
-    try {
-        return [double]$Value
+    return $Value.Trim().ToUpper()
+}
+
+function Get-MatchKeys {
+    param([object[]]$Values)
+
+    $keys = @()
+
+    foreach ($v in @($Values)) {
+
+        if ($null -eq $v) {
+            continue
+        }
+
+        $s = "$v"
+
+        if ([string]::IsNullOrWhiteSpace($s)) {
+            continue
+        }
+
+        $n = Normalize-Key -Value $s
+
+        if (-not [string]::IsNullOrWhiteSpace($n)) {
+            $keys += $n
+        }
+
+        if ($n -match '\.') {
+            $keys += (($n -split '\.')[0])
+        }
     }
-    catch {
-        return 0
+
+    return @(
+        $keys |
+        Where-Object { $_ -and "$_".Trim() -ne "" } |
+        Select-Object -Unique
+    )
+}
+
+function Resolve-HostName {
+    param([string]$NameOrIp)
+
+    if ([string]::IsNullOrWhiteSpace($NameOrIp)) {
+        return ""
     }
+
+    if ($NameOrIp -match '^\d{1,3}(\.\d{1,3}){3}$') {
+        try {
+            return ([System.Net.Dns]::GetHostEntry($NameOrIp).HostName)
+        }
+        catch {
+            return $NameOrIp
+        }
+    }
+
+    return $NameOrIp
 }
 
 function Convert-UsecsToET {
@@ -210,6 +270,38 @@ function Convert-UsecsToET {
     }
 }
 
+function To-Number {
+    param($Value)
+
+    if ($null -eq $Value -or "$Value".Trim() -eq "") {
+        return 0
+    }
+
+    try {
+        return [double]$Value
+    }
+    catch {
+        return 0
+    }
+}
+
+function Convert-BytesToGB {
+    param($Bytes)
+
+    $v = Get-FirstNonEmpty -Values @($Bytes)
+
+    if ([string]::IsNullOrWhiteSpace($v)) {
+        return ""
+    }
+
+    try {
+        return [math]::Round(([double]$v / 1GB), 4)
+    }
+    catch {
+        return ""
+    }
+}
+
 function Test-SuccessStatus {
     param([string]$Status)
 
@@ -230,31 +322,12 @@ function Test-LogRunType {
     return ($RunType -match '(?i)log|archive')
 }
 
-function Resolve-HostName {
-    param([string]$nameOrIp)
-
-    if ([string]::IsNullOrWhiteSpace($nameOrIp)) {
-        return ""
-    }
-
-    if ($nameOrIp -match '^\d{1,3}(\.\d{1,3}){3}$') {
-        try {
-            return ([System.Net.Dns]::GetHostEntry($nameOrIp).HostName)
-        }
-        catch {
-            return $nameOrIp
-        }
-    }
-
-    return $nameOrIp
-}
-
 function Get-TdeEncryptedTsCount {
-    param([object]$node)
+    param([object]$Node)
 
     try {
-        if ($node.PSObject.Properties["tdeEncryptedTsCount"]) {
-            $v = $node.tdeEncryptedTsCount
+        if ($Node.PSObject.Properties["tdeEncryptedTsCount"]) {
+            $v = $Node.tdeEncryptedTsCount
 
             if ($null -eq $v) {
                 return 0
@@ -269,14 +342,14 @@ function Get-TdeEncryptedTsCount {
 }
 
 function Get-DataGuardRole {
-    param([object]$node)
+    param([object]$Node)
 
     try {
-        if (-not $node.PSObject.Properties["dataGuardInfo"]) {
+        if (-not $Node.PSObject.Properties["dataGuardInfo"]) {
             return ""
         }
 
-        $dg = $node.dataGuardInfo
+        $dg = $Node.dataGuardInfo
 
         if ($null -eq $dg) {
             return ""
@@ -315,12 +388,12 @@ function Get-ReplicationTarget {
     param([object]$Run)
 
     return Get-FirstNonEmpty -Values @(
-        $Run.replicationInfo.replicationTargetResults.ClusterName,
         $Run.replicationInfo.replicationTargetResults.clusterName,
+        $Run.replicationInfo.replicationTargetResults.ClusterName,
         $Run.replicationInfo.replicationTargetResults.targetClusterName,
         $Run.replicationInfo.replicationTargetResults.targetName,
-        $Run.localBackupInfo.replicationInfo.replicationTargetResults.ClusterName,
         $Run.localBackupInfo.replicationInfo.replicationTargetResults.clusterName,
+        $Run.localBackupInfo.replicationInfo.replicationTargetResults.ClusterName,
         $Run.localBackupInfo.replicationInfo.replicationTargetResults.targetClusterName,
         $Run.localBackupInfo.replicationInfo.replicationTargetResults.targetName
     )
@@ -336,6 +409,7 @@ function Get-ReplicationEndUsecs {
         $Run.replicationInfo.replicationTargetResults.finishTimeUsecs,
         $Run.replicationInfo.replicationTargetResults.completedTimeUsecs,
         $Run.replicationInfo.replicationTargetResults.completionTimeUsecs,
+
         $Run.localBackupInfo.replicationInfo.replicationTargetResults.endTimeUsecs,
         $Run.localBackupInfo.replicationInfo.replicationTargetResults.endTimeInUsecs,
         $Run.localBackupInfo.replicationInfo.replicationTargetResults.replicationEndTimeUsecs,
@@ -474,8 +548,20 @@ if (-not $json_clu -or $json_clu.Count -eq 0) {
 }
 
 $clusters = $json_clu | ForEach-Object {
-    $name = ($_.name,$_.clusterName,$_.displayName | Where-Object { $_ -and $_.Trim() } | Select-Object -First 1)
-    $cid  = ($_.clusterId,$_.id | Where-Object { $_ } | Select-Object -First 1)
+    $name = @(
+        $_.name,
+        $_.clusterName,
+        $_.displayName
+    ) |
+        Where-Object { $_ -and "$_".Trim() -ne "" } |
+        Select-Object -First 1
+
+    $cid = @(
+        $_.clusterId,
+        $_.id
+    ) |
+        Where-Object { $_ } |
+        Select-Object -First 1
 
     if (-not $name) {
         $name = "Unknown-$cid"
@@ -503,15 +589,15 @@ Write-Host "[0] All clusters" -ForegroundColor Yellow
 Write-Host "[X] Exit" -ForegroundColor Yellow
 
 while ($true) {
-    $in = Read-Host "Select cluster: 0 for ALL, 1-$($clusterMenu.Count) for single, or X"
+    $selection = Read-Host "Select cluster: 0 for ALL, 1-$($clusterMenu.Count) for single, or X"
 
-    if ($in -match '^(x|X|q|Q)$') {
+    if ($selection -match '^(x|X|q|Q)$') {
         return
     }
 
     $n = 0
 
-    if (-not [int]::TryParse($in, [ref]$n)) {
+    if (-not [int]::TryParse($selection, [ref]$n)) {
         Write-Host "Enter 0, 1-$($clusterMenu.Count), or X." -ForegroundColor Red
         continue
     }
@@ -557,7 +643,9 @@ foreach ($cluster in $clustersAvailable) {
         accept          = "application/json"
     }
 
-    # ----------------------------- Script 1 (DB attributes) -----------------------------
+    # -----------------------------
+    # Oracle registration details
+    # -----------------------------
     $uri1 = "$baseUrl/irisservices/api/v1/public/protectionSources/registrationInfo" +
             "?environments=kOracle&includeEmbeddedApplication=true&includeApplicationTreeInfo=true" +
             "&allUnderHierarchy=true&includeData=true"
@@ -593,19 +681,19 @@ foreach ($cluster in $clustersAvailable) {
 
     foreach ($node in $db_nodes) {
 
-        $cpu = (@($node.hosts.cpuCount) -join ';')
+        $cpu = To-FlatString $node.hosts.cpuCount
         if ([string]::IsNullOrWhiteSpace($cpu)) {
-            $cpu = 'N/A'
+            $cpu = "N/A"
         }
 
-        $dbHome = (@($node.hosts.sessions.location) -join ';')
+        $dbHome = To-FlatString $node.hosts.sessions.location
         if ([string]::IsNullOrWhiteSpace($dbHome)) {
-            $dbHome = 'N/A'
+            $dbHome = "N/A"
         }
 
-        $tdeCount   = Get-TdeEncryptedTsCount -node $node
+        $tdeCount   = Get-TdeEncryptedTsCount -Node $node
         $tdeEnabled = if ($tdeCount -gt 0) { "Yes" } else { "No" }
-        $dgRole     = Get-DataGuardRole -node $node
+        $dgRole     = Get-DataGuardRole -Node $node
 
         $regRows += [PSCustomObject]@{
             Cluster              = $cluster_name
@@ -617,19 +705,20 @@ foreach ($cluster in $clustersAvailable) {
             TDE_EncryptedTsCount = $tdeCount
             DataGuardRole        = $dgRole
             DB_Type              = $node.dbType
-            DB_Size_in_GB        = [math]::Round(((($node.size) | ForEach-Object { $_ }) / 1GB), 4)
-            DB_Instances         = (@($node.hosts.sessions.systemIdentifier) -join ';')
+            DB_Size_in_GB        = Convert-BytesToGB $node.size
+            DB_Instances         = To-FlatString $node.hosts.sessions.systemIdentifier
             CPU_Count            = $cpu
             DB_Home              = $dbHome
             SharedPool_Size      = $node.sgaTargetSize
             Fragment_Size        = $node.sharedPoolSize
-            FRA_Size_in_GB       = [math]::Round(((($node.frasize) | ForEach-Object { $_ }) / 1GB), 4)
+            FRA_Size_in_GB       = Convert-BytesToGB $node.frasize
         }
     }
 
-    # ----------------------------- Script 2 (PG/Policy/Host) -----------------------------
-    # IMPORTANT: kept same query and same channel walk style
-    $uri2  = "$baseUrl/v2/data-protect/protection-groups?environments=kOracle&isDeleted=false&isActive=true&includeLastRunInfo=true"
+    # -----------------------------
+    # Oracle PG details + latest PG run dates
+    # -----------------------------
+    $uri2 = "$baseUrl/v2/data-protect/protection-groups?environments=kOracle&isDeleted=false&isActive=true&includeLastRunInfo=true"
 
     try {
         $json2 = Invoke-HeliosGetJson -Uri $uri2 -Headers $headers
@@ -646,10 +735,48 @@ foreach ($cluster in $clustersAvailable) {
         continue
     }
 
-    foreach ($dbd in ($json2.protectionGroups | Where-Object { $_ })) {
+    foreach ($dbd in (@($json2.protectionGroups) | Where-Object { $_ })) {
 
         $pgId = Get-PgIdFromProtectionGroup -Pg $dbd
 
+        # PolicyName
+        $policyName = ""
+
+        if ($dbd.policyId) {
+            $pk = "$cluster_id|$($dbd.policyId)"
+
+            if ($policyCache.ContainsKey($pk)) {
+                $policyName = $policyCache[$pk]
+            }
+            else {
+                $policyUri = "$baseUrl/v2/data-protect/policies?ids=$($dbd.policyId)"
+
+                try {
+                    $pJson = Invoke-HeliosGetJson -Uri $policyUri -Headers $headers
+
+                    $policyName = (
+                        $pJson.policies |
+                        Where-Object { $_._id -eq $dbd.policyId -or $_.id -eq $dbd.policyId } |
+                        Select-Object -ExpandProperty name -First 1
+                    )
+                }
+                catch {
+                    Add-ErrorRow `
+                        -Stage "PolicyLookup" `
+                        -Cluster $cluster_name `
+                        -PGName $dbd.name `
+                        -PGID $pgId `
+                        -Uri $policyUri `
+                        -ErrorObject $_
+
+                    $policyName = ""
+                }
+
+                $policyCache[$pk] = $policyName
+            }
+        }
+
+        # Latest dates once per PG
         $pgRunInfo = [PSCustomObject]@{
             LatestRegularBackupET      = ""
             LatestLogBackupET          = ""
@@ -674,140 +801,265 @@ foreach ($cluster in $clustersAvailable) {
             }
         }
 
-        foreach ($channels in ($dbd.oracleParams.objects | Where-Object { $_ })) {
-            foreach ($channel in ($channels.dbParams.dbChannels.dbChannel | Where-Object { $_ })) {
+        $replicatedToFromPg = To-FlatString @(
+            $dbd.lastRun.replicationInfo.replicationTargetResults.ClusterName,
+            $dbd.lastRun.replicationInfo.replicationTargetResults.clusterName,
+            $dbd.runs.replicationInfo.replicationTargetResults.ClusterName,
+            $dbd.runs.replicationInfo.replicationTargetResults.clusterName
+        )
 
-                # PolicyName cached
-                $policyName = ""
+        if ([string]::IsNullOrWhiteSpace($replicatedToFromPg)) {
+            $replicatedToFromPg = $pgRunInfo.ReplicationTargetCluster
+        }
 
-                if ($dbd.policyId) {
-                    $pk = "$cluster_id|$($dbd.policyId)"
+        $persistMountPoints = To-FlatString @(
+            $dbd.oracleParams.persistMountPoints,
+            $dbd.oracleParams.persistMountpoints
+        )
 
-                    if ($policyCache.ContainsKey($pk)) {
-                        $policyName = $policyCache[$pk]
+        foreach ($obj in (As-Array $dbd.oracleParams.objects)) {
+
+            $dbParams = As-Array $obj.dbParams
+
+            if ($dbParams.Count -eq 0) {
+
+                $dbName = Get-FirstNonEmpty -Values @(
+                    $obj.databaseName,
+                    $obj.databaseUniqueName,
+                    $obj.dbUniqueName,
+                    $obj.name
+                )
+
+                if (-not [string]::IsNullOrWhiteSpace($dbName)) {
+
+                    $pgRows += [PSCustomObject]@{
+                        Cluster                    = $cluster_name
+                        Replicated_To_Cluster      = $replicatedToFromPg
+                        DBName                     = $dbName
+                        JoinKeys                   = To-FlatString (Get-MatchKeys -Values @($dbName, $obj.databaseUniqueName, $obj.dbUniqueName, $obj.name))
+                        HostName                   = ""
+                        PGName                     = $dbd.name
+                        PolicyName                 = $policyName
+                        SourceName                 = Get-FirstNonEmpty -Values @($obj.SourceName, $obj.sourceName)
+                        PersistMountPoints         = $persistMountPoints
+                        LogRetentionDays           = ""
+                        ChannelCount               = ""
+                        Port                       = ""
+                        LatestRegularBackupET      = $pgRunInfo.LatestRegularBackupET
+                        LatestLogBackupET          = $pgRunInfo.LatestLogBackupET
+                        ReplicationTargetCluster   = $pgRunInfo.ReplicationTargetCluster
+                        LatestReplicationEndTimeET = $pgRunInfo.LatestReplicationEndTimeET
                     }
-                    else {
-                        $policyUri = "$baseUrl/v2/data-protect/policies?ids=$($dbd.policyId)"
+                }
+
+                continue
+            }
+
+            foreach ($dbParam in $dbParams) {
+
+                $dbChannels = @()
+
+                if ($dbParam.dbChannels.dbChannel) {
+                    $dbChannels += @(As-Array $dbParam.dbChannels.dbChannel)
+                }
+                elseif ($dbParam.dbChannels) {
+                    $dbChannels += @(As-Array $dbParam.dbChannels)
+                }
+
+                if ($dbChannels.Count -eq 0) {
+
+                    $dbName = Get-FirstNonEmpty -Values @(
+                        $dbParam.databaseName,
+                        $dbParam.databaseUniqueName,
+                        $obj.databaseUniqueName,
+                        $obj.dbUniqueName,
+                        $obj.name
+                    )
+
+                    if (-not [string]::IsNullOrWhiteSpace($dbName)) {
+
+                        $pgRows += [PSCustomObject]@{
+                            Cluster                    = $cluster_name
+                            Replicated_To_Cluster      = $replicatedToFromPg
+                            DBName                     = $dbName
+                            JoinKeys                   = To-FlatString (Get-MatchKeys -Values @($dbName, $dbParam.databaseName, $dbParam.databaseUniqueName, $obj.databaseUniqueName, $obj.dbUniqueName, $obj.name))
+                            HostName                   = ""
+                            PGName                     = $dbd.name
+                            PolicyName                 = $policyName
+                            SourceName                 = Get-FirstNonEmpty -Values @($obj.SourceName, $obj.sourceName, $dbParam.SourceName, $dbParam.sourceName)
+                            PersistMountPoints         = $persistMountPoints
+                            LogRetentionDays           = ""
+                            ChannelCount               = ""
+                            Port                       = ""
+                            LatestRegularBackupET      = $pgRunInfo.LatestRegularBackupET
+                            LatestLogBackupET          = $pgRunInfo.LatestLogBackupET
+                            ReplicationTargetCluster   = $pgRunInfo.ReplicationTargetCluster
+                            LatestReplicationEndTimeET = $pgRunInfo.LatestReplicationEndTimeET
+                        }
+                    }
+
+                    continue
+                }
+
+                foreach ($channel in $dbChannels) {
+
+                    $dbName = Get-FirstNonEmpty -Values @(
+                        $channel.databaseUniqueName,
+                        $channel.databaseName,
+                        $dbParam.databaseUniqueName,
+                        $dbParam.databaseName,
+                        $obj.databaseUniqueName,
+                        $obj.dbUniqueName,
+                        $obj.name
+                    )
+
+                    if ([string]::IsNullOrWhiteSpace($dbName)) {
+                        continue
+                    }
+
+                    $sourceName = Get-FirstNonEmpty -Values @(
+                        $obj.SourceName,
+                        $obj.sourceName,
+                        $dbParam.SourceName,
+                        $dbParam.sourceName
+                    )
+
+                    $logRetentionDays = Get-FirstNonEmpty -Values @(
+                        $channel.archiveVolRetentionDays,
+                        $channel.archiveLogRetentionDays
+                    )
+
+                    $channelCount = To-FlatString @(
+                        $channel.databaseNodeList.ChannelCount,
+                        $channel.databaseNodeList.channelCount
+                    )
+
+                    $port = To-FlatString @(
+                        $channel.databaseNodeList.port
+                    )
+
+                    # HostName from host IDs, but HostIds are not output.
+                    $hostNames = @()
+
+                    $hostIds = @()
+                    $hostIds += @($channel.databaseNodeList.hostId)
+                    $hostIds += @($channel.databaseNodeList.id)
+
+                    $hostIds = @(
+                        $hostIds |
+                        Where-Object { $_ -and "$_".Trim() -ne "" } |
+                        Select-Object -Unique
+                    )
+
+                    foreach ($hostId in $hostIds) {
+                        $ipApiUrl = "$baseUrl/v2/data-protect/objects/$hostId"
 
                         try {
-                            $pJson = Invoke-HeliosGetJson -Uri $policyUri -Headers $headers
-                            $policyName = ($pJson.policies | Where-Object { $_._id -eq $dbd.policyId } | Select-Object -ExpandProperty name -First 1)
+                            $hk = "$cluster_id|$hostId"
+
+                            if ($hostCache.ContainsKey($hk)) {
+                                $hostNames += $hostCache[$hk]
+                            }
+                            else {
+                                $ipJson = Invoke-HeliosGetJson -Uri $ipApiUrl -Headers $headers
+                                $ip = $ipJson.name
+
+                                $resolved = Resolve-HostName -NameOrIp $ip
+                                $hostCache[$hk] = $resolved
+                                $hostNames += $resolved
+                            }
                         }
                         catch {
                             Add-ErrorRow `
-                                -Stage "PolicyLookup" `
+                                -Stage "HostLookup" `
                                 -Cluster $cluster_name `
                                 -PGName $dbd.name `
                                 -PGID $pgId `
-                                -Uri $policyUri `
+                                -Uri $ipApiUrl `
                                 -ErrorObject $_
-
-                            $policyName = ""
-                        }
-
-                        $policyCache[$pk] = $policyName
-                    }
-                }
-
-                # Hostname exact style
-                $hostName = ""
-
-                try {
-                    $hostId = $channel.databaseNodeList.hostId
-
-                    if ($hostId) {
-                        $hk = "$cluster_id|$hostId"
-
-                        if ($hostCache.ContainsKey($hk)) {
-                            $hostName = $hostCache[$hk]
-                        }
-                        else {
-                            $ipApiUrl  = "$baseUrl/v2/data-protect/objects/$hostId"
-                            $ipResponse = Invoke-WebRequest -Method Get -Uri $ipApiUrl -Headers $headers -UseBasicParsing
-                            $ipJson = $ipResponse.Content | ConvertFrom-Json
-                            $ip = $ipJson.name
-
-                            $hostName = Resolve-HostName -nameOrIp $ip
-                            $hostCache[$hk] = $hostName
                         }
                     }
-                }
-                catch {
-                    Add-ErrorRow `
-                        -Stage "HostLookup" `
-                        -Cluster $cluster_name `
-                        -PGName $dbd.name `
-                        -PGID $pgId `
-                        -Uri $ipApiUrl `
-                        -ErrorObject $_
 
-                    $hostName = ""
-                }
-
-                $replicatedToCluster = To-FlatString $dbd.lastRun.replicationInfo.replicationTargetResults.ClusterName
-
-                if ([string]::IsNullOrWhiteSpace($replicatedToCluster)) {
-                    $replicatedToCluster = $pgRunInfo.ReplicationTargetCluster
-                }
-
-                $pgRows += [PSCustomObject]@{
-                    Cluster                    = $cluster_name
-                    PGName                     = $dbd.name
-                    Replicated_To_Cluster      = $replicatedToCluster
-                    PolicyName                 = $policyName
-                    SourceName                 = $channels.SourceName
-                    DBName                     = $channel.databaseUniqueName
-                    PersistMountPoints         = (To-FlatString $dbd.oracleParams.persistMountPoints)
-                    LogRetentionDays           = $channel.archiveVolRetentionDays
-                    ChannelCount               = $channel.databaseNodeList.ChannelCount
-                    Port                       = $channel.databaseNodeList.port
-                    HostName                   = $hostName
-
-                    LatestRegularBackupET      = $pgRunInfo.LatestRegularBackupET
-                    LatestLogBackupET          = $pgRunInfo.LatestLogBackupET
-                    ReplicationTargetCluster   = $pgRunInfo.ReplicationTargetCluster
-                    LatestReplicationEndTimeET = $pgRunInfo.LatestReplicationEndTimeET
+                    $pgRows += [PSCustomObject]@{
+                        Cluster                    = $cluster_name
+                        Replicated_To_Cluster      = $replicatedToFromPg
+                        DBName                     = $dbName
+                        JoinKeys                   = To-FlatString (Get-MatchKeys -Values @(
+                            $dbName,
+                            $channel.databaseUniqueName,
+                            $channel.databaseName,
+                            $channel.databaseUuid,
+                            $dbParam.databaseUniqueName,
+                            $dbParam.databaseName,
+                            $obj.databaseUniqueName,
+                            $obj.dbUniqueName,
+                            $obj.name
+                        ))
+                        HostName                   = To-FlatString $hostNames
+                        PGName                     = $dbd.name
+                        PolicyName                 = $policyName
+                        SourceName                 = $sourceName
+                        PersistMountPoints         = $persistMountPoints
+                        LogRetentionDays           = $logRetentionDays
+                        ChannelCount               = $channelCount
+                        Port                       = $port
+                        LatestRegularBackupET      = $pgRunInfo.LatestRegularBackupET
+                        LatestLogBackupET          = $pgRunInfo.LatestLogBackupET
+                        ReplicationTargetCluster   = $pgRunInfo.ReplicationTargetCluster
+                        LatestReplicationEndTimeET = $pgRunInfo.LatestReplicationEndTimeET
+                    }
                 }
             }
         }
     }
-
-    Write-Host ("   Cluster done: {0} | regRows(add)={1} | pgRows(add)={2}" -f $cluster_name,
-        (@($regRows | Where-Object { $_.Cluster -eq $cluster_name }).Count),
-        (@($pgRows  | Where-Object { $_.Cluster -eq $cluster_name }).Count)
-    ) -ForegroundColor DarkCyan
 }
 
 # =====================================================================
-# 3) JOIN BOTH OUTPUTS BY DBName (case-insensitive) - original style
+# 3) Join registration + PG rows
 # =====================================================================
 $ix = New-Object System.Collections.Hashtable ([StringComparer]::OrdinalIgnoreCase)
 
 foreach ($r in $pgRows) {
-    $k = ($r.DBName -as [string]).Trim()
 
-    if (-not [string]::IsNullOrWhiteSpace($k)) {
-        $ix[$k] = $r
+    $keys = @()
+
+    if (-not [string]::IsNullOrWhiteSpace($r.JoinKeys)) {
+        $keys += @($r.JoinKeys -split ';')
+    }
+
+    $keys += @(Get-MatchKeys -Values @($r.DBName))
+
+    foreach ($key in ($keys | Where-Object { $_ -and "$_".Trim() -ne "" } | Select-Object -Unique)) {
+        $joinKey = "{0}|{1}" -f $r.Cluster, $key
+        $ix[$joinKey] = $r
     }
 }
 
 $final = @()
+$finalSeen = New-Object System.Collections.Hashtable ([StringComparer]::OrdinalIgnoreCase)
 
 foreach ($a in $regRows) {
 
-    $k  = ($a.DBName -as [string]).Trim()
     $sb = $null
 
-    if (-not [string]::IsNullOrWhiteSpace($k)) {
-        $sb = $ix[$k]
+    foreach ($key in (Get-MatchKeys -Values @($a.DBName))) {
+        $joinKey = "{0}|{1}" -f $a.Cluster, $key
+
+        if ($ix.ContainsKey($joinKey)) {
+            $sb = $ix[$joinKey]
+            break
+        }
     }
+
+    $rowKey = "{0}|{1}" -f $a.Cluster, (Normalize-Key $a.DBName)
+    $finalSeen[$rowKey] = $true
 
     $final += [PSCustomObject]@{
         Cluster                    = $a.Cluster
+        Replicated_To_Cluster      = if ($sb) { $sb.Replicated_To_Cluster } else { "" }
         DBName                     = $a.DBName
         HostName                   = if ($sb) { $sb.HostName } else { "" }
         PGName                     = if ($sb) { $sb.PGName } else { "" }
-        Replicated_To_Cluster      = if ($sb) { $sb.Replicated_To_Cluster } else { "" }
         PolicyName                 = if ($sb) { $sb.PolicyName } else { "" }
         SourceName                 = if ($sb) { $sb.SourceName } else { "" }
         PersistMountPoints         = if ($sb) { $sb.PersistMountPoints } else { "" }
@@ -837,78 +1089,132 @@ foreach ($a in $regRows) {
     }
 }
 
+# Add PG-only DB rows if a DB is present in PG config but not in registrationInfo.
+foreach ($p in $pgRows) {
+
+    $rowKey = "{0}|{1}" -f $p.Cluster, (Normalize-Key $p.DBName)
+
+    if ($finalSeen.ContainsKey($rowKey)) {
+        continue
+    }
+
+    $finalSeen[$rowKey] = $true
+
+    $final += [PSCustomObject]@{
+        Cluster                    = $p.Cluster
+        Replicated_To_Cluster      = $p.Replicated_To_Cluster
+        DBName                     = $p.DBName
+        HostName                   = $p.HostName
+        PGName                     = $p.PGName
+        PolicyName                 = $p.PolicyName
+        SourceName                 = $p.SourceName
+        PersistMountPoints         = $p.PersistMountPoints
+        LogRetentionDays           = $p.LogRetentionDays
+        ChannelCount               = $p.ChannelCount
+        Port                       = $p.Port
+
+        LatestRegularBackupET      = $p.LatestRegularBackupET
+        LatestLogBackupET          = $p.LatestLogBackupET
+        ReplicationTargetCluster   = $p.ReplicationTargetCluster
+        LatestReplicationEndTimeET = $p.LatestReplicationEndTimeET
+
+        DBVersion                  = ""
+        ArchiveLog_Enabled         = ""
+        BCT_Enabled                = ""
+        TDE_Enabled                = ""
+        TDE_EncryptedTsCount       = ""
+        DataGuardRole              = ""
+        DB_Type                    = ""
+        DB_Size_in_GB              = ""
+        DB_Instances               = ""
+        CPU_Count                  = ""
+        DB_Home                    = ""
+        SharedPool_Size            = ""
+        Fragment_Size              = ""
+        FRA_Size_in_GB             = ""
+    }
+}
+
 # =====================================================================
-# 4) ONE CLEAN TABLE + CSV
+# 4) Output table + CSV
 # =====================================================================
 $final = $final | Sort-Object Cluster, DBName
 
-$colsDef = @(
-    @{Label='Cluster';                    Expression = { $_.Cluster } },
-    @{Label='Replicated_To_Cluster';      Expression = { $_.Replicated_To_Cluster } },
-    @{Label='DBName';                     Expression = { $_.DBName } },
-    @{Label='HostName';                   Expression = { $_.HostName } },
-    @{Label='PGName';                     Expression = { $_.PGName } },
-    @{Label='PolicyName';                 Expression = { $_.PolicyName } },
-    @{Label='SourceName';                 Expression = { $_.SourceName } },
-    @{Label='PersistMountPoints';         Expression = { $_.PersistMountPoints } },
-    @{Label='LogRetentionDays';           Expression = { $_.LogRetentionDays } },
-    @{Label='ChannelCount';               Expression = { $_.ChannelCount } },
-    @{Label='Port';                       Expression = { $_.Port } },
+$cols = @(
+    "Cluster",
+    "Replicated_To_Cluster",
+    "DBName",
+    "HostName",
+    "PGName",
+    "PolicyName",
+    "SourceName",
+    "PersistMountPoints",
+    "LogRetentionDays",
+    "ChannelCount",
+    "Port",
 
-    @{Label='LatestRegularBackupET';      Expression = { $_.LatestRegularBackupET } },
-    @{Label='LatestLogBackupET';          Expression = { $_.LatestLogBackupET } },
-    @{Label='ReplicationTargetCluster';   Expression = { $_.ReplicationTargetCluster } },
-    @{Label='LatestReplicationEndTimeET'; Expression = { $_.LatestReplicationEndTimeET } },
+    "LatestRegularBackupET",
+    "LatestLogBackupET",
+    "ReplicationTargetCluster",
+    "LatestReplicationEndTimeET",
 
-    @{Label='DataGuardRole';              Expression = { $_.DataGuardRole } },
-    @{Label='TDE_Enabled';                Expression = { $_.TDE_Enabled } },
-    @{Label='TDE_EncryptedTsCount';       Expression = { $_.TDE_EncryptedTsCount } },
-
-    @{Label='DBVersion';                  Expression = { $_.DBVersion } },
-    @{Label='ArchiveLog_Enabled';         Expression = { $_.ArchiveLog_Enabled } },
-    @{Label='BCT_Enabled';                Expression = { $_.BCT_Enabled } },
-    @{Label='DB_Type';                    Expression = { $_.DB_Type } },
-    @{Label='DB_Size_in_GB';              Expression = { $_.DB_Size_in_GB } },
-    @{Label='DB_Instances';               Expression = { $_.DB_Instances } },
-    @{Label='CPU_Count';                  Expression = { $_.CPU_Count } },
-    @{Label='DB_Home';                    Expression = { $_.DB_Home } },
-    @{Label='SharedPool_Size';            Expression = { $_.SharedPool_Size } },
-    @{Label='Fragment_Size';              Expression = { $_.Fragment_Size } },
-    @{Label='FRA_Size_in_GB';             Expression = { $_.FRA_Size_in_GB } }
+    "DBVersion",
+    "ArchiveLog_Enabled",
+    "BCT_Enabled",
+    "TDE_Enabled",
+    "TDE_EncryptedTsCount",
+    "DataGuardRole",
+    "DB_Type",
+    "DB_Size_in_GB",
+    "DB_Instances",
+    "CPU_Count",
+    "DB_Home",
+    "SharedPool_Size",
+    "Fragment_Size",
+    "FRA_Size_in_GB"
 )
 
 try {
     $raw = $Host.UI.RawUI
-    $raw.BufferSize = New-Object Management.Automation.Host.Size (10000, $raw.BufferSize.Height)
+    $targetWidth = 10000
+
+    if ($raw.BufferSize.Width -lt $targetWidth) {
+        $raw.BufferSize = New-Object Management.Automation.Host.Size ($targetWidth, $raw.BufferSize.Height)
+    }
 }
 catch {}
 
-$txt = $final | Format-Table -Property $colsDef -AutoSize | Out-String -Width 10000
-$txt
+Write-Host ""
+
+$tableText = $final |
+    Select-Object $cols |
+    Format-Table -AutoSize -Wrap |
+    Out-String -Width 10000
+
+Write-Host $tableText
 
 $stamp   = Get-Date -Format "yyyy-MM-dd_HHmm"
-$csvPath = Join-Path $outDir "oracle_DB_combined_$stamp.csv"
+$csvPath = Join-Path $outDir "oracle_DB_combined_latest_dates_$stamp.csv"
 
 $final |
-    Select-Object ($colsDef | ForEach-Object { $_.Label }) |
+    Select-Object $cols |
     Export-Csv -Path $csvPath -NoTypeInformation -Encoding utf8
 
 Write-Host "CSV exported: $csvPath" -ForegroundColor Gray
 
 # =====================================================================
-# 5) Error Exceptions
+# 5) Error exception output
 # =====================================================================
 if ($script:ErrorRows.Count -gt 0) {
 
     Write-Host ""
     Write-Host "Error Exceptions" -ForegroundColor Yellow
 
-    $errTxt = $script:ErrorRows |
+    $script:ErrorRows |
         Select-Object Stage, Cluster, PGName, PGID, ErrorMessage |
         Format-Table -AutoSize -Wrap |
-        Out-String -Width 10000
-
-    $errTxt
+        Out-String -Width 10000 |
+        Write-Host
 
     $errPath = Join-Path $outDir "oracle_DB_combined_errors_$stamp.csv"
 
