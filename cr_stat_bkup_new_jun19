@@ -6,7 +6,8 @@
 # - Searches clusters alphabetically
 # - Displays full report on screen
 # - Writes same report to TXT
-# - Adds BackupType: SQL / FS / NAS / VM / Oracle / Unknown
+# - Shows BackupType: SQL / Oracle / FS / NAS / VM / Unknown
+# - If SQL or Oracle backup exists, also validates FS backup exists
 # ==========================================================
 
 $ErrorActionPreference = "Stop"
@@ -49,9 +50,11 @@ function Invoke-HeliosJson {
 
     try {
         $r = Invoke-WebRequest -UseBasicParsing -Method Get -Uri $Uri -Headers $Headers -TimeoutSec $TimeoutSec -ErrorAction Stop
+
         if ([string]::IsNullOrWhiteSpace($r.Content)) {
             return $null
         }
+
         return ($r.Content | ConvertFrom-Json)
     }
     catch {
@@ -79,9 +82,11 @@ function Get-UsecsValue {
 
     if ($Value -is [array]) {
         $FirstValue = $Value | Where-Object { $_ } | Select-Object -First 1
+
         if ($null -ne $FirstValue) {
             try { return [int64]$FirstValue } catch { return $null }
         }
+
         return $null
     }
 
@@ -111,9 +116,11 @@ function Get-FirstText {
 
     if ($Value -is [array]) {
         $FirstValue = $Value | Where-Object { $_ } | Select-Object -First 1
+
         if ($null -ne $FirstValue) {
             return "$FirstValue".Trim()
         }
+
         return ""
     }
 
@@ -135,6 +142,7 @@ function Get-BackupType {
         $Candidates += $Object.type
         $Candidates += $Object.protectionType
         $Candidates += $Object.sourceInfo.environment
+        $Candidates += $Object.sourceInfo.type
         $Candidates += $Object.protectionSource.environment
         $Candidates += $Object.protectionSource.type
         $Candidates += $Object.entity.environment
@@ -154,13 +162,14 @@ function Get-BackupType {
 
     foreach ($Candidate in $Candidates) {
         $Text = Get-FirstText $Candidate
+
         if ([string]::IsNullOrWhiteSpace($Text)) {
             continue
         }
 
         $Lower = $Text.ToLower()
 
-        if ($Lower -match "ksql|sql|mssql|microsoft") {
+        if ($Lower -match "ksql|mssql|sql") {
             return "SQL"
         }
 
@@ -168,7 +177,7 @@ function Get-BackupType {
             return "Oracle"
         }
 
-        if ($Lower -match "kphysical|physical|file|filesystem|file_system|windows|linux") {
+        if ($Lower -match "kphysical|physical|filesystem|file_system|file system|volume|windows|linux") {
             return "FS"
         }
 
@@ -218,6 +227,7 @@ if (-not $CiList -or $CiList.Count -eq 0) {
 # Get Clusters
 # -------------------------
 $ClusterUrl = "https://helios.cohesity.com/v2/mcm/cluster-mgmt/info"
+
 $ClusterJson = Invoke-HeliosJson -Uri $ClusterUrl -Headers @{
     accept = "application/json"
     apiKey = $ApiKey
@@ -244,7 +254,8 @@ foreach ($Ci in $CiList) {
     }
 
     $SearchUrl = "https://helios.cohesity.com/v2/data-protect/search/protected-objects?searchString=$([uri]::EscapeDataString($Ci))"
-    $Found = $false
+
+    $CiRows = @()
 
     foreach ($Clu in $Clusters) {
 
@@ -258,59 +269,54 @@ foreach ($Ci in $CiList) {
             continue
         }
 
-        $Found = $true
-
-        $Snap = $null
-        $MatchedObj = $null
-
         foreach ($Obj in $Json.objects) {
-            $MatchedObj = $Obj
+
             $Snap = Get-SnapshotInfo -Object $Obj
-            if ($Snap) { break }
-        }
+            $BackupType = Get-BackupType -Object $Obj -Snapshot $Snap
 
-        $BackupType = Get-BackupType -Object $MatchedObj -Snapshot $Snap
+            if ($Snap) {
+                $Usecs = Get-UsecsValue -Value $Snap.protectionRunStartTimeUsecs
 
-        if ($Snap) {
-            $Usecs = Get-UsecsValue -Value $Snap.protectionRunStartTimeUsecs
+                if ($Usecs) {
+                    $LastBackupTime = ToDate $Usecs
+                }
+                else {
+                    $LastBackupTime = "NoBackupTime"
+                }
 
-            if ($Usecs) {
-                $LastBackupTime = ToDate $Usecs
+                $ProtectionGroup = $Snap.protectionGroupName
+
+                if ($ProtectionGroup -is [array]) {
+                    $ProtectionGroup = ($ProtectionGroup | Where-Object { $_ } | Select-Object -First 1)
+                }
+
+                if ([string]::IsNullOrWhiteSpace("$ProtectionGroup")) {
+                    $ProtectionGroup = "-"
+                }
+
+                $CiRows += [pscustomobject]@{
+                    ServerName      = $Ci
+                    BackupType      = $BackupType
+                    ClusterName     = $Clu.clusterName
+                    ProtectionGroup = $ProtectionGroup
+                    LastBackupTime  = $LastBackupTime
+                    LastBackupUsecs = $Usecs
+                }
             }
             else {
-                $LastBackupTime = "NoBackupTime"
-            }
-
-            $ProtectionGroup = $Snap.protectionGroupName
-            if ($ProtectionGroup -is [array]) {
-                $ProtectionGroup = ($ProtectionGroup | Where-Object { $_ } | Select-Object -First 1)
-            }
-            if ([string]::IsNullOrWhiteSpace("$ProtectionGroup")) {
-                $ProtectionGroup = "-"
-            }
-
-            $Results += [pscustomobject]@{
-                ServerName      = $Ci
-                BackupType      = $BackupType
-                ClusterName     = $Clu.clusterName
-                ProtectionGroup = $ProtectionGroup
-                LastBackupTime  = $LastBackupTime
+                $CiRows += [pscustomobject]@{
+                    ServerName      = $Ci
+                    BackupType      = $BackupType
+                    ClusterName     = $Clu.clusterName
+                    ProtectionGroup = "-"
+                    LastBackupTime  = "NoBackup"
+                    LastBackupUsecs = 0
+                }
             }
         }
-        else {
-            $Results += [pscustomobject]@{
-                ServerName      = $Ci
-                BackupType      = $BackupType
-                ClusterName     = $Clu.clusterName
-                ProtectionGroup = "-"
-                LastBackupTime  = "NoBackup"
-            }
-        }
-
-        break
     }
 
-    if (-not $Found) {
+    if (-not $CiRows -or $CiRows.Count -eq 0) {
         $Results += [pscustomobject]@{
             ServerName      = $Ci
             BackupType      = "Unknown"
@@ -318,16 +324,66 @@ foreach ($Ci in $CiList) {
             ProtectionGroup = "-"
             LastBackupTime  = "NoObject"
         }
+
+        continue
+    }
+
+    # Keep latest row per CI + BackupType + Cluster + ProtectionGroup
+    $DedupedRows = $CiRows |
+        Group-Object ServerName, BackupType, ClusterName, ProtectionGroup |
+        ForEach-Object {
+            $_.Group | Sort-Object LastBackupUsecs -Descending | Select-Object -First 1
+        }
+
+    foreach ($Row in $DedupedRows) {
+        $Results += [pscustomobject]@{
+            ServerName      = $Row.ServerName
+            BackupType      = $Row.BackupType
+            ClusterName     = $Row.ClusterName
+            ProtectionGroup = $Row.ProtectionGroup
+            LastBackupTime  = $Row.LastBackupTime
+        }
+    }
+
+    # If SQL or Oracle backup exists but no FS backup exists, show that clearly
+    $HasSQL    = ($DedupedRows | Where-Object { $_.BackupType -eq "SQL" }).Count -gt 0
+    $HasOracle = ($DedupedRows | Where-Object { $_.BackupType -eq "Oracle" }).Count -gt 0
+    $HasFS     = ($DedupedRows | Where-Object { $_.BackupType -eq "FS" }).Count -gt 0
+
+    $HasDBBackup = $HasSQL -or $HasOracle
+
+    if ($HasDBBackup -and -not $HasFS) {
+        $Results += [pscustomobject]@{
+            ServerName      = $Ci
+            BackupType      = "FS"
+            ClusterName     = "-"
+            ProtectionGroup = "-"
+            LastBackupTime  = "NoFSBackupFound"
+        }
     }
 }
 
 # -------------------------
 # Summary
 # -------------------------
-$TotalCIs = $Results.Count
-$BackedUp = ($Results | Where-Object { $_.LastBackupTime -notin @("NoBackup", "NoBackupTime", "NoObject", "") }).Count
-$NoBackup = ($Results | Where-Object { $_.LastBackupTime -in @("NoBackup", "NoBackupTime") }).Count
-$NoObject = ($Results | Where-Object { $_.LastBackupTime -eq "NoObject" }).Count
+$TotalInputCIs = $CiList.Count
+$TotalBackupRows = $Results.Count
+
+$BackedUp = ($Results | Where-Object {
+    $_.LastBackupTime -notin @("NoBackup", "NoBackupTime", "NoObject", "NoFSBackupFound", "")
+}).Count
+
+$NoBackup = ($Results | Where-Object {
+    $_.LastBackupTime -in @("NoBackup", "NoBackupTime")
+}).Count
+
+$NoFSBackupFound = ($Results | Where-Object {
+    $_.LastBackupTime -eq "NoFSBackupFound"
+}).Count
+
+$NoObject = ($Results | Where-Object {
+    $_.LastBackupTime -eq "NoObject"
+}).Count
 
 # -------------------------
 # Build Report
@@ -336,28 +392,31 @@ $Report = @()
 $Report += "=========================================================="
 $Report += "Cohesity Backup Validation Report"
 $Report += "=========================================================="
-$Report += "Change Number : $ChangeID"
-$Report += "Executed By   : $ExecutedBy"
-$Report += "Run Date      : $(Get-Date -Format 'dd-MMM-yyyy HH:mm:ss')"
+$Report += "Change Number      : $ChangeID"
+$Report += "Executed By        : $ExecutedBy"
+$Report += "Run Date           : $(Get-Date -Format 'dd-MMM-yyyy HH:mm:ss')"
 $Report += ""
-$Report += "Total CIs     : $TotalCIs"
-$Report += "Backed Up     : $BackedUp"
-$Report += "No Backup     : $NoBackup"
-$Report += "No Object     : $NoObject"
+$Report += "Total Input CIs    : $TotalInputCIs"
+$Report += "Total Backup Rows  : $TotalBackupRows"
+$Report += "Backed Up          : $BackedUp"
+$Report += "No Backup          : $NoBackup"
+$Report += "No FS Backup Found : $NoFSBackupFound"
+$Report += "No Object          : $NoObject"
 $Report += ""
 $Report += "----------------------------------------------------------"
 $Report += "Details"
 $Report += "----------------------------------------------------------"
 $Report += ""
-$Report += ($Results | Format-Table ServerName, BackupType, ClusterName, ProtectionGroup, LastBackupTime -AutoSize | Out-String).TrimEnd()
+$Report += ($Results | Sort-Object ServerName, BackupType, ClusterName, ProtectionGroup | Format-Table ServerName, BackupType, ClusterName, ProtectionGroup, LastBackupTime -AutoSize | Out-String).TrimEnd()
 $Report += ""
 $Report += "----------------------------------------------------------"
 $Report += "Summary Notes"
 $Report += "----------------------------------------------------------"
-$Report += "- Backed Up   : CI found with valid snapshot and backup time"
-$Report += "- No Backup   : CI found in cluster but no usable snapshot time returned"
-$Report += "- No Object   : CI not found in any cluster"
-$Report += "- BackupType  : Derived from Cohesity protected object/search metadata"
+$Report += "- Backed Up          : CI found with valid snapshot and backup time"
+$Report += "- No Backup          : CI found in cluster but no usable snapshot time returned"
+$Report += "- No Object          : CI not found in any cluster"
+$Report += "- NoFSBackupFound    : SQL/Oracle backup found, but no matching FS backup found for the CI"
+$Report += "- BackupType         : Derived from Cohesity protected object/search metadata"
 $Report += ""
 $Report += "----------------------------------------------------------"
 $Report += "Report Location"
@@ -377,20 +436,26 @@ Write-Host ""
 Write-Host "=========================================================="
 Write-Host "Cohesity Backup Validation Report"
 Write-Host "=========================================================="
-Write-Host "Change Number : $ChangeID"
-Write-Host "Executed By   : $ExecutedBy"
-Write-Host "Run Date      : $(Get-Date -Format 'dd-MMM-yyyy HH:mm:ss')"
+Write-Host "Change Number      : $ChangeID"
+Write-Host "Executed By        : $ExecutedBy"
+Write-Host "Run Date           : $(Get-Date -Format 'dd-MMM-yyyy HH:mm:ss')"
 Write-Host ""
-Write-Host "Total CIs     : $TotalCIs"
-Write-Host "Backed Up     : $BackedUp"
-Write-Host "No Backup     : $NoBackup"
-Write-Host "No Object     : $NoObject"
+Write-Host "Total Input CIs    : $TotalInputCIs"
+Write-Host "Total Backup Rows  : $TotalBackupRows"
+Write-Host "Backed Up          : $BackedUp"
+Write-Host "No Backup          : $NoBackup"
+Write-Host "No FS Backup Found : $NoFSBackupFound"
+Write-Host "No Object          : $NoObject"
 Write-Host ""
 Write-Host "----------------------------------------------------------"
 Write-Host "Details"
 Write-Host "----------------------------------------------------------"
 Write-Host ""
-$Results | Format-Table ServerName, BackupType, ClusterName, ProtectionGroup, LastBackupTime -AutoSize
+
+$Results |
+Sort-Object ServerName, BackupType, ClusterName, ProtectionGroup |
+Format-Table ServerName, BackupType, ClusterName, ProtectionGroup, LastBackupTime -AutoSize
+
 Write-Host ""
 Write-Host "----------------------------------------------------------"
 Write-Host "Report Location"
