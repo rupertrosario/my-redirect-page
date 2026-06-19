@@ -4,12 +4,12 @@
 # - Reads CIs from CSV
 # - Writes unique cleaned CIs to TXT in same location
 # - Uses global search first to identify candidate clusterId
+# - Trusts only clusterIds present in /v2/mcm/cluster-mgmt/info
+# - Falls back to all clusters if global clusterId cannot be mapped
 # - Searches candidate clusters alphabetically
 # - Adds only one valid row per CI + BackupType
 # - If same BackupType has NoBackup/NoBackupTime, continues searching
 # - Does not call /protection-groups
-# - Displays full report on screen
-# - Writes same report to TXT
 # - Shows BackupType: SQL / Oracle / FS / NAS / Hyper-V / Nutanix / VMware / Unknown
 # - If SQL or Oracle backup exists, also validates FS backup exists
 # ==========================================================
@@ -36,6 +36,7 @@ if (-not (Test-Path $InputCsv)) {
 # API Key
 # -------------------------
 $ApiKeyPath = "X:\PowerShell\Cohesity_API_Scripts\DO_NOT_Delete\apikey.txt"
+
 if (-not (Test-Path $ApiKeyPath)) {
     throw "API key file not found: $ApiKeyPath"
 }
@@ -47,7 +48,7 @@ $ApiKey = (Get-Content -Path $ApiKeyPath -Raw).Trim()
 # -------------------------
 $GlobalSearchCount = 100
 
-# Fallback only when global search finds object but clusterId is missing.
+# Fallback only when global search finds object but clusterId cannot be mapped.
 $EnableAllClusterFallback = $true
 
 # Keep false for speed.
@@ -122,6 +123,7 @@ function Get-FirstText {
             $Text = Get-FirstText $Item
             if ($Text) { return $Text }
         }
+
         return ""
     }
 
@@ -132,6 +134,7 @@ function Get-FirstText {
                 if ($Text) { return $Text }
             }
         }
+
         return ""
     }
 
@@ -588,9 +591,27 @@ if (-not $ClusterJson -or -not $ClusterJson.cohesityClusters -or $ClusterJson.co
 
 $Clusters = $ClusterJson.cohesityClusters | Sort-Object -Property clusterName
 
+# IMPORTANT:
+# ClusterMap stores only valid MCM clusters.
+# Global search cluster-like IDs are trusted only if they match this map.
 $ClusterMap = @{}
+
 foreach ($Clu in $Clusters) {
-    $ClusterMap["$($Clu.clusterId)"] = "$($Clu.clusterName)"
+
+    $PossibleIds = @(
+        $Clu.clusterId,
+        $Clu.id,
+        $Clu.clusterIdentifier.clusterId,
+        $Clu.clusterInfo.clusterId
+    )
+
+    foreach ($Id in $PossibleIds) {
+        $IdText = Get-FirstText $Id
+
+        if (-not [string]::IsNullOrWhiteSpace($IdText)) {
+            $ClusterMap[$IdText] = $Clu
+        }
+    }
 }
 
 # -------------------------
@@ -637,20 +658,23 @@ foreach ($Ci in $CiList) {
     if ($CandidateClusterIds -and $CandidateClusterIds.Count -gt 0) {
 
         foreach ($ClusterId in $CandidateClusterIds) {
-            $ClusterName = $ClusterMap["$ClusterId"]
 
-            if ([string]::IsNullOrWhiteSpace($ClusterName)) {
-                $ClusterName = "$ClusterId"
-            }
+            if ($ClusterMap.ContainsKey("$ClusterId")) {
 
-            $CandidateClusters += [pscustomobject]@{
-                clusterId   = "$ClusterId"
-                clusterName = "$ClusterName"
-                searchMode  = "Fast"
+                $MatchedCluster = $ClusterMap["$ClusterId"]
+
+                $CandidateClusters += [pscustomobject]@{
+                    clusterId   = "$($MatchedCluster.clusterId)"
+                    clusterName = "$($MatchedCluster.clusterName)"
+                    searchMode  = "Fast"
+                }
             }
         }
     }
-    else {
+
+    # If global search returned bad/unmapped cluster IDs, fallback to all clusters alphabetically.
+    if (-not $CandidateClusters -or $CandidateClusters.Count -eq 0) {
+
         $ShouldFallback =
             $EnableAllClusterFallback -and
             (
@@ -735,7 +759,6 @@ foreach ($Ci in $CiList) {
             $Snap = Get-BestSnapshot -Object $Obj
             $BackupType = Get-BackupType -Object $Obj -Snapshot $Snap
 
-            # If this BackupType already has valid evidence, skip further rows of same type.
             if ($SatisfiedTypes.Contains($BackupType)) {
                 continue
             }
@@ -794,8 +817,8 @@ foreach ($Ci in $CiList) {
             }
         }
 
-        # Keep NoBackup/NoBackupTime rows only as pending.
-        # They are added later only if no valid row of same type is ever found.
+        # Keep NoBackup/NoBackupTime rows pending.
+        # They are added only if no valid row of same type is found later.
         $InvalidRowsThisCluster = @(
             $ClusterCandidateRows |
             Where-Object { -not (Is-ValidBackupRow $_) }
@@ -812,7 +835,6 @@ foreach ($Ci in $CiList) {
         $HasFS     = $SatisfiedTypes.Contains("FS")
 
         # Stop only when DB + FS evidence is complete.
-        # If NoBackup/NoBackupTime was found, do not stop.
         if (($HasSQL -or $HasOracle) -and $HasFS) {
             break
         }
@@ -857,7 +879,6 @@ foreach ($Ci in $CiList) {
     }
 
     # If SQL or Oracle backup exists but no FS backup exists, show that clearly.
-    # This is based only on valid DB evidence.
     $HasValidSQL = @($CiRows | Where-Object {
         $_.BackupType -eq "SQL" -and (Is-ValidBackupRow $_)
     }).Count -gt 0
@@ -906,7 +927,7 @@ $NoObject = ($Results | Where-Object {
 $SortedResults = $Results |
     Sort-Object `
         ServerName,
-        @{ Expression = { Get-BackupTypeRank $_.BackupType } },
+        @{ Expression = { Get-BackupTypeRank -BackupType $_.BackupType } },
         ClusterName,
         ProtectionGroup
 
@@ -952,10 +973,11 @@ $Report += "- No Backup          : CI found in Cohesity but no usable snapshot t
 $Report += "- No Object          : CI not found in Cohesity search"
 $Report += "- NoFSBackupFound    : SQL/Oracle backup found, but no matching FS backup found for the CI"
 $Report += "- BackupType         : Derived from Cohesity protected object/search metadata"
-$Report += "- Fast Logic         : Global search identifies candidate clusterId first, then protected-object search runs only on candidate clusters"
+$Report += "- Fast Logic         : Global search identifies candidate clusterId first, then protected-object search runs only on mapped candidate clusters"
+$Report += "- Cluster Name Rule  : Cluster names are displayed only from /v2/mcm/cluster-mgmt/info"
 $Report += "- Alphabetic Rule    : Candidate clusters are checked alphabetically"
 $Report += "- Same Type Rule     : Once a valid BackupType row is found, another row of the same type is not added"
-$Report += "- Fallback           : All-cluster scan is used only when global search finds an object but does not return clusterId"
+$Report += "- Fallback           : All-cluster scan is used only when global search finds an object but no mapped clusterId is found"
 $Report += ""
 $Report += "----------------------------------------------------------"
 $Report += "Report Location"
