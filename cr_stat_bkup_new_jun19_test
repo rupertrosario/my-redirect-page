@@ -1,25 +1,21 @@
 # ==========================================================
 # Cohesity Backup Validation Report
-# GET ONLY | GLOBAL SEARCH count=100 | MULTI-CANDIDATE VALIDATION
+# GET ONLY | GLOBAL SEARCH count=100 | PG RUN VALIDATION
 #
 # Endpoints:
 # 1) GET /v2/mcm/cluster-mgmt/info
 # 2) GET /v2/data-protect/search/objects?searchString=<CI>&includeTenants=true&count=100
-# 3) GET /v2/data-protect/search/protected-objects?searchString=<CI>
+# 3) GET /v2/data-protect/protection-groups/<PG_ID>/runs
 #
 # Final Output:
 # ServerName | BackupType | ClusterName | ProtectionGroup | LastBackupTime
 #
 # Logic:
-# - Global search count=100 is used to collect all candidate clusters.
-# - Cluster IDs are extracted DTSK-style:
-#     objectProtectionInfos first
-#     protectionGroups second
-#     object-level fallback last
-# - Protected-object search is run on each candidate cluster.
+# - Global search finds all matching protected object / PG candidates.
+# - PG runs endpoint is used to find latest actual backup time.
 # - Final ClusterName always comes from /v2/mcm/cluster-mgmt/info.
 # - Latest valid row per BackupType is selected.
-# - SQL/Oracle backup requires FS validation.
+# - If SQL/Oracle exists but FS does not, FS = NoFSBackupFound.
 # ==========================================================
 
 $ErrorActionPreference = "Stop"
@@ -61,15 +57,16 @@ $ApiKey = (Get-Content -Path $ApiKeyPath -Raw).Trim()
 # Settings
 # -------------------------
 $GlobalSearchCount = 100
-$FallbackToAllClustersIfNoCandidate = $true
-$ShowProgress = $true
+$ShowProgress      = $true
+
+# Use ET for report time display
+$ReportTimeZoneId = "Eastern Standard Time"
 
 # -------------------------
 # Counters
 # -------------------------
-$GlobalSearchCalls    = 0
-$ProtectedSearchCalls = 0
-$FallbackCiCount      = 0
+$GlobalSearchCalls = 0
+$RunSearchCalls    = 0
 
 # ==========================================================
 # Basic Helpers
@@ -78,7 +75,7 @@ function Invoke-HeliosGetJson {
     param(
         [Parameter(Mandatory = $true)][string]$Uri,
         [Parameter(Mandatory = $true)][hashtable]$Headers,
-        [int]$TimeoutSec = 60
+        [int]$TimeoutSec = 90
     )
 
     try {
@@ -175,15 +172,20 @@ function First-NonBlank {
                 "name",
                 "value",
                 "id",
+                "uid",
                 "clusterId",
                 "clusterID",
                 "sourceClusterId",
                 "sourceClusterID",
                 "accessClusterId",
-                "intId"
+                "protectionGroupId",
+                "protectionGroupID",
+                "groupId",
+                "jobId"
             )) {
                 if ($v.PSObject.Properties.Name -contains $p) {
                     $t = First-NonBlank -Values $v.$p
+
                     if (-not [string]::IsNullOrWhiteSpace($t)) {
                         return $t
                     }
@@ -224,7 +226,7 @@ function Get-Usecs {
     return ($values | Sort-Object -Descending | Select-Object -First 1)
 }
 
-function Convert-UsecsToLocal {
+function Convert-UsecsToReportTime {
     param($Usecs)
 
     if (-not $Usecs -or [int64]$Usecs -le 0) {
@@ -232,7 +234,15 @@ function Convert-UsecsToLocal {
     }
 
     try {
-        return [DateTimeOffset]::FromUnixTimeMilliseconds([int64]($Usecs / 1000)).LocalDateTime.ToString("dd-MMM-yyyy HH:mm:ss")
+        $dto = [DateTimeOffset]::FromUnixTimeMilliseconds([int64]($Usecs / 1000))
+
+        try {
+            $tz = [System.TimeZoneInfo]::FindSystemTimeZoneById($ReportTimeZoneId)
+            return ([System.TimeZoneInfo]::ConvertTime($dto, $tz)).ToString("yyyy-MM-dd HH:mm:ss") + " ET"
+        }
+        catch {
+            return $dto.LocalDateTime.ToString("yyyy-MM-dd HH:mm:ss")
+        }
     }
     catch {
         return ""
@@ -252,9 +262,12 @@ function Is-ValidBackupRow {
         "NoBackup",
         "NoBackupTime",
         "NoObject",
+        "NoPGFound",
+        "NoRunFound",
         "NoFSBackupFound",
         "SearchFailed",
-        "ClusterIdMissing"
+        "ClusterIdMissing",
+        "PGIdMissing"
     )
 }
 
@@ -322,120 +335,305 @@ function Get-GlobalObjectArray {
     return @()
 }
 
-function Add-UniqueText {
-    param(
-        [System.Collections.ArrayList]$List,
-        $Value
-    )
-
-    $txt = First-NonBlank -Values @($Value)
-
-    if ([string]::IsNullOrWhiteSpace($txt)) {
-        return
-    }
-
-    if (-not $List.Contains("$txt")) {
-        [void]$List.Add("$txt")
-    }
-}
-
-function Add-NodeClusterIds {
-    param(
-        [System.Collections.ArrayList]$List,
-        $Node
-    )
+function Get-ClusterIdFromNode {
+    param($Node)
 
     if ($null -eq $Node) {
+        return ""
+    }
+
+    return First-NonBlank -Values @(
+        $Node.clusterId,
+        $Node.clusterID,
+        $Node.accessClusterId,
+        $Node.cluster.id,
+        $Node.cluster.clusterId,
+        $Node.cluster.clusterID,
+        $Node.clusterInfo.id,
+        $Node.clusterInfo.clusterId,
+        $Node.clusterInfo.clusterID,
+        $Node.sourceClusterId,
+        $Node.sourceClusterID
+    )
+}
+
+function Get-PGIdFromNode {
+    param($Node)
+
+    if ($null -eq $Node) {
+        return ""
+    }
+
+    return First-NonBlank -Values @(
+        $Node.protectionGroupId,
+        $Node.protectionGroupID,
+        $Node.groupId,
+        $Node.jobId,
+        $Node.id,
+        $Node.uid,
+        $Node.protectionGroup.id,
+        $Node.protectionGroup.uid,
+        $Node.protectionGroupInfo.id,
+        $Node.protectionGroupInfo.uid
+    )
+}
+
+function Get-PGNameFromNode {
+    param($Node)
+
+    if ($null -eq $Node) {
+        return ""
+    }
+
+    return First-NonBlank -Values @(
+        $Node.protectionGroupName,
+        $Node.name,
+        $Node.displayName,
+        $Node.protectionGroup.name,
+        $Node.protectionGroup.displayName,
+        $Node.protectionGroupInfo.name,
+        $Node.protectionGroupInfo.displayName,
+        $Node.policyName
+    )
+}
+
+function Get-NodeTextForType {
+    param($Node)
+
+    if ($null -eq $Node) {
+        return ""
+    }
+
+    $parts = @()
+
+    foreach ($v in @(
+        $Node.environment,
+        $Node.object.environment,
+        $Node.objectType,
+        $Node.type,
+        $Node.protectionType,
+        $Node.sourceInfo.environment,
+        $Node.sourceInfo.type,
+        $Node.protectionSource.environment,
+        $Node.protectionSource.type,
+        $Node.entity.environment,
+        $Node.entity.type,
+        $Node.name,
+        $Node.displayName,
+        $Node.object.name,
+        $Node.object.displayName,
+        $Node.protectionGroupName,
+        $Node.policyName
+    )) {
+        $t = First-NonBlank -Values @($v)
+
+        if (-not [string]::IsNullOrWhiteSpace($t)) {
+            $parts += $t
+        }
+    }
+
+    return (($parts | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }) -join " ")
+}
+
+function Get-BackupTypeFromText {
+    param([string]$Text)
+
+    $t = "$Text".ToLower()
+
+    if ($t -match "ksql|mssql|sqlserver|sql server|\bsql\b") {
+        return "SQL"
+    }
+
+    if ($t -match "koracle|\boracle\b") {
+        return "Oracle"
+    }
+
+    if ($t -match "kgenericnas|kisilon|nas|isilon|smb|cifs|nfs") {
+        return "NAS"
+    }
+
+    if ($t -match "khyperv|hyperv|hyper-v") {
+        return "Hyper-V"
+    }
+
+    if ($t -match "kacropolis|nutanix|ahv|acropolis") {
+        return "Nutanix"
+    }
+
+    if ($t -match "kvmware|vmware|vc-") {
+        return "VMware"
+    }
+
+    if ($t -match "kphysical|physical|filesystem|file_system|file system|volume|windows|linux|\bfs\b|_fs_|-fs-") {
+        return "FS"
+    }
+
+    return "Unknown"
+}
+
+function Add-Candidate {
+    param(
+        [System.Collections.ArrayList]$List,
+        [hashtable]$Seen,
+        [string]$ServerName,
+        [string]$ClusterId,
+        [string]$PGId,
+        [string]$PGName,
+        [string]$BackupType,
+        [string]$TypeHint
+    )
+
+    if ([string]::IsNullOrWhiteSpace($ClusterId)) {
         return
     }
 
-    Add-UniqueText -List $List -Value $Node.clusterId
-    Add-UniqueText -List $List -Value $Node.clusterID
-    Add-UniqueText -List $List -Value $Node.cluster.id
-    Add-UniqueText -List $List -Value $Node.cluster.clusterId
-    Add-UniqueText -List $List -Value $Node.cluster.clusterID
-    Add-UniqueText -List $List -Value $Node.clusterInfo.id
-    Add-UniqueText -List $List -Value $Node.clusterInfo.clusterId
-    Add-UniqueText -List $List -Value $Node.clusterInfo.clusterID
-    Add-UniqueText -List $List -Value $Node.accessClusterId
-    Add-UniqueText -List $List -Value $Node.sourceClusterId
-    Add-UniqueText -List $List -Value $Node.sourceClusterID
-}
-
-function Get-CandidateClusterIdsFromGlobalSearch {
-    param($Json)
-
-    $ids = New-Object System.Collections.ArrayList
-    $objects = @(Get-GlobalObjectArray -Json $Json)
-
-    foreach ($obj in $objects) {
-
-        # DTSK-style priority:
-        # 1. objectProtectionInfos first
-        foreach ($opi in (As-Array -Value $obj.objectProtectionInfos)) {
-
-            Add-NodeClusterIds -List $ids -Node $opi
-
-            # 2. protectionGroups second
-            foreach ($pg in (As-Array -Value $opi.protectionGroups)) {
-                Add-NodeClusterIds -List $ids -Node $pg
-            }
-        }
-
-        # Some responses may also have object-level protectionGroups.
-        foreach ($pg2 in (As-Array -Value $obj.protectionGroups)) {
-            Add-NodeClusterIds -List $ids -Node $pg2
-        }
-
-        # 3. object-level fallback last
-        Add-NodeClusterIds -List $ids -Node $obj
+    if ([string]::IsNullOrWhiteSpace($PGId)) {
+        return
     }
 
-    return @($ids)
+    if ([string]::IsNullOrWhiteSpace($PGName)) {
+        $PGName = "N/A"
+    }
+
+    if ([string]::IsNullOrWhiteSpace($BackupType)) {
+        $BackupType = "Unknown"
+    }
+
+    $key = "$ClusterId|$PGId|$BackupType|$PGName"
+
+    if ($Seen.ContainsKey($key)) {
+        return
+    }
+
+    $Seen[$key] = $true
+
+    [void]$List.Add([pscustomobject]@{
+        ServerName = $ServerName
+        ClusterId  = "$ClusterId"
+        PGId       = "$PGId"
+        PGName     = "$PGName"
+        BackupType = "$BackupType"
+        TypeHint   = "$TypeHint"
+    })
 }
 
-function Get-GlobalFallbackPGName {
-    param($Json)
+function Get-CandidatesFromGlobalSearch {
+    param(
+        [string]$CI,
+        $Json
+    )
+
+    $candidates = New-Object System.Collections.ArrayList
+    $seen       = @{}
 
     $objects = @(Get-GlobalObjectArray -Json $Json)
 
     foreach ($obj in $objects) {
 
+        $objectClusterId = Get-ClusterIdFromNode -Node $obj
+        $objectPGId      = Get-PGIdFromNode -Node $obj
+        $objectPGName    = Get-PGNameFromNode -Node $obj
+        $objectText      = Get-NodeTextForType -Node $obj
+        $objectType      = Get-BackupTypeFromText -Text $objectText
+
+        # Object-level candidate, if PG exists at object level.
+        Add-Candidate `
+            -List $candidates `
+            -Seen $seen `
+            -ServerName $CI `
+            -ClusterId $objectClusterId `
+            -PGId $objectPGId `
+            -PGName $objectPGName `
+            -BackupType $objectType `
+            -TypeHint $objectText
+
+        # objectProtectionInfos first - DTSK idea
         foreach ($opi in (As-Array -Value $obj.objectProtectionInfos)) {
+
+            $opiClusterId = Get-ClusterIdFromNode -Node $opi
+
+            if ([string]::IsNullOrWhiteSpace($opiClusterId)) {
+                $opiClusterId = $objectClusterId
+            }
+
+            $opiPGId   = Get-PGIdFromNode -Node $opi
+            $opiPGName = Get-PGNameFromNode -Node $opi
+            $opiText   = "$objectText " + (Get-NodeTextForType -Node $opi)
+            $opiType   = Get-BackupTypeFromText -Text $opiText
+
+            Add-Candidate `
+                -List $candidates `
+                -Seen $seen `
+                -ServerName $CI `
+                -ClusterId $opiClusterId `
+                -PGId $opiPGId `
+                -PGName $opiPGName `
+                -BackupType $opiType `
+                -TypeHint $opiText
+
+            # protectionGroups second - DTSK idea
             foreach ($pg in (As-Array -Value $opi.protectionGroups)) {
 
-                $pgName = First-NonBlank -Values @(
-                    $pg.name,
-                    $pg.protectionGroupName,
-                    $pg.policyName
-                )
+                $pgClusterId = Get-ClusterIdFromNode -Node $pg
 
-                if (-not [string]::IsNullOrWhiteSpace($pgName)) {
-                    return $pgName
+                if ([string]::IsNullOrWhiteSpace($pgClusterId)) {
+                    $pgClusterId = $opiClusterId
                 }
+
+                if ([string]::IsNullOrWhiteSpace($pgClusterId)) {
+                    $pgClusterId = $objectClusterId
+                }
+
+                $pgId   = Get-PGIdFromNode -Node $pg
+                $pgName = Get-PGNameFromNode -Node $pg
+                $pgText = "$opiText " + (Get-NodeTextForType -Node $pg)
+                $pgType = Get-BackupTypeFromText -Text $pgText
+
+                Add-Candidate `
+                    -List $candidates `
+                    -Seen $seen `
+                    -ServerName $CI `
+                    -ClusterId $pgClusterId `
+                    -PGId $pgId `
+                    -PGName $pgName `
+                    -BackupType $pgType `
+                    -TypeHint $pgText
             }
         }
 
+        # Some responses may have protectionGroups directly under object.
         foreach ($pg2 in (As-Array -Value $obj.protectionGroups)) {
-            $pgName = First-NonBlank -Values @(
-                $pg2.name,
-                $pg2.protectionGroupName,
-                $pg2.policyName
-            )
 
-            if (-not [string]::IsNullOrWhiteSpace($pgName)) {
-                return $pgName
+            $pg2ClusterId = Get-ClusterIdFromNode -Node $pg2
+
+            if ([string]::IsNullOrWhiteSpace($pg2ClusterId)) {
+                $pg2ClusterId = $objectClusterId
             }
+
+            $pg2Id   = Get-PGIdFromNode -Node $pg2
+            $pg2Name = Get-PGNameFromNode -Node $pg2
+            $pg2Text = "$objectText " + (Get-NodeTextForType -Node $pg2)
+            $pg2Type = Get-BackupTypeFromText -Text $pg2Text
+
+            Add-Candidate `
+                -List $candidates `
+                -Seen $seen `
+                -ServerName $CI `
+                -ClusterId $pg2ClusterId `
+                -PGId $pg2Id `
+                -PGName $pg2Name `
+                -BackupType $pg2Type `
+                -TypeHint $pg2Text
         }
     }
 
-    return "N/A"
+    return @($candidates)
 }
 
 # ==========================================================
-# Protected Object Parsing
+# Runs Parsing
 # ==========================================================
-function Get-ProtectedObjectArray {
+function Get-RunArray {
     param($Json)
 
     if ($null -eq $Json) {
@@ -447,14 +645,14 @@ function Get-ProtectedObjectArray {
     }
 
     foreach ($p in @(
-        "objects",
-        "protectedObjects",
-        "protectedObjectResults",
-        "searchResults",
+        "runs",
+        "protectionRuns",
+        "protectionGroupRuns",
+        "runList",
         "results",
-        "entities",
         "items",
-        "data"
+        "data",
+        "entities"
     )) {
         if ($Json.PSObject.Properties.Name -contains $p) {
             return @(As-Array -Value $Json.$p | Where-Object { $_ })
@@ -462,15 +660,11 @@ function Get-ProtectedObjectArray {
     }
 
     if (
-        (Has-Prop -Object $Json -Name "latestSnapshotInfo") -or
-        (Has-Prop -Object $Json -Name "latestSnapshotsInfo") -or
-        (Has-Prop -Object $Json -Name "snapshotInfo") -or
-        (Has-Prop -Object $Json -Name "backupInfo") -or
-        (Has-Prop -Object $Json -Name "protectionGroupName") -or
-        (Has-Prop -Object $Json -Name "environment") -or
-        (Has-Prop -Object $Json -Name "objectType") -or
-        (Has-Prop -Object $Json -Name "name") -or
-        (Has-Prop -Object $Json -Name "displayName")
+        (Has-Prop -Object $Json -Name "status") -or
+        (Has-Prop -Object $Json -Name "localBackupInfo") -or
+        (Has-Prop -Object $Json -Name "objects") -or
+        (Has-Prop -Object $Json -Name "startTimeUsecs") -or
+        (Has-Prop -Object $Json -Name "endTimeUsecs")
     ) {
         return @($Json)
     }
@@ -478,43 +672,59 @@ function Get-ProtectedObjectArray {
     return @()
 }
 
-function Get-Snapshots {
-    param($Object)
+function Get-RunObjects {
+    param($Run)
 
-    $snaps = @()
+    $objs = @()
 
-    $snaps += @(As-Array -Value $Object.latestSnapshotInfo)
-    $snaps += @(As-Array -Value $Object.latestSnapshotsInfo)
-    $snaps += @(As-Array -Value $Object.latestSnapshot)
-    $snaps += @(As-Array -Value $Object.latestSnapshots)
-    $snaps += @(As-Array -Value $Object.snapshotInfo)
-    $snaps += @(As-Array -Value $Object.backupInfo)
+    $objs += @(As-Array -Value $Run.objects)
+    $objs += @(As-Array -Value $Run.objectRuns)
+    $objs += @(As-Array -Value $Run.protectedObjects)
+    $objs += @(As-Array -Value $Run.entities)
+    $objs += @(As-Array -Value $Run.protectionRun.objects)
+    $objs += @(As-Array -Value $Run.protectionRun.objectRuns)
 
-    foreach ($opi in (As-Array -Value $Object.objectProtectionInfos)) {
-        $snaps += @(As-Array -Value $opi.latestSnapshotInfo)
-        $snaps += @(As-Array -Value $opi.latestSnapshotsInfo)
-        $snaps += @(As-Array -Value $opi.snapshotInfo)
-        $snaps += @(As-Array -Value $opi.backupInfo)
+    return @($objs | Where-Object { $_ })
+}
 
-        foreach ($pg in (As-Array -Value $opi.protectionGroups)) {
-            $snaps += @(As-Array -Value $pg.latestSnapshotInfo)
-            $snaps += @(As-Array -Value $pg.latestSnapshotsInfo)
-            $snaps += @(As-Array -Value $pg.snapshotInfo)
-            $snaps += @(As-Array -Value $pg.backupInfo)
-        }
+function Get-StatusText {
+    param($Node)
+
+    if ($null -eq $Node) {
+        return ""
     }
 
-    $snaps = @($snaps | Where-Object { $_ })
+    return First-NonBlank -Values @(
+        $Node.status,
+        $Node.runStatus,
+        $Node.backupStatus,
+        $Node.protectionStatus,
+        $Node.localBackupInfo.status,
+        $Node.localSnapshotInfo.status,
+        $Node.error,
+        $Node.message
+    )
+}
 
-    if ($snaps.Count -eq 0) {
-        # If time fields are present at object root, use root as snapshot candidate.
-        $rootTime = Get-MaxTimeUsecsFromNode -Node $Object
-        if ($rootTime -gt 0) {
-            return @($Object)
-        }
+function Is-SuccessStatus {
+    param([string]$StatusText)
+
+    if ([string]::IsNullOrWhiteSpace($StatusText)) {
+        return $true
     }
 
-    return $snaps
+    $s = "$StatusText".ToLower()
+
+    if ($s -match "fail|failed|failure|error|cancel|canceled|cancelled|abort|aborted|skipped") {
+        return $false
+    }
+
+    if ($s -match "success|succeeded|warning|succeededwithwarning|finished|complete|completed|kfinished|ksuccess") {
+        return $true
+    }
+
+    # Unknown status but time exists can still be usable.
+    return $true
 }
 
 function Get-MaxTimeUsecsFromNode {
@@ -527,7 +737,7 @@ function Get-MaxTimeUsecsFromNode {
         return 0
     }
 
-    if ($Depth -gt 5) {
+    if ($Depth -gt 6) {
         return 0
     }
 
@@ -571,180 +781,6 @@ function Get-MaxTimeUsecsFromNode {
     return $max
 }
 
-function Get-SnapshotTimeUsecs {
-    param($Snapshot)
-
-    if ($null -eq $Snapshot) {
-        return 0
-    }
-
-    foreach ($f in @(
-        "protectionRunStartTimeUsecs",
-        "protectionRunEndTimeUsecs",
-        "runStartTimeUsecs",
-        "runEndTimeUsecs",
-        "snapshotCreationTimeUsecs",
-        "creationTimeUsecs",
-        "startTimeUsecs",
-        "endTimeUsecs",
-        "lastRunStartTimeUsecs",
-        "lastRunEndTimeUsecs",
-        "backupRunStartTimeUsecs",
-        "backupRunEndTimeUsecs"
-    )) {
-        if (Has-Prop -Object $Snapshot -Name $f) {
-            $u = Get-Usecs -Value $Snapshot.$f
-
-            if ($u -gt 0) {
-                return $u
-            }
-        }
-    }
-
-    if (Has-Prop -Object $Snapshot -Name "localBackupInfo") {
-        foreach ($lbi in (As-Array -Value $Snapshot.localBackupInfo)) {
-            $u = Get-Usecs -Value $lbi.endTimeUsecs
-            if ($u -gt 0) { return $u }
-
-            $u = Get-Usecs -Value $lbi.startTimeUsecs
-            if ($u -gt 0) { return $u }
-        }
-    }
-
-    if (Has-Prop -Object $Snapshot -Name "localSnapshotInfo") {
-        foreach ($lsi in (As-Array -Value $Snapshot.localSnapshotInfo)) {
-            $u = Get-MaxTimeUsecsFromNode -Node $lsi
-            if ($u -gt 0) { return $u }
-        }
-    }
-
-    $max = Get-MaxTimeUsecsFromNode -Node $Snapshot
-    return $max
-}
-
-function Get-BestSnapshot {
-    param($Object)
-
-    $snaps = @(Get-Snapshots -Object $Object)
-
-    if (-not $snaps -or $snaps.Count -eq 0) {
-        return $null
-    }
-
-    return $snaps |
-        Sort-Object @{ Expression = { [int64](Get-SnapshotTimeUsecs -Snapshot $_) } } -Descending |
-        Select-Object -First 1
-}
-
-# ==========================================================
-# Object Detail Helpers
-# ==========================================================
-function Get-BackupType {
-    param(
-        $Object,
-        $Snapshot,
-        [string]$FallbackPGName
-    )
-
-    $textParts = @()
-
-    $textParts += First-NonBlank -Values @($Object.environment)
-    $textParts += First-NonBlank -Values @($Object.object.environment)
-    $textParts += First-NonBlank -Values @($Object.objectType)
-    $textParts += First-NonBlank -Values @($Object.type)
-    $textParts += First-NonBlank -Values @($Object.protectionType)
-
-    $textParts += First-NonBlank -Values @($Object.sourceInfo.environment)
-    $textParts += First-NonBlank -Values @($Object.sourceInfo.type)
-
-    $textParts += First-NonBlank -Values @($Object.protectionSource.environment)
-    $textParts += First-NonBlank -Values @($Object.protectionSource.type)
-
-    $textParts += First-NonBlank -Values @($Object.entity.environment)
-    $textParts += First-NonBlank -Values @($Object.entity.type)
-
-    $textParts += First-NonBlank -Values @($Object.name)
-    $textParts += First-NonBlank -Values @($Object.displayName)
-    $textParts += First-NonBlank -Values @($Object.object.name)
-    $textParts += First-NonBlank -Values @($Object.object.displayName)
-
-    $textParts += First-NonBlank -Values @($Snapshot.environment)
-    $textParts += First-NonBlank -Values @($Snapshot.objectType)
-    $textParts += First-NonBlank -Values @($Snapshot.sourceInfo.environment)
-    $textParts += First-NonBlank -Values @($Snapshot.sourceInfo.type)
-
-    $textParts += $FallbackPGName
-
-    $text = (($textParts | Where-Object {
-        -not [string]::IsNullOrWhiteSpace($_)
-    }) -join " ").ToLower()
-
-    if ($text -match "ksql|mssql|sqlserver|sql server|\bsql\b") {
-        return "SQL"
-    }
-
-    if ($text -match "koracle|\boracle\b") {
-        return "Oracle"
-    }
-
-    if ($text -match "kgenericnas|kisilon|nas|isilon|smb|cifs|nfs") {
-        return "NAS"
-    }
-
-    if ($text -match "khyperv|hyperv|hyper-v") {
-        return "Hyper-V"
-    }
-
-    if ($text -match "kacropolis|nutanix|ahv|acropolis") {
-        return "Nutanix"
-    }
-
-    if ($text -match "kvmware|vmware|vc-") {
-        return "VMware"
-    }
-
-    if ($text -match "kphysical|physical|filesystem|file_system|file system|volume|windows|linux|\bfs\b|_fs_|-fs-") {
-        return "FS"
-    }
-
-    return "Unknown"
-}
-
-function Get-PGName {
-    param(
-        $Object,
-        $Snapshot,
-        [string]$FallbackPGName
-    )
-
-    $pg = First-NonBlank -Values @(
-        $Snapshot.protectionGroupName,
-        $Snapshot.protectionGroup.name,
-        $Snapshot.protectionGroup.displayName,
-        $Snapshot.protectionGroupInfo.name,
-        $Snapshot.protectionGroupInfo.displayName,
-
-        $Object.protectionGroupName,
-        $Object.protectionGroup.name,
-        $Object.protectionGroup.displayName,
-        $Object.protectionGroupInfo.name,
-        $Object.protectionGroupInfo.displayName,
-
-        $Object.objectProtectionInfos.protectionGroups.name,
-        $Object.objectProtectionInfos.protectionGroups.protectionGroupName
-    )
-
-    if (-not [string]::IsNullOrWhiteSpace($pg)) {
-        return $pg
-    }
-
-    if (-not [string]::IsNullOrWhiteSpace($FallbackPGName)) {
-        return $FallbackPGName
-    }
-
-    return "N/A"
-}
-
 function Get-ObjectNames {
     param($Object)
 
@@ -785,7 +821,7 @@ function Object-MatchesCI {
     $names = @(Get-ObjectNames -Object $Object)
 
     if (-not $names -or $names.Count -eq 0) {
-        return $true
+        return $false
     }
 
     foreach ($n in $names) {
@@ -797,6 +833,74 @@ function Object-MatchesCI {
     return $false
 }
 
+function Get-LatestBackupFromRuns {
+    param(
+        [string]$CI,
+        $Runs
+    )
+
+    $bestUsecs = 0
+
+    foreach ($run in (As-Array -Value $Runs)) {
+
+        if ($null -eq $run) {
+            continue
+        }
+
+        $runStatus = Get-StatusText -Node $run
+
+        if (-not (Is-SuccessStatus -StatusText $runStatus)) {
+            continue
+        }
+
+        $runObjects = @(Get-RunObjects -Run $run)
+
+        if ($runObjects.Count -gt 0) {
+
+            $matchedObjects = @($runObjects | Where-Object {
+                Object-MatchesCI -Object $_ -CI $CI
+            })
+
+            if ($matchedObjects.Count -eq 0) {
+                continue
+            }
+
+            foreach ($obj in $matchedObjects) {
+
+                $objStatus = Get-StatusText -Node $obj
+
+                if (-not (Is-SuccessStatus -StatusText $objStatus)) {
+                    continue
+                }
+
+                $objUsecs = Get-MaxTimeUsecsFromNode -Node $obj
+
+                if ($objUsecs -le 0) {
+                    $objUsecs = Get-MaxTimeUsecsFromNode -Node $run
+                }
+
+                if ($objUsecs -gt $bestUsecs) {
+                    $bestUsecs = $objUsecs
+                }
+            }
+        }
+        else {
+            # If run has no object list, use PG-level run time.
+            # This is allowed because the candidate came from global search for that CI.
+            $runUsecs = Get-MaxTimeUsecsFromNode -Node $run
+
+            if ($runUsecs -gt $bestUsecs) {
+                $bestUsecs = $runUsecs
+            }
+        }
+    }
+
+    return $bestUsecs
+}
+
+# ==========================================================
+# Report Helpers
+# ==========================================================
 function Get-BackupTypeRank {
     param([string]$BackupType)
 
@@ -828,7 +932,7 @@ function Select-BestRows {
         if ($valid.Count -gt 0) {
             $selected += (
                 $valid |
-                Sort-Object `
+                Sort-Object -Property `
                     @{ Expression = { $_.LastBackupUsecs }; Descending = $true },
                     ClusterName,
                     ProtectionGroup |
@@ -838,7 +942,7 @@ function Select-BestRows {
         else {
             $selected += (
                 $groupRows |
-                Sort-Object ClusterName, ProtectionGroup |
+                Sort-Object -Property ClusterName, ProtectionGroup |
                 Select-Object -First 1
             )
         }
@@ -892,7 +996,6 @@ if (-not $ClusterJson -or -not $ClusterJson.cohesityClusters) {
 }
 
 $ClusterMap = @{}
-$AllClusters = @()
 
 foreach ($c in @($ClusterJson.cohesityClusters)) {
 
@@ -912,16 +1015,12 @@ foreach ($c in @($ClusterJson.cohesityClusters)) {
         ClusterName = "$cn"
     }
 
-    $AllClusters += $clusterObj
-
     Add-ClusterMapEntry -Map $ClusterMap -Id $c.clusterId -ClusterObject $clusterObj
     Add-ClusterMapEntry -Map $ClusterMap -Id $c.id -ClusterObject $clusterObj
     Add-ClusterMapEntry -Map $ClusterMap -Id $c.intId -ClusterObject $clusterObj
     Add-ClusterMapEntry -Map $ClusterMap -Id $c.clusterIdentifier.clusterId -ClusterObject $clusterObj
     Add-ClusterMapEntry -Map $ClusterMap -Id $c.clusterInfo.clusterId -ClusterObject $clusterObj
 }
-
-$AllClusters = $AllClusters | Sort-Object ClusterName, ClusterId
 
 # ==========================================================
 # Main Processing
@@ -955,146 +1054,100 @@ foreach ($CI in $CiList) {
             apiKey = $ApiKey
         }
 
-    $FallbackPGName = Get-GlobalFallbackPGName -Json $GlobalJson
-
-    $CandidateClusterIds = @(Get-CandidateClusterIdsFromGlobalSearch -Json $GlobalJson)
-
-    # Only keep unique candidate IDs in the order found.
-    $CandidateClusterIds = @($CandidateClusterIds | Where-Object {
-        -not [string]::IsNullOrWhiteSpace($_)
-    })
-
-    if (-not $CandidateClusterIds -or $CandidateClusterIds.Count -eq 0) {
-
-        if ($FallbackToAllClustersIfNoCandidate) {
-            $FallbackCiCount++
-
-            if ($ShowProgress) {
-                Write-Host "  No candidate cluster from global search. Falling back to all clusters." -ForegroundColor DarkYellow
-            }
-
-            $CandidateClusterIds = @($AllClusters | ForEach-Object { $_.ClusterId })
-        }
-        else {
-            $Results += [pscustomobject]@{
-                ServerName      = $CI
-                BackupType      = "Unknown"
-                ClusterName     = "-"
-                ProtectionGroup = "N/A"
-                LastBackupTime  = "NoObject"
-            }
-
-            continue
-        }
-    }
+    $Candidates = @(Get-CandidatesFromGlobalSearch -CI $CI -Json $GlobalJson)
 
     if ($ShowProgress) {
-        Write-Host "  Candidate clusters: $($CandidateClusterIds.Count)" -ForegroundColor DarkGray
+        Write-Host "  PG candidates found: $($Candidates.Count)" -ForegroundColor DarkGray
+    }
+
+    if (-not $Candidates -or $Candidates.Count -eq 0) {
+        $Results += [pscustomobject]@{
+            ServerName      = $CI
+            BackupType      = "Unknown"
+            ClusterName     = "-"
+            ProtectionGroup = "N/A"
+            LastBackupTime  = "NoPGFound"
+        }
+
+        continue
     }
 
     # ------------------------------------------------------
-    # Step 2: Search protected-objects on each candidate cluster
+    # Step 2: For each candidate PG, read PG runs
     # ------------------------------------------------------
-    foreach ($CandidateClusterId in $CandidateClusterIds) {
+    foreach ($Candidate in $Candidates) {
 
-        if ([string]::IsNullOrWhiteSpace($CandidateClusterId)) {
-            continue
-        }
-
-        $CandidateClusterName = Get-ClusterNameFromMap `
-            -ClusterId "$CandidateClusterId" `
+        $ClusterName = Get-ClusterNameFromMap `
+            -ClusterId $Candidate.ClusterId `
             -ClusterMap $ClusterMap
 
-        $ProtectedSearchCalls++
+        $RunSearchCalls++
 
-        $ProtectedUri =
-            "$BaseUrl/v2/data-protect/search/protected-objects" +
-            "?searchString=$([uri]::EscapeDataString($CI))"
+        $RunsUri =
+            "$BaseUrl/v2/data-protect/protection-groups/" +
+            "$([uri]::EscapeDataString($Candidate.PGId))" +
+            "/runs"
 
-        $ProtectedJson = Invoke-HeliosGetJson `
-            -Uri $ProtectedUri `
+        $RunsJson = Invoke-HeliosGetJson `
+            -Uri $RunsUri `
             -Headers @{
                 accept          = "application/json"
                 apiKey          = $ApiKey
-                accessClusterId = "$CandidateClusterId"
+                accessClusterId = "$($Candidate.ClusterId)"
             }
 
-        $ProtectedObjects = @(Get-ProtectedObjectArray -Json $ProtectedJson)
+        $Runs = @(Get-RunArray -Json $RunsJson)
 
-        if (-not $ProtectedObjects -or $ProtectedObjects.Count -eq 0) {
+        if (-not $Runs -or $Runs.Count -eq 0) {
+            $RowsForCi += [pscustomobject]@{
+                ServerName      = $CI
+                BackupType      = $Candidate.BackupType
+                ClusterName     = $ClusterName
+                ProtectionGroup = $Candidate.PGName
+                LastBackupTime  = "NoRunFound"
+                LastBackupUsecs = 0
+            }
+
             continue
         }
 
-        $MatchingObjects = @($ProtectedObjects | Where-Object {
-            Object-MatchesCI -Object $_ -CI $CI
-        })
+        $LatestUsecs = Get-LatestBackupFromRuns `
+            -CI $CI `
+            -Runs $Runs
 
-        if ($MatchingObjects.Count -gt 0) {
-            $ObjectsToCheck = $MatchingObjects
+        if ($LatestUsecs -gt 0) {
+            $LastBackupTime = Convert-UsecsToReportTime -Usecs $LatestUsecs
         }
         else {
-            # If Helios returned objects for searchString=<CI>, use them.
-            $ObjectsToCheck = $ProtectedObjects
+            $LastBackupTime = "NoBackup"
         }
 
-        foreach ($Obj in $ObjectsToCheck) {
-
-            $Snapshot = Get-BestSnapshot -Object $Obj
-
-            if ($Snapshot) {
-                $BackupUsecs = Get-SnapshotTimeUsecs -Snapshot $Snapshot
-            }
-            else {
-                $BackupUsecs = 0
-            }
-
-            if ($BackupUsecs -gt 0) {
-                $LastBackupTime = Convert-UsecsToLocal -Usecs $BackupUsecs
-            }
-            elseif ($Snapshot) {
-                $LastBackupTime = "NoBackupTime"
-            }
-            else {
-                $LastBackupTime = "NoBackup"
-            }
-
-            $BackupType = Get-BackupType `
-                -Object $Obj `
-                -Snapshot $Snapshot `
-                -FallbackPGName $FallbackPGName
-
-            $PGName = Get-PGName `
-                -Object $Obj `
-                -Snapshot $Snapshot `
-                -FallbackPGName $FallbackPGName
-
-            $RowsForCi += [pscustomobject]@{
-                ServerName      = $CI
-                BackupType      = $BackupType
-                ClusterName     = $CandidateClusterName
-                ProtectionGroup = $PGName
-                LastBackupTime  = $LastBackupTime
-                LastBackupUsecs = $BackupUsecs
-            }
+        $RowsForCi += [pscustomobject]@{
+            ServerName      = $CI
+            BackupType      = $Candidate.BackupType
+            ClusterName     = $ClusterName
+            ProtectionGroup = $Candidate.PGName
+            LastBackupTime  = $LastBackupTime
+            LastBackupUsecs = $LatestUsecs
         }
     }
 
     # ------------------------------------------------------
-    # Step 3: If no rows found
+    # Step 3: Clean/select rows
     # ------------------------------------------------------
     if (-not $RowsForCi -or $RowsForCi.Count -eq 0) {
         $Results += [pscustomobject]@{
             ServerName      = $CI
             BackupType      = "Unknown"
             ClusterName     = "-"
-            ProtectionGroup = $FallbackPGName
-            LastBackupTime  = "NoObject"
+            ProtectionGroup = "N/A"
+            LastBackupTime  = "NoBackup"
         }
 
         continue
     }
 
-    # If known backup types exist, remove Unknown rows.
+    # If known backup types exist, drop Unknown rows.
     $KnownRows = @($RowsForCi | Where-Object {
         $_.BackupType -ne "Unknown"
     })
@@ -1103,13 +1156,10 @@ foreach ($CI in $CiList) {
         $RowsForCi = $KnownRows
     }
 
-    # ------------------------------------------------------
-    # Step 4: Select latest valid row per BackupType
-    # ------------------------------------------------------
     $SelectedRows = @(Select-BestRows -Rows $RowsForCi)
 
     # ------------------------------------------------------
-    # Step 5: DB requires FS validation
+    # Step 4: DB requires FS validation
     # ------------------------------------------------------
     $HasValidSQL = @($SelectedRows | Where-Object {
         $_.BackupType -eq "SQL" -and (Is-ValidBackupRow -Row $_)
@@ -1169,22 +1219,25 @@ $BackedUp = @($SortedResults | Where-Object {
         "NoBackup",
         "NoBackupTime",
         "NoObject",
+        "NoPGFound",
+        "NoRunFound",
         "NoFSBackupFound",
         "ClusterIdMissing",
+        "PGIdMissing",
         "SearchFailed"
     )
 }).Count
 
 $NoBackup = @($SortedResults | Where-Object {
-    $_.LastBackupTime -in @("NoBackup", "NoBackupTime")
+    $_.LastBackupTime -in @("NoBackup", "NoBackupTime", "NoRunFound")
+}).Count
+
+$NoPGFound = @($SortedResults | Where-Object {
+    $_.LastBackupTime -eq "NoPGFound"
 }).Count
 
 $NoFSBackupFound = @($SortedResults | Where-Object {
     $_.LastBackupTime -eq "NoFSBackupFound"
-}).Count
-
-$NoObject = @($SortedResults | Where-Object {
-    $_.LastBackupTime -eq "NoObject"
 }).Count
 
 $DetailsText = (
@@ -1202,18 +1255,17 @@ $Report += "Cohesity Backup Validation Report"
 $Report += "=========================================================="
 $Report += "Change Number              : $ChangeID"
 $Report += "Executed By                : $ExecutedBy"
-$Report += "Run Date                   : $(Get-Date -Format 'dd-MMM-yyyy HH:mm:ss')"
+$Report += "Run Date                   : $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
 $Report += ""
 $Report += "Total Input CIs            : $TotalInputCIs"
 $Report += "Total Backup Rows          : $TotalRows"
 $Report += "Backed Up                  : $BackedUp"
 $Report += "No Backup                  : $NoBackup"
+$Report += "No PG Found                : $NoPGFound"
 $Report += "No FS Backup Found         : $NoFSBackupFound"
-$Report += "No Object                  : $NoObject"
 $Report += ""
 $Report += "Global Search Calls        : $GlobalSearchCalls"
-$Report += "Protected Search Calls     : $ProtectedSearchCalls"
-$Report += "Fallback CI Count          : $FallbackCiCount"
+$Report += "PG Run Search Calls        : $RunSearchCalls"
 $Report += ""
 $Report += "----------------------------------------------------------"
 $Report += "Details"
@@ -1225,8 +1277,8 @@ $Report += "----------------------------------------------------------"
 $Report += "Notes"
 $Report += "----------------------------------------------------------"
 $Report += "- Global search uses count=100."
-$Report += "- Candidate cluster IDs are collected from objectProtectionInfos first, protectionGroups second, and object-level fields last."
-$Report += "- Protected-object search is run only against candidate clusters."
+$Report += "- Global search is used to identify all candidate PGs and clusters for the CI."
+$Report += "- PG runs endpoint is used to calculate latest backup time."
 $Report += "- Final ClusterName is resolved from /v2/mcm/cluster-mgmt/info."
 $Report += "- SQL/Oracle backup rows require an FS row. If FS is missing, NoFSBackupFound is added."
 $Report += ""
