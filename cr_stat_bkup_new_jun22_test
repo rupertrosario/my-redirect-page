@@ -1,0 +1,450 @@
+# ==========================================================
+# SQL Module - Intelligent DB Discovery + PG Success Validation
+#
+# Logic:
+#   1. Scan recent SQL runs with includeObjectDetails=true.
+#   2. Discover DB names from ANY recent run where DB objects are visible.
+#      This includes failed runs, warning runs, or successful runs.
+#   3. Separately find latest successful regular run for the same PG.
+#   4. Report each discovered DB with the latest successful regular PG backup time.
+#
+# Why:
+#   Failed runs often expose DB objects.
+#   Successful runs may expose only the SQL server/source object.
+# ==========================================================
+
+function Test-SqlDbCandidate {
+    param(
+        [string]$ObjectType,
+        [string]$ObjectName,
+        [string]$ObjectId,
+        [string]$SourceId,
+        [int]$FailedAttemptsCount
+    )
+
+    if ([string]::IsNullOrWhiteSpace($ObjectName)) {
+        return $false
+    }
+
+    # Strong DB indicators.
+    if ($ObjectType -in @("kDatabase", "kSQLDB")) {
+        return $true
+    }
+
+    if ($ObjectType -match "(?i)database|sqldb|sql.*db") {
+        return $true
+    }
+
+    # Some SQL DB failure objects can appear as kSQL.
+    # Treat kSQL as DB only if it has a parent/sourceId or failedAttempts.
+    # This avoids treating the SQL server/source object itself as a DB.
+    if ($ObjectType -eq "kSQL") {
+        if (-not [string]::IsNullOrWhiteSpace($SourceId)) {
+            return $true
+        }
+
+        if ($FailedAttemptsCount -gt 0) {
+            return $true
+        }
+    }
+
+    return $false
+}
+
+function Get-SqlObjectFields {
+    param([object]$Obj)
+
+    $objectName = Get-FirstText @(
+        $Obj.object.name,
+        $Obj.object.displayName,
+        $Obj.name,
+        $Obj.displayName,
+        $Obj.databaseName,
+        $Obj.dbName,
+        $Obj.dbUniqueName
+    )
+
+    $objectType = Get-FirstText @(
+        $Obj.object.objectType,
+        $Obj.objectType,
+        $Obj.type
+    )
+
+    $env = Get-FirstText @(
+        $Obj.object.environment,
+        $Obj.environment
+    )
+
+    $objectId = Get-FirstText @(
+        $Obj.object.id,
+        $Obj.object.uid,
+        $Obj.id,
+        $Obj.uid
+    )
+
+    $sourceId = Get-FirstText @(
+        $Obj.object.sourceId,
+        $Obj.sourceId,
+        $Obj.parentId,
+        $Obj.parentObjectId
+    )
+
+    $failedAttemptsCount = 0
+
+    try {
+        $failedAttemptsCount = @(AsArray $Obj.localSnapshotInfo.failedAttempts).Count
+    }
+    catch {
+        $failedAttemptsCount = 0
+    }
+
+    return [pscustomobject]@{
+        ObjectName          = $objectName
+        ObjectType          = $objectType
+        Environment         = $env
+        ObjectId            = $objectId
+        SourceId            = $sourceId
+        FailedAttemptsCount = $failedAttemptsCount
+    }
+}
+
+function Get-SqlHostMapFromRun {
+    param([object]$Run)
+
+    $hostMap = @{}
+    $objects = @(AsArray $Run.objects)
+
+    foreach ($obj in $objects) {
+        $f = Get-SqlObjectFields -Obj $obj
+
+        if ($f.Environment -ne "kSQL") {
+            continue
+        }
+
+        # Host/source object, not DB.
+        if ($f.ObjectType -in @("kDatabase", "kSQLDB")) {
+            continue
+        }
+
+        # If kSQL has sourceId/failedAttempts, it may be a DB object, not host.
+        if ($f.ObjectType -eq "kSQL" -and
+            (-not [string]::IsNullOrWhiteSpace($f.SourceId) -or $f.FailedAttemptsCount -gt 0)) {
+            continue
+        }
+
+        if (-not [string]::IsNullOrWhiteSpace($f.ObjectId) -and
+            -not [string]::IsNullOrWhiteSpace($f.ObjectName)) {
+            $hostMap[$f.ObjectId] = $f.ObjectName
+        }
+    }
+
+    return $hostMap
+}
+
+function Get-SqlDbRowsFromRun {
+    param(
+        [object]$Run,
+        [string]$RunStatus,
+        [string]$RunType,
+        [int64]$RunEndUsecs
+    )
+
+    $rows = @()
+    $objects = @(AsArray $Run.objects)
+
+    if ($objects.Count -eq 0) {
+        return @()
+    }
+
+    $hostMap = Get-SqlHostMapFromRun -Run $Run
+
+    foreach ($obj in $objects) {
+        $f = Get-SqlObjectFields -Obj $obj
+
+        $isDb = Test-SqlDbCandidate `
+            -ObjectType $f.ObjectType `
+            -ObjectName $f.ObjectName `
+            -ObjectId $f.ObjectId `
+            -SourceId $f.SourceId `
+            -FailedAttemptsCount $f.FailedAttemptsCount
+
+        if (-not $isDb) {
+            continue
+        }
+
+        $hostName = ""
+
+        if (-not [string]::IsNullOrWhiteSpace($f.SourceId) -and $hostMap.ContainsKey($f.SourceId)) {
+            $hostName = $hostMap[$f.SourceId]
+        }
+
+        $rows += [pscustomobject]@{
+            DbName              = $f.ObjectName
+            HostName            = $hostName
+            ObjectType          = $f.ObjectType
+            ObjectId            = $f.ObjectId
+            SourceId            = $f.SourceId
+            DiscoveryRunStatus  = $RunStatus
+            DiscoveryRunType    = $RunType
+            DiscoveryRunEndUsecs = $RunEndUsecs
+            FailedAttemptsCount = $f.FailedAttemptsCount
+        }
+    }
+
+    return @($rows)
+}
+
+function Get-SqlRunEvidenceFromRecentRuns {
+    param(
+        [string]$PgId,
+        [hashtable]$Headers
+    )
+
+    $allDbRows = @()
+    $latestSuccessRun = $null
+    $latestSuccessUsecs = 0
+
+    if ([string]::IsNullOrWhiteSpace($PgId)) {
+        return [pscustomobject]@{
+            DbRows             = @()
+            LatestSuccessRun   = $null
+            LatestSuccessUsecs = 0
+            LatestSuccessTime  = "NoBackup"
+        }
+    }
+
+    $page = 0
+    $cookie = ""
+
+    do {
+        $page++
+
+        $uri = "$BaseUrl/v2/data-protect/protection-groups/$PgId/runs" +
+               "?environments=kSQL" +
+               "&isDeleted=false" +
+               "&isPaused=false" +
+               "&isActive=true" +
+               "&numRuns=$NumRunsPerPg" +
+               "&excludeNonRestorableRuns=false" +
+               "&includeObjectDetails=true"
+
+        if (-not [string]::IsNullOrWhiteSpace($cookie)) {
+            $uri += "&paginationCookie=$([uri]::EscapeDataString($cookie))"
+        }
+
+        $script:PgRunCalls++
+
+        $json = Invoke-HeliosGetJson -Uri $uri -Headers $Headers -Quiet
+
+        if (-not $json -or -not $json.runs) {
+            break
+        }
+
+        $runs = @(AsArray $json.runs | Where-Object { $_ })
+
+        $runs = $runs |
+            Sort-Object @{ Expression = { To-Int64Safe (Get-RunEndUsecsFromRun $_) }; Descending = $true }
+
+        foreach ($run in $runs) {
+            $status   = Get-RunStatusFromRun $run
+            $runType  = Get-RunTypeFromRun $run
+            $endUsecs = To-Int64Safe (Get-RunEndUsecsFromRun $run)
+
+            if ($endUsecs -le 0) {
+                continue
+            }
+
+            # Discover DBs from ANY recent run where DB objects exist.
+            $dbRows = @(Get-SqlDbRowsFromRun `
+                -Run $run `
+                -RunStatus $status `
+                -RunType $runType `
+                -RunEndUsecs $endUsecs)
+
+            if ($dbRows.Count -gt 0) {
+                $allDbRows += $dbRows
+            }
+
+            # Separately track latest successful regular run for backup time.
+            if ((Test-SuccessStatus $status) -and (Test-RegularRunType $runType)) {
+                $script:SqlSuccessfulRunsChecked++
+
+                if ($endUsecs -gt $latestSuccessUsecs) {
+                    $latestSuccessRun = $run
+                    $latestSuccessUsecs = $endUsecs
+                }
+            }
+        }
+
+        $cookie = Get-FirstText $json.paginationCookie
+
+        if ($json.isResponseTruncated -ne $true) {
+            break
+        }
+
+    } while (-not [string]::IsNullOrWhiteSpace($cookie) -and $page -lt $MaxRunPagesPerPg)
+
+    # Deduplicate DB rows. Prefer rows with host name and latest discovery run.
+    $deduped = @()
+
+    foreach ($grp in ($allDbRows | Group-Object DbName, HostName)) {
+        $deduped += (
+            $grp.Group |
+            Sort-Object `
+                @{ Expression = { if ([string]::IsNullOrWhiteSpace($_.HostName)) { 0 } else { 1 } }; Descending = $true },
+                @{ Expression = { [int64]$_.DiscoveryRunEndUsecs }; Descending = $true } |
+            Select-Object -First 1
+        )
+    }
+
+    $successTime = "NoBackup"
+
+    if ($latestSuccessUsecs -gt 0) {
+        $successTime = Convert-UsecsToET $latestSuccessUsecs
+    }
+
+    return [pscustomobject]@{
+        DbRows             = @($deduped)
+        LatestSuccessRun   = $latestSuccessRun
+        LatestSuccessUsecs = $latestSuccessUsecs
+        LatestSuccessTime  = $successTime
+    }
+}
+
+function Get-TargetedSqlRowsFromPg {
+    param(
+        [object]$Context,
+        [string]$SearchTerm,
+        [object]$Candidate,
+        [hashtable]$ClusterMap
+    )
+
+    $rows = @()
+
+    if ([string]::IsNullOrWhiteSpace($Candidate.PgId)) {
+        return @()
+    }
+
+    $clusterId = "$($Candidate.ClusterId)"
+    $clusterName = Get-ClusterNameFromMap -ClusterId $clusterId -ClusterMap $ClusterMap
+
+    if ($clusterName -eq $clusterId -and -not [string]::IsNullOrWhiteSpace($Candidate.ClusterName)) {
+        $clusterName = "$($Candidate.ClusterName)"
+    }
+
+    $headers = @{
+        accept          = "application/json"
+        apiKey          = $ApiKey
+        accessClusterId = "$clusterId"
+    }
+
+    $script:TargetedSqlInspections++
+
+    $evidence = Get-SqlRunEvidenceFromRecentRuns `
+        -PgId "$($Candidate.PgId)" `
+        -Headers $headers
+
+    # No successful regular backup for this PG.
+    if (-not $evidence -or $evidence.LatestSuccessUsecs -le 0) {
+        return @(
+            [pscustomobject]@{
+                InputCI         = $Context.InputCI
+                BackupType      = "SQL"
+                ObjectName      = $SearchTerm
+                ClusterName     = $clusterName
+                ProtectionGroup = "$($Candidate.PgName)"
+                LastBackupTime  = "NoBackup"
+                LastBackupUsecs = 0
+                HostName        = ""
+                Source          = "SQLNoSuccessfulRegularRun"
+            }
+        )
+    }
+
+    # Successful PG backup exists, but DB list could not be discovered from recent run objects.
+    if (-not $evidence.DbRows -or @($evidence.DbRows).Count -eq 0) {
+        $script:SqlNoDbDetailFound++
+
+        return @(
+            [pscustomobject]@{
+                InputCI         = $Context.InputCI
+                BackupType      = "SQL"
+                ObjectName      = $SearchTerm
+                ClusterName     = $clusterName
+                ProtectionGroup = "$($Candidate.PgName)"
+                LastBackupTime  = "DbListNotDiscovered"
+                LastBackupUsecs = $evidence.LatestSuccessUsecs
+                HostName        = $SearchTerm
+                Source          = "SQLPgSuccessButNoDbList"
+            }
+        )
+    }
+
+    foreach ($db in @($evidence.DbRows)) {
+        $dbName = $db.DbName
+        $hostName = $db.HostName
+
+        if ([string]::IsNullOrWhiteSpace($dbName)) {
+            continue
+        }
+
+        if ($Context.IsDbAtServer) {
+            # DB@SERVER: DB must match. Host match is used only if host is known.
+            if (-not (Text-MatchesName -Text $dbName -Name $Context.DbName)) {
+                continue
+            }
+
+            if (-not [string]::IsNullOrWhiteSpace($hostName)) {
+                if (-not (Text-MatchesName -Text $hostName -Name $Context.ServerName)) {
+                    continue
+                }
+            }
+        }
+        else {
+            # Server-only input:
+            # If the candidate PG came from the server search, include DBs from that PG.
+            # If host name is available, prefer host match.
+            $dbMatches = Text-MatchesName -Text $dbName -Name $Context.InputCI
+            $hostMatches = Text-MatchesName -Text $hostName -Name $Context.InputCI
+
+            if (-not $dbMatches -and
+                -not $hostMatches -and
+                -not [string]::IsNullOrWhiteSpace($hostName)) {
+                continue
+            }
+        }
+
+        $rows += [pscustomobject]@{
+            InputCI         = $Context.InputCI
+            BackupType      = "SQL"
+            ObjectName      = $dbName
+            ClusterName     = $clusterName
+            ProtectionGroup = "$($Candidate.PgName)"
+            LastBackupTime  = $evidence.LatestSuccessTime
+            LastBackupUsecs = $evidence.LatestSuccessUsecs
+            HostName        = $hostName
+            Source          = "SQLDbDiscoveredFromRecentRuns_PgSuccessTime"
+        }
+    }
+
+    if ($rows.Count -gt 0) {
+        $script:SqlDbObjectsFound += $rows.Count
+        return @($rows)
+    }
+
+    $script:SqlNoDbDetailFound++
+
+    return @(
+        [pscustomobject]@{
+            InputCI         = $Context.InputCI
+            BackupType      = "SQL"
+            ObjectName      = $SearchTerm
+            ClusterName     = $clusterName
+            ProtectionGroup = "$($Candidate.PgName)"
+            LastBackupTime  = "DbListFoundButNoInputMatch"
+            LastBackupUsecs = $evidence.LatestSuccessUsecs
+            HostName        = $SearchTerm
+            Source          = "SQLDbListFoundButNoInputMatch"
+        }
+    )
+}
