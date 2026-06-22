@@ -1,5 +1,5 @@
 # ==========================================================
-# Cohesity Backup Validation – DISPLAY + TXT REPORT OUTPUT
+# Cohesity Backup Validation – DISPLAY + TXT + CSV OUTPUT
 # GET ONLY | SEARCH ONLY | FAST CLUSTER DISCOVERY
 #
 # - Reads CIs from CSV
@@ -9,11 +9,13 @@
 # - Falls back to all clusters only if global search returns object but no clusterId
 # - Displays full report on screen
 # - Writes same report to TXT
+# - Writes clean final CSV
+# - Writes validation CSV with source/replica selection details
 #
 # BackupType:
 # SQL / Oracle / FS / NAS / Hyper-V / Nutanix / VMware / Unknown
 #
-# Important fixes:
+# Important logic:
 # - BackupType is derived only from Cohesity environment/type metadata
 # - PG name / object name / display name are NOT used for BackupType
 # - SQL/Oracle prefer kRegular and ignore kLog
@@ -39,7 +41,10 @@ $BaseDir   = "X:\PowerShell\Data\Cohesity\BackupValidation"
 $InputCsv  = Join-Path $BaseDir "$ChangeID.csv"
 $InputTxt  = Join-Path $BaseDir "$ChangeID.txt"
 $TimeStamp = Get-Date -Format "yyyyMMdd_HHmm"
-$OutputTxt = Join-Path $BaseDir "${ChangeID}_BackupReport_$TimeStamp.txt"
+
+$OutputTxt     = Join-Path $BaseDir "${ChangeID}_BackupReport_$TimeStamp.txt"
+$OutputCsv     = Join-Path $BaseDir "${ChangeID}_BackupReport_$TimeStamp.csv"
+$ValidationCsv = Join-Path $BaseDir "${ChangeID}_BackupValidation_Details_$TimeStamp.csv"
 
 if (-not (Test-Path $InputCsv)) {
     throw "CSV not found: $InputCsv"
@@ -63,8 +68,8 @@ $BaseUrl = "https://helios.cohesity.com"
 
 $GlobalSearchCount = 100
 
-# Keeps the script fast.
-# If global search finds object but cannot return clusterId, fallback to all clusters.
+# Fast mode.
+# If global search finds an object but cannot return clusterId, fallback to all clusters.
 $EnableAllClusterFallback = $true
 
 # Keep false for speed.
@@ -72,7 +77,7 @@ $EnableAllClusterFallback = $true
 $FallbackWhenNoGlobalObject = $false
 
 # SQL/Oracle:
-# true  = if runType is blank, allow the timestamp because some responses do not expose runType
+# true  = if runType is blank, allow timestamp because some responses do not expose runType
 # false = only kRegular/Regular is accepted
 $AllowBlankRunTypeForDb = $true
 
@@ -450,10 +455,10 @@ function Add-CandidateDetail {
     $Seen[$Key] = $true
 
     [void]$List.Add([pscustomobject]@{
-        clusterId                = "$ClusterId"
-        clusterName              = "$ClusterName"
-        fallbackProtectionGroup  = "$ProtectionGroup"
-        searchMode               = "$SearchMode"
+        clusterId               = "$ClusterId"
+        clusterName             = "$ClusterName"
+        fallbackProtectionGroup = "$ProtectionGroup"
+        searchMode              = "$SearchMode"
     })
 }
 
@@ -470,7 +475,6 @@ function Get-CandidateDetailsFromGlobalSearch {
 
     foreach ($Obj in $Objects) {
 
-        # objectProtectionInfos -> protectionGroups is the most useful path.
         foreach ($ProtectionInfo in (AsArray $Obj.objectProtectionInfos)) {
 
             $HasPg = $false
@@ -501,7 +505,6 @@ function Get-CandidateDetailsFromGlobalSearch {
                     -SearchMode "Fast"
             }
 
-            # OPI has cluster but no PG array.
             if (-not $HasPg) {
                 $ClusterId = Get-ClusterIdFromSearchNode `
                     -Object $Obj `
@@ -525,7 +528,6 @@ function Get-CandidateDetailsFromGlobalSearch {
             }
         }
 
-        # Direct object.protectionGroups if present.
         foreach ($Pg2 in (AsArray $Obj.protectionGroups)) {
             $ClusterId = Get-ClusterIdFromSearchNode `
                 -Object $Obj `
@@ -550,7 +552,6 @@ function Get-CandidateDetailsFromGlobalSearch {
                 -SearchMode "Fast"
         }
 
-        # Object-level fallback.
         $ObjectClusterId = Get-ClusterIdFromSearchNode `
             -Object $Obj `
             -ProtectionInfo $null `
@@ -691,7 +692,6 @@ function Get-BackupType {
         $Snapshot
     )
 
-    # Important:
     # Do NOT use object name, display name, PG name, or policy name here.
     # BackupType must be from Cohesity environment/type fields only.
 
@@ -755,7 +755,6 @@ function Get-SnapshotUsecs {
         return $null
     }
 
-    # Prefer end time, then creation/start.
     foreach ($Field in @(
         $Snapshot.protectionRunEndTimeUsecs,
         $Snapshot.runEndTimeUsecs,
@@ -838,7 +837,6 @@ function Get-BestSnapshot {
 
     if ($BackupType -in @("SQL", "Oracle")) {
 
-        # First preference: kRegular / Regular.
         $RegularSnaps = @($Snapshots | Where-Object {
             $rt = (Get-SnapshotRunType -Snapshot $_).ToLower()
             $rt -match "kregular|regular"
@@ -850,7 +848,6 @@ function Get-BestSnapshot {
                 Select-Object -First 1
         }
 
-        # Explicitly ignore kLog / Log.
         $NonLogSnaps = @($Snapshots | Where-Object {
             $rt = (Get-SnapshotRunType -Snapshot $_).ToLower()
 
@@ -874,7 +871,6 @@ function Get-BestSnapshot {
         return $null
     }
 
-    # Non-DB: use latest non-log snapshot.
     $AllowedSnaps = @($Snapshots | Where-Object {
         $rt = (Get-SnapshotRunType -Snapshot $_).ToLower()
         $rt -notmatch "klog|\blog\b"
@@ -1041,7 +1037,6 @@ function Select-BestRowsForCi {
 
         $GroupRows = @($Group.Group)
 
-        # 1. Valid source/original row first.
         $ValidSourceRows = @($GroupRows | Where-Object {
             (Is-ValidBackupTime $_.LastBackupTime) -and (-not $_.IsReplicatedCopy)
         })
@@ -1059,7 +1054,6 @@ function Select-BestRowsForCi {
             continue
         }
 
-        # 2. Valid replicated row only if source/original row does not exist.
         $ValidReplicaRows = @($GroupRows | Where-Object {
             (Is-ValidBackupTime $_.LastBackupTime) -and ($_.IsReplicatedCopy)
         })
@@ -1077,7 +1071,6 @@ function Select-BestRowsForCi {
             continue
         }
 
-        # 3. Invalid source row.
         $InvalidSourceRows = @($GroupRows | Where-Object {
             -not $_.IsReplicatedCopy
         })
@@ -1092,7 +1085,6 @@ function Select-BestRowsForCi {
             continue
         }
 
-        # 4. Last fallback: invalid replicated row.
         $Selected += (
             $GroupRows |
             Sort-Object ClusterName, ProtectionGroup |
@@ -1169,6 +1161,7 @@ foreach ($Clu in $Clusters) {
 # Process
 # ==========================================================
 $Results = @()
+$ValidationResults = @()
 
 foreach ($Ci in $CiList) {
 
@@ -1217,20 +1210,6 @@ foreach ($Ci in $CiList) {
 
         if ($ShouldFallback) {
             $FallbackCiCount++
-
-            foreach ($Clu in $Clusters) {
-                $ClusterName = Get-FirstText @($Clu.clusterName, $Clu.name, $Clu.displayName)
-
-                Add-CandidateDetail `
-                    -List ([System.Collections.ArrayList]$CandidateClusters) `
-                    -Seen @{} `
-                    -ClusterId "$($Clu.clusterId)" `
-                    -ClusterName "$ClusterName" `
-                    -ProtectionGroup "-" `
-                    -SearchMode "Fallback"
-            }
-
-            # The cast above is awkward with arrays, so rebuild fallback directly.
             $CandidateClusters = @()
 
             foreach ($Clu in $Clusters) {
@@ -1251,6 +1230,7 @@ foreach ($Ci in $CiList) {
     }
 
     if (-not $CandidateClusters -or $CandidateClusters.Count -eq 0) {
+
         $Results += [pscustomobject]@{
             ServerName      = $Ci
             BackupType      = "Unknown"
@@ -1259,13 +1239,28 @@ foreach ($Ci in $CiList) {
             LastBackupTime  = "NoObject"
         }
 
+        $ValidationResults += [pscustomobject]@{
+            ServerName                 = $Ci
+            BackupType                 = "Unknown"
+            ClusterName                = "-"
+            ClusterId                  = ""
+            ProtectionGroup            = "-"
+            LastBackupTime             = "NoObject"
+            LastBackupUsecs            = 0
+            RunType                    = ""
+            IsReplicatedCopy           = $false
+            ReplicationSourceClusterId = ""
+            SearchMode                 = ""
+            SelectionNote              = "No candidate cluster found from global search"
+        }
+
         continue
     }
 
     # ------------------------------------------------------
     # STEP 2:
     # Search protected-objects on candidate clusters.
-    # Also add source cluster if replicated row points to source.
+    # Add source cluster if replicated row points to source.
     # ------------------------------------------------------
     $SearchQueue = New-Object System.Collections.ArrayList
     $SearchedClusters = @{}
@@ -1279,7 +1274,6 @@ foreach ($Ci in $CiList) {
     for ($i = 0; $i -lt $SearchQueue.Count; $i++) {
 
         $Clu = $SearchQueue[$i]
-
         $ClusterId = "$($Clu.clusterId)"
 
         if ([string]::IsNullOrWhiteSpace($ClusterId)) {
@@ -1361,13 +1355,9 @@ foreach ($Ci in $CiList) {
                 $ReplicationSourceAdds++
             }
 
-            # First classify using object metadata only.
             $PreBackupType = Get-BackupType -Object $Obj -Snapshot $null
-
-            # Then pick snapshot according to type.
             $Snap = Get-BestSnapshot -Object $Obj -BackupType $PreBackupType
 
-            # Re-classify with snapshot metadata also.
             $BackupType = Get-BackupType -Object $Obj -Snapshot $Snap
 
             if ([string]::IsNullOrWhiteSpace($BackupType)) {
@@ -1378,7 +1368,6 @@ foreach ($Ci in $CiList) {
                 $BackupType = "Unknown"
             }
 
-            # If final type changed after snapshot metadata, re-select snapshot.
             if ($BackupType -ne $PreBackupType) {
                 $Snap = Get-BestSnapshot -Object $Obj -BackupType $BackupType
             }
@@ -1413,6 +1402,8 @@ foreach ($Ci in $CiList) {
                 $ReplicationSourceAdds++
             }
 
+            $RunType = Get-SnapshotRunType -Snapshot $Snap
+
             if ($Snap) {
                 $Usecs = Get-SnapshotUsecs -Snapshot $Snap
 
@@ -1432,11 +1423,14 @@ foreach ($Ci in $CiList) {
                     ServerName                 = $Ci
                     BackupType                 = $BackupType
                     ClusterName                = $ClusterName
+                    ClusterId                  = $ClusterId
                     ProtectionGroup            = $ProtectionGroup
                     LastBackupTime             = $LastBackupTime
                     LastBackupUsecs            = if ($Usecs) { [int64]$Usecs } else { 0 }
+                    RunType                    = $RunType
                     IsReplicatedCopy           = $IsReplicatedCopy
                     ReplicationSourceClusterId = $ReplicationSourceClusterId
+                    SearchMode                 = "$($Clu.searchMode)"
                 }
             }
             else {
@@ -1449,17 +1443,21 @@ foreach ($Ci in $CiList) {
                     ServerName                 = $Ci
                     BackupType                 = $BackupType
                     ClusterName                = $ClusterName
+                    ClusterId                  = $ClusterId
                     ProtectionGroup            = $ProtectionGroup
                     LastBackupTime             = "NoBackup"
                     LastBackupUsecs            = 0
+                    RunType                    = ""
                     IsReplicatedCopy           = $IsReplicatedCopy
                     ReplicationSourceClusterId = $ReplicationSourceClusterId
+                    SearchMode                 = "$($Clu.searchMode)"
                 }
             }
         }
     }
 
     if (-not $CiRows -or $CiRows.Count -eq 0) {
+
         $Results += [pscustomobject]@{
             ServerName      = $Ci
             BackupType      = "Unknown"
@@ -1468,10 +1466,24 @@ foreach ($Ci in $CiList) {
             LastBackupTime  = "NoObject"
         }
 
+        $ValidationResults += [pscustomobject]@{
+            ServerName                 = $Ci
+            BackupType                 = "Unknown"
+            ClusterName                = "-"
+            ClusterId                  = ""
+            ProtectionGroup            = "-"
+            LastBackupTime             = "NoObject"
+            LastBackupUsecs            = 0
+            RunType                    = ""
+            IsReplicatedCopy           = $false
+            ReplicationSourceClusterId = ""
+            SearchMode                 = ""
+            SelectionNote              = "Candidate clusters searched but no protected-object rows returned"
+        }
+
         continue
     }
 
-    # Drop Unknown if known types exist.
     $KnownRows = @($CiRows | Where-Object {
         $_.BackupType -ne "Unknown"
     })
@@ -1480,11 +1492,10 @@ foreach ($Ci in $CiList) {
         $CiRows = $KnownRows
     }
 
-    # Final row selection:
-    # Valid source/original > valid replicated > invalid source > invalid replicated
     $SelectedRows = @(Select-BestRowsForCi -Rows $CiRows)
 
     foreach ($Row in $SelectedRows) {
+
         $Results += [pscustomobject]@{
             ServerName      = $Row.ServerName
             BackupType      = $Row.BackupType
@@ -1492,9 +1503,23 @@ foreach ($Ci in $CiList) {
             ProtectionGroup = $Row.ProtectionGroup
             LastBackupTime  = $Row.LastBackupTime
         }
+
+        $ValidationResults += [pscustomobject]@{
+            ServerName                 = $Row.ServerName
+            BackupType                 = $Row.BackupType
+            ClusterName                = $Row.ClusterName
+            ClusterId                  = $Row.ClusterId
+            ProtectionGroup            = $Row.ProtectionGroup
+            LastBackupTime             = $Row.LastBackupTime
+            LastBackupUsecs            = $Row.LastBackupUsecs
+            RunType                    = $Row.RunType
+            IsReplicatedCopy           = $Row.IsReplicatedCopy
+            ReplicationSourceClusterId = $Row.ReplicationSourceClusterId
+            SearchMode                 = $Row.SearchMode
+            SelectionNote              = if ($Row.IsReplicatedCopy) { "Replicated row selected - source/original row not found" } else { "Source/original row selected" }
+        }
     }
 
-    # If SQL or Oracle backup exists but no FS backup exists, show that clearly.
     $HasSQL = @($SelectedRows | Where-Object {
         $_.BackupType -eq "SQL" -and (Is-ValidBackupTime $_.LastBackupTime)
     }).Count -gt 0
@@ -1510,12 +1535,28 @@ foreach ($Ci in $CiList) {
     $HasDBBackup = $HasSQL -or $HasOracle
 
     if ($HasDBBackup -and -not $HasFS) {
+
         $Results += [pscustomobject]@{
             ServerName      = $Ci
             BackupType      = "FS"
             ClusterName     = "-"
             ProtectionGroup = "-"
             LastBackupTime  = "NoFSBackupFound"
+        }
+
+        $ValidationResults += [pscustomobject]@{
+            ServerName                 = $Ci
+            BackupType                 = "FS"
+            ClusterName                = "-"
+            ClusterId                  = ""
+            ProtectionGroup            = "-"
+            LastBackupTime             = "NoFSBackupFound"
+            LastBackupUsecs            = 0
+            RunType                    = ""
+            IsReplicatedCopy           = $false
+            ReplicationSourceClusterId = ""
+            SearchMode                 = ""
+            SelectionNote              = "SQL/Oracle found but FS backup not found"
         }
     }
 }
@@ -1549,11 +1590,41 @@ $SortedResults = $Results |
         ClusterName,
         ProtectionGroup
 
+$SortedValidationResults = $ValidationResults |
+    Sort-Object `
+        ServerName,
+        @{ Expression = { Get-BackupTypeRank $_.BackupType } },
+        ClusterName,
+        ProtectionGroup
+
 $DetailsText = (
     $SortedResults |
     Format-Table ServerName, BackupType, ClusterName, ProtectionGroup, LastBackupTime -AutoSize |
     Out-String -Width 300
 ).TrimEnd()
+
+# ==========================================================
+# Export CSVs
+# ==========================================================
+$SortedResults |
+    Select-Object ServerName, BackupType, ClusterName, ProtectionGroup, LastBackupTime |
+    Export-Csv -Path $OutputCsv -NoTypeInformation
+
+$SortedValidationResults |
+    Select-Object `
+        ServerName,
+        BackupType,
+        ClusterName,
+        ClusterId,
+        ProtectionGroup,
+        LastBackupTime,
+        LastBackupUsecs,
+        RunType,
+        IsReplicatedCopy,
+        ReplicationSourceClusterId,
+        SearchMode,
+        SelectionNote |
+    Export-Csv -Path $ValidationCsv -NoTypeInformation
 
 # ==========================================================
 # Build Report
@@ -1601,13 +1672,15 @@ $Report += "- Fast Logic         : Global search identifies candidate clusterId 
 $Report += "- Fallback           : All-cluster scan is used only when global search finds an object but does not return clusterId"
 $Report += ""
 $Report += "----------------------------------------------------------"
-$Report += "Report Location"
+$Report += "Report Locations"
 $Report += "----------------------------------------------------------"
-$Report += $OutputTxt
+$Report += "TXT Report            : $OutputTxt"
+$Report += "Final CSV             : $OutputCsv"
+$Report += "Validation CSV        : $ValidationCsv"
 $Report += "=========================================================="
 
 # ==========================================================
-# Write Report
+# Write TXT Report
 # ==========================================================
 $Report | Set-Content -Path $OutputTxt
 
@@ -1642,7 +1715,9 @@ Write-Host ""
 Write-Host $DetailsText
 Write-Host ""
 Write-Host "----------------------------------------------------------"
-Write-Host "Report Location"
+Write-Host "Report Locations"
 Write-Host "----------------------------------------------------------"
-Write-Host $OutputTxt
+Write-Host "TXT Report            : $OutputTxt"
+Write-Host "Final CSV             : $OutputCsv"
+Write-Host "Validation CSV        : $ValidationCsv"
 Write-Host "=========================================================="
