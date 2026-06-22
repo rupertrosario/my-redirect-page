@@ -1,29 +1,26 @@
 # ==========================================================
-# Cohesity Backup Validation – Targeted SQL + Oracle + FS
+# Cohesity Backup Validation – SQL + Oracle + Server Backup
 # GET-only | No write operations
 #
-# Input:
+# Input CSV:
 #   X:\PowerShell\Data\Cohesity\BackupValidation\<ChangeID>.csv
-#   Required column: ci_item
+#
+# Required input column:
+#   ci_item
 #
 # Output:
-#   X:\PowerShell\Data\Cohesity\BackupValidation\<ChangeID>.txt
-#   X:\PowerShell\Data\Cohesity\BackupValidation\<ChangeID>_BackupReport_<timestamp>.txt
-#   X:\PowerShell\Data\Cohesity\BackupValidation\<ChangeID>_BackupReport_<timestamp>.csv
+#   <ChangeID>.txt
+#   <ChangeID>_BackupReport_<timestamp>.txt
+#   <ChangeID>_BackupReport_<timestamp>.csv
 #
-# Final columns:
-#   InputCI, BackupType, ObjectName, ClusterName, ProtectionGroup, LastBackupTime
+# Final CSV columns:
+#   InputCI,BackupType,ObjectName,ClusterName,ProtectionGroup,LastBackupTime
 #
-# SQL behavior:
-#   1. Try Helios object search for SQL PG candidates.
-#   2. If no SQL candidate is found, fallback to active SQL PG list.
-#   3. For candidate SQL PGs:
-#        - discover DB names from any recent SQL run object details
-#        - get latest successful regular SQL PG backup time
-#        - report DB names with latest successful PG backup time
+# Backup types:
+#   SQL, Oracle, FS, VMware, Hyper-V, Nutanix, NAS, Unknown
 #
-# Safe:
-#   Uses GET only.
+# Safety:
+#   GET-only.
 #   No POST / PUT / PATCH / DELETE.
 # ==========================================================
 
@@ -169,10 +166,12 @@ function Get-FirstText {
     if ($Value -is [array]) {
         foreach ($item in $Value) {
             $v = Get-FirstText $item
+
             if (-not [string]::IsNullOrWhiteSpace($v)) {
                 return "$v".Trim()
             }
         }
+
         return ""
     }
 
@@ -191,6 +190,7 @@ function Get-FirstText {
         )) {
             if ($Value.PSObject.Properties.Name -contains $prop) {
                 $v = Get-FirstText $Value.$prop
+
                 if (-not [string]::IsNullOrWhiteSpace($v)) {
                     return "$v".Trim()
                 }
@@ -294,6 +294,28 @@ function Text-MatchesName {
     return $false
 }
 
+function Get-SearchVariants {
+    param([string]$Value)
+
+    $list = New-Object System.Collections.ArrayList
+
+    if ([string]::IsNullOrWhiteSpace($Value)) {
+        return @()
+    }
+
+    $v = "$Value".Trim()
+
+    Add-UniqueText -List $list -Value $v
+    Add-UniqueText -List $list -Value $v.ToLower()
+    Add-UniqueText -List $list -Value $v.ToUpper()
+
+    if ($v -match "\.") {
+        Add-UniqueText -List $list -Value (($v -split "\.")[0])
+    }
+
+    return @($list)
+}
+
 function Test-SuccessStatus {
     param([string]$Status)
 
@@ -326,6 +348,7 @@ function Is-ValidBackupTime {
     }
 
     return $Value -notin @(
+        "Unknown",
         "NoObject",
         "NoBackup",
         "NoBackupTime",
@@ -341,10 +364,14 @@ function Get-BackupTypeRank {
     param([string]$BackupType)
 
     switch ($BackupType) {
-        "SQL"    { return 1 }
-        "Oracle" { return 2 }
-        "FS"     { return 3 }
-        default  { return 9 }
+        "SQL"     { return 1 }
+        "Oracle"  { return 2 }
+        "FS"      { return 3 }
+        "VMware"  { return 4 }
+        "Hyper-V" { return 5 }
+        "Nutanix" { return 6 }
+        "NAS"     { return 7 }
+        default   { return 9 }
     }
 }
 
@@ -385,11 +412,18 @@ function Get-SearchTermsForSql {
     $terms = New-Object System.Collections.ArrayList
 
     if ($Context.IsDbAtServer) {
-        Add-UniqueText -List $terms -Value $Context.DbName
-        Add-UniqueText -List $terms -Value $Context.ServerName
+        foreach ($v in (Get-SearchVariants -Value $Context.DbName)) {
+            Add-UniqueText -List $terms -Value $v
+        }
+
+        foreach ($v in (Get-SearchVariants -Value $Context.ServerName)) {
+            Add-UniqueText -List $terms -Value $v
+        }
     }
     else {
-        Add-UniqueText -List $terms -Value $Context.InputCI
+        foreach ($v in (Get-SearchVariants -Value $Context.InputCI)) {
+            Add-UniqueText -List $terms -Value $v
+        }
     }
 
     return @($terms)
@@ -858,7 +892,7 @@ function Get-SqlCandidatesFromActivePgList {
                 $pgText = ""
 
                 try {
-                    $pgText = ($pg | ConvertTo-Json -Depth 40 -Compress)
+                    $pgText = ($pg | ConvertTo-Json -Depth 40 -Compress).ToLower()
                 }
                 catch {
                     $pgText = ""
@@ -869,7 +903,7 @@ function Get-SqlCandidatesFromActivePgList {
                         continue
                     }
 
-                    if ($pgText.ToLower().Contains("$term".ToLower())) {
+                    if ($pgText.Contains("$term".ToLower())) {
                         $matched = $true
                         break
                     }
@@ -932,7 +966,7 @@ function Get-RunEndUsecsFromRun {
 }
 
 # ==========================================================
-# Snapshot Helpers for FS / Oracle fallback
+# Snapshot Helpers
 # ==========================================================
 function Get-SnapshotArray {
     param([object]$Obj)
@@ -1094,9 +1128,9 @@ function Get-PgNameFromProtectedObject {
 }
 
 # ==========================================================
-# FS Module
+# Server Backup Module: FS / VMware / Hyper-V / Nutanix / NAS
 # ==========================================================
-function Get-FsRows {
+function Get-ServerBackupRows {
     param(
         [object]$Context,
         [string]$ServerName,
@@ -1109,63 +1143,85 @@ function Get-FsRows {
         return @()
     }
 
-    $candidates = Get-SearchCandidates `
-        -SearchTerm $ServerName `
-        -Environment "kPhysical" `
-        -ClusterMap $ClusterMap
+    $envMap = @(
+        [pscustomobject]@{ Environment = "kPhysical";   BackupType = "FS" }
+        [pscustomobject]@{ Environment = "kVMware";     BackupType = "VMware" }
+        [pscustomobject]@{ Environment = "kHyperV";     BackupType = "Hyper-V" }
+        [pscustomobject]@{ Environment = "kAcropolis";  BackupType = "Nutanix" }
+        [pscustomobject]@{ Environment = "kGenericNas"; BackupType = "NAS" }
+        [pscustomobject]@{ Environment = "kIsilon";     BackupType = "NAS" }
+    )
 
-    foreach ($candidate in $candidates) {
-        if ([string]::IsNullOrWhiteSpace($candidate.ClusterId)) {
-            continue
+    $searchTerms = @(Get-SearchVariants -Value $ServerName)
+
+    foreach ($map in $envMap) {
+
+        $candidatesAll = @()
+
+        foreach ($term in $searchTerms) {
+            $candidatesAll += @(Get-SearchCandidates `
+                -SearchTerm $term `
+                -Environment $map.Environment `
+                -ClusterMap $ClusterMap)
         }
 
-        $clusterName = Get-ClusterNameFromMap -ClusterId $candidate.ClusterId -ClusterMap $ClusterMap
+        $candidates = @(Get-UniqueCandidates -Candidates $candidatesAll)
 
-        $headers = @{
-            accept          = "application/json"
-            apiKey          = $ApiKey
-            accessClusterId = "$($candidate.ClusterId)"
-        }
-
-        $script:ProtectedSearchCalls++
-
-        $url = New-SearchUrl `
-            -Endpoint "/v2/data-protect/search/protected-objects" `
-            -SearchTerm $ServerName `
-            -Environment "kPhysical"
-
-        $json = Invoke-HeliosGetJson -Uri $url -Headers $headers -Quiet
-        $objects = @(Get-ObjectArrayFromJson $json)
-
-        foreach ($obj in $objects) {
-            $objName = Get-ObjectNameFromProtectedObject $obj
-
-            if (-not (Text-MatchesName -Text $objName -Name $ServerName)) {
+        foreach ($candidate in $candidates) {
+            if ([string]::IsNullOrWhiteSpace($candidate.ClusterId)) {
                 continue
             }
 
-            $snap = Get-BestSnapshot -Obj $obj -BackupType "FS"
+            $clusterName = Get-ClusterNameFromMap -ClusterId $candidate.ClusterId -ClusterMap $ClusterMap
 
-            $usecs = 0
-            $timeText = "NoBackup"
-
-            if ($snap) {
-                $usecs = Get-SnapshotUsecs $snap
-                $timeText = if ($usecs -gt 0) { Convert-UsecsToET $usecs } else { "NoBackupTime" }
+            $headers = @{
+                accept          = "application/json"
+                apiKey          = $ApiKey
+                accessClusterId = "$($candidate.ClusterId)"
             }
 
-            $pgName = Get-PgNameFromProtectedObject -Obj $obj -Snap $snap -FallbackPgName $candidate.PgName
+            foreach ($term in $searchTerms) {
+                $script:ProtectedSearchCalls++
 
-            $rows += [pscustomobject]@{
-                InputCI         = $Context.InputCI
-                BackupType      = "FS"
-                ObjectName      = $ServerName
-                ClusterName     = $clusterName
-                ProtectionGroup = $pgName
-                LastBackupTime  = $timeText
-                LastBackupUsecs = $usecs
-                HostName        = $ServerName
-                Source          = "FSProtectedObject"
+                $url = New-SearchUrl `
+                    -Endpoint "/v2/data-protect/search/protected-objects" `
+                    -SearchTerm $term `
+                    -Environment $map.Environment
+
+                $json = Invoke-HeliosGetJson -Uri $url -Headers $headers -Quiet
+                $objects = @(Get-ObjectArrayFromJson $json)
+
+                foreach ($obj in $objects) {
+                    $objName = Get-ObjectNameFromProtectedObject $obj
+
+                    if (-not (Text-MatchesName -Text $objName -Name $ServerName)) {
+                        continue
+                    }
+
+                    $snap = Get-BestSnapshot -Obj $obj -BackupType $map.BackupType
+
+                    $usecs = 0
+                    $timeText = "NoBackup"
+
+                    if ($snap) {
+                        $usecs = Get-SnapshotUsecs $snap
+                        $timeText = if ($usecs -gt 0) { Convert-UsecsToET $usecs } else { "NoBackupTime" }
+                    }
+
+                    $pgName = Get-PgNameFromProtectedObject -Obj $obj -Snap $snap -FallbackPgName $candidate.PgName
+
+                    $rows += [pscustomobject]@{
+                        InputCI         = $Context.InputCI
+                        BackupType      = $map.BackupType
+                        ObjectName      = $objName
+                        ClusterName     = $clusterName
+                        ProtectionGroup = $pgName
+                        LastBackupTime  = $timeText
+                        LastBackupUsecs = $usecs
+                        HostName        = $objName
+                        Source          = "$($map.BackupType)ProtectedObject"
+                    }
+                }
             }
         }
     }
@@ -1174,7 +1230,7 @@ function Get-FsRows {
 }
 
 # ==========================================================
-# SQL Module - DB Discovery from Any Recent Run + PG Success Time
+# SQL Module
 # ==========================================================
 function Test-SqlDbCandidate {
     param(
@@ -1555,7 +1611,6 @@ function Get-TargetedSqlRowsFromPg {
             $dbMatches   = Text-MatchesName -Text $dbName -Name $Context.InputCI
             $hostMatches = Text-MatchesName -Text $hostName -Name $Context.InputCI
 
-            # Server input: if host is blank, still include DBs from candidate PG.
             if (-not $dbMatches -and -not $hostMatches -and
                 -not [string]::IsNullOrWhiteSpace($hostName)) {
                 continue
@@ -1981,84 +2036,6 @@ function Get-TargetedOracleRowsFromPg {
     return @($rows)
 }
 
-function Get-OracleFallbackRowsFromProtectedObjects {
-    param(
-        [object]$Context,
-        [string]$SearchTerm,
-        [object[]]$Candidates,
-        [hashtable]$ClusterMap
-    )
-
-    $rows = @()
-
-    foreach ($candidate in ($Candidates | Where-Object { -not [string]::IsNullOrWhiteSpace($_.ClusterId) })) {
-        $clusterId = "$($candidate.ClusterId)"
-        $clusterName = Get-ClusterNameFromMap -ClusterId $clusterId -ClusterMap $ClusterMap
-
-        $headers = @{
-            accept          = "application/json"
-            apiKey          = $ApiKey
-            accessClusterId = "$clusterId"
-        }
-
-        $script:ProtectedSearchCalls++
-
-        $url = New-SearchUrl `
-            -Endpoint "/v2/data-protect/search/protected-objects" `
-            -SearchTerm $SearchTerm `
-            -Environment "kOracle"
-
-        $json = Invoke-HeliosGetJson -Uri $url -Headers $headers -Quiet
-        $objects = @(Get-ObjectArrayFromJson $json)
-
-        foreach ($obj in $objects) {
-            $objName = Get-ObjectNameFromProtectedObject $obj
-
-            if ($Context.IsDbAtServer) {
-                if (-not (Text-MatchesName -Text $objName -Name $Context.DbName)) {
-                    continue
-                }
-
-                $objName = $Context.DbName
-            }
-            else {
-                $objMatches = Text-MatchesName -Text $objName -Name $Context.InputCI
-                $pgMatches = Text-MatchesName -Text "$($candidate.PgName)" -Name $Context.InputCI
-
-                if (-not $objMatches -and -not $pgMatches) {
-                    continue
-                }
-            }
-
-            $snap = Get-BestSnapshot -Obj $obj -BackupType "Oracle"
-
-            $usecs = 0
-            $timeText = "NoBackup"
-
-            if ($snap) {
-                $usecs = Get-SnapshotUsecs $snap
-                $timeText = if ($usecs -gt 0) { Convert-UsecsToET $usecs } else { "NoBackupTime" }
-            }
-
-            $pgName = Get-PgNameFromProtectedObject -Obj $obj -Snap $snap -FallbackPgName "$($candidate.PgName)"
-
-            $rows += [pscustomobject]@{
-                InputCI         = $Context.InputCI
-                BackupType      = "Oracle"
-                ObjectName      = $objName
-                ClusterName     = $clusterName
-                ProtectionGroup = $pgName
-                LastBackupTime  = $timeText
-                LastBackupUsecs = $usecs
-                HostName        = ""
-                Source          = "OracleProtectedObjectFallback"
-            }
-        }
-    }
-
-    return @($rows)
-}
-
 # ==========================================================
 # Row Selection
 # ==========================================================
@@ -2151,24 +2128,26 @@ foreach ($ci in $CiList) {
     $dbHostNames = New-Object System.Collections.ArrayList
 
     if ($context.IsDbAtServer) {
-        $fsSearchTerm = $context.ServerName
-        $oraSearchTerm = $context.DbName
+        $serverSearchTerm = $context.ServerName
+        $oraSearchTerm    = $context.DbName
     }
     else {
-        $fsSearchTerm = $context.InputCI
-        $oraSearchTerm = $context.InputCI
+        $serverSearchTerm = $context.InputCI
+        $oraSearchTerm    = $context.InputCI
     }
 
     # -------------------------
-    # FS validation
+    # Server backup validation: FS / VMware / Hyper-V / Nutanix / NAS
     # -------------------------
-    $fsRows = @(Get-FsRows -Context $context -ServerName $fsSearchTerm -ClusterMap $ClusterMap)
-    $ciRows += $fsRows
+    $serverBackupRows = @(Get-ServerBackupRows `
+        -Context $context `
+        -ServerName $serverSearchTerm `
+        -ClusterMap $ClusterMap)
+
+    $ciRows += $serverBackupRows
 
     # -------------------------
     # SQL targeted validation
-    # Step 1: Helios object search
-    # Step 2: Active SQL PG list fallback
     # -------------------------
     $sqlCandidatesAll = @()
     $sqlTerms = @(Get-SearchTermsForSql -Context $context)
@@ -2192,19 +2171,7 @@ foreach ($ci in $CiList) {
     }
 
     if ($sqlCandidates.Count -eq 0) {
-        Write-Host "  No SQL PG candidate found for $($context.InputCI)" -ForegroundColor DarkYellow
-
-        $ciRows += [pscustomobject]@{
-            InputCI         = $context.InputCI
-            BackupType      = "SQL"
-            ObjectName      = $context.InputCI
-            ClusterName     = "-"
-            ProtectionGroup = "-"
-            LastBackupTime  = "NoSqlPgCandidateFound"
-            LastBackupUsecs = 0
-            HostName        = ""
-            Source          = "NoSqlPgCandidateFound"
-        }
+        Write-Host "  No SQL PG candidate found for $($context.InputCI). Continuing with server backup result if available." -ForegroundColor DarkYellow
     }
     else {
         Write-Host "  SQL PG candidates found: $($sqlCandidates.Count)" -ForegroundColor Green
@@ -2235,10 +2202,16 @@ foreach ($ci in $CiList) {
     # -------------------------
     # Oracle targeted validation
     # -------------------------
-    $oraCandidates = @(Get-SearchCandidates `
-        -SearchTerm $oraSearchTerm `
-        -Environment "kOracle" `
-        -ClusterMap $ClusterMap)
+    $oraCandidatesAll = @()
+
+    foreach ($oraTerm in (Get-SearchVariants -Value $oraSearchTerm)) {
+        $oraCandidatesAll += @(Get-SearchCandidates `
+            -SearchTerm $oraTerm `
+            -Environment "kOracle" `
+            -ClusterMap $ClusterMap)
+    }
+
+    $oraCandidates = @(Get-UniqueCandidates -Candidates $oraCandidatesAll)
 
     foreach ($candidate in $oraCandidates) {
         if ($EnableTargetedOraclePgInspection -and -not [string]::IsNullOrWhiteSpace($candidate.PgId)) {
@@ -2260,44 +2233,38 @@ foreach ($ci in $CiList) {
         }
     }
 
-    $hasOraRows = @($ciRows | Where-Object { $_.BackupType -eq "Oracle" }).Count -gt 0
-
-    if (-not $hasOraRows -and $oraCandidates.Count -gt 0) {
-        $ciRows += @(Get-OracleFallbackRowsFromProtectedObjects `
-            -Context $context `
-            -SearchTerm $oraSearchTerm `
-            -Candidates $oraCandidates `
-            -ClusterMap $ClusterMap)
-    }
-
     # -------------------------
-    # DB-name-only host -> FS check
+    # If DB-only input found DB host, also check server backup for host
     # -------------------------
     if (-not $context.IsDbAtServer -and $dbHostNames.Count -gt 0) {
-        $hasFsAlready = @($ciRows | Where-Object {
-            $_.BackupType -eq "FS" -and
+        $hasServerBackupAlready = @($ciRows | Where-Object {
+            $_.BackupType -in @("FS", "VMware", "Hyper-V", "Nutanix", "NAS") -and
             (Is-ValidBackupTime $_.LastBackupTime)
         }).Count -gt 0
 
-        if (-not $hasFsAlready) {
+        if (-not $hasServerBackupAlready) {
             foreach ($hostName in @($dbHostNames)) {
-                $hostFsRows = @(Get-FsRows -Context $context -ServerName $hostName -ClusterMap $ClusterMap)
-                $ciRows += $hostFsRows
+                $hostRows = @(Get-ServerBackupRows `
+                    -Context $context `
+                    -ServerName $hostName `
+                    -ClusterMap $ClusterMap)
+
+                $ciRows += $hostRows
             }
         }
     }
 
     # -------------------------
-    # No result
+    # Unknown if nothing found
     # -------------------------
     if (-not $ciRows -or $ciRows.Count -eq 0) {
         $Results += [pscustomobject]@{
             InputCI         = $context.InputCI
             BackupType      = "Unknown"
-            ObjectName      = "-"
+            ObjectName      = $context.InputCI
             ClusterName     = "-"
             ProtectionGroup = "-"
-            LastBackupTime  = "NoObject"
+            LastBackupTime  = "Unknown"
         }
 
         continue
@@ -2320,32 +2287,32 @@ foreach ($ci in $CiList) {
     }
 
     # -------------------------
-    # Add NoFSBackupFound when DB found but FS not found
+    # Add NoFSBackupFound only when DB backup exists but no server backup exists
     # -------------------------
     $hasDbBackup = @($selected | Where-Object {
         $_.BackupType -in @("SQL", "Oracle") -and
         (Is-ValidBackupTime $_.LastBackupTime)
     }).Count -gt 0
 
-    $hasFsBackup = @($selected | Where-Object {
-        $_.BackupType -eq "FS" -and
+    $hasServerBackup = @($selected | Where-Object {
+        $_.BackupType -in @("FS", "VMware", "Hyper-V", "Nutanix", "NAS") -and
         (Is-ValidBackupTime $_.LastBackupTime)
     }).Count -gt 0
 
-    if ($hasDbBackup -and -not $hasFsBackup) {
-        $fsObject = "-"
+    if ($hasDbBackup -and -not $hasServerBackup) {
+        $serverObject = "-"
 
         if ($context.IsDbAtServer) {
-            $fsObject = $context.ServerName
+            $serverObject = $context.ServerName
         }
         elseif ($dbHostNames.Count -gt 0) {
-            $fsObject = (@($dbHostNames) -join ";")
+            $serverObject = (@($dbHostNames) -join ";")
         }
 
         $Results += [pscustomobject]@{
             InputCI         = $context.InputCI
             BackupType      = "FS"
-            ObjectName      = $fsObject
+            ObjectName      = $serverObject
             ClusterName     = "-"
             ProtectionGroup = "-"
             LastBackupTime  = "NoFSBackupFound"
@@ -2371,8 +2338,8 @@ $BackedUp = @($SortedResults | Where-Object {
     Is-ValidBackupTime $_.LastBackupTime
 }).Count
 
-$NoObject = @($SortedResults | Where-Object {
-    $_.LastBackupTime -eq "NoObject"
+$Unknown = @($SortedResults | Where-Object {
+    $_.LastBackupTime -eq "Unknown"
 }).Count
 
 $NoBackup = @($SortedResults | Where-Object {
@@ -2419,8 +2386,8 @@ $Report += "Total Input CIs            : $TotalInputCIs"
 $Report += "Total Backup Rows          : $TotalBackupRows"
 $Report += "Backed Up                  : $BackedUp"
 $Report += "No Backup                  : $NoBackup"
-$Report += "No FS Backup Found         : $NoFSBackupFound"
-$Report += "No Object                  : $NoObject"
+$Report += "No Server Backup Found     : $NoFSBackupFound"
+$Report += "Unknown                    : $Unknown"
 $Report += ""
 $Report += "Global Search Calls        : $script:GlobalSearchCalls"
 $Report += "Protected Search Calls     : $script:ProtectedSearchCalls"
@@ -2447,17 +2414,17 @@ $Report += "Validation Scope / Limitations"
 $Report += "----------------------------------------------------------"
 $Report += "- This is a best-effort Cohesity backup validation report."
 $Report += "- The script uses GET-only API calls."
+$Report += "- Matching inside PowerShell is case-insensitive."
+$Report += "- API searches use original, lowercase, uppercase, and short-hostname variants."
+$Report += "- Server backup validation checks kPhysical, kVMware, kHyperV, kAcropolis, kGenericNas, and kIsilon."
 $Report += "- SQL candidate discovery first uses Helios object search."
 $Report += "- If SQL object search fails, the script lists active SQL Protection Groups and matches by PG name or PG JSON content."
 $Report += "- SQL DB names are discovered from recent SQL run object details where DB objects are exposed."
 $Report += "- SQL LastBackupTime is based on the latest successful regular run of the same SQL Protection Group."
 $Report += "- This is correlated DB validation: DB list evidence and successful backup time come from the same PG, but not necessarily the same run."
-$Report += "- SQL protected-object fallback is intentionally disabled because it can show the SQL server/source as if it were DB-level evidence."
 $Report += "- If SQL shows DbListNotDiscovered, the PG had a successful regular backup but recent run objects did not expose DB names."
-$Report += "- If SQL shows NoSqlPgCandidateFound, neither object search nor active SQL PG list matched the CI/server/DB name."
 $Report += "- Oracle DB details are shown only when targeted Oracle PG configuration exposes oracleParams/dbParams/dbChannels."
-$Report += "- FS validation uses kPhysical protected-object search."
-$Report += "- If expected DBs or server backups are missing, search manually in Cohesity using DB name, server name, PG name, VIP, and cluster node names."
+$Report += "- Unknown means no matching backup object was found in the checked environments."
 $Report += ""
 $Report += "----------------------------------------------------------"
 $Report += "Report Locations"
@@ -2485,8 +2452,8 @@ Write-Host "Total Input CIs            : $TotalInputCIs"
 Write-Host "Total Backup Rows          : $TotalBackupRows"
 Write-Host "Backed Up                  : $BackedUp"
 Write-Host "No Backup                  : $NoBackup"
-Write-Host "No FS Backup Found         : $NoFSBackupFound"
-Write-Host "No Object                  : $NoObject"
+Write-Host "No Server Backup Found     : $NoFSBackupFound"
+Write-Host "Unknown                    : $Unknown"
 Write-Host ""
 Write-Host "Global Search Calls        : $script:GlobalSearchCalls"
 Write-Host "Protected Search Calls     : $script:ProtectedSearchCalls"
