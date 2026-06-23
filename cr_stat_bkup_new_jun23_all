@@ -11,13 +11,18 @@
 # Output:
 #   ServerName, BackupType, ObjectName, SourceName, ClusterName, ProtectionGroup, LastBackupTime
 #
-# Important fixes:
+# Rules:
 # - Shortname + FQDN are merged into one CI identity.
-# - FS is NOT classified as DB only because server/FQDN contains DB.
+# - SQL SourceName    = objects.mssqlParams.hostInfo.name first.
+# - Oracle SourceName = objects.oracleParams.hostInfo.name ONLY.
+# - Oracle rows without oracleParams.hostInfo.name are skipped.
+# - Oracle DB rows are still extracted from oracleParams.
+# - FS is NOT classified as DB just because server/FQDN contains DB.
 # - Generic BackupType DB is removed.
-# - DB/CN fallback is only for SQL and Oracle.
-# - Oracle SourceName = objects.oracleParams.hostInfo.name only.
-# - SQL SourceName = objects.mssqlParams.hostInfo.name first.
+# - DB/CN name rule is only used to trigger extra SQL/Oracle fallback.
+# - No BackupLocation.
+# - No replication columns.
+# - No SyntheticReason.
 # - No Debug CSV.
 # ==========================================================
 
@@ -72,8 +77,8 @@ $GlobalSearchCount                     = 100
 $FallbackWhenNoGlobalObject            = $true
 $FallbackWhenDbMissingForDbNamedServer = $true
 
-# This only decides whether to do extra SQL/Oracle fallback.
-# It does NOT classify anything as DB.
+# Only used to trigger extra SQL/Oracle fallback.
+# This does NOT classify anything as DB.
 $DbServerNamePattern = '(?i)db|cn'
 
 $ShowProgress     = $true
@@ -141,10 +146,12 @@ function First-NonBlank {
         if ($v -is [array]) {
             foreach ($x in $v) {
                 $t = First-NonBlank -Values $x
+
                 if (-not [string]::IsNullOrWhiteSpace($t)) {
                     return "$t".Trim()
                 }
             }
+
             continue
         }
 
@@ -169,11 +176,13 @@ function First-NonBlank {
             )) {
                 if ($v.PSObject.Properties.Name -contains $p) {
                     $t = First-NonBlank -Values $v.$p
+
                     if (-not [string]::IsNullOrWhiteSpace($t)) {
                         return "$t".Trim()
                     }
                 }
             }
+
             continue
         }
 
@@ -328,8 +337,7 @@ function Is-ValidBackupTime {
         "NoBackup",
         "NoBackupTime",
         "NoObject",
-        "NoFSBackupFound",
-        "NoSqlOracleBackupFound"
+        "NoFSBackupFound"
     ))
 }
 
@@ -844,27 +852,30 @@ function Get-BackupType {
         return "Container"
     }
 
-    # Strict SQL detection.
+    if (-not [string]::IsNullOrWhiteSpace($FlatObject.BackupTypeHint)) {
+        if ($FlatObject.BackupTypeHint -in @("SQL", "Oracle")) {
+            return $FlatObject.BackupTypeHint
+        }
+    }
+
     if (-not [string]::IsNullOrWhiteSpace($FlatObject.SqlHostName)) {
         return "SQL"
     }
 
-    # Strict Oracle detection.
     if (-not [string]::IsNullOrWhiteSpace($FlatObject.OracleHostName)) {
         return "Oracle"
     }
 
     $envTypeText = "$($FlatObject.Environment) $($FlatObject.ObjectType)"
 
-    if ($envTypeText -match '(?i)kSQL') {
+    if ($envTypeText -match '(?i)kSQL|mssql') {
         return "SQL"
     }
 
-    if ($envTypeText -match '(?i)kOracle') {
+    if ($envTypeText -match '(?i)kOracle|kRACDatabase|kNonRACDatabase|kOracleDatabase') {
         return "Oracle"
     }
 
-    # VM detection.
     $vmType = Get-VmBackupTypeFromText `
         -Environment $FlatObject.Environment `
         -ObjectType $FlatObject.ObjectType `
@@ -876,8 +887,9 @@ function Get-BackupType {
         return $vmType
     }
 
-    # Anything else is FS.
-    # Do NOT use object/source name containing "db" to classify as DB.
+    # Critical:
+    # No generic DB classification.
+    # FS hostnames/FQDNs containing "db" must stay FS.
     return "FS"
 }
 
@@ -998,7 +1010,7 @@ function Get-ProtectionGroupName {
 }
 
 # ==========================================================
-# SQL / Oracle DB Name Extraction From Params Only
+# SQL / Oracle DB Name Extraction From Params
 # ==========================================================
 function Test-ValidDbName {
     param(
@@ -1137,37 +1149,106 @@ function Get-ParamDbRows {
 
     $rows = @()
 
-    if ([string]::IsNullOrWhiteSpace($SourceName) -or
-        (Test-OracleContainerName -Name $SourceName)) {
-        return @()
-    }
-
     $sqlHostName    = Get-SqlHostNameFromNode -Object $Object
     $oracleHostName = Get-OracleHostNameFromNode -Object $Object
 
+    $hasSqlParams = $false
+    $hasOracleParams = $false
+
+    if ($null -ne $Object.mssqlParams -or $null -ne $Object.sqlParams -or $null -ne $Object.mssql) {
+        $hasSqlParams = $true
+    }
+
+    if ($null -ne $Object.oracleParams) {
+        $hasOracleParams = $true
+    }
+
+    $envText = "$Environment $(Get-EnvironmentFromNode -Object $Object -ParentEnvironment $Environment) $(Get-ObjectTypeFromNode -Object $Object)"
+
+    if ($envText -match '(?i)kSQL|mssql') {
+        $hasSqlParams = $true
+    }
+
+    if ($envText -match '(?i)kOracle|kRACDatabase|kNonRACDatabase|kOracleDatabase') {
+        $hasOracleParams = $true
+    }
+
     # Critical:
-    # Only create DB child rows if real SQL/Oracle params exist.
-    # Never create DB rows from physical FS objects just because name contains DB.
-    if ([string]::IsNullOrWhiteSpace($sqlHostName) -and
-        [string]::IsNullOrWhiteSpace($oracleHostName)) {
+    # Only create DB child rows when the object is actually SQL/Oracle.
+    # Never create DB rows because the physical server name contains DB.
+    if (-not $hasSqlParams -and -not $hasOracleParams) {
         return @()
     }
 
-    $containers = @(
-        $Object.mssqlParams,
-        $Object.sqlParams,
-        $Object.oracleParams
-    )
+    $dbType = ""
+
+    if ($hasOracleParams) {
+        $dbType = "Oracle"
+    }
+    elseif ($hasSqlParams) {
+        $dbType = "SQL"
+    }
+
+    if ($dbType -eq "Oracle" -and [string]::IsNullOrWhiteSpace($oracleHostName)) {
+        return @()
+    }
+
+    if ($dbType -eq "SQL" -and [string]::IsNullOrWhiteSpace($sqlHostName)) {
+        return @()
+    }
+
+    $realSourceName = if ($dbType -eq "Oracle") {
+        $oracleHostName
+    }
+    elseif ($dbType -eq "SQL") {
+        $sqlHostName
+    }
+    else {
+        $SourceName
+    }
+
+    if ([string]::IsNullOrWhiteSpace($realSourceName) -or
+        (Test-OracleContainerName -Name $realSourceName)) {
+        return @()
+    }
+
+    $containers = @()
+
+    if ($dbType -eq "SQL") {
+        $containers += $Object.mssqlParams
+        $containers += $Object.sqlParams
+        $containers += $Object.mssql
+        $containers += $Object.databaseParams
+        $containers += $Object.dbParams
+        $containers += $Object.databaseInfo
+        $containers += $Object.databases
+        $containers += $Object.databaseList
+        $containers += $Object.protectedDatabases
+        $containers += $Object.selectedDatabases
+        $containers += $Object.includedDatabases
+    }
+
+    if ($dbType -eq "Oracle") {
+        $containers += $Object.oracleParams
+        $containers += $Object.databaseParams
+        $containers += $Object.dbParams
+        $containers += $Object.databaseInfo
+        $containers += $Object.databases
+        $containers += $Object.databaseList
+        $containers += $Object.protectedDatabases
+        $containers += $Object.selectedDatabases
+        $containers += $Object.includedDatabases
+    }
 
     $dbNames = @()
 
     foreach ($container in $containers) {
-        $dbNames += Find-DatabaseNames -Value $container -ServerName $SourceName
+        $dbNames += Find-DatabaseNames -Value $container -ServerName $realSourceName
     }
 
     $dbNames = @(
         $dbNames |
-        Where-Object { Test-ValidDbName -Name $_ -ServerName $SourceName } |
+        Where-Object { Test-ValidDbName -Name $_ -ServerName $realSourceName } |
         Sort-Object -Unique
     )
 
@@ -1175,7 +1256,7 @@ function Get-ParamDbRows {
         $fullName = "$db"
 
         if ($fullName -notlike "*/*") {
-            $fullName = "$SourceName/$db"
+            $fullName = "$realSourceName/$db"
         }
 
         if (Test-OracleContainerName -Name $fullName) {
@@ -1188,12 +1269,13 @@ function Get-ParamDbRows {
             ParentName        = $ParentName
             ParentEnvironment = $Environment
             Environment       = $Environment
-            ObjectType        = "kDatabase"
-            SqlHostName       = $sqlHostName
-            OracleHostName    = $oracleHostName
+            ObjectType        = if ($dbType -eq "Oracle") { "kOracleDatabase" } else { "kSQLDatabase" }
+            BackupTypeHint    = $dbType
+            SqlHostName       = if ($dbType -eq "SQL") { $sqlHostName } else { "" }
+            OracleHostName    = if ($dbType -eq "Oracle") { $oracleHostName } else { "" }
             GenericSourceName = Get-GenericSourceNameFromNode -Object $Object
-            SourceName        = $SourceName
-            SourceInfoName    = $SourceName
+            SourceName        = $realSourceName
+            SourceInfoName    = $realSourceName
             Depth             = $Depth + 1
         }
     }
@@ -1241,10 +1323,10 @@ function Get-FlatProtectedObjects {
     elseif (-not [string]::IsNullOrWhiteSpace($oracleHostName)) {
         $preType = "Oracle"
     }
-    elseif ("$env $objectType" -match '(?i)kSQL') {
+    elseif ("$env $objectType" -match '(?i)kSQL|mssql') {
         $preType = "SQL"
     }
-    elseif ("$env $objectType" -match '(?i)kOracle') {
+    elseif ("$env $objectType" -match '(?i)kOracle|kRACDatabase|kNonRACDatabase|kOracleDatabase') {
         $preType = "Oracle"
     }
     elseif (-not [string]::IsNullOrWhiteSpace($preVmType)) {
@@ -1267,6 +1349,7 @@ function Get-FlatProtectedObjects {
         ParentEnvironment = $ParentEnvironment
         Environment       = $env
         ObjectType        = $objectType
+        BackupTypeHint    = ""
         SqlHostName       = $sqlHostName
         OracleHostName    = $oracleHostName
         GenericSourceName = $genericSourceName
@@ -1414,26 +1497,17 @@ function Search-ProtectedObjectsOnClusters {
                 Object-MatchesCiAliasesFlat -FlatObject $_ -CiAliases $CiAliases
             })
 
-            $VmFlatObjects = @($FlatObjects | Where-Object {
-                Test-VmLikeFlat -FlatObject $_
-            })
-
             if ($SqlOracleOnly) {
                 $ObjectsToCheck = @($MatchingFlatObjects | Where-Object {
                     Test-SqlOracleLikeFlat -FlatObject $_
                 })
             }
             else {
-                $ObjectsToCheck = @(
-                    $MatchingFlatObjects
-                    $VmFlatObjects
-                ) | Where-Object { $_ } |
-                    Sort-Object ObjectName, SourceName, ObjectType -Unique
+                $ObjectsToCheck = @($MatchingFlatObjects)
             }
 
-            # Safer fallback:
-            # Only use all flat objects if there is exactly one returned object.
-            # This avoids unrelated DB/FS rows from broad search results.
+            # Safe fallback only if there is exactly one object returned.
+            # Avoids unrelated broad search rows.
             if (-not $ObjectsToCheck -or $ObjectsToCheck.Count -eq 0) {
                 if ($FlatObjects.Count -eq 1) {
                     $ObjectsToCheck = $FlatObjects
@@ -1492,6 +1566,14 @@ function Test-HasValidFs {
     }).Count -gt 0)
 }
 
+function Test-HasAnyFs {
+    param($Rows)
+
+    return (@($Rows | Where-Object {
+        $_.BackupType -eq "FS"
+    }).Count -gt 0)
+}
+
 function Test-HasValidSqlOrOracle {
     param($Rows)
 
@@ -1499,6 +1581,29 @@ function Test-HasValidSqlOrOracle {
         $_.BackupType -in @("SQL", "Oracle") -and
         (Is-ValidBackupTime -TimeText $_.LastBackupTime)
     }).Count -gt 0)
+}
+
+function Remove-InvalidRowsWhenValidExists {
+    param($Rows)
+
+    $out = @()
+
+    foreach ($g in @($Rows | Group-Object BackupType)) {
+        $hasValid = @($g.Group | Where-Object {
+            Is-ValidBackupTime -TimeText $_.LastBackupTime
+        }).Count -gt 0
+
+        if ($hasValid) {
+            $out += @($g.Group | Where-Object {
+                Is-ValidBackupTime -TimeText $_.LastBackupTime
+            })
+        }
+        else {
+            $out += @($g.Group)
+        }
+    }
+
+    return @($out)
 }
 
 # ==========================================================
@@ -1527,7 +1632,7 @@ if (-not $RawCiNames -or $RawCiNames.Count -eq 0) {
 
 $CiGroups = @(
     $RawCiNames |
-    Group-Object { Get-CiIdentityKey -Ci $_ } |
+    Group-Object -Property { Get-CiIdentityKey -Ci $_ } |
     ForEach-Object {
         $aliases = @($_.Group | Sort-Object -Unique)
         $display = Get-PreferredCiDisplayName -Aliases $aliases
@@ -1682,7 +1787,7 @@ foreach ($CiGroup in $CiGroups) {
     }
 
     # ------------------------------------------------------
-    # Step 3: Extra fallback only for SQL/Oracle and only if CI name has DB/CN.
+    # Step 3: Extra fallback only for SQL/Oracle if CI shortname has DB/CN.
     # ------------------------------------------------------
     $HasSqlOrOracle = Test-HasValidSqlOrOracle -Rows $CiRows
     $CiLooksLikeDbServer = Test-CiLooksLikeDbServer -CiAliases $CiAliases
@@ -1740,6 +1845,8 @@ foreach ($CiGroup in $CiGroups) {
             $_.Group | Sort-Object LastBackupUsecs -Descending | Select-Object -First 1
         }
 
+    $DedupedRows = Remove-InvalidRowsWhenValidExists -Rows $DedupedRows
+
     foreach ($Row in $DedupedRows) {
         $Results += [pscustomobject]@{
             ServerName      = $Row.ServerName
@@ -1754,9 +1861,9 @@ foreach ($CiGroup in $CiGroups) {
     }
 
     $HasSqlOrOracleBackup = Test-HasValidSqlOrOracle -Rows $DedupedRows
-    $HasFSBackup = Test-HasValidFs -Rows $DedupedRows
+    $HasAnyFS = Test-HasAnyFs -Rows $DedupedRows
 
-    if ($HasSqlOrOracleBackup -and -not $HasFSBackup) {
+    if ($HasSqlOrOracleBackup -and -not $HasAnyFS) {
         $Results += [pscustomobject]@{
             ServerName      = $Ci
             BackupType      = "FS"
