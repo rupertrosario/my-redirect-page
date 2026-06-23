@@ -11,10 +11,13 @@
 #   InputServer, BackupType, ObjectName, SourceName, ProtectionGroup,
 #   ClusterName, BackupLevel, StartTimeET, EndTimeET, Status
 #
-# Scope:
-#   FS, Nutanix, Hyper-V, NAS, SQL DB, Oracle DB
+# Default scope:
+#   FS, Nutanix, Hyper-V, SQL DB, Oracle DB
 #
-# Main fix:
+# NAS:
+#   Disabled by default. Set $IncludeNAS = $true only when NAS validation is needed.
+#
+# Main DB fix:
 #   DB runs are NOT filtered in the API by runTypes because many SQL/Oracle
 #   regular DB rows appear as kRegular. Logs/archive are removed locally.
 # =====================================================================
@@ -59,28 +62,35 @@ $CommonHeaders = @{ accept = "application/json"; apiKey = $ApiKey }
 # -----------------------------
 $ReportTimeZoneId = "Eastern Standard Time"
 $SearchCount = 100
-$NumRunsPerPg = 30
-$MaxRunPagesPerPg = 2
+$NumRunsPerPg = 20
+$MaxRunPagesPerPg = 1
 $ExportDebugRows = $true
 $EmitMissingWorkloadRows = $true
 
+# NAS is intentionally OFF by default because it is expensive and not needed for normal server validation.
+$IncludeNAS = $false
+
 $NonDbTargets = @(
-    [pscustomobject]@{ BackupType = "FS";      Environment = "kPhysical"   },
-    [pscustomobject]@{ BackupType = "Nutanix"; Environment = "kAcropolis"  },
-    [pscustomobject]@{ BackupType = "Hyper-V"; Environment = "kHyperV"     },
-    [pscustomobject]@{ BackupType = "NAS";     Environment = "kGenericNas" },
-    [pscustomobject]@{ BackupType = "NAS";     Environment = "kIsilon"     }
+    [pscustomobject]@{ BackupType = "FS";      Environment = "kPhysical"  },
+    [pscustomobject]@{ BackupType = "Nutanix"; Environment = "kAcropolis" },
+    [pscustomobject]@{ BackupType = "Hyper-V"; Environment = "kHyperV"    }
 )
+
+if ($IncludeNAS) {
+    $NonDbTargets += [pscustomobject]@{ BackupType = "NAS"; Environment = "kGenericNas" }
+    $NonDbTargets += [pscustomobject]@{ BackupType = "NAS"; Environment = "kIsilon" }
+}
 
 $DbTargets = @(
     [pscustomobject]@{ BackupType = "SQL DB";    Environment = "kSQL"    },
     [pscustomobject]@{ BackupType = "Oracle DB"; Environment = "kOracle" }
 )
 
+$ScopeText = "FS, Nutanix, Hyper-V, SQL DB, Oracle DB"
+if ($IncludeNAS) { $ScopeText = "FS, Nutanix, Hyper-V, NAS, SQL DB, Oracle DB" }
+
 $script:SearchCalls = 0
 $script:PgRunCalls = 0
-$script:PgDetailCalls = 0
-$script:ObjectLookupCalls = 0
 $script:FailedGets = 0
 $script:CandidatePgsInspected = 0
 
@@ -113,7 +123,6 @@ function Match-Name($Text, $Name) {
     return $false
 }
 function Any-Match([string[]]$Texts, [string]$Name) { foreach ($t in $Texts) { if (Match-Name $t $Name) { return $true } }; return $false }
-function Add-UniqueText([System.Collections.ArrayList]$List, [string]$Value) { $v = Norm $Value; if ($v -and -not $List.Contains($v)) { [void]$List.Add($v) } }
 function To-Int64Safe($v) { try { if ($null -eq $v -or "$v".Trim() -eq "") { return 0 }; return [int64]$v } catch { return 0 } }
 function Convert-UsecsToET($Usecs) {
     $u = To-Int64Safe $Usecs
@@ -222,6 +231,7 @@ function HostMap($Run) {
     foreach ($o in (AsArray $Run.objects)) {
         $id = ObjId $o; $name = ObjName $o; $type = ObjType $o
         if ($id -and $name -and $type -match '(?i)host|server') { $m[$id] = $name }
+        elseif ($id -and $name -and $type -match '(?i)physical') { $m[$id] = $name }
     }
     return $m
 }
@@ -308,6 +318,7 @@ function MissingRow($Server,$Type,$Msg) {
     [pscustomobject]@{ InputServer=$Server; BackupType=$Type; ObjectName='-'; SourceName=$Server; ProtectionGroup='-'; ClusterName='-'; BackupLevel='Full/Incremental/Regular'; StartTimeET='-'; EndTimeET=$Msg; Status='Unknown'; BackupUsecs=0; DebugSource='MissingRow' }
 }
 function TypeRank($t) { switch ($t) { 'FS'{1} 'Nutanix'{2} 'Hyper-V'{3} 'NAS'{4} 'SQL DB'{5} 'Oracle DB'{6} 'DB'{7} default{9} } }
+function MissingMessage($bt) { switch ($bt) { 'FS'{'NoFSBackupFound'} 'Nutanix'{'NoNutanixBackupFound'} 'Hyper-V'{'NoHyperVBackupFound'} 'NAS'{'NoNASBackupFound'} default{"No${bt}BackupFound"} } }
 
 # -----------------------------
 # Load CSV
@@ -335,6 +346,8 @@ foreach ($c in (AsArray $clusterJson.cohesityClusters)) {
 # Main
 # -----------------------------
 $results = @(); $debug = @()
+$ExpectedNonDbBackupTypes = @($NonDbTargets | Select-Object -ExpandProperty BackupType -Unique)
+
 foreach ($s in $servers) {
     Write-Host "Processing server: $s" -ForegroundColor Cyan
     $serverRows = @(); $dbRows = @()
@@ -354,10 +367,9 @@ foreach ($s in $servers) {
     $selected = @(LatestRows $serverRows)
 
     if ($EmitMissingWorkloadRows) {
-        foreach ($bt in @('FS','Nutanix','Hyper-V','NAS')) {
+        foreach ($bt in $ExpectedNonDbBackupTypes) {
             if (@($selected | Where-Object { $_.BackupType -eq $bt -and (ValidTime $_.EndTimeET) }).Count -eq 0) {
-                $msg = switch ($bt) { 'FS'{'NoFSBackupFound'} 'Nutanix'{'NoNutanixBackupFound'} 'Hyper-V'{'NoHyperVBackupFound'} 'NAS'{'NoNASBackupFound'} }
-                $selected += MissingRow $s $bt $msg
+                $selected += MissingRow $s $bt (MissingMessage $bt)
             }
         }
     }
@@ -387,7 +399,8 @@ $report += "Change Number              : $ChangeID"
 $report += "Executed By                : $ExecutedBy"
 $report += "Run Date                   : $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
 $report += ""
-$report += "Scope                      : FS, Nutanix, Hyper-V, NAS, SQL DB, Oracle DB"
+$report += "Scope                      : $ScopeText"
+$report += "NAS Checks                 : $IncludeNAS"
 $report += "API Mode                   : GET only"
 $report += "Run Filter                 : Local filtering; logs/archive excluded"
 $report += "Report Preview POST        : No"
@@ -421,6 +434,8 @@ $report | Set-Content -Path $OutputTxt -Encoding UTF8
 Write-Host ""
 Write-Host $details
 Write-Host ""
+Write-Host "Scope     : $ScopeText"
+Write-Host "NAS Checks: $IncludeNAS"
 Write-Host "Final CSV : $OutputCsv" -ForegroundColor Green
 Write-Host "TXT Report: $OutputTxt" -ForegroundColor Green
 if ($ExportDebugRows) { Write-Host "Debug CSV : $DebugCsv" -ForegroundColor Green }
