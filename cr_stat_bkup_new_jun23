@@ -1,13 +1,15 @@
 # =====================================================================
-# Cohesity Helios - GET-Only Backup Validation
+# Cohesity Helios - Backup Validation using Protection Runs Report Preview
 #
 # Purpose:
-#   Get latest non-log backup status for input server / DB / VM / NAS CI.
+#   Read a CSV containing server / DB / VM / NAS CI names and return latest
+#   non-log backup status from the Helios Protection Runs report.
 #
-# GET-only:
-#   GET /v2/mcm/cluster-mgmt/info
-#   GET /v2/data-protect/protection-groups
-#   GET /v2/data-protect/protection-groups/{id}/runs
+# Important:
+#   - GET is used to list available reports.
+#   - POST is used only to fetch report preview data.
+#   - This POST is reporting/read-preview only.
+#   - It does NOT modify backups, jobs, policies, snapshots, restores, or expiry.
 #
 # Input:
 #   X:\PowerShell\Data\Cohesity\BackupValidation\<ChangeID>.csv
@@ -15,21 +17,34 @@
 # Required CSV column:
 #   ci_item
 #
-# Supports:
-#   FS / Physical
+# Supported input examples:
+#   SERVER01
+#   DBNAME
+#   DBNAME@SERVER01
+#
+# Output columns:
+#   InputCI
+#   Workload
+#   ClusterName
+#   ProtectionGroup
+#   SourceName
+#   ObjectName
+#   BackupLevel
+#   Status
+#   EndTimeET
+#
+# Workload distinction:
+#   FS
 #   SQL
 #   Oracle
-#   Nutanix / AHV
+#   Nutanix
 #   Hyper-V
-#   NAS / Isilon
+#   NAS
 #
 # Excludes:
 #   SQL logs
 #   Oracle archive logs
-#   Any run type containing log/archive
-#
-# Output:
-#   CSV + TXT summary
+#   Archive/log rows
 # =====================================================================
 
 $ErrorActionPreference = "Stop"
@@ -38,7 +53,7 @@ $FormatEnumerationLimit = -1
 # -----------------------------
 # Config
 # -----------------------------
-$BaseUrl    = "https://helios.cohesity.com"
+$BaseUrl    = "https://helios.cohesity.com/heliosreporting/api/v1"
 $ApiKeyFile = "X:\PowerShell\Cohesity_API_Scripts\DO_NOT_Delete\apikey.txt"
 
 $InputDir  = "X:\PowerShell\Data\Cohesity\BackupValidation"
@@ -51,28 +66,30 @@ $InputTxt = Join-Path $InputDir "$ChangeID.txt"
 
 $TimeStamp = Get-Date -Format "yyyyMMdd_HHmmss"
 
-$CsvOutput = Join-Path $OutputDir "${ChangeID}_BackupStatus_GETOnly_$TimeStamp.csv"
-$TxtOutput = Join-Path $OutputDir "${ChangeID}_BackupStatus_GETOnly_$TimeStamp.txt"
-$AllRowsCsv = Join-Path $OutputDir "${ChangeID}_AllRegularBackupRows_GETOnly_$TimeStamp.csv"
+$CsvOutput = Join-Path $OutputDir "${ChangeID}_BackupValidation_ProtectionRuns_$TimeStamp.csv"
+$TxtOutput = Join-Path $OutputDir "${ChangeID}_BackupValidation_ProtectionRuns_$TimeStamp.txt"
 
-$LookbackDays = 30
+# Troubleshooting export. Keep true until output is confirmed.
+$ExportNormalizedRows = $true
+$NormalizedRowsCsv = Join-Path $OutputDir "${ChangeID}_ProtectionRuns_NormalizedRows_$TimeStamp.csv"
 
-# Set to $true for troubleshooting.
-$ExportAllRegularRows = $true
+# Report settings.
+$PreferredDateRange = "Last7Days"
+$FallbackDateRange  = "CurrentMonth"
+$PreviewLimit       = 100000
 
 # Display timezone.
 $DisplayTimeZoneId = "Eastern Standard Time"
+$ReportTimezone    = "America/New_York"
 
-# Workloads to scan.
-$TargetEnvironments = @(
-    "kPhysical",
-    "kSQL",
-    "kOracle",
-    "kAcropolis",
-    "kHyperV",
-    "kGenericNas",
-    "kIsilon"
-)
+# DB@SERVER matching:
+# $true  = DB and server both must match.
+# $false = DB match is enough if server is not exposed cleanly in report row.
+$RequireServerMatchForDbAtServer = $false
+
+# Keep only successful backup rows and remove logs/archive.
+$OnlySuccessfulRows = $true
+$ExcludeLogArchiveRows = $true
 
 # -----------------------------
 # TLS
@@ -86,7 +103,7 @@ $script:ApiCalls = 0
 $script:FailedApiCalls = 0
 
 # =====================================================================
-# Helpers
+# Common helpers
 # =====================================================================
 function Norm {
     param([object]$Value)
@@ -199,6 +216,41 @@ function Get-FirstNonBlank {
     return ""
 }
 
+function Get-HttpErrorBody {
+    param([object]$ErrorRecord)
+
+    try {
+        if ($ErrorRecord.Exception.Response) {
+            $stream = $ErrorRecord.Exception.Response.GetResponseStream()
+
+            if ($stream) {
+                $reader = New-Object System.IO.StreamReader($stream)
+                return $reader.ReadToEnd()
+            }
+        }
+    }
+    catch {
+        return ""
+    }
+
+    return ""
+}
+
+function Get-HttpStatusCode {
+    param([object]$ErrorRecord)
+
+    try {
+        if ($ErrorRecord.Exception.Response) {
+            return [int]$ErrorRecord.Exception.Response.StatusCode
+        }
+    }
+    catch {
+        return ""
+    }
+
+    return ""
+}
+
 function Convert-UsecsToDisplayTime {
     param(
         [object]$Usecs,
@@ -241,86 +293,272 @@ function Convert-UsecsToDisplayTime {
     }
 }
 
-function Get-NowUsecs {
-    return [int64](([DateTimeOffset](Get-Date)).ToUnixTimeMilliseconds() * 1000)
-}
-
-function Get-StartUsecs {
-    param([int]$DaysBack)
-
-    return [int64](([DateTimeOffset]((Get-Date).AddDays(-1 * $DaysBack))).ToUnixTimeMilliseconds() * 1000)
-}
-
-function Get-HttpErrorBody {
-    param([object]$ErrorRecord)
-
-    try {
-        if ($ErrorRecord.Exception.Response) {
-            $stream = $ErrorRecord.Exception.Response.GetResponseStream()
-
-            if ($stream) {
-                $reader = New-Object System.IO.StreamReader($stream)
-                return $reader.ReadToEnd()
-            }
-        }
-    }
-    catch {
-        return ""
-    }
-
-    return ""
-}
-
-function Get-HttpStatusCode {
-    param([object]$ErrorRecord)
-
-    try {
-        if ($ErrorRecord.Exception.Response) {
-            return [int]$ErrorRecord.Exception.Response.StatusCode
-        }
-    }
-    catch {
-        return ""
-    }
-
-    return ""
-}
-
-function Copy-Headers {
-    param([hashtable]$Headers)
-
-    $copy = @{}
-
-    foreach ($k in $Headers.Keys) {
-        $copy[$k] = $Headers[$k]
-    }
-
-    return $copy
-}
-
-function Invoke-HeliosGetJson {
+function Convert-AnyTimeToDisplayTime {
     param(
+        [object]$Value,
+        [string]$TimeZoneId
+    )
+
+    $raw = Norm $Value
+
+    if ([string]::IsNullOrWhiteSpace($raw)) {
+        return ""
+    }
+
+    # microseconds
+    if ($raw -match '^\d{16}$') {
+        return Convert-UsecsToDisplayTime -Usecs $raw -TimeZoneId $TimeZoneId
+    }
+
+    # milliseconds
+    if ($raw -match '^\d{13}$') {
+        try {
+            [int64]$ms = [int64]$raw
+            [int64]$usecs = $ms * 1000
+            return Convert-UsecsToDisplayTime -Usecs $usecs -TimeZoneId $TimeZoneId
+        }
+        catch {
+            return $raw
+        }
+    }
+
+    # seconds
+    if ($raw -match '^\d{10}$') {
+        try {
+            [int64]$sec = [int64]$raw
+            [int64]$usecs = $sec * 1000000
+            return Convert-UsecsToDisplayTime -Usecs $usecs -TimeZoneId $TimeZoneId
+        }
+        catch {
+            return $raw
+        }
+    }
+
+    # date string
+    try {
+        $dt = [datetimeoffset]::Parse($raw)
+        $tz = [System.TimeZoneInfo]::FindSystemTimeZoneById($TimeZoneId)
+        $converted = [System.TimeZoneInfo]::ConvertTime($dt, $tz)
+        return $converted.ToString("yyyy-MM-dd HH:mm:ss")
+    }
+    catch {
+        return $raw
+    }
+}
+
+function Convert-AnyTimeToTicks {
+    param([object]$Value)
+
+    $raw = Norm $Value
+
+    if ([string]::IsNullOrWhiteSpace($raw)) {
+        return 0
+    }
+
+    try {
+        # microseconds
+        if ($raw -match '^\d{16}$') {
+            return [int64]$raw
+        }
+
+        # milliseconds
+        if ($raw -match '^\d{13}$') {
+            return ([int64]$raw) * 1000
+        }
+
+        # seconds
+        if ($raw -match '^\d{10}$') {
+            return ([int64]$raw) * 1000000
+        }
+
+        $dt = [datetimeoffset]::Parse($raw)
+        return ([int64]$dt.ToUnixTimeMilliseconds()) * 1000
+    }
+    catch {
+        return 0
+    }
+}
+
+function Test-SuccessStatus {
+    param([object]$Status)
+
+    $s = Normalize-Text $Status
+
+    if ([string]::IsNullOrWhiteSpace($s)) {
+        # Some report rows do not expose status cleanly.
+        # Do not discard just because status is blank.
+        return $true
+    }
+
+    if ($s -match 'fail|failed|error|cancel|cancelled|missed|skipped') {
+        if ($s -match 'success|succeed|succeeded') {
+            return $true
+        }
+
+        return $false
+    }
+
+    if ($s -match 'success|succeeded|complete|completed|available|active|protected') {
+        return $true
+    }
+
+    return $true
+}
+
+function Test-LogArchiveRow {
+    param(
+        [object]$RunType,
+        [object]$BackupLevel,
+        [object]$SnapshotType
+    )
+
+    $s = Normalize-Text "$RunType $BackupLevel $SnapshotType"
+
+    if ([string]::IsNullOrWhiteSpace($s)) {
+        return $false
+    }
+
+    if ($s -match 'archivelog|archive\s*log|transaction\s*log|db\s*log|klog|logsnapshot') {
+        return $true
+    }
+
+    if ($s -match '\blog\b|archive') {
+        return $true
+    }
+
+    return $false
+}
+
+function Get-BackupLevel {
+    param(
+        [object]$RunType,
+        [object]$BackupType,
+        [object]$SnapshotType
+    )
+
+    $s = Normalize-Text "$RunType $BackupType $SnapshotType"
+
+    if ($s -match 'full') {
+        return "Full"
+    }
+
+    if ($s -match 'incr|incremental|diff|differential') {
+        return "Incremental"
+    }
+
+    if ($s -match 'regular') {
+        return "Regular"
+    }
+
+    if ([string]::IsNullOrWhiteSpace($s)) {
+        return "Regular"
+    }
+
+    $clean = (Norm "$RunType $BackupType $SnapshotType").Trim()
+
+    if ([string]::IsNullOrWhiteSpace($clean)) {
+        return "Regular"
+    }
+
+    return $clean
+}
+
+function Get-WorkloadFromRow {
+    param(
+        [object]$Environment,
+        [object]$ObjectType,
+        [object]$RowText
+    )
+
+    $v = Normalize-Text "$Environment $ObjectType $RowText"
+
+    if ($v -match 'ksql|sql') {
+        return "SQL"
+    }
+
+    if ($v -match 'koracle|oracle') {
+        return "Oracle"
+    }
+
+    if ($v -match 'kphysical|physical|file based|file-based|filesystem|file system') {
+        return "FS"
+    }
+
+    if ($v -match 'kacropolis|nutanix|ahv') {
+        return "Nutanix"
+    }
+
+    if ($v -match 'khyperv|hyper-v|hyperv') {
+        return "Hyper-V"
+    }
+
+    if ($v -match 'kgenericnas|kisilon|nas|isilon|netapp|smb|nfs') {
+        return "NAS"
+    }
+
+    if ($v -match 'kvmware|vmware') {
+        return "VMware"
+    }
+
+    return "Unknown"
+}
+
+function Get-WorkloadRank {
+    param([string]$Workload)
+
+    switch ($Workload) {
+        "FS"       { return 1 }
+        "SQL"      { return 2 }
+        "Oracle"   { return 3 }
+        "Nutanix"  { return 4 }
+        "Hyper-V"  { return 5 }
+        "NAS"      { return 6 }
+        "VMware"   { return 7 }
+        default    { return 9 }
+    }
+}
+
+# =====================================================================
+# API helper
+# =====================================================================
+function Invoke-HeliosReportingJson {
+    param(
+        [Parameter(Mandatory)][string]$Method,
         [Parameter(Mandatory)][string]$Uri,
         [Parameter(Mandatory)][hashtable]$Headers,
+        [object]$Body = $null,
         [switch]$Quiet
     )
 
     $script:ApiCalls++
 
     try {
-        $response = Invoke-WebRequest `
-            -Method Get `
-            -Uri $Uri `
-            -Headers $Headers `
-            -UseBasicParsing `
-            -TimeoutSec 180
+        if ($null -ne $Body) {
+            $bodyJson = $Body | ConvertTo-Json -Depth 50
+
+            $response = Invoke-WebRequest `
+                -Method $Method `
+                -Uri $Uri `
+                -Headers $Headers `
+                -Body $bodyJson `
+                -UseBasicParsing `
+                -TimeoutSec 180
+        }
+        else {
+            $response = Invoke-WebRequest `
+                -Method $Method `
+                -Uri $Uri `
+                -Headers $Headers `
+                -UseBasicParsing `
+                -TimeoutSec 180
+        }
 
         if ($null -eq $response) {
             throw "API returned no response object."
         }
 
         if ([string]::IsNullOrWhiteSpace($response.Content)) {
-            return $null
+            throw "API returned an empty response body."
         }
 
         return ($response.Content | ConvertFrom-Json)
@@ -336,7 +574,8 @@ function Invoke-HeliosGetJson {
         $bodyText   = Get-HttpErrorBody -ErrorRecord $_
 
         Write-Host ""
-        Write-Host "GET API call failed." -ForegroundColor Red
+        Write-Host "API call failed." -ForegroundColor Red
+        Write-Host "Method : $Method" -ForegroundColor Red
         Write-Host "URI    : $Uri" -ForegroundColor Red
 
         if ($statusCode) {
@@ -356,7 +595,41 @@ function Invoke-HeliosGetJson {
     }
 }
 
-function Get-ResponseItems {
+# =====================================================================
+# CI parsing
+# =====================================================================
+function Get-CiContext {
+    param([string]$Ci)
+
+    $clean = (Norm $Ci).Trim('"').Trim("'")
+
+    $isDbAtServer = $false
+    $dbName = ""
+    $serverName = ""
+
+    if ($clean -match "@") {
+        $parts = $clean -split "@", 2
+        $dbName = Norm $parts[0]
+        $serverName = Norm $parts[1]
+
+        if (-not [string]::IsNullOrWhiteSpace($dbName) -and
+            -not [string]::IsNullOrWhiteSpace($serverName)) {
+            $isDbAtServer = $true
+        }
+    }
+
+    [pscustomobject]@{
+        InputCI      = $clean
+        IsDbAtServer = $isDbAtServer
+        DbName       = $dbName
+        ServerName   = $serverName
+    }
+}
+
+# =====================================================================
+# Report discovery
+# =====================================================================
+function Get-ResponseArray {
     param([object]$Json)
 
     if ($null -eq $Json) {
@@ -367,21 +640,266 @@ function Get-ResponseItems {
         return @($Json)
     }
 
-    foreach ($prop in @(
-        "cohesityClusters",
-        "clusters",
-        "protectionGroups",
-        "runs",
-        "items",
-        "data",
-        "results"
-    )) {
+    foreach ($prop in @("reports", "data", "items", "results")) {
         if ($Json.PSObject.Properties.Name -contains $prop) {
             return @(To-ArrayMaybe $Json.$prop)
         }
     }
 
     return @($Json)
+}
+
+function Get-ReportName {
+    param([object]$Report)
+
+    Get-FirstNonBlank @(
+        $Report.name,
+        $Report.displayName,
+        $Report.title,
+        $Report.reportName,
+        $Report.label
+    )
+}
+
+function Get-ReportId {
+    param([object]$Report)
+
+    Get-FirstNonBlank @(
+        $Report.id,
+        $Report.reportId,
+        $Report.uid,
+        $Report._id
+    )
+}
+
+function Get-ComponentIdsFromReport {
+    param([object]$Report)
+
+    $ids = New-Object System.Collections.Generic.List[string]
+
+    foreach ($c in @(To-ArrayMaybe $Report.components)) {
+        $id = Get-FirstNonBlank @($c.id, $c.componentId, $c.uid)
+
+        if (-not [string]::IsNullOrWhiteSpace($id) -and -not $ids.Contains($id)) {
+            $ids.Add($id)
+        }
+    }
+
+    foreach ($c in @(To-ArrayMaybe $Report.reportComponents)) {
+        $id = Get-FirstNonBlank @($c.id, $c.componentId, $c.uid)
+
+        if (-not [string]::IsNullOrWhiteSpace($id) -and -not $ids.Contains($id)) {
+            $ids.Add($id)
+        }
+    }
+
+    return @($ids)
+}
+
+function Find-ProtectionRunsReport {
+    param([object[]]$Reports)
+
+    foreach ($r in $Reports) {
+        $name = Get-ReportName $r
+        $json = $r | ConvertTo-Json -Depth 30 -Compress
+
+        if ($name -match '(?i)protection\s*runs' -or $json -match '(?i)protection\s*runs') {
+            return $r
+        }
+    }
+
+    foreach ($r in $Reports) {
+        $name = Get-ReportName $r
+        $json = $r | ConvertTo-Json -Depth 30 -Compress
+
+        if ($name -match '(?i)run' -or $json -match '(?i)run') {
+            return $r
+        }
+    }
+
+    return $null
+}
+
+# =====================================================================
+# Report preview
+# =====================================================================
+function Get-ProtectionRunsPreview {
+    param(
+        [string]$ReportId,
+        [object[]]$ComponentIds,
+        [hashtable]$Headers
+    )
+
+    $uri = "$BaseUrl/public/reports/$ReportId/preview"
+
+    $bodies = @()
+
+    $bodies += @{
+        Name = "Preferred range with components"
+        Body = @{
+            timezone     = $ReportTimezone
+            componentIds = @($ComponentIds)
+            filters      = @(
+                @{
+                    attribute             = "date"
+                    filterType            = "TimeRange"
+                    timeRangeFilterParams = @{
+                        dateRange = $PreferredDateRange
+                    }
+                }
+            )
+            limit        = @{
+                size = $PreviewLimit
+            }
+        }
+    }
+
+    $bodies += @{
+        Name = "Fallback range with components"
+        Body = @{
+            timezone     = $ReportTimezone
+            componentIds = @($ComponentIds)
+            filters      = @(
+                @{
+                    attribute             = "date"
+                    filterType            = "TimeRange"
+                    timeRangeFilterParams = @{
+                        dateRange = $FallbackDateRange
+                    }
+                }
+            )
+            limit        = @{
+                size = $PreviewLimit
+            }
+        }
+    }
+
+    $bodies += @{
+        Name = "No date filter with components"
+        Body = @{
+            timezone     = $ReportTimezone
+            componentIds = @($ComponentIds)
+            limit        = @{
+                size = $PreviewLimit
+            }
+        }
+    }
+
+    $bodies += @{
+        Name = "Minimal"
+        Body = @{
+            timezone = $ReportTimezone
+            limit    = @{
+                size = $PreviewLimit
+            }
+        }
+    }
+
+    $attempt = 0
+
+    foreach ($item in $bodies) {
+        $attempt++
+
+        Write-Host "Trying Protection Runs preview body #$attempt - $($item.Name)..." -ForegroundColor DarkCyan
+
+        $json = Invoke-HeliosReportingJson `
+            -Method "Post" `
+            -Uri $uri `
+            -Headers $Headers `
+            -Body $item.Body `
+            -Quiet
+
+        if ($null -ne $json) {
+            Write-Host "Preview body #$attempt succeeded." -ForegroundColor Green
+
+            return [pscustomobject]@{
+                Json        = $json
+                Attempt     = $attempt
+                AttemptName = $item.Name
+            }
+        }
+
+        Write-Host "Preview body #$attempt failed. Trying next body..." -ForegroundColor Yellow
+    }
+
+    throw "All Protection Runs preview body attempts failed."
+}
+
+# =====================================================================
+# Report row extraction
+# =====================================================================
+function Get-ReportArrays {
+    param(
+        [object]$Node,
+        [string]$Path = "root",
+        [int]$Depth = 0
+    )
+
+    $out = @()
+
+    if ($Depth -gt 12) {
+        return @()
+    }
+
+    if ($null -eq $Node) {
+        return @()
+    }
+
+    if ($Node -is [array]) {
+        $items = @($Node | Where-Object {
+            $_ -is [pscustomobject]
+        })
+
+        if ($items.Count -gt 0) {
+            $sampleJson = $items[0] | ConvertTo-Json -Depth 10 -Compress
+
+            $score = 0
+
+            foreach ($pattern in @(
+                "object",
+                "protection",
+                "cluster",
+                "status",
+                "time",
+                "run",
+                "environment",
+                "source",
+                "snapshot",
+                "policy",
+                "job",
+                "database",
+                "host"
+            )) {
+                if ($sampleJson -match "(?i)$pattern") {
+                    $score++
+                }
+            }
+
+            $out += [pscustomobject]@{
+                Path  = $Path
+                Count = $items.Count
+                Score = $score
+                Rows  = $items
+            }
+        }
+
+        $i = 0
+
+        foreach ($item in @($Node | Select-Object -First 20)) {
+            $out += @(Get-ReportArrays -Node $item -Path "${Path}[$i]" -Depth ($Depth + 1))
+            $i++
+        }
+
+        return @($out)
+    }
+
+    if ($Node -is [pscustomobject]) {
+        foreach ($p in $Node.PSObject.Properties) {
+            $out += @(Get-ReportArrays -Node $p.Value -Path "$Path.$($p.Name)" -Depth ($Depth + 1))
+        }
+    }
+
+    return @($out)
 }
 
 function Flatten-ObjectToHash {
@@ -512,132 +1030,216 @@ function Get-HashValueByAliases {
     return ""
 }
 
-function Get-WorkloadName {
-    param(
-        [object]$Environment,
-        [object]$Text
-    )
+function Convert-ReportRowsToNormalizedRows {
+    param([object[]]$Rows)
 
-    $v = Normalize-Text "$Environment $Text"
+    $normalized = @()
 
-    if ($v -match 'ksql|sql') {
-        return "SQL"
-    }
+    foreach ($row in $Rows) {
+        $hash = Flatten-ObjectToHash -Node $row
 
-    if ($v -match 'koracle|oracle') {
-        return "Oracle"
-    }
+        $rowText = (($hash.Values | Where-Object {
+            -not [string]::IsNullOrWhiteSpace("$_")
+        }) -join " ")
 
-    if ($v -match 'kphysical|physical') {
-        return "FS"
-    }
+        $objectName = Get-HashValueByAliases -Hash $hash -Aliases @(
+            "objectName",
+            "object.name",
+            "protectedObjectName",
+            "protectedObject.name",
+            "entityName",
+            "entity.name",
+            "databaseName",
+            "dbName",
+            "dbUniqueName",
+            "vmName",
+            "viewName",
+            "filePath",
+            "sourceName",
+            "source.name",
+            "hostName"
+        )
 
-    if ($v -match 'kacropolis|nutanix|ahv') {
-        return "Nutanix"
-    }
+        $sourceName = Get-HashValueByAliases -Hash $hash -Aliases @(
+            "sourceName",
+            "source.name",
+            "source.displayName",
+            "rootSourceName",
+            "rootSource.name",
+            "parentSourceName",
+            "parentSource.name",
+            "registeredSourceName",
+            "registeredSource.name"
+        )
 
-    if ($v -match 'khyperv|hyper-v|hyperv') {
-        return "Hyper-V"
-    }
+        $hostName = Get-HashValueByAliases -Hash $hash -Aliases @(
+            "hostName",
+            "serverName",
+            "sourceHost",
+            "parentSource",
+            "parentObject",
+            "sqlServer",
+            "oracleHost",
+            "host.name",
+            "server.name",
+            "source.name",
+            "parentSourceName"
+        )
 
-    if ($v -match 'kgenericnas|kisilon|nas|isilon') {
-        return "NAS"
-    }
+        if ([string]::IsNullOrWhiteSpace($sourceName)) {
+            $sourceName = $hostName
+        }
 
-    return "Unknown"
-}
+        if ([string]::IsNullOrWhiteSpace($hostName)) {
+            $hostName = $sourceName
+        }
 
-function Get-WorkloadRank {
-    param([string]$Workload)
+        $environment = Get-HashValueByAliases -Hash $hash -Aliases @(
+            "environment",
+            "sourceEnvironment",
+            "objectEnvironment",
+            "workload",
+            "workloadType",
+            "sourceType",
+            "environmentType"
+        )
 
-    switch ($Workload) {
-        "FS"       { return 1 }
-        "SQL"      { return 2 }
-        "Oracle"   { return 3 }
-        "Nutanix"  { return 4 }
-        "Hyper-V"  { return 5 }
-        "NAS"      { return 6 }
-        default    { return 9 }
-    }
-}
+        $objectType = Get-HashValueByAliases -Hash $hash -Aliases @(
+            "objectType",
+            "sourceType",
+            "entityType",
+            "type",
+            "object.type",
+            "protectedObject.type"
+        )
 
-function Test-IsLogOrArchiveRun {
-    param(
-        [object]$RunType,
-        [object]$BackupLevel,
-        [object]$SnapshotType
-    )
+        $clusterName = Get-HashValueByAliases -Hash $hash -Aliases @(
+            "clusterName",
+            "cluster.name",
+            "cluster",
+            "clusterDisplayName"
+        )
 
-    $s = Normalize-Text "$RunType $BackupLevel $SnapshotType"
+        $protectionGroup = Get-HashValueByAliases -Hash $hash -Aliases @(
+            "protectionGroupName",
+            "protectionGroup.name",
+            "protectionGroup",
+            "jobName",
+            "protectionJob",
+            "groupName",
+            "protectionJobName"
+        )
 
-    if ([string]::IsNullOrWhiteSpace($s)) {
-        return $false
-    }
+        $status = Get-HashValueByAliases -Hash $hash -Aliases @(
+            "status",
+            "runStatus",
+            "backupStatus",
+            "snapshotStatus",
+            "protectionStatus",
+            "localSnapshotInfo.snapshotInfo.status",
+            "localBackupInfo.status"
+        )
 
-    if ($s -match 'log|archive|archivelog|transaction') {
-        return $true
-    }
+        $runType = Get-HashValueByAliases -Hash $hash -Aliases @(
+            "runType",
+            "backupRunType",
+            "backupType",
+            "localBackupInfo.runType",
+            "localSnapshotInfo.snapshotInfo.runType"
+        )
 
-    return $false
-}
+        $backupType = Get-HashValueByAliases -Hash $hash -Aliases @(
+            "backupType",
+            "snapshotType",
+            "localBackupInfo.backupType",
+            "localSnapshotInfo.snapshotInfo.backupType",
+            "localSnapshotInfo.snapshotInfo.type"
+        )
 
-function Get-BackupLevel {
-    param(
-        [object]$RunType,
-        [object]$BackupType,
-        [object]$SnapshotType
-    )
+        $snapshotType = Get-HashValueByAliases -Hash $hash -Aliases @(
+            "snapshotType",
+            "snapshot.type",
+            "snapshotInfo.type",
+            "localSnapshotInfo.snapshotInfo.type",
+            "type"
+        )
 
-    $s = Normalize-Text "$RunType $BackupType $SnapshotType"
+        $endTimeRaw = Get-HashValueByAliases -Hash $hash -Aliases @(
+            "endTimeUsecs",
+            "runEndTimeUsecs",
+            "protectionRunEndTimeUsecs",
+            "backupEndTimeUsecs",
+            "localBackupInfo.endTimeUsecs",
+            "localBackupInfo.runEndTimeUsecs",
+            "localSnapshotInfo.snapshotInfo.endTimeUsecs",
+            "localSnapshotInfo.endTimeUsecs",
+            "snapshotInfo.endTimeUsecs",
+            "endTime",
+            "runEndTime",
+            "backupEndTime",
+            "protectionRunEndTime",
+            "lastBackupTime",
+            "startTimeUsecs",
+            "startTime",
+            "runStartTime"
+        )
 
-    if ($s -match 'full') {
-        return "Full"
-    }
+        if ([string]::IsNullOrWhiteSpace($objectName)) {
+            continue
+        }
 
-    if ($s -match 'incr|incremental|diff|differential') {
-        return "Incremental"
-    }
+        if ($OnlySuccessfulRows) {
+            if (-not (Test-SuccessStatus -Status $status)) {
+                continue
+            }
+        }
 
-    if ($s -match 'regular') {
-        return "Regular"
-    }
+        if ($ExcludeLogArchiveRows) {
+            if (Test-LogArchiveRow -RunType $runType -BackupLevel $backupType -SnapshotType $snapshotType) {
+                continue
+            }
+        }
 
-    if ([string]::IsNullOrWhiteSpace($s)) {
-        return "Regular"
-    }
+        $workload = Get-WorkloadFromRow `
+            -Environment $environment `
+            -ObjectType $objectType `
+            -RowText $rowText
 
-    return (Norm "$RunType $BackupType $SnapshotType").Trim()
-}
+        $backupLevel = Get-BackupLevel `
+            -RunType $runType `
+            -BackupType $backupType `
+            -SnapshotType $snapshotType
 
-function Get-CiContext {
-    param([string]$Ci)
+        $endTimeET = Convert-AnyTimeToDisplayTime -Value $endTimeRaw -TimeZoneId $DisplayTimeZoneId
+        $endTimeTicks = Convert-AnyTimeToTicks -Value $endTimeRaw
 
-    $clean = (Norm $Ci).Trim('"').Trim("'")
+        if ([string]::IsNullOrWhiteSpace($endTimeET)) {
+            $endTimeET = "Unknown"
+        }
 
-    $isDbAtServer = $false
-    $dbName = ""
-    $serverName = ""
-
-    if ($clean -match "@") {
-        $parts = $clean -split "@", 2
-        $dbName = Norm $parts[0]
-        $serverName = Norm $parts[1]
-
-        if (-not [string]::IsNullOrWhiteSpace($dbName) -and
-            -not [string]::IsNullOrWhiteSpace($serverName)) {
-            $isDbAtServer = $true
+        $normalized += [pscustomobject]@{
+            ObjectName       = $objectName
+            SourceName       = if ($sourceName) { $sourceName } else { "-" }
+            HostName         = if ($hostName) { $hostName } else { "-" }
+            Workload         = $workload
+            ClusterName      = if ($clusterName) { $clusterName } else { "-" }
+            ProtectionGroup  = if ($protectionGroup) { $protectionGroup } else { "-" }
+            BackupLevel      = $backupLevel
+            Status           = if ($status) { $status } else { "Unknown" }
+            RunTypeRaw       = if ($runType) { $runType } else { "-" }
+            EndTimeET        = $endTimeET
+            EndTimeTicks     = $endTimeTicks
+            RowText          = $rowText
         }
     }
 
-    [pscustomobject]@{
-        InputCI      = $clean
-        IsDbAtServer = $isDbAtServer
-        DbName       = $dbName
-        ServerName   = $serverName
-    }
+    return @($normalized)
 }
 
-function Test-BackupRowMatchesCi {
+# =====================================================================
+# Matching
+# =====================================================================
+function Test-ReportRowMatchesCi {
     param(
         [object]$Row,
         [object]$Context
@@ -656,13 +1258,20 @@ function Test-BackupRowMatchesCi {
             return $false
         }
 
+        $serverMatch = $false
+
         foreach ($candidateText in @($sourceName, $hostName, $pgName, $rowText)) {
             if (Test-TextMatchesName -Text $candidateText -Name $Context.ServerName) {
-                return $true
+                $serverMatch = $true
+                break
             }
         }
 
-        return $false
+        if ($RequireServerMatchForDbAtServer) {
+            return $serverMatch
+        }
+
+        return $true
     }
 
     foreach ($candidateText in @($sourceName, $hostName, $objectName, $pgName)) {
@@ -680,7 +1289,7 @@ function Test-BackupRowMatchesCi {
     return $false
 }
 
-function Select-LatestRows {
+function Select-BestRows {
     param([object[]]$Rows)
 
     $out = @()
@@ -688,7 +1297,7 @@ function Select-LatestRows {
     foreach ($grp in ($Rows | Group-Object InputCI, Workload, ClusterName, ProtectionGroup, SourceName, ObjectName)) {
         $best = $grp.Group |
             Sort-Object `
-                @{ Expression = { [int64]$_.EndTimeUsecs }; Descending = $true },
+                @{ Expression = { [int64]$_.EndTimeTicks }; Descending = $true },
                 Status |
             Select-Object -First 1
 
@@ -698,58 +1307,6 @@ function Select-LatestRows {
     return @($out)
 }
 
-function Get-PgId {
-    param([object]$Pg)
-
-    Get-FirstNonBlank @(
-        $Pg.id,
-        $Pg.protectionGroupId,
-        $Pg.uid
-    )
-}
-
-function Get-PgName {
-    param([object]$Pg)
-
-    Get-FirstNonBlank @(
-        $Pg.name,
-        $Pg.protectionGroupName,
-        $Pg.jobName
-    )
-}
-
-function Get-PgEnvironment {
-    param([object]$Pg)
-
-    Get-FirstNonBlank @(
-        $Pg.environment,
-        $Pg.sourceEnvironment,
-        $Pg.objectEnvironment,
-        $Pg.workloadType
-    )
-}
-
-function Get-ClusterId {
-    param([object]$Cluster)
-
-    Get-FirstNonBlank @(
-        $Cluster.clusterId,
-        $Cluster.id,
-        $Cluster.clusterUid,
-        $Cluster.clusterIdentifier
-    )
-}
-
-function Get-ClusterName {
-    param([object]$Cluster)
-
-    Get-FirstNonBlank @(
-        $Cluster.clusterName,
-        $Cluster.name,
-        $Cluster.displayName
-    )
-}
-
 # =====================================================================
 # Validate API key
 # =====================================================================
@@ -757,15 +1314,21 @@ if (-not (Test-Path $ApiKeyFile)) {
     throw "API key file not found: $ApiKeyFile"
 }
 
-$ApiKey = (Get-Content -Path $ApiKeyFile -Raw).Trim()
+try {
+    $ApiKey = (Get-Content -Path $ApiKeyFile -Raw).Trim()
+}
+catch {
+    throw "Unable to read API key file: $ApiKeyFile. Error: $($_.Exception.Message)"
+}
 
 if ([string]::IsNullOrWhiteSpace($ApiKey)) {
     throw "API key file is empty: $ApiKeyFile"
 }
 
 $Headers = @{
-    "accept" = "application/json"
-    "apiKey" = $ApiKey
+    "accept"       = "application/json"
+    "content-type" = "application/json"
+    "apiKey"       = $ApiKey
 }
 
 # =====================================================================
@@ -801,363 +1364,118 @@ if ($CiList.Count -eq 0) {
 $CiList | Set-Content -Path $InputTxt -Encoding UTF8
 
 # =====================================================================
-# Step 1 - Get clusters
+# Step 1 - Get reports
 # =====================================================================
-$clustersUri = "$BaseUrl/v2/mcm/cluster-mgmt/info"
+$reportsUri = "$BaseUrl/public/reports"
 
 Write-Host ""
-Write-Host "Calling Helios cluster API..." -ForegroundColor Cyan
+Write-Host "Calling Helios Reporting reports API..." -ForegroundColor Cyan
 Write-Host "Method : GET"
-Write-Host "URI    : $clustersUri"
+Write-Host "URI    : $reportsUri"
+Write-Host ""
 
-$clustersJson = Invoke-HeliosGetJson -Uri $clustersUri -Headers $Headers
-$clusters = @(Get-ResponseItems -Json $clustersJson | Where-Object { $null -ne $_ })
+$reportsJson = Invoke-HeliosReportingJson `
+    -Method "Get" `
+    -Uri $reportsUri `
+    -Headers $Headers
 
-if ($clusters.Count -eq 0) {
-    throw "No clusters returned from Helios."
+$reports = @(Get-ResponseArray -Json $reportsJson | Where-Object { $null -ne $_ })
+
+if ($reports.Count -eq 0) {
+    throw "No reports returned from Helios Reporting API."
 }
 
-$clusterList = @()
+$protectionRunsReport = Find-ProtectionRunsReport -Reports $reports
 
-foreach ($c in $clusters) {
-    $cid = Get-ClusterId -Cluster $c
-    $cn  = Get-ClusterName -Cluster $c
-
-    if ([string]::IsNullOrWhiteSpace($cid)) {
-        continue
-    }
-
-    if ([string]::IsNullOrWhiteSpace($cn)) {
-        $cn = $cid
-    }
-
-    $clusterList += [pscustomobject]@{
-        ClusterId   = "$cid"
-        ClusterName = "$cn"
-    }
+if ($null -eq $protectionRunsReport) {
+    throw "Could not find Protection Runs report in available reports."
 }
 
-$clusterList = @($clusterList | Sort-Object ClusterName)
+$reportName = Get-ReportName $protectionRunsReport
+$reportId   = Get-ReportId $protectionRunsReport
+$componentIds = @(Get-ComponentIdsFromReport -Report $protectionRunsReport)
 
-if ($clusterList.Count -eq 0) {
-    throw "No usable clusters found."
+if ([string]::IsNullOrWhiteSpace($reportId)) {
+    throw "Protection Runs report found, but report ID could not be determined."
 }
 
-Write-Host "Clusters found : $($clusterList.Count)" -ForegroundColor Green
+Write-Host "Protection Runs report found." -ForegroundColor Green
+Write-Host "Report Name : $reportName"
+Write-Host "Report ID   : $reportId"
 
-# =====================================================================
-# Step 2 - Get active protection groups and latest runs
-# =====================================================================
-$startUsecs = Get-StartUsecs -DaysBack $LookbackDays
-$endUsecs   = Get-NowUsecs
-
-$allRegularRows = @()
-
-$envParam = [uri]::EscapeDataString(($TargetEnvironments -join ","))
-
-foreach ($cluster in $clusterList) {
-    Write-Host ""
-    Write-Host "Cluster : $($cluster.ClusterName)" -ForegroundColor Cyan
-
-    $clusterHeaders = Copy-Headers -Headers $Headers
-    $clusterHeaders["accessClusterId"] = $cluster.ClusterId
-
-    $pgUri = "$BaseUrl/v2/data-protect/protection-groups?isDeleted=false&isActive=true&includeLastRunInfo=true&environments=$envParam"
-
-    Write-Host "Getting active protection groups..." -ForegroundColor DarkCyan
-
-    $pgJson = Invoke-HeliosGetJson `
-        -Uri $pgUri `
-        -Headers $clusterHeaders `
-        -Quiet
-
-    if ($null -eq $pgJson) {
-        Write-Host "Skipped cluster due to protection group API failure." -ForegroundColor Yellow
-        continue
-    }
-
-    $pgs = @(Get-ResponseItems -Json $pgJson | Where-Object { $null -ne $_ })
-
-    Write-Host "Protection Groups : $($pgs.Count)"
-
-    foreach ($pg in $pgs) {
-        $pgId = Get-PgId -Pg $pg
-        $pgName = Get-PgName -Pg $pg
-        $pgEnvironment = Get-PgEnvironment -Pg $pg
-
-        if ([string]::IsNullOrWhiteSpace($pgId)) {
-            continue
-        }
-
-        if ([string]::IsNullOrWhiteSpace($pgName)) {
-            $pgName = $pgId
-        }
-
-        $pgFlat = Flatten-ObjectToHash -Node $pg
-        $pgText = (($pgFlat.Values | Where-Object {
-            -not [string]::IsNullOrWhiteSpace("$_")
-        }) -join " ")
-
-        $pgSourceName = Get-HashValueByAliases -Hash $pgFlat -Aliases @(
-            "sourceName",
-            "source.name",
-            "parentSourceName",
-            "parentSource.name",
-            "hostName",
-            "serverName",
-            "rootSourceName"
-        )
-
-        $workloadFromPg = Get-WorkloadName -Environment $pgEnvironment -Text $pgText
-
-        $runsUri = "$BaseUrl/v2/data-protect/protection-groups/$pgId/runs?startTimeUsecs=$startUsecs&endTimeUsecs=$endUsecs"
-
-        $runsJson = Invoke-HeliosGetJson `
-            -Uri $runsUri `
-            -Headers $clusterHeaders `
-            -Quiet
-
-        if ($null -eq $runsJson) {
-            continue
-        }
-
-        $runs = @(Get-ResponseItems -Json $runsJson | Where-Object { $null -ne $_ })
-
-        foreach ($run in $runs) {
-            $runFlat = Flatten-ObjectToHash -Node $run
-
-            $runStatus = Get-HashValueByAliases -Hash $runFlat -Aliases @(
-                "localBackupInfo.status",
-                "status",
-                "runStatus",
-                "backupStatus"
-            )
-
-            $runType = Get-HashValueByAliases -Hash $runFlat -Aliases @(
-                "localBackupInfo.runType",
-                "runType",
-                "backupRunType",
-                "localBackupInfo.backupRunType"
-            )
-
-            $runBackupType = Get-HashValueByAliases -Hash $runFlat -Aliases @(
-                "localBackupInfo.backupType",
-                "backupType",
-                "snapshotType",
-                "type"
-            )
-
-            $runEndTimeUsecs = Get-HashValueByAliases -Hash $runFlat -Aliases @(
-                "localBackupInfo.endTimeUsecs",
-                "localBackupInfo.runEndTimeUsecs",
-                "runEndTimeUsecs",
-                "endTimeUsecs",
-                "stats.endTimeUsecs"
-            )
-
-            if (Test-IsLogOrArchiveRun -RunType $runType -BackupLevel $runBackupType -SnapshotType "") {
-                continue
-            }
-
-            $objects = @()
-
-            if ($run.PSObject.Properties.Name -contains "objects") {
-                $objects = @(To-ArrayMaybe $run.objects)
-            }
-
-            if ($objects.Count -eq 0) {
-                $backupLevel = Get-BackupLevel `
-                    -RunType $runType `
-                    -BackupType $runBackupType `
-                    -SnapshotType ""
-
-                $endTimeUsecs = $runEndTimeUsecs
-                $endTimeEt = Convert-UsecsToDisplayTime -Usecs $endTimeUsecs -TimeZoneId $DisplayTimeZoneId
-
-                if ([string]::IsNullOrWhiteSpace($endTimeEt)) {
-                    $endTimeEt = "Unknown"
-                }
-
-                $status = if ($runStatus) { $runStatus } else { "Unknown" }
-
-                $allRegularRows += [pscustomobject]@{
-                    InputCI          = ""
-                    Workload         = $workloadFromPg
-                    ClusterName      = $cluster.ClusterName
-                    ProtectionGroup  = $pgName
-                    SourceName       = if ($pgSourceName) { $pgSourceName } else { "-" }
-                    HostName         = if ($pgSourceName) { $pgSourceName } else { "-" }
-                    ObjectName       = $pgName
-                    BackupLevel      = $backupLevel
-                    RunTypeRaw       = if ($runType) { $runType } else { "-" }
-                    Status           = $status
-                    EndTimeET        = $endTimeEt
-                    EndTimeUsecs     = if ($endTimeUsecs) { [int64]$endTimeUsecs } else { 0 }
-                    RowText          = "$pgText $($run | ConvertTo-Json -Depth 20 -Compress)"
-                }
-
-                continue
-            }
-
-            foreach ($obj in $objects) {
-                $objFlat = Flatten-ObjectToHash -Node $obj
-
-                $objText = (($objFlat.Values | Where-Object {
-                    -not [string]::IsNullOrWhiteSpace("$_")
-                }) -join " ")
-
-                $objectName = Get-HashValueByAliases -Hash $objFlat -Aliases @(
-                    "object.name",
-                    "name",
-                    "objectName",
-                    "protectedObjectName",
-                    "sourceName",
-                    "entityName",
-                    "databaseName",
-                    "dbName",
-                    "dbUniqueName",
-                    "vmName",
-                    "viewName",
-                    "filePath"
-                )
-
-                $sourceName = Get-HashValueByAliases -Hash $objFlat -Aliases @(
-                    "object.parentSourceName",
-                    "parentSourceName",
-                    "sourceName",
-                    "source.name",
-                    "hostName",
-                    "serverName",
-                    "sqlServer",
-                    "oracleHost",
-                    "rootSourceName"
-                )
-
-                $hostName = Get-HashValueByAliases -Hash $objFlat -Aliases @(
-                    "hostName",
-                    "serverName",
-                    "object.hostName",
-                    "object.parentSourceName",
-                    "parentSourceName",
-                    "sqlServer",
-                    "oracleHost"
-                )
-
-                $objStatus = Get-HashValueByAliases -Hash $objFlat -Aliases @(
-                    "localSnapshotInfo.snapshotInfo.status",
-                    "localSnapshotInfo.status",
-                    "snapshotInfo.status",
-                    "status",
-                    "objectStatus",
-                    "backupStatus"
-                )
-
-                $objRunType = Get-HashValueByAliases -Hash $objFlat -Aliases @(
-                    "localSnapshotInfo.snapshotInfo.runType",
-                    "localSnapshotInfo.runType",
-                    "snapshotInfo.runType",
-                    "runType",
-                    "backupRunType"
-                )
-
-                $objBackupType = Get-HashValueByAliases -Hash $objFlat -Aliases @(
-                    "localSnapshotInfo.snapshotInfo.backupType",
-                    "localSnapshotInfo.backupType",
-                    "snapshotInfo.backupType",
-                    "backupType",
-                    "snapshotType",
-                    "type"
-                )
-
-                $objSnapshotType = Get-HashValueByAliases -Hash $objFlat -Aliases @(
-                    "localSnapshotInfo.snapshotInfo.type",
-                    "snapshotInfo.type",
-                    "snapshotType",
-                    "type"
-                )
-
-                if (Test-IsLogOrArchiveRun -RunType "$runType $objRunType" -BackupLevel "$runBackupType $objBackupType" -SnapshotType $objSnapshotType) {
-                    continue
-                }
-
-                $endTimeUsecs = Get-HashValueByAliases -Hash $objFlat -Aliases @(
-                    "localSnapshotInfo.snapshotInfo.endTimeUsecs",
-                    "localSnapshotInfo.endTimeUsecs",
-                    "snapshotInfo.endTimeUsecs",
-                    "endTimeUsecs",
-                    "runEndTimeUsecs",
-                    "backupEndTimeUsecs"
-                )
-
-                if ([string]::IsNullOrWhiteSpace($endTimeUsecs)) {
-                    $endTimeUsecs = $runEndTimeUsecs
-                }
-
-                $endTimeEt = Convert-UsecsToDisplayTime -Usecs $endTimeUsecs -TimeZoneId $DisplayTimeZoneId
-
-                if ([string]::IsNullOrWhiteSpace($endTimeEt)) {
-                    $endTimeEt = "Unknown"
-                }
-
-                if ([string]::IsNullOrWhiteSpace($objectName)) {
-                    $objectName = Get-FirstNonBlank @($sourceName, $hostName, $pgName)
-                }
-
-                if ([string]::IsNullOrWhiteSpace($sourceName)) {
-                    $sourceName = $pgSourceName
-                }
-
-                if ([string]::IsNullOrWhiteSpace($hostName)) {
-                    $hostName = $sourceName
-                }
-
-                $backupLevel = Get-BackupLevel `
-                    -RunType "$runType $objRunType" `
-                    -BackupType "$runBackupType $objBackupType" `
-                    -SnapshotType $objSnapshotType
-
-                $status = Get-FirstNonBlank @(
-                    $objStatus,
-                    $runStatus,
-                    "Unknown"
-                )
-
-                $workload = Get-WorkloadName `
-                    -Environment $pgEnvironment `
-                    -Text "$pgText $objText"
-
-                if ($workload -eq "Unknown") {
-                    $workload = $workloadFromPg
-                }
-
-                $rowText = "$pgText $objText"
-
-                $allRegularRows += [pscustomobject]@{
-                    InputCI          = ""
-                    Workload         = $workload
-                    ClusterName      = $cluster.ClusterName
-                    ProtectionGroup  = $pgName
-                    SourceName       = if ($sourceName) { $sourceName } else { "-" }
-                    HostName         = if ($hostName) { $hostName } else { "-" }
-                    ObjectName       = if ($objectName) { $objectName } else { "-" }
-                    BackupLevel      = $backupLevel
-                    RunTypeRaw       = if ($runType) { $runType } else { "-" }
-                    Status           = $status
-                    EndTimeET        = $endTimeEt
-                    EndTimeUsecs     = if ($endTimeUsecs) { [int64]$endTimeUsecs } else { 0 }
-                    RowText          = $rowText
-                }
-            }
-        }
-    }
+if ($componentIds.Count -gt 0) {
+    Write-Host "Components  : $($componentIds -join ',')"
 }
-
-if ($allRegularRows.Count -eq 0) {
-    throw "No non-log backup rows found in the last $LookbackDays days."
+else {
+    Write-Host "Components  : none detected"
 }
 
 # =====================================================================
-# Step 3 - Match CI list
+# Step 2 - Fetch Protection Runs preview
+# =====================================================================
+Write-Host ""
+Write-Host "Calling Protection Runs report preview API..." -ForegroundColor Cyan
+Write-Host "Method : POST"
+Write-Host "Report : $reportName"
+Write-Host ""
+
+$previewResult = Get-ProtectionRunsPreview `
+    -ReportId $reportId `
+    -ComponentIds $componentIds `
+    -Headers $Headers
+
+$previewJson = $previewResult.Json
+
+# =====================================================================
+# Step 3 - Extract best row array
+# =====================================================================
+Write-Host ""
+Write-Host "Extracting report rows..." -ForegroundColor Cyan
+
+$arrays = @(Get-ReportArrays -Node $previewJson)
+
+if ($arrays.Count -eq 0) {
+    throw "No row arrays found in Protection Runs preview response."
+}
+
+$bestArray = $arrays |
+    Sort-Object `
+        @{ Expression = { [int]$_.Score }; Descending = $true },
+        @{ Expression = { [int]$_.Count }; Descending = $true } |
+    Select-Object -First 1
+
+$rawRows = @($bestArray.Rows)
+
+Write-Host "Selected Row Path : $($bestArray.Path)"
+Write-Host "Raw Row Count     : $($rawRows.Count)"
+Write-Host "Row Score         : $($bestArray.Score)"
+
+$normalizedRows = @(Convert-ReportRowsToNormalizedRows -Rows $rawRows)
+
+if ($normalizedRows.Count -eq 0) {
+    throw "Report preview returned rows, but no usable rows were normalized."
+}
+
+Write-Host "Normalized Rows   : $($normalizedRows.Count)" -ForegroundColor Green
+
+if ($ExportNormalizedRows) {
+    $normalizedRows |
+        Select-Object `
+            Workload,
+            ClusterName,
+            ProtectionGroup,
+            SourceName,
+            HostName,
+            ObjectName,
+            BackupLevel,
+            Status,
+            RunTypeRaw,
+            EndTimeET |
+        Export-Csv -Path $NormalizedRowsCsv -NoTypeInformation -Encoding UTF8
+}
+
+# =====================================================================
+# Step 4 - Match CI list
 # =====================================================================
 Write-Host ""
 Write-Host "Matching CI list..." -ForegroundColor Cyan
@@ -1167,25 +1485,22 @@ $results = @()
 foreach ($ci in $CiList) {
     $context = Get-CiContext -Ci $ci
 
-    $matches = @($allRegularRows | Where-Object {
-        Test-BackupRowMatchesCi -Row $_ -Context $context
+    $matches = @($normalizedRows | Where-Object {
+        Test-ReportRowMatchesCi -Row $_ -Context $context
     })
 
     if ($matches.Count -eq 0) {
         $results += [pscustomobject]@{
-            InputCI          = $context.InputCI
-            Workload         = "Unknown"
-            ClusterName      = "-"
-            ProtectionGroup  = "-"
-            SourceName       = "-"
-            HostName         = "-"
-            ObjectName       = $context.InputCI
-            BackupLevel      = "Unknown"
-            RunTypeRaw       = "-"
-            Status           = "Unknown"
-            EndTimeET        = "Unknown"
-            EndTimeUsecs     = 0
-            RowText          = ""
+            InputCI         = $context.InputCI
+            Workload        = "Unknown"
+            ClusterName     = "-"
+            ProtectionGroup = "-"
+            SourceName      = "-"
+            ObjectName      = $context.InputCI
+            BackupLevel     = "Unknown"
+            Status          = "Unknown"
+            EndTimeET       = "Unknown"
+            EndTimeTicks    = 0
         }
 
         continue
@@ -1193,24 +1508,21 @@ foreach ($ci in $CiList) {
 
     foreach ($m in $matches) {
         $results += [pscustomobject]@{
-            InputCI          = $context.InputCI
-            Workload         = $m.Workload
-            ClusterName      = $m.ClusterName
-            ProtectionGroup  = $m.ProtectionGroup
-            SourceName       = $m.SourceName
-            HostName         = $m.HostName
-            ObjectName       = $m.ObjectName
-            BackupLevel      = $m.BackupLevel
-            RunTypeRaw       = $m.RunTypeRaw
-            Status           = $m.Status
-            EndTimeET        = $m.EndTimeET
-            EndTimeUsecs     = $m.EndTimeUsecs
-            RowText          = $m.RowText
+            InputCI         = $context.InputCI
+            Workload        = $m.Workload
+            ClusterName     = $m.ClusterName
+            ProtectionGroup = $m.ProtectionGroup
+            SourceName      = $m.SourceName
+            ObjectName      = $m.ObjectName
+            BackupLevel     = $m.BackupLevel
+            Status          = $m.Status
+            EndTimeET       = $m.EndTimeET
+            EndTimeTicks    = $m.EndTimeTicks
         }
     }
 }
 
-$finalRows = @(Select-LatestRows -Rows $results)
+$finalRows = @(Select-BestRows -Rows $results)
 
 $finalRows = @(
     $finalRows |
@@ -1223,7 +1535,7 @@ $finalRows = @(
 )
 
 # =====================================================================
-# Export
+# Export final CSV
 # =====================================================================
 $finalOutput = $finalRows |
     Select-Object `
@@ -1239,26 +1551,12 @@ $finalOutput = $finalRows |
 
 $finalOutput | Export-Csv -Path $CsvOutput -NoTypeInformation -Encoding UTF8
 
-if ($ExportAllRegularRows) {
-    $allRegularRows |
-        Select-Object `
-            Workload,
-            ClusterName,
-            ProtectionGroup,
-            SourceName,
-            HostName,
-            ObjectName,
-            BackupLevel,
-            RunTypeRaw,
-            Status,
-            EndTimeET |
-        Export-Csv -Path $AllRowsCsv -NoTypeInformation -Encoding UTF8
-}
-
 # =====================================================================
-# TXT report
+# Text report
 # =====================================================================
-$runTimeEt = Convert-UsecsToDisplayTime -Usecs (Get-NowUsecs) -TimeZoneId $DisplayTimeZoneId
+$runTimeEt = Convert-UsecsToDisplayTime `
+    -Usecs ([int64](([DateTimeOffset](Get-Date)).ToUnixTimeMilliseconds() * 1000)) `
+    -TimeZoneId $DisplayTimeZoneId
 
 $totalInput = $CiList.Count
 $totalRows = $finalOutput.Count
@@ -1289,18 +1587,22 @@ $summaryText = (
 
 $report = @()
 $report += "============================================================"
-$report += "Cohesity Backup Validation - GET-Only"
+$report += "Cohesity Backup Validation - Protection Runs Report Preview"
 $report += "============================================================"
 $report += "Change Number             : $ChangeID"
 $report += "Run Time                  : $runTimeEt ET"
-$report += "Lookback Days             : $LookbackDays"
+$report += "Report Used               : $reportName"
+$report += "Report ID                 : $reportId"
+$report += "Preview Attempt           : #$($previewResult.Attempt) - $($previewResult.AttemptName)"
+$report += "Selected Row Path         : $($bestArray.Path)"
 $report += ""
 $report += "Total Input CIs           : $totalInput"
 $report += "Total Output Rows         : $totalRows"
 $report += "Found                     : $foundCount"
 $report += "Unknown                   : $unknownCount"
 $report += ""
-$report += "API Method Used           : GET only"
+$report += "API Usage                 : GET reports + POST report preview"
+$report += "Backup Impact             : None - report preview only"
 $report += "API Calls                 : $script:ApiCalls"
 $report += "Failed API Calls          : $script:FailedApiCalls"
 $report += ""
@@ -1322,8 +1624,8 @@ $report += "Input TXT                 : $InputTxt"
 $report += "Final CSV                 : $CsvOutput"
 $report += "Text Report               : $TxtOutput"
 
-if ($ExportAllRegularRows) {
-    $report += "All Regular Rows CSV      : $AllRowsCsv"
+if ($ExportNormalizedRows) {
+    $report += "Normalized Rows CSV       : $NormalizedRowsCsv"
 }
 
 $report += "============================================================"
@@ -1334,16 +1636,19 @@ $report | Set-Content -Path $TxtOutput -Encoding UTF8
 # Screen output
 # =====================================================================
 Write-Host ""
-Write-Host "Cohesity Backup Validation - GET-Only" -ForegroundColor Cyan
+Write-Host "Cohesity Backup Validation - Protection Runs Report Preview" -ForegroundColor Cyan
 Write-Host "Change Number     : $ChangeID"
 Write-Host "Run Time          : $runTimeEt ET"
-Write-Host "Lookback Days     : $LookbackDays"
+Write-Host "Report Used       : $reportName"
+Write-Host "Preview Attempt   : #$($previewResult.Attempt) - $($previewResult.AttemptName)"
+Write-Host "Selected Row Path : $($bestArray.Path)"
 Write-Host ""
 Write-Host "Total Input CIs   : $totalInput"
 Write-Host "Total Output Rows : $totalRows"
 Write-Host "Found             : $foundCount"
 Write-Host "Unknown           : $unknownCount"
-Write-Host "API Method Used   : GET only"
+Write-Host "API Usage         : GET reports + POST report preview"
+Write-Host "Backup Impact     : None - report preview only"
 Write-Host "API Calls         : $script:ApiCalls"
 Write-Host "Failed API Calls  : $script:FailedApiCalls"
 Write-Host ""
@@ -1353,7 +1658,13 @@ $byType | Format-Table -AutoSize
 
 Write-Host ""
 Write-Host "Details:" -ForegroundColor Cyan
-$finalOutput | Format-Table -AutoSize -Wrap
+
+if ($finalOutput.Count -eq 0) {
+    Write-Host "No matching backup rows found." -ForegroundColor Yellow
+}
+else {
+    $finalOutput | Format-Table -AutoSize -Wrap
+}
 
 Write-Host ""
 Write-Host "CSV Output:" -ForegroundColor Green
@@ -1363,10 +1674,10 @@ Write-Host ""
 Write-Host "Text Report:" -ForegroundColor Green
 Write-Host $TxtOutput
 
-if ($ExportAllRegularRows) {
+if ($ExportNormalizedRows) {
     Write-Host ""
-    Write-Host "All Regular Rows CSV:" -ForegroundColor Green
-    Write-Host $AllRowsCsv
+    Write-Host "Normalized Rows CSV:" -ForegroundColor Green
+    Write-Host $NormalizedRowsCsv
 }
 
 Write-Host ""
