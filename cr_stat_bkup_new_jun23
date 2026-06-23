@@ -9,7 +9,9 @@
 #
 # Important:
 # - Global search is used only to identify candidate clusterId values quickly.
-# - Protected-object search is then run only on candidate clusters using accessClusterId.
+# - Protected-object search is then run on candidate clusters using accessClusterId.
+# - If snapshots point to replicationSnapshotInfo.clusterId, that replicated cluster is also searched.
+# - If FS or DB is still missing, all-cluster fallback search runs for that CI.
 # - Protected-object endpoint is called exactly as shown above: no count, no includeTenants, no environment filter.
 # - No PG runs endpoint is used.
 # - FS row comes from parent/root object latestSnapshotsInfo.
@@ -23,7 +25,7 @@
 #   ci_item
 #
 # Output:
-#   TXT report + CSV report
+#   TXT report + CSV report + Debug CSV
 # ==========================================================
 
 $ErrorActionPreference = "Stop"
@@ -74,19 +76,22 @@ if ([string]::IsNullOrWhiteSpace($ApiKey)) {
 # -------------------------
 # Settings
 # -------------------------
-$GlobalSearchCount        = 100
-$EnableAllClusterFallback = $true
-$FallbackWhenNoGlobalObject = $false
-$ShowProgress            = $true
-$ReportTimeZoneId        = "Eastern Standard Time"
+$GlobalSearchCount            = 100
+$EnableAllClusterFallback     = $true
+$FallbackWhenNoGlobalObject   = $false
+$FallbackWhenMissingFsOrDb    = $true
+$SearchReplicatedClusterToo   = $true
+$ShowProgress                 = $true
+$ReportTimeZoneId             = "Eastern Standard Time"
 
 # -------------------------
 # Counters
 # -------------------------
-$GlobalSearchCalls    = 0
-$ProtectedSearchCalls = 0
-$FallbackCiCount      = 0
-$FailedGets           = 0
+$GlobalSearchCalls       = 0
+$ProtectedSearchCalls    = 0
+$ReplicatedProbeCiCount  = 0
+$FallbackCiCount         = 0
+$FailedGets              = 0
 
 # ==========================================================
 # Basic Helpers
@@ -157,23 +162,6 @@ function Has-Prop {
     catch {
         return $false
     }
-}
-
-function Get-Prop {
-    param(
-        $Object,
-        [string]$Name
-    )
-
-    if ($null -eq $Object) {
-        return $null
-    }
-
-    if (Has-Prop -Object $Object -Name $Name) {
-        return $Object.$Name
-    }
-
-    return $null
 }
 
 function First-NonBlank {
@@ -379,7 +367,8 @@ function Is-ValidBackupTime {
         "NoBackup",
         "NoBackupTime",
         "NoObject",
-        "NoFSBackupFound"
+        "NoFSBackupFound",
+        "NoDbBackupFound"
     ))
 }
 
@@ -415,6 +404,36 @@ function Get-ClusterNameFromMap {
     }
 
     return "$ClusterId"
+}
+
+function Add-CandidateCluster {
+    param(
+        [System.Collections.ArrayList]$List,
+        [hashtable]$Seen,
+        [string]$ClusterId,
+        [string]$ClusterName,
+        [string]$SearchMode
+    )
+
+    if ([string]::IsNullOrWhiteSpace($ClusterId)) {
+        return
+    }
+
+    if ($Seen.ContainsKey("$ClusterId")) {
+        return
+    }
+
+    if ([string]::IsNullOrWhiteSpace($ClusterName)) {
+        $ClusterName = $ClusterId
+    }
+
+    $Seen["$ClusterId"] = $true
+
+    [void]$List.Add([pscustomobject]@{
+        clusterId   = "$ClusterId"
+        clusterName = "$ClusterName"
+        searchMode  = "$SearchMode"
+    })
 }
 
 # ==========================================================
@@ -506,7 +525,6 @@ function Get-CandidateClusterIdsFromGlobalSearch {
             return
         }
 
-        # Keep only IDs known from /v2/mcm/cluster-mgmt/info.
         if (-not $ClusterMap.ContainsKey("$idText")) {
             return
         }
@@ -881,6 +899,108 @@ function Convert-FlatObjectToBackupRow {
     }
 }
 
+function Search-ProtectedObjectsOnClusters {
+    param(
+        [string]$Ci,
+        [object[]]$CandidateClusters,
+        [hashtable]$ClusterMap,
+        [System.Collections.ArrayList]$SearchedClusterIds,
+        [System.Collections.ArrayList]$DebugRows
+    )
+
+    $Rows = @()
+
+    foreach ($Clu in @($CandidateClusters)) {
+
+        if ([string]::IsNullOrWhiteSpace("$($Clu.clusterId)")) {
+            continue
+        }
+
+        if ($SearchedClusterIds.Contains("$($Clu.clusterId)")) {
+            continue
+        }
+
+        [void]$SearchedClusterIds.Add("$($Clu.clusterId)")
+
+        $script:ProtectedSearchCalls++
+
+        # Exact protected-object endpoint from the working image.
+        # Do not add includeTenants/count/environment here.
+        $ProtectedSearchUrl =
+            "$BaseUrl/v2/data-protect/search/protected-objects" +
+            "?searchString=$([uri]::EscapeDataString($Ci))"
+
+        $ProtectedJson = Invoke-HeliosJson -Uri $ProtectedSearchUrl -Headers @{
+            accept          = "application/json"
+            apiKey          = $ApiKey
+            accessClusterId = "$($Clu.clusterId)"
+        } -Quiet
+
+        $ProtectedObjects = @(Get-ProtectedObjects -Json $ProtectedJson)
+
+        if (-not $ProtectedObjects -or $ProtectedObjects.Count -eq 0) {
+            continue
+        }
+
+        $FlatObjects = @()
+
+        foreach ($Obj in $ProtectedObjects) {
+            $FlatObjects += Get-FlatProtectedObjects -Object $Obj
+        }
+
+        $MatchingFlatObjects = @($FlatObjects | Where-Object {
+            Object-MatchesCiFlat `
+                -ObjectName "$($_.ObjectName)" `
+                -ParentName "$($_.ParentName)" `
+                -SourceName "$($_.SourceName)" `
+                -CiName $Ci
+        })
+
+        if ($MatchingFlatObjects -and $MatchingFlatObjects.Count -gt 0) {
+            $ObjectsToCheck = $MatchingFlatObjects
+        }
+        else {
+            # Protected-object search is already scoped by searchString.
+            # Keep this fallback so DB objects are not lost if Cohesity returns weak parent/source metadata.
+            $ObjectsToCheck = $FlatObjects
+        }
+
+        foreach ($Flat in $ObjectsToCheck) {
+            $row = Convert-FlatObjectToBackupRow `
+                -FlatObject $Flat `
+                -Ci $Ci `
+                -CandidateCluster $Clu `
+                -ClusterMap $ClusterMap
+
+            $Rows += $row
+
+            [void]$DebugRows.Add([pscustomobject]@{
+                ServerName        = $Ci
+                SearchMode        = $Clu.searchMode
+                SearchClusterId   = $Clu.clusterId
+                SearchCluster     = $Clu.clusterName
+                RawObjectName     = $Flat.ObjectName
+                ParentName        = $Flat.ParentName
+                SourceName        = $Flat.SourceName
+                Environment       = $Flat.Environment
+                ParentEnvironment = $Flat.ParentEnvironment
+                ObjectType        = $Flat.ObjectType
+                Depth             = $Flat.Depth
+                BackupType        = $row.BackupType
+                ObjectName        = $row.ObjectName
+                BackupLocation    = $row.BackupLocation
+                BackupClusterId   = $row.BackupClusterId
+                ClusterName       = $row.ClusterName
+                ProtectionGroup   = $row.ProtectionGroup
+                LastBackupTime    = $row.LastBackupTime
+                LastBackupUsecs   = $row.LastBackupUsecs
+            })
+        }
+    }
+
+    return @($Rows)
+}
+
 # ==========================================================
 # Report Helpers
 # ==========================================================
@@ -894,6 +1014,22 @@ function Get-BackupTypeRank {
         "DB"      { return 4 }
         default   { return 9 }
     }
+}
+
+function Test-HasValidFs {
+    param($Rows)
+
+    return (@($Rows | Where-Object {
+        $_.BackupType -eq "FS" -and (Is-ValidBackupTime -TimeText $_.LastBackupTime)
+    }).Count -gt 0)
+}
+
+function Test-HasValidDb {
+    param($Rows)
+
+    return (@($Rows | Where-Object {
+        $_.BackupType -in @("SQL", "Oracle", "DB") -and (Is-ValidBackupTime -TimeText $_.LastBackupTime)
+    }).Count -gt 0)
 }
 
 # ==========================================================
@@ -1003,7 +1139,7 @@ Write-Host "Cluster map entries  : $($ClusterMap.Count)" -ForegroundColor Green
 # Main Processing
 # ==========================================================
 $Results = @()
-$DebugRows = @()
+$DebugRows = New-Object System.Collections.ArrayList
 
 foreach ($Ci in $CiList) {
 
@@ -1013,6 +1149,7 @@ foreach ($Ci in $CiList) {
     }
 
     $CiRows = @()
+    $SearchedClusterIds = New-Object System.Collections.ArrayList
 
     # ------------------------------------------------------
     # FAST STEP 1:
@@ -1034,17 +1171,17 @@ foreach ($Ci in $CiList) {
     $GlobalObjects = @(Get-GlobalObjects -Json $GlobalJson)
     $CandidateClusterIds = @(Get-CandidateClusterIdsFromGlobalSearch -Json $GlobalJson -ClusterMap $ClusterMap)
 
-    $CandidateClusters = @()
+    $CandidateClusters = New-Object System.Collections.ArrayList
+    $CandidateSeen = @{}
 
     if ($CandidateClusterIds -and $CandidateClusterIds.Count -gt 0) {
         foreach ($ClusterId in $CandidateClusterIds) {
-            $ClusterName = Get-ClusterNameFromMap -ClusterId "$ClusterId" -ClusterMap $ClusterMap
-
-            $CandidateClusters += [pscustomobject]@{
-                clusterId   = "$ClusterId"
-                clusterName = "$ClusterName"
-                searchMode  = "Fast"
-            }
+            Add-CandidateCluster `
+                -List $CandidateClusters `
+                -Seen $CandidateSeen `
+                -ClusterId "$ClusterId" `
+                -ClusterName (Get-ClusterNameFromMap -ClusterId "$ClusterId" -ClusterMap $ClusterMap) `
+                -SearchMode "Fast"
         }
     }
     else {
@@ -1059,11 +1196,12 @@ foreach ($Ci in $CiList) {
             $FallbackCiCount++
 
             foreach ($Clu in $Clusters) {
-                $CandidateClusters += [pscustomobject]@{
-                    clusterId   = "$($Clu.clusterId)"
-                    clusterName = "$($Clu.clusterName)"
-                    searchMode  = "Fallback"
-                }
+                Add-CandidateCluster `
+                    -List $CandidateClusters `
+                    -Seen $CandidateSeen `
+                    -ClusterId "$($Clu.clusterId)" `
+                    -ClusterName "$($Clu.clusterName)" `
+                    -SearchMode "FallbackNoClusterId"
             }
         }
     }
@@ -1089,81 +1227,99 @@ foreach ($Ci in $CiList) {
     # FAST STEP 2:
     # Protected-object search on candidate clusters only
     # ------------------------------------------------------
-    foreach ($Clu in $CandidateClusters) {
+    $CiRows += Search-ProtectedObjectsOnClusters `
+        -Ci $Ci `
+        -CandidateClusters @($CandidateClusters) `
+        -ClusterMap $ClusterMap `
+        -SearchedClusterIds $SearchedClusterIds `
+        -DebugRows $DebugRows
 
-        $ProtectedSearchCalls++
+    # ------------------------------------------------------
+    # FAST STEP 3:
+    # If snapshot reports replicationSnapshotInfo.clusterId,
+    # search that replicated cluster too.
+    # ------------------------------------------------------
+    if ($SearchReplicatedClusterToo) {
+        $ReplicatedClusterIds = @(
+            $CiRows |
+            Where-Object {
+                $_.BackupLocation -eq "Replicated" -and
+                -not [string]::IsNullOrWhiteSpace($_.BackupClusterId) -and
+                $_.BackupClusterId -ne "-" -and
+                $ClusterMap.ContainsKey("$($_.BackupClusterId)")
+            } |
+            Select-Object -ExpandProperty BackupClusterId -Unique
+        )
 
-        # Exact protected-object endpoint from the working image.
-        # Do not add includeTenants/count/environment here.
-        $ProtectedSearchUrl =
-            "$BaseUrl/v2/data-protect/search/protected-objects" +
-            "?searchString=$([uri]::EscapeDataString($Ci))"
+        $ReplicatedClustersToSearch = New-Object System.Collections.ArrayList
+        $RepSeen = @{}
 
-        $ProtectedJson = Invoke-HeliosJson -Uri $ProtectedSearchUrl -Headers @{
-            accept          = "application/json"
-            apiKey          = $ApiKey
-            accessClusterId = "$($Clu.clusterId)"
-        } -Quiet
-
-        $ProtectedObjects = @(Get-ProtectedObjects -Json $ProtectedJson)
-
-        if (-not $ProtectedObjects -or $ProtectedObjects.Count -eq 0) {
-            continue
-        }
-
-        $FlatObjects = @()
-
-        foreach ($Obj in $ProtectedObjects) {
-            $FlatObjects += Get-FlatProtectedObjects -Object $Obj
-        }
-
-        $MatchingFlatObjects = @($FlatObjects | Where-Object {
-            Object-MatchesCiFlat `
-                -ObjectName "$($_.ObjectName)" `
-                -ParentName "$($_.ParentName)" `
-                -SourceName "$($_.SourceName)" `
-                -CiName $Ci
-        })
-
-        if ($MatchingFlatObjects -and $MatchingFlatObjects.Count -gt 0) {
-            $ObjectsToCheck = $MatchingFlatObjects
-        }
-        else {
-            # Protected-object search is already scoped by searchString.
-            # Keep this fallback so DB objects are not lost if Cohesity returns weak parent/source metadata.
-            $ObjectsToCheck = $FlatObjects
-        }
-
-        foreach ($Flat in $ObjectsToCheck) {
-            $row = Convert-FlatObjectToBackupRow `
-                -FlatObject $Flat `
-                -Ci $Ci `
-                -CandidateCluster $Clu `
-                -ClusterMap $ClusterMap
-
-            $CiRows += $row
-
-            $DebugRows += [pscustomobject]@{
-                ServerName       = $Ci
-                SearchMode       = $Clu.searchMode
-                SearchClusterId  = $Clu.clusterId
-                SearchCluster    = $Clu.clusterName
-                RawObjectName    = $Flat.ObjectName
-                ParentName       = $Flat.ParentName
-                SourceName       = $Flat.SourceName
-                Environment      = $Flat.Environment
-                ParentEnvironment = $Flat.ParentEnvironment
-                ObjectType       = $Flat.ObjectType
-                Depth            = $Flat.Depth
-                BackupType       = $row.BackupType
-                ObjectName       = $row.ObjectName
-                BackupLocation   = $row.BackupLocation
-                BackupClusterId  = $row.BackupClusterId
-                ClusterName      = $row.ClusterName
-                ProtectionGroup  = $row.ProtectionGroup
-                LastBackupTime   = $row.LastBackupTime
-                LastBackupUsecs  = $row.LastBackupUsecs
+        foreach ($Rid in $ReplicatedClusterIds) {
+            if (-not $SearchedClusterIds.Contains("$Rid")) {
+                Add-CandidateCluster `
+                    -List $ReplicatedClustersToSearch `
+                    -Seen $RepSeen `
+                    -ClusterId "$Rid" `
+                    -ClusterName (Get-ClusterNameFromMap -ClusterId "$Rid" -ClusterMap $ClusterMap) `
+                    -SearchMode "ReplicatedProbe"
             }
+        }
+
+        if ($ReplicatedClustersToSearch.Count -gt 0) {
+            $ReplicatedProbeCiCount++
+
+            if ($ShowProgress) {
+                Write-Host "  Replicated cluster probe: $($ReplicatedClustersToSearch.Count)" -ForegroundColor DarkGray
+            }
+
+            $CiRows += Search-ProtectedObjectsOnClusters `
+                -Ci $Ci `
+                -CandidateClusters @($ReplicatedClustersToSearch) `
+                -ClusterMap $ClusterMap `
+                -SearchedClusterIds $SearchedClusterIds `
+                -DebugRows $DebugRows
+        }
+    }
+
+    # ------------------------------------------------------
+    # FALLBACK STEP:
+    # If FS or DB is still missing, search all clusters not already searched.
+    # ------------------------------------------------------
+    $NeedFallbackForMissingType =
+        $FallbackWhenMissingFsOrDb -and
+        (
+            -not (Test-HasValidFs -Rows $CiRows) -or
+            -not (Test-HasValidDb -Rows $CiRows)
+        )
+
+    if ($NeedFallbackForMissingType) {
+        $AllClusterFallback = New-Object System.Collections.ArrayList
+        $FallbackSeen = @{}
+
+        foreach ($Clu in $Clusters) {
+            if (-not $SearchedClusterIds.Contains("$($Clu.clusterId)")) {
+                Add-CandidateCluster `
+                    -List $AllClusterFallback `
+                    -Seen $FallbackSeen `
+                    -ClusterId "$($Clu.clusterId)" `
+                    -ClusterName "$($Clu.clusterName)" `
+                    -SearchMode "FallbackMissingFsOrDb"
+            }
+        }
+
+        if ($AllClusterFallback.Count -gt 0) {
+            $FallbackCiCount++
+
+            if ($ShowProgress) {
+                Write-Host "  Fallback all-cluster search: $($AllClusterFallback.Count)" -ForegroundColor DarkGray
+            }
+
+            $CiRows += Search-ProtectedObjectsOnClusters `
+                -Ci $Ci `
+                -CandidateClusters @($AllClusterFallback) `
+                -ClusterMap $ClusterMap `
+                -SearchedClusterIds $SearchedClusterIds `
+                -DebugRows $DebugRows
         }
     }
 
@@ -1207,21 +1363,10 @@ foreach ($Ci in $CiList) {
     }
 
     # If SQL or Oracle backup exists but no FS backup exists, show that clearly.
-    $HasSQL = @($DedupedRows | Where-Object {
-        $_.BackupType -eq "SQL" -and (Is-ValidBackupTime -TimeText $_.LastBackupTime)
-    }).Count -gt 0
+    $HasDbBackup = Test-HasValidDb -Rows $DedupedRows
+    $HasFS       = Test-HasValidFs -Rows $DedupedRows
 
-    $HasOracle = @($DedupedRows | Where-Object {
-        $_.BackupType -eq "Oracle" -and (Is-ValidBackupTime -TimeText $_.LastBackupTime)
-    }).Count -gt 0
-
-    $HasFS = @($DedupedRows | Where-Object {
-        $_.BackupType -eq "FS" -and (Is-ValidBackupTime -TimeText $_.LastBackupTime)
-    }).Count -gt 0
-
-    $HasDBBackup = $HasSQL -or $HasOracle
-
-    if ($HasDBBackup -and -not $HasFS) {
+    if ($HasDbBackup -and -not $HasFS) {
         $Results += [pscustomobject]@{
             ServerName      = $Ci
             BackupType      = "FS"
@@ -1244,7 +1389,7 @@ $TotalInputCIs = $CiList.Count
 $TotalBackupRows = $Results.Count
 
 $BackedUp = ($Results | Where-Object {
-    $_.LastBackupTime -notin @("NoBackup", "NoBackupTime", "NoObject", "NoFSBackupFound", "")
+    $_.LastBackupTime -notin @("NoBackup", "NoBackupTime", "NoObject", "NoFSBackupFound", "NoDbBackupFound", "")
 }).Count
 
 $NoBackup = ($Results | Where-Object {
@@ -1303,6 +1448,7 @@ $Report += "No Object              : $NoObject"
 $Report += ""
 $Report += "Global Search Calls    : $GlobalSearchCalls"
 $Report += "Protected Search Calls : $ProtectedSearchCalls"
+$Report += "Replicated Probe CIs   : $ReplicatedProbeCiCount"
 $Report += "Fallback CI Count      : $FallbackCiCount"
 $Report += "Failed GETs            : $FailedGets"
 $Report += ""
@@ -1323,8 +1469,9 @@ $Report += "- No Backup          : CI found in Cohesity but no usable snapshot t
 $Report += "- No Object          : CI not found in Cohesity search."
 $Report += "- NoFSBackupFound    : SQL/Oracle backup found, but no matching FS backup found for the CI."
 $Report += "- BackupLocation     : Replicated when latestSnapshotsInfo.replicationSnapshotInfo.clusterId exists; otherwise Local."
+$Report += "- Replicated Probe   : If snapshot points to replicationSnapshotInfo.clusterId, that cluster is searched too."
 $Report += "- Fast Logic         : Global search identifies candidate clusterId first, then protected-object search runs only on candidate clusters."
-$Report += "- Fallback           : All-cluster scan is used only when global search finds an object but does not return clusterId."
+$Report += "- Fallback           : All-cluster scan is used when global search has no usable cluster or when FS/DB is missing after fast search."
 $Report += ""
 $Report += "----------------------------------------------------------"
 $Report += "Report Location"
@@ -1359,6 +1506,7 @@ Write-Host "No Object              : $NoObject"
 Write-Host ""
 Write-Host "Global Search Calls    : $GlobalSearchCalls"
 Write-Host "Protected Search Calls : $ProtectedSearchCalls"
+Write-Host "Replicated Probe CIs   : $ReplicatedProbeCiCount"
 Write-Host "Fallback CI Count      : $FallbackCiCount"
 Write-Host "Failed GETs            : $FailedGets"
 Write-Host ""
