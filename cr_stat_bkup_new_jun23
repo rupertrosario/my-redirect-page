@@ -6,6 +6,23 @@
 #     1) Latest FS backup
 #     2) Latest SQL / Oracle DB backups
 #
+# Uses ONLY this endpoint:
+#   GET /v2/data-protect/search/protected-objects?searchString=<ci_item>
+#
+# Parses:
+#   $json23.objects
+#   $json23.objects.latestSnapshotsInfo
+#   $json23.objects.childObjects
+#   $json23.objects.childObjects.latestSnapshotsInfo
+#
+# Replication rule:
+#   latestSnapshotsInfo.replicationSnapshotInfo.clusterId present
+#     => BackupLocation = Replicated
+#     => ClusterName/System use replication cluster id/name
+#
+#   replicationSnapshotInfo missing
+#     => BackupLocation = Local
+#
 # Input:
 #   X:\PowerShell\Data\Cohesity\BackupValidation\<ChangeID>.csv
 #
@@ -14,22 +31,6 @@
 #
 # Output:
 #   CSV + TXT + Debug CSV + console table
-#
-# API mode:
-#   GET only
-#
-# Logic:
-#   Uses protected-object search:
-#     /v1/data-protect/search/protected-objects?searchString=<ci_item>
-#
-#   Expands:
-#     objects[]
-#     childObjects[]
-#     latestSnapshotsInfo[]
-#
-# Note:
-#   Duration is "-" because protected-object search gives latest snapshot/run
-#   timestamp, not full object-level duration.
 # =====================================================================
 
 $ErrorActionPreference = "Stop"
@@ -94,10 +95,11 @@ $ExportDebugCsv = $true
 
 $script:SearchCalls = 0
 $script:FailedGets  = 0
+$script:ServersProcessed = 0
 $script:SearchCache = @{}
 
 # =====================================================================
-# Helpers
+# Basic helpers
 # =====================================================================
 
 function Norm {
@@ -317,6 +319,34 @@ function Convert-UsecsToET {
     }
 }
 
+function Get-DurationText {
+    param(
+        [object]$StartUsecs,
+        [object]$EndUsecs
+    )
+
+    $s = To-Int64Safe $StartUsecs
+    $e = To-Int64Safe $EndUsecs
+
+    if ($s -le 0 -or $e -le 0 -or $e -lt $s -or $e -eq $s) {
+        return "-"
+    }
+
+    $seconds = [math]::Floor(($e - $s) / 1000000)
+
+    if ($seconds -lt 60) {
+        return "${seconds}s"
+    }
+
+    $ts = [TimeSpan]::FromSeconds($seconds)
+
+    if ($ts.Hours -gt 0) {
+        return ("{0}h {1}m {2}s" -f $ts.Hours, $ts.Minutes, $ts.Seconds)
+    }
+
+    return ("{0}m {1}s" -f $ts.Minutes, $ts.Seconds)
+}
+
 function Get-BackupAgeDays {
     param([object]$Usecs)
 
@@ -421,48 +451,7 @@ function Invoke-HeliosGetJson {
 }
 
 # =====================================================================
-# Cluster map
-# =====================================================================
-
-function Add-ClusterMapEntry {
-    param(
-        [hashtable]$Map,
-        [object]$Id,
-        [string]$Name
-    )
-
-    $idText = Get-FirstText @($Id)
-
-    if (-not [string]::IsNullOrWhiteSpace($idText) -and
-        -not [string]::IsNullOrWhiteSpace($Name)) {
-        $Map["$idText"] = $Name
-    }
-}
-
-function Get-ClusterNameFromMap {
-    param(
-        [string]$ClusterId,
-        [hashtable]$ClusterMap,
-        [string]$FallbackName = ""
-    )
-
-    if (-not [string]::IsNullOrWhiteSpace($FallbackName) -and $FallbackName -ne "-") {
-        return $FallbackName
-    }
-
-    if ([string]::IsNullOrWhiteSpace($ClusterId)) {
-        return "-"
-    }
-
-    if ($ClusterMap.ContainsKey("$ClusterId")) {
-        return "$($ClusterMap["$ClusterId"])"
-    }
-
-    return "$ClusterId"
-}
-
-# =====================================================================
-# Protected-object parsing
+# Response parsing
 # =====================================================================
 
 function Get-ResponseObjects {
@@ -476,107 +465,174 @@ function Get-ResponseObjects {
         return @($Json)
     }
 
-    foreach ($prop in @(
-        "objects",
-        "protectedObjects",
-        "protectedObjectResults",
-        "searchResults",
-        "results",
-        "entities",
-        "items",
-        "data",
-        "rootNodes"
-    )) {
-        if ($Json.PSObject.Properties.Name -contains $prop) {
-            return @(AsArray $Json.$prop | Where-Object { $_ })
-        }
+    if ($Json.PSObject.Properties.Name -contains "objects") {
+        return @(AsArray $Json.objects | Where-Object { $_ })
     }
 
-    return @($Json)
+    return @()
 }
 
-function Get-UsecValuesFromSnapshot {
-    param([object]$Snapshot)
-
-    $values = @()
-
-    if ($null -eq $Snapshot) {
-        return @()
-    }
-
-    foreach ($field in @(
-        "protectionRunStartTimeUsecs",
-        "snapshotTimestampUsecs",
-        "runStartTimeUsecs",
-        "startTimeUsecs",
-        "endTimeUsecs"
-    )) {
-        $v = Get-Prop -Obj $Snapshot -Name $field
-
-        if ($v) {
-            try {
-                $values += [int64]$v
-            }
-            catch {}
-        }
-    }
-
-    foreach ($nestedName in @(
-        "localSnapshotInfo",
-        "archivalSnapshotsInfo",
-        "replicationSnapshotInfo"
-    )) {
-        $nestedItems = @(AsArray (Get-Prop -Obj $Snapshot -Name $nestedName))
-
-        foreach ($nested in $nestedItems) {
-            foreach ($field in @(
-                "snapshotTimestampUsecs",
-                "runStartTimeUsecs",
-                "startTimeUsecs",
-                "endTimeUsecs"
-            )) {
-                $v = Get-Prop -Obj $nested -Name $field
-
-                if ($v) {
-                    try {
-                        $values += [int64]$v
-                    }
-                    catch {}
-                }
-            }
-
-            $snapInfo = Get-Prop -Obj $nested -Name "snapshotInfo"
-
-            foreach ($si in @(AsArray $snapInfo)) {
-                foreach ($field in @(
-                    "snapshotTimestampUsecs",
-                    "runStartTimeUsecs",
-                    "startTimeUsecs",
-                    "endTimeUsecs"
-                )) {
-                    $v = Get-Prop -Obj $si -Name $field
-
-                    if ($v) {
-                        try {
-                            $values += [int64]$v
-                        }
-                        catch {}
-                    }
-                }
-            }
-        }
-    }
-
-    return @($values)
-}
-
-function Get-ClusterIdFromProtectedObject {
-    param(
-        [object]$Obj,
-        [object[]]$Snapshots
-    )
+function Get-ObjectNameFromProtectedObject {
+    param([object]$Obj)
 
     return Get-FirstText @(
+        $Obj.name,
+        $Obj.displayName,
+        $Obj.databaseName,
+        $Obj.dbName,
+        $Obj.dbUniqueName
+    )
+}
+
+function Get-SourceNameFromProtectedObject {
+    param(
+        [object]$Obj,
+        [string]$ParentName
+    )
+
+    $sourceInfo = Get-Prop -Obj $Obj -Name "sourceInfo"
+
+    $direct = Get-FirstText @(
+        $Obj.sourceName,
+        $Obj.parentSourceName,
+        $Obj.hostName,
+        $Obj.serverName,
+        $Obj.rootSourceName,
+        $sourceInfo.name,
+        $sourceInfo.displayName
+    )
+
+    if (-not [string]::IsNullOrWhiteSpace($ParentName)) {
+        return $ParentName
+    }
+
+    return $direct
+}
+
+function Get-SnapshotRunType {
+    param([object]$Snapshot)
+
+    return Get-FirstText @(
+        $Snapshot.runType,
+        $Snapshot.backupRunType
+    )
+}
+
+function Get-SnapshotProtectionGroupName {
+    param([object]$Snapshot)
+
+    return Get-FirstText @(
+        $Snapshot.protectionGroupName,
+        $Snapshot.protectionGroup.name,
+        $Snapshot.protectionGroupInfo.name
+    )
+}
+
+function Get-SnapshotProtectionGroupId {
+    param([object]$Snapshot)
+
+    return Get-FirstText @(
+        $Snapshot.protectionGroupId,
+        $Snapshot.protectionGroup.id,
+        $Snapshot.protectionGroupInfo.id
+    )
+}
+
+function Get-SnapshotStartUsecs {
+    param([object]$Snapshot)
+
+    $localInfo = @(AsArray (Get-Prop -Obj $Snapshot -Name "localSnapshotInfo"))
+    $archiveInfo = @(AsArray (Get-Prop -Obj $Snapshot -Name "archivalSnapshotsInfo"))
+    $repInfo = @(AsArray (Get-Prop -Obj $Snapshot -Name "replicationSnapshotInfo"))
+
+    $u = To-Int64Safe (Get-FirstText @(
+        $Snapshot.protectionRunStartTimeUsecs,
+        $Snapshot.runStartTimeUsecs,
+        $Snapshot.startTimeUsecs,
+        $Snapshot.snapshotTimestampUsecs,
+        $localInfo.snapshotInfo.startTimeUsecs,
+        $localInfo.snapshotInfo.runStartTimeUsecs,
+        $localInfo.snapshotInfo.snapshotTimestampUsecs,
+        $archiveInfo.snapshotInfo.startTimeUsecs,
+        $repInfo.snapshotInfo.startTimeUsecs
+    ))
+
+    return $u
+}
+
+function Get-SnapshotEndUsecs {
+    param([object]$Snapshot)
+
+    $localInfo = @(AsArray (Get-Prop -Obj $Snapshot -Name "localSnapshotInfo"))
+    $archiveInfo = @(AsArray (Get-Prop -Obj $Snapshot -Name "archivalSnapshotsInfo"))
+    $repInfo = @(AsArray (Get-Prop -Obj $Snapshot -Name "replicationSnapshotInfo"))
+
+    $u = To-Int64Safe (Get-FirstText @(
+        $Snapshot.endTimeUsecs,
+        $Snapshot.snapshotTimestampUsecs,
+        $localInfo.snapshotInfo.endTimeUsecs,
+        $localInfo.snapshotInfo.snapshotTimestampUsecs,
+        $archiveInfo.snapshotInfo.endTimeUsecs,
+        $repInfo.snapshotInfo.endTimeUsecs
+    ))
+
+    if ($u -le 0) {
+        $u = Get-SnapshotStartUsecs -Snapshot $Snapshot
+    }
+
+    return $u
+}
+
+function Get-SnapshotClusterInfo {
+    param(
+        [object]$Obj,
+        [object]$Snapshot
+    )
+
+    $repInfo = @()
+    $repInfo += @(AsArray (Get-Prop -Obj $Snapshot -Name "replicationSnapshotInfo"))
+    $repInfo += @(AsArray (Get-Prop -Obj $Snapshot -Name "replicationSnapshotsInfo"))
+
+    $repClusterId = Get-FirstText @(
+        $repInfo.clusterId,
+        $repInfo.clusterID,
+        $repInfo.cluster.id,
+        $repInfo.cluster.clusterId,
+        $repInfo.clusterInfo.clusterId
+    )
+
+    $repClusterName = Get-FirstText @(
+        $repInfo.clusterName,
+        $repInfo.cluster.name,
+        $repInfo.clusterInfo.name
+    )
+
+    if (-not [string]::IsNullOrWhiteSpace($repClusterId)) {
+        if ([string]::IsNullOrWhiteSpace($repClusterName)) {
+            $repClusterName = $repClusterId
+        }
+
+        return [pscustomobject]@{
+            BackupLocation = "Replicated"
+            BackupClusterId = $repClusterId
+            ClusterName = $repClusterName
+            System = $repClusterName
+        }
+    }
+
+    $localInfo = @(AsArray (Get-Prop -Obj $Snapshot -Name "localSnapshotInfo"))
+    $sourceInfo = Get-Prop -Obj $Obj -Name "sourceInfo"
+
+    $localClusterId = Get-FirstText @(
+        $Snapshot.clusterId,
+        $Snapshot.clusterID,
+        $Snapshot.cluster.id,
+        $Snapshot.cluster.clusterId,
+        $Snapshot.clusterInfo.clusterId,
+        $localInfo.clusterId,
+        $localInfo.clusterID,
+        $localInfo.cluster.id,
+        $localInfo.clusterInfo.clusterId,
         $Obj.clusterId,
         $Obj.clusterID,
         $Obj.sourceClusterId,
@@ -584,30 +640,65 @@ function Get-ClusterIdFromProtectedObject {
         $Obj.cluster.id,
         $Obj.cluster.clusterId,
         $Obj.clusterInfo.clusterId,
-        $Snapshots.clusterId,
-        $Snapshots.clusterID,
-        $Snapshots.cluster.id,
-        $Snapshots.clusterInfo.clusterId
-    )
-}
-
-function Get-ClusterNameFromProtectedObject {
-    param(
-        [object]$Obj,
-        [object[]]$Snapshots
+        $sourceInfo.clusterId,
+        $sourceInfo.clusterInfo.clusterId
     )
 
-    return Get-FirstText @(
+    $localClusterName = Get-FirstText @(
+        $Snapshot.clusterName,
+        $Snapshot.cluster.name,
+        $Snapshot.clusterInfo.name,
+        $localInfo.clusterName,
+        $localInfo.cluster.name,
+        $localInfo.clusterInfo.name,
         $Obj.clusterName,
         $Obj.cluster.name,
         $Obj.clusterInfo.name,
-        $Snapshots.clusterName,
-        $Snapshots.cluster.name,
-        $Snapshots.clusterInfo.name
+        $sourceInfo.clusterName,
+        $sourceInfo.clusterInfo.name
     )
+
+    if ([string]::IsNullOrWhiteSpace($localClusterName)) {
+        if (-not [string]::IsNullOrWhiteSpace($localClusterId)) {
+            $localClusterName = $localClusterId
+        }
+        else {
+            $localClusterName = "Local"
+        }
+    }
+
+    return [pscustomobject]@{
+        BackupLocation = "Local"
+        BackupClusterId = if ($localClusterId) { $localClusterId } else { "-" }
+        ClusterName = $localClusterName
+        System = $localClusterName
+    }
 }
 
-function Expand-ProtectedObject {
+function Get-SnapshotStatus {
+    param([object]$Snapshot)
+
+    $localInfo = @(AsArray (Get-Prop -Obj $Snapshot -Name "localSnapshotInfo"))
+
+    $status = Get-FirstText @(
+        $Snapshot.status,
+        $Snapshot.indexingStatus,
+        $localInfo.snapshotInfo.status,
+        $localInfo.status
+    )
+
+    if ([string]::IsNullOrWhiteSpace($status)) {
+        return "Protected"
+    }
+
+    if ($status -match '(?i)done|success|succeeded|warning') {
+        return "Protected"
+    }
+
+    return $status
+}
+
+function Expand-ProtectedObjectSnapshots {
     param(
         [object]$Obj,
         [string]$ParentName = "",
@@ -620,120 +711,108 @@ function Expand-ProtectedObject {
         return @()
     }
 
-    $snapshots = @(AsArray (Get-Prop -Obj $Obj -Name "latestSnapshotsInfo"))
-
-    $pgNames = @(
-        $snapshots |
-        ForEach-Object {
-            Get-FirstText @(
-                $_.protectionGroupName,
-                $_.protectionGroup.name,
-                $_.protectionGroupInfo.name
-            )
-        } |
-        Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
-        Sort-Object -Unique
-    )
-
-    $runTypes = @(
-        $snapshots |
-        ForEach-Object {
-            Get-FirstText @(
-                $_.runType,
-                $_.backupRunType
-            )
-        } |
-        Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
-        Sort-Object -Unique
-    )
-
-    $pgIds = @(
-        $snapshots |
-        ForEach-Object {
-            Get-FirstText @(
-                $_.protectionGroupId,
-                $_.protectionGroup.id,
-                $_.protectionGroupInfo.id
-            )
-        } |
-        Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
-        Sort-Object -Unique
-    )
-
-    $allUsecs = @()
-
-    foreach ($s in $snapshots) {
-        $allUsecs += Get-UsecValuesFromSnapshot -Snapshot $s
-    }
-
-    $latestUsecs = 0
-
-    if ($allUsecs.Count -gt 0) {
-        $latestUsecs = $allUsecs |
-            Sort-Object -Descending |
-            Select-Object -First 1
-    }
-
+    $objectName = Get-ObjectNameFromProtectedObject -Obj $Obj
+    $sourceName = Get-SourceNameFromProtectedObject -Obj $Obj -ParentName $ParentName
     $sourceInfo = Get-Prop -Obj $Obj -Name "sourceInfo"
 
-    $objName = Get-FirstText @(
-        $Obj.name,
-        $Obj.displayName,
-        $Obj.databaseName,
-        $Obj.dbName,
-        $Obj.dbUniqueName
+    $environment = Get-FirstText @(
+        $Obj.environment,
+        $sourceInfo.environment
     )
 
-    $srcName = Get-FirstText @(
-        $Obj.sourceName,
-        $Obj.parentSourceName,
-        $Obj.hostName,
-        $Obj.serverName,
-        $sourceInfo.name,
-        $sourceInfo.displayName
+    $objectType = Get-FirstText @(
+        $Obj.objectType,
+        $Obj.type
     )
 
-    if ($Depth -gt 0 -and -not [string]::IsNullOrWhiteSpace($ParentName)) {
-        $effectiveSource = $ParentName
+    $snapshots = @(AsArray (Get-Prop -Obj $Obj -Name "latestSnapshotsInfo"))
+
+    if ($snapshots.Count -eq 0) {
+        $rows += [pscustomobject]@{
+            ObjectName          = $objectName
+            ParentName          = $ParentName
+            SourceName          = $sourceName
+            Environment         = $environment
+            ObjectType          = $objectType
+            OsType              = Get-FirstText @($Obj.osType)
+            ObjectId            = Get-FirstText @($Obj.id, $Obj.uid, $Obj._id)
+            SourceId            = Get-FirstText @($Obj.sourceId, $Obj.parentId, $Obj.hostId)
+            ProtectionGroup     = "-"
+            ProtectionGroupId   = "-"
+            BackupLevel         = "-"
+            StartUsecs          = 0
+            EndUsecs            = 0
+            BackupUsecs         = 0
+            StartTimeET         = "-"
+            EndTimeET           = "-"
+            BackupLocation      = "-"
+            BackupClusterId     = "-"
+            ClusterName         = "-"
+            System              = "-"
+            Status              = "Found_NoSnapshot"
+            Depth               = $Depth
+            DebugSource         = "ObjectNoSnapshot"
+        }
     }
     else {
-        $effectiveSource = $srcName
-    }
+        foreach ($snapshot in $snapshots) {
+            $startUsecs = Get-SnapshotStartUsecs -Snapshot $snapshot
+            $endUsecs = Get-SnapshotEndUsecs -Snapshot $snapshot
 
-    $rows += [pscustomobject]@{
-        ObjectName          = $objName
-        ParentName          = $ParentName
-        SourceName          = $effectiveSource
-        RawSourceName       = $srcName
-        Environment         = Get-FirstText @($Obj.environment, $sourceInfo.environment)
-        ObjectType          = Get-FirstText @($Obj.objectType, $Obj.type)
-        OsType              = Get-FirstText @($Obj.osType)
-        SourceId            = Get-FirstText @($Obj.sourceId, $Obj.parentId, $Obj.hostId)
-        ObjectId            = Get-FirstText @($Obj.id, $Obj.uid, $Obj._id)
-        ProtectionGroups    = ($pgNames -join "; ")
-        ProtectionGroupIds  = ($pgIds -join "; ")
-        RunTypes            = ($runTypes -join "; ")
-        SnapshotCount       = $snapshots.Count
-        LatestSnapshotUsecs = $latestUsecs
-        LatestSnapshotET    = Convert-UsecsToET $latestUsecs
-        ClusterId           = Get-ClusterIdFromProtectedObject -Obj $Obj -Snapshots $snapshots
-        ClusterName         = Get-ClusterNameFromProtectedObject -Obj $Obj -Snapshots $snapshots
-        Depth               = $Depth
+            if ($endUsecs -le 0) {
+                $endUsecs = $startUsecs
+            }
+
+            $cluster = Get-SnapshotClusterInfo -Obj $Obj -Snapshot $snapshot
+            $status = Get-SnapshotStatus -Snapshot $snapshot
+
+            $ageDays = Get-BackupAgeDays -Usecs $endUsecs
+
+            if ($endUsecs -gt 0 -and $ageDays -ne "" -and $ageDays -gt $ProtectedWithinDays) {
+                $status = "Stale"
+            }
+
+            $rows += [pscustomobject]@{
+                ObjectName          = $objectName
+                ParentName          = $ParentName
+                SourceName          = $sourceName
+                Environment         = $environment
+                ObjectType          = $objectType
+                OsType              = Get-FirstText @($Obj.osType)
+                ObjectId            = Get-FirstText @($Obj.id, $Obj.uid, $Obj._id)
+                SourceId            = Get-FirstText @($Obj.sourceId, $Obj.parentId, $Obj.hostId)
+                ProtectionGroup     = Get-SnapshotProtectionGroupName -Snapshot $snapshot
+                ProtectionGroupId   = Get-SnapshotProtectionGroupId -Snapshot $snapshot
+                BackupLevel         = Get-BackupLevelFromRunType (Get-SnapshotRunType -Snapshot $snapshot)
+                StartUsecs          = $startUsecs
+                EndUsecs            = $endUsecs
+                BackupUsecs         = $endUsecs
+                StartTimeET         = Convert-UsecsToET $startUsecs
+                EndTimeET           = Convert-UsecsToET $endUsecs
+                BackupLocation      = $cluster.BackupLocation
+                BackupClusterId     = $cluster.BackupClusterId
+                ClusterName         = $cluster.ClusterName
+                System              = $cluster.System
+                Status              = $status
+                Depth               = $Depth
+                DebugSource         = "LatestSnapshotsInfo"
+            }
+        }
     }
 
     $children = @(AsArray (Get-Prop -Obj $Obj -Name "childObjects"))
 
     foreach ($child in $children) {
-        $rows += Expand-ProtectedObject `
+        $rows += Expand-ProtectedObjectSnapshots `
             -Obj $child `
-            -ParentName $objName `
+            -ParentName $objectName `
             -Depth ($Depth + 1)
     }
 
     return @($rows)
 }
 
-function Search-ProtectedObjects {
+function Search-ProtectedObjectsOnly {
     param([string]$SearchString)
 
     $cacheKey = Normalize-Name $SearchString
@@ -744,45 +823,32 @@ function Search-ProtectedObjects {
 
     $encoded = [uri]::EscapeDataString($SearchString)
 
-    $uri = "$BaseUrl/v1/data-protect/search/protected-objects?searchString=$encoded"
+    # EXACT endpoint from the image. No includeTenants. No count. No environments.
+    $url = "$BaseUrl/v2/data-protect/search/protected-objects?searchString=$encoded"
 
     $script:SearchCalls++
 
-    $json = Invoke-HeliosGetJson `
-        -Uri $uri `
+    $json23 = Invoke-HeliosGetJson `
+        -Uri $url `
         -Headers $CommonHeaders `
         -Quiet
 
     $rows = @()
 
-    if ($json) {
-        foreach ($obj in @(Get-ResponseObjects $json)) {
-            $rows += Expand-ProtectedObject -Obj $obj
+    if ($json23) {
+        foreach ($obj in @(Get-ResponseObjects -Json $json23)) {
+            $rows += Expand-ProtectedObjectSnapshots -Obj $obj
         }
     }
 
     $rows = @(
         $rows |
-        Sort-Object ObjectId, ObjectName, ParentName, SourceName -Unique
+        Sort-Object ObjectId, ObjectName, ParentName, ProtectionGroup, BackupUsecs, BackupLocation -Unique
     )
 
     $script:SearchCache[$cacheKey] = $rows
 
     return @($rows)
-}
-
-function Get-SearchStringsForServer {
-    param([string]$ServerName)
-
-    $items = @()
-    $items += $ServerName
-    $items += Get-ShortName $ServerName
-
-    return @(
-        $items |
-        Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
-        Sort-Object -Unique
-    )
 }
 
 # =====================================================================
@@ -805,31 +871,24 @@ function Get-NamePrefixBeforeSlash {
     return ""
 }
 
-function Get-DbNameFromProtectedObjectName {
-    param(
-        [string]$ObjectName,
-        [string]$ServerName
-    )
+function Get-NameAfterSlash {
+    param([string]$Name)
 
-    $o = Norm $ObjectName
+    $v = Norm $Name
 
-    if ([string]::IsNullOrWhiteSpace($o)) {
-        return "-"
+    if ([string]::IsNullOrWhiteSpace($v)) {
+        return ""
     }
 
-    $prefix = Get-NamePrefixBeforeSlash $o
+    if ($v -like "*/*") {
+        $parts = $v -split "/", 2
 
-    if (-not [string]::IsNullOrWhiteSpace($prefix) -and
-        (Text-MatchesName -Text $prefix -Name $ServerName)) {
-
-        $parts = $o -split "/", 2
-
-        if ($parts.Count -eq 2 -and -not [string]::IsNullOrWhiteSpace($parts[1])) {
+        if ($parts.Count -eq 2) {
             return $parts[1].Trim()
         }
     }
 
-    return $o
+    return $v
 }
 
 function Test-RowBelongsToServer {
@@ -854,6 +913,53 @@ function Test-RowBelongsToServer {
         -Name $ServerName
 }
 
+function Test-IsDbRow {
+    param(
+        [object]$Row,
+        [string]$ServerName
+    )
+
+    if (-not (Test-RowBelongsToServer -Row $Row -ServerName $ServerName)) {
+        return $false
+    }
+
+    if ($Row.Environment -match '(?i)kSQL|kOracle|sql|oracle') {
+        return $true
+    }
+
+    if ($Row.ObjectType -match '(?i)kDatabase|database|db') {
+        return $true
+    }
+
+    if ((Normalize-Name $Row.ObjectName) -like "*/*" -and $Row.Depth -ge 0) {
+        return $true
+    }
+
+    return $false
+}
+
+function Get-DbBackupType {
+    param([object]$Row)
+
+    if ($Row.Environment -match '(?i)kOracle|oracle') {
+        return "Oracle DB"
+    }
+
+    if ($Row.Environment -match '(?i)kSQL|sql') {
+        return "SQL DB"
+    }
+
+    if ($Row.ObjectType -match '(?i)oracle') {
+        return "Oracle DB"
+    }
+
+    if ($Row.ObjectType -match '(?i)sql|database|db|kDatabase') {
+        return "SQL DB"
+    }
+
+    return "DB"
+}
+
 function Test-IsFsRow {
     param(
         [object]$Row,
@@ -864,76 +970,15 @@ function Test-IsFsRow {
         return $false
     }
 
-    if ($Row.Environment -notmatch '(?i)kPhysical|physical') {
+    if (Test-IsDbRow -Row $Row -ServerName $ServerName) {
         return $false
     }
 
-    if ($Row.ObjectType -match '(?i)database|db|sql|oracle') {
+    if ($Row.Environment -match '(?i)kSQL|kOracle|sql|oracle') {
         return $false
     }
 
     return $true
-}
-
-function Test-IsSqlDbRow {
-    param(
-        [object]$Row,
-        [string]$ServerName
-    )
-
-    if (-not (Test-RowBelongsToServer -Row $Row -ServerName $ServerName)) {
-        return $false
-    }
-
-    if ($Row.Environment -match '(?i)kSQL|sql') {
-        return $true
-    }
-
-    if ($Row.ObjectType -match '(?i)database|db|sql' -and
-        $Row.ObjectName -like "*/*") {
-        return $true
-    }
-
-    return $false
-}
-
-function Test-IsOracleDbRow {
-    param(
-        [object]$Row,
-        [string]$ServerName
-    )
-
-    if (-not (Test-RowBelongsToServer -Row $Row -ServerName $ServerName)) {
-        return $false
-    }
-
-    if ($Row.Environment -match '(?i)kOracle|oracle') {
-        return $true
-    }
-
-    if ($Row.ObjectType -match '(?i)database|db|oracle') {
-        return $true
-    }
-
-    return $false
-}
-
-function Get-StatusFromSnapshot {
-    param([object]$LatestUsecs)
-
-    $u = To-Int64Safe $LatestUsecs
-
-    if ($u -le 0) {
-        return "Found_NoSnapshot"
-    }
-
-    $age = Get-BackupAgeDays $u
-
-    if ($age -ne "" -and $age -gt $ProtectedWithinDays) {
-        return "Stale"
-    }
-
-    return "Protected"
 }
 
 function Get-BackupTypeRank {
@@ -948,72 +993,65 @@ function Get-BackupTypeRank {
     }
 }
 
-function New-OutputRow {
+function New-MissingRow {
     param(
         [string]$InputServer,
         [string]$BackupType,
-        [string]$ObjectName,
-        [string]$BackupLevel,
-        [object]$BackupUsecs,
-        [string]$ProtectionGroup,
-        [string]$SourceName,
-        [string]$ClusterName,
-        [string]$Status,
+        [string]$EndText,
         [string]$DebugSource
     )
 
-    $timeText = Convert-UsecsToET $BackupUsecs
-
     return [pscustomobject]@{
-        InputServer     = if ($InputServer) { $InputServer } else { "-" }
-        BackupType      = if ($BackupType) { $BackupType } else { "-" }
-        ObjectName      = if ($ObjectName) { $ObjectName } else { "-" }
-        BackupLevel     = if ($BackupLevel) { $BackupLevel } else { "-" }
-        StartTimeET     = $timeText
-        EndTimeET       = $timeText
+        InputServer     = $InputServer
+        BackupType      = $BackupType
+        ObjectName      = if ($BackupType -eq "FS") { $InputServer } else { "-" }
+        BackupLevel     = "-"
+        StartTimeET     = "-"
+        EndTimeET       = $EndText
         Duration        = "-"
-        ProtectionGroup = if ($ProtectionGroup) { $ProtectionGroup } else { "-" }
-        SourceName      = if ($SourceName) { $SourceName } else { "-" }
-        ClusterName     = if ($ClusterName) { $ClusterName } else { "-" }
-        System          = if ($ClusterName) { $ClusterName } else { "-" }
-        Status          = if ($Status) { $Status } else { "Unknown" }
-        BackupUsecs     = To-Int64Safe $BackupUsecs
+        ProtectionGroup = "-"
+        BackupLocation  = "-"
+        BackupClusterId = "-"
+        ClusterName     = "-"
+        SourceName      = $InputServer
+        System          = "-"
+        Status          = "Unknown"
+        BackupUsecs     = 0
         DebugSource     = $DebugSource
     }
 }
 
-function Convert-ProtectedRowToOutput {
+function Convert-SnapshotRowToOutput {
     param(
         [object]$Row,
         [string]$InputServer,
-        [string]$BackupType,
-        [hashtable]$ClusterMap
+        [string]$BackupType
     )
-
-    $clusterName = Get-ClusterNameFromMap `
-        -ClusterId "$($Row.ClusterId)" `
-        -ClusterMap $ClusterMap `
-        -FallbackName "$($Row.ClusterName)"
 
     $objectName = $Row.ObjectName
 
-    if ($BackupType -in @("SQL DB", "Oracle DB")) {
-        $objectName = Get-DbNameFromProtectedObjectName `
-            -ObjectName "$($Row.ObjectName)" `
-            -ServerName $InputServer
+    if ($BackupType -ne "FS") {
+        $objectName = Get-NameAfterSlash $Row.ObjectName
     }
 
-    return New-OutputRow `
-        -InputServer $InputServer `
-        -BackupType $BackupType `
-        -ObjectName $objectName `
-        -BackupLevel (Get-BackupLevelFromRunType "$($Row.RunTypes)") `
-        -BackupUsecs $Row.LatestSnapshotUsecs `
-        -ProtectionGroup "$($Row.ProtectionGroups)" `
-        -SourceName "$($Row.SourceName)" `
-        -ClusterName $clusterName `
-        -Status (Get-StatusFromSnapshot $Row.LatestSnapshotUsecs) `
-        -DebugSource "ProtectedObjectSearch"
+    return [pscustomobject]@{
+        InputServer     = $InputServer
+        BackupType      = $BackupType
+        ObjectName      = if ($objectName) { $objectName } else { "-" }
+        BackupLevel     = if ($Row.BackupLevel) { $Row.BackupLevel } else { "-" }
+        StartTimeET     = if ($Row.StartTimeET) { $Row.StartTimeET } else { "-" }
+        EndTimeET       = if ($Row.EndTimeET) { $Row.EndTimeET } else { "-" }
+        Duration        = Get-DurationText -StartUsecs $Row.StartUsecs -EndUsecs $Row.EndUsecs
+        ProtectionGroup = if ($Row.ProtectionGroup) { $Row.ProtectionGroup } else { "-" }
+        BackupLocation  = if ($Row.BackupLocation) { $Row.BackupLocation } else { "-" }
+        BackupClusterId = if ($Row.BackupClusterId) { $Row.BackupClusterId } else { "-" }
+        ClusterName     = if ($Row.ClusterName) { $Row.ClusterName } else { "-" }
+        SourceName      = if ($Row.SourceName) { $Row.SourceName } else { $InputServer }
+        System          = if ($Row.System) { $Row.System } else { "-" }
+        Status          = if ($Row.Status) { $Row.Status } else { "Unknown" }
+        BackupUsecs     = To-Int64Safe $Row.BackupUsecs
+        DebugSource     = $Row.DebugSource
+    }
 }
 
 function Select-LatestFsRow {
@@ -1068,42 +1106,6 @@ if (-not $ServerList -or $ServerList.Count -eq 0) {
 $ServerList | Set-Content -Path $InputTxt -Encoding UTF8
 
 # =====================================================================
-# Build cluster map
-# =====================================================================
-
-Write-Host ""
-Write-Host "Building cluster map..." -ForegroundColor Cyan
-
-$clusterJson = Invoke-HeliosGetJson `
-    -Uri "$BaseUrl/v2/mcm/cluster-mgmt/info" `
-    -Headers $CommonHeaders `
-    -Quiet
-
-$ClusterMap = @{}
-
-if ($clusterJson -and $clusterJson.cohesityClusters) {
-    foreach ($c in @(AsArray $clusterJson.cohesityClusters)) {
-        $cname = Get-FirstText @(
-            $c.clusterName,
-            $c.name,
-            $c.displayName
-        )
-
-        if ([string]::IsNullOrWhiteSpace($cname)) {
-            $cname = "UnknownCluster"
-        }
-
-        Add-ClusterMapEntry -Map $ClusterMap -Id $c.clusterId -Name $cname
-        Add-ClusterMapEntry -Map $ClusterMap -Id $c.id -Name $cname
-        Add-ClusterMapEntry -Map $ClusterMap -Id $c.intId -Name $cname
-        Add-ClusterMapEntry -Map $ClusterMap -Id $c.clusterIdentifier.clusterId -Name $cname
-        Add-ClusterMapEntry -Map $ClusterMap -Id $c.clusterInfo.clusterId -Name $cname
-    }
-}
-
-Write-Host "Cluster map entries: $($ClusterMap.Count)" -ForegroundColor Green
-
-# =====================================================================
 # Main processing
 # =====================================================================
 
@@ -1115,6 +1117,7 @@ $count = 0
 
 foreach ($server in $ServerList) {
     $count++
+    $script:ServersProcessed++
 
     Write-Progress `
         -Activity "Cohesity Backup Validation" `
@@ -1124,39 +1127,38 @@ foreach ($server in $ServerList) {
     Write-Host ""
     Write-Host "Processing server: $server" -ForegroundColor Cyan
 
-    $protectedRows = @()
+    $snapshotRows = @(Search-ProtectedObjectsOnly -SearchString $server)
 
-    foreach ($searchString in @(Get-SearchStringsForServer -ServerName $server)) {
-        $protectedRows += @(Search-ProtectedObjects -SearchString $searchString)
-    }
+    foreach ($r in $snapshotRows) {
+        $isDb = Test-IsDbRow -Row $r -ServerName $server
+        $isFs = Test-IsFsRow -Row $r -ServerName $server
 
-    $protectedRows = @(
-        $protectedRows |
-        Sort-Object ObjectId, ObjectName, ParentName, SourceName -Unique
-    )
-
-    foreach ($r in $protectedRows) {
         $DebugRows += [pscustomobject]@{
-            InputServer          = $server
-            ObjectName           = $r.ObjectName
-            ParentName           = $r.ParentName
-            SourceName           = $r.SourceName
-            RawSourceName        = $r.RawSourceName
-            Environment          = $r.Environment
-            ObjectType           = $r.ObjectType
-            OsType               = $r.OsType
-            ProtectionGroups     = $r.ProtectionGroups
-            RunTypes             = $r.RunTypes
-            SnapshotCount        = $r.SnapshotCount
-            LatestSnapshotET     = $r.LatestSnapshotET
-            LatestSnapshotUsecs  = $r.LatestSnapshotUsecs
-            ClusterId            = $r.ClusterId
-            ClusterName          = $r.ClusterName
-            Depth                = $r.Depth
-            MatchesServer        = Test-RowBelongsToServer -Row $r -ServerName $server
-            IsFS                 = Test-IsFsRow -Row $r -ServerName $server
-            IsSQL                = Test-IsSqlDbRow -Row $r -ServerName $server
-            IsOracle             = Test-IsOracleDbRow -Row $r -ServerName $server
+            InputServer        = $server
+            ObjectName         = $r.ObjectName
+            ParentName         = $r.ParentName
+            SourceName         = $r.SourceName
+            Environment        = $r.Environment
+            ObjectType         = $r.ObjectType
+            OsType             = $r.OsType
+            ObjectId           = $r.ObjectId
+            SourceId           = $r.SourceId
+            ProtectionGroup    = $r.ProtectionGroup
+            ProtectionGroupId  = $r.ProtectionGroupId
+            BackupLevel        = $r.BackupLevel
+            StartTimeET        = $r.StartTimeET
+            EndTimeET          = $r.EndTimeET
+            BackupLocation     = $r.BackupLocation
+            BackupClusterId    = $r.BackupClusterId
+            ClusterName        = $r.ClusterName
+            System             = $r.System
+            Status             = $r.Status
+            Depth              = $r.Depth
+            MatchesServer      = Test-RowBelongsToServer -Row $r -ServerName $server
+            IsFS               = $isFs
+            IsDB               = $isDb
+            DbBackupType       = if ($isDb) { Get-DbBackupType -Row $r } else { "" }
+            DebugSource        = $r.DebugSource
         }
     }
 
@@ -1165,99 +1167,52 @@ foreach ($server in $ServerList) {
     # -------------------------
 
     $fsRows = @(
-        $protectedRows |
+        $snapshotRows |
         Where-Object { Test-IsFsRow -Row $_ -ServerName $server } |
         ForEach-Object {
-            Convert-ProtectedRowToOutput `
+            Convert-SnapshotRowToOutput `
                 -Row $_ `
                 -InputServer $server `
-                -BackupType "FS" `
-                -ClusterMap $ClusterMap
+                -BackupType "FS"
         }
     )
 
     $fsLatest = @(Select-LatestFsRow -Rows $fsRows)
 
     if ($fsLatest.Count -eq 0) {
-        $Results += [pscustomobject]@{
-            InputServer     = $server
-            BackupType      = "FS"
-            ObjectName      = $server
-            BackupLevel     = "-"
-            StartTimeET     = "-"
-            EndTimeET       = "NoFSBackupFound"
-            Duration        = "-"
-            ProtectionGroup = "-"
-            SourceName      = $server
-            ClusterName     = "-"
-            System          = "-"
-            Status          = "Unknown"
-            BackupUsecs     = 0
-            DebugSource     = "MissingFS"
-        }
+        $Results += New-MissingRow `
+            -InputServer $server `
+            -BackupType "FS" `
+            -EndText "NoFSBackupFound" `
+            -DebugSource "MissingFS"
     }
     else {
         $Results += $fsLatest
     }
 
     # -------------------------
-    # SQL DB
+    # DB
     # -------------------------
 
-    $sqlRows = @(
-        $protectedRows |
-        Where-Object { Test-IsSqlDbRow -Row $_ -ServerName $server } |
+    $dbRows = @(
+        $snapshotRows |
+        Where-Object { Test-IsDbRow -Row $_ -ServerName $server } |
         ForEach-Object {
-            Convert-ProtectedRowToOutput `
+            Convert-SnapshotRowToOutput `
                 -Row $_ `
                 -InputServer $server `
-                -BackupType "SQL DB" `
-                -ClusterMap $ClusterMap
+                -BackupType (Get-DbBackupType -Row $_)
         }
     )
-
-    # -------------------------
-    # Oracle DB
-    # -------------------------
-
-    $oracleRows = @(
-        $protectedRows |
-        Where-Object {
-            (Test-IsOracleDbRow -Row $_ -ServerName $server) -and
-            -not (Test-IsSqlDbRow -Row $_ -ServerName $server)
-        } |
-        ForEach-Object {
-            Convert-ProtectedRowToOutput `
-                -Row $_ `
-                -InputServer $server `
-                -BackupType "Oracle DB" `
-                -ClusterMap $ClusterMap
-        }
-    )
-
-    $dbRows = @()
-    $dbRows += $sqlRows
-    $dbRows += $oracleRows
 
     $dbLatest = @(Select-LatestDbRows -Rows $dbRows)
 
     if ($dbLatest.Count -eq 0) {
-        $Results += [pscustomobject]@{
-            InputServer     = $server
-            BackupType      = "DB"
-            ObjectName      = "-"
-            BackupLevel     = "-"
-            StartTimeET     = "-"
-            EndTimeET       = "NoDbBackupFound"
-            Duration        = "-"
-            ProtectionGroup = "-"
-            SourceName      = $server
-            ClusterName     = "-"
-            System          = "-"
-            Status          = "Unknown"
-            BackupUsecs     = 0
-            DebugSource     = "MissingDB"
-        }
+        $Results += New-MissingRow `
+            -InputServer $server `
+            -BackupType "DB" `
+            -EndText "NoDbBackupFound" `
+            -DebugSource "MissingDB"
     }
     else {
         $Results += $dbLatest
@@ -1285,8 +1240,10 @@ $FinalRows = $Results |
         EndTimeET,
         Duration,
         ProtectionGroup,
-        SourceName,
+        BackupLocation,
+        BackupClusterId,
         ClusterName,
+        SourceName,
         System,
         Status
 
@@ -1302,7 +1259,7 @@ if ($ExportDebugCsv) {
 $TableText = (
     $FinalRows |
     Format-Table -AutoSize -Wrap |
-    Out-String -Width 360
+    Out-String -Width 420
 ).TrimEnd()
 
 $TotalRows = @($FinalRows).Count
@@ -1312,6 +1269,8 @@ $FoundCount = @($FinalRows | Where-Object { $_.EndTimeET -notin @("NoFSBackupFou
 $ProtectedCount = @($FinalRows | Where-Object { $_.Status -eq "Protected" }).Count
 $StaleCount = @($FinalRows | Where-Object { $_.Status -eq "Stale" }).Count
 $UnknownCount = @($FinalRows | Where-Object { $_.Status -eq "Unknown" }).Count
+$LocalCount = @($FinalRows | Where-Object { $_.BackupLocation -eq "Local" }).Count
+$ReplicatedCount = @($FinalRows | Where-Object { $_.BackupLocation -eq "Replicated" }).Count
 
 $Report = @()
 $Report += "============================================================"
@@ -1324,8 +1283,10 @@ $Report += ""
 $Report += "Scope                      : Latest FS + SQL/Oracle DB backups"
 $Report += "Input Column               : ci_item"
 $Report += "API Mode                   : GET only"
-$Report += "Search API                 : /v1/data-protect/search/protected-objects"
-$Report += "Search Structure           : objects + childObjects + latestSnapshotsInfo"
+$Report += "Search API                 : /v2/data-protect/search/protected-objects?searchString=<ci_item>"
+$Report += "Search Params              : None"
+$Report += "Parsed Structure           : objects + latestSnapshotsInfo + childObjects"
+$Report += "Replication Rule           : replicationSnapshotInfo.clusterId => Replicated"
 $Report += "Protected Threshold Days   : $ProtectedWithinDays"
 $Report += ""
 $Report += "Total Input Servers        : $($ServerList.Count)"
@@ -1334,13 +1295,15 @@ $Report += "Backup Rows Found          : $FoundCount"
 $Report += "Protected Rows             : $ProtectedCount"
 $Report += "Stale Rows                 : $StaleCount"
 $Report += "Unknown Rows               : $UnknownCount"
+$Report += "Local Rows                 : $LocalCount"
+$Report += "Replicated Rows            : $ReplicatedCount"
 $Report += "No FS Backup Found         : $NoFsCount"
 $Report += "No DB Backup Found         : $NoDbCount"
 $Report += ""
 $Report += "Search Calls               : $script:SearchCalls"
 $Report += "Failed GETs                : $script:FailedGets"
 $Report += ""
-$Report += "Note                       : Duration is '-' because protected-object search does not expose object-level duration."
+$Report += "Note                       : ClusterName is taken from this endpoint only. If name is not present, clusterId is shown."
 $Report += ""
 $Report += "------------------------------------------------------------"
 $Report += "Backup Validation Table"
@@ -1379,8 +1342,10 @@ Write-Host ""
 Write-Host "Scope                      : Latest FS + SQL/Oracle DB backups"
 Write-Host "Input Column               : ci_item"
 Write-Host "API Mode                   : GET only"
-Write-Host "Search API                 : /v1/data-protect/search/protected-objects"
-Write-Host "Search Structure           : objects + childObjects + latestSnapshotsInfo"
+Write-Host "Search API                 : /v2/data-protect/search/protected-objects?searchString=<ci_item>"
+Write-Host "Search Params              : None"
+Write-Host "Parsed Structure           : objects + latestSnapshotsInfo + childObjects"
+Write-Host "Replication Rule           : replicationSnapshotInfo.clusterId => Replicated"
 Write-Host "Protected Threshold Days   : $ProtectedWithinDays"
 Write-Host ""
 Write-Host "Total Input Servers        : $($ServerList.Count)"
@@ -1389,13 +1354,15 @@ Write-Host "Backup Rows Found          : $FoundCount"
 Write-Host "Protected Rows             : $ProtectedCount"
 Write-Host "Stale Rows                 : $StaleCount"
 Write-Host "Unknown Rows               : $UnknownCount"
+Write-Host "Local Rows                 : $LocalCount"
+Write-Host "Replicated Rows            : $ReplicatedCount"
 Write-Host "No FS Backup Found         : $NoFsCount"
 Write-Host "No DB Backup Found         : $NoDbCount"
 Write-Host ""
 Write-Host "Search Calls               : $script:SearchCalls"
 Write-Host "Failed GETs                : $script:FailedGets"
 Write-Host ""
-Write-Host "Note                       : Duration is '-' because protected-object search does not expose object-level duration."
+Write-Host "Note                       : ClusterName is taken from this endpoint only. If name is not present, clusterId is shown."
 Write-Host ""
 Write-Host "------------------------------------------------------------" -ForegroundColor Cyan
 Write-Host "Backup Validation Table" -ForegroundColor Cyan
