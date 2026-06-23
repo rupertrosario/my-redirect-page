@@ -1,6 +1,6 @@
 # ==========================================================
 # Cohesity Backup Validation Report
-# GET ONLY | FS + SQL + ORACLE + HYPERV + NUTANIX + VM
+# GET ONLY | FS + DB(SQL/Oracle) + HyperV + Nutanix + VM
 #
 # Input:
 #   X:\PowerShell\Data\Cohesity\BackupValidation\<ChangeID>.csv
@@ -11,15 +11,17 @@
 # Output:
 #   ServerName, BackupType, ObjectName, SourceName, ClusterName, ProtectionGroup, LastBackupTime
 #
-# Rules:
+# Key rules:
+# - Output BackupType uses: FS, DB, HyperV, Nutanix, VM, Unknown.
+# - SQL and Oracle are internally detected, but output label is DB.
+# - FS must never become DB just because hostname/FQDN contains "db".
 # - Shortname + FQDN are merged into one CI identity.
-# - SQL SourceName    = objects.mssqlParams.hostInfo.name first.
-# - Oracle SourceName = objects.oracleParams.hostInfo.name ONLY.
+# - FS and DB rows use the same merged ServerName, preferably FQDN.
+# - db|cn name rule only triggers extra SQL/Oracle DB fallback.
+# - db|cn does not trigger FS/VM/HyperV/Nutanix fallback.
+# - Oracle SourceName = objects.oracleParams.hostInfo.name only.
 # - Oracle rows without oracleParams.hostInfo.name are skipped.
 # - Oracle DB rows are still extracted from oracleParams.
-# - FS is NOT classified as DB just because server/FQDN contains DB.
-# - Generic BackupType DB is removed.
-# - DB/CN name rule is only used to trigger extra SQL/Oracle fallback.
 # - No BackupLocation.
 # - No replication columns.
 # - No SyntheticReason.
@@ -77,7 +79,7 @@ $GlobalSearchCount                     = 100
 $FallbackWhenNoGlobalObject            = $true
 $FallbackWhenDbMissingForDbNamedServer = $true
 
-# Only used to trigger extra SQL/Oracle fallback.
+# Only used to trigger extra SQL/Oracle DB fallback.
 # This does NOT classify anything as DB.
 $DbServerNamePattern = '(?i)db|cn'
 
@@ -146,7 +148,6 @@ function First-NonBlank {
         if ($v -is [array]) {
             foreach ($x in $v) {
                 $t = First-NonBlank -Values $x
-
                 if (-not [string]::IsNullOrWhiteSpace($t)) {
                     return "$t".Trim()
                 }
@@ -176,7 +177,6 @@ function First-NonBlank {
             )) {
                 if ($v.PSObject.Properties.Name -contains $p) {
                     $t = First-NonBlank -Values $v.$p
-
                     if (-not [string]::IsNullOrWhiteSpace($t)) {
                         return "$t".Trim()
                     }
@@ -411,6 +411,62 @@ function Get-SearchTermsForCiAliases {
         Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
         Sort-Object -Unique
     )
+}
+
+function Get-CanonicalNameIfAlias {
+    param(
+        [string]$Name,
+        [string[]]$CiAliases,
+        [string]$DisplayName
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Name)) {
+        return $Name
+    }
+
+    foreach ($alias in @($CiAliases)) {
+        if ([string]::IsNullOrWhiteSpace($alias)) {
+            continue
+        }
+
+        if (Text-MatchesName -Text $Name -Name $alias) {
+            return $DisplayName
+        }
+    }
+
+    return $Name
+}
+
+function Canonicalize-DbObjectNamePrefix {
+    param(
+        [string]$ObjectName,
+        [string[]]$CiAliases,
+        [string]$DisplayName
+    )
+
+    if ([string]::IsNullOrWhiteSpace($ObjectName)) {
+        return $ObjectName
+    }
+
+    if ($ObjectName -notlike "*/*") {
+        return $ObjectName
+    }
+
+    $parts = $ObjectName -split "/", 2
+    $prefix = $parts[0]
+    $suffix = $parts[1]
+
+    foreach ($alias in @($CiAliases)) {
+        if ([string]::IsNullOrWhiteSpace($alias)) {
+            continue
+        }
+
+        if (Text-MatchesName -Text $prefix -Name $alias) {
+            return "$DisplayName/$suffix"
+        }
+    }
+
+    return $ObjectName
 }
 
 # ==========================================================
@@ -721,7 +777,7 @@ function Get-VmBackupTypeFromText {
 
 function Resolve-SourceName {
     param(
-        [string]$BackupType,
+        [string]$InternalBackupType,
         [string]$ObjectName,
         [string]$ParentName,
         [string]$SqlHostName,
@@ -730,7 +786,7 @@ function Resolve-SourceName {
         [string]$ParentSourceName
     )
 
-    if ($BackupType -eq "Oracle") {
+    if ($InternalBackupType -eq "Oracle") {
         if (-not [string]::IsNullOrWhiteSpace($OracleHostName)) {
             return $OracleHostName
         }
@@ -738,7 +794,7 @@ function Resolve-SourceName {
         return ""
     }
 
-    if ($BackupType -eq "SQL") {
+    if ($InternalBackupType -eq "SQL") {
         if (-not [string]::IsNullOrWhiteSpace($SqlHostName)) {
             return $SqlHostName
         }
@@ -845,7 +901,7 @@ function Test-NonDisplayObject {
     return $false
 }
 
-function Get-BackupType {
+function Get-InternalBackupType {
     param($FlatObject)
 
     if (Test-NonDisplayObject -FlatObject $FlatObject) {
@@ -893,6 +949,16 @@ function Get-BackupType {
     return "FS"
 }
 
+function Get-OutputBackupType {
+    param([string]$InternalBackupType)
+
+    if ($InternalBackupType -in @("SQL", "Oracle")) {
+        return "DB"
+    }
+
+    return $InternalBackupType
+}
+
 function Test-SqlOracleLikeFlat {
     param($FlatObject)
 
@@ -900,7 +966,7 @@ function Test-SqlOracleLikeFlat {
         return $false
     }
 
-    $bt = Get-BackupType -FlatObject $FlatObject
+    $bt = Get-InternalBackupType -FlatObject $FlatObject
 
     return ($bt -in @("SQL", "Oracle"))
 }
@@ -908,7 +974,7 @@ function Test-SqlOracleLikeFlat {
 function Test-VmLikeFlat {
     param($FlatObject)
 
-    $bt = Get-BackupType -FlatObject $FlatObject
+    $bt = Get-InternalBackupType -FlatObject $FlatObject
 
     return ($bt -in @("HyperV", "Nutanix", "VM"))
 }
@@ -1175,7 +1241,7 @@ function Get-ParamDbRows {
 
     # Critical:
     # Only create DB child rows when the object is actually SQL/Oracle.
-    # Never create DB rows because the physical server name contains DB.
+    # Never create DB rows because a physical server name contains DB.
     if (-not $hasSqlParams -and -not $hasOracleParams) {
         return @()
     }
@@ -1334,7 +1400,7 @@ function Get-FlatProtectedObjects {
     }
 
     $sourceName = Resolve-SourceName `
-        -BackupType $preType `
+        -InternalBackupType $preType `
         -ObjectName $objectName `
         -ParentName $ParentName `
         -SqlHostName $sqlHostName `
@@ -1381,26 +1447,29 @@ function Convert-FlatObjectToBackupRow {
     param(
         $FlatObject,
         [string]$Ci,
+        [string[]]$CiAliases,
         $CandidateCluster
     )
 
-    $obj        = $FlatObject.Object
-    $snap       = Get-BestSnapshot -Object $obj
-    $backupType = Get-BackupType -FlatObject $FlatObject
+    $obj = $FlatObject.Object
+    $snap = Get-BestSnapshot -Object $obj
+    $internalBackupType = Get-InternalBackupType -FlatObject $FlatObject
 
-    if ($backupType -eq "Container") {
+    if ($internalBackupType -eq "Container") {
         return $null
     }
 
-    if ($backupType -eq "Oracle" -and
+    if ($internalBackupType -eq "Oracle" -and
         [string]::IsNullOrWhiteSpace($FlatObject.OracleHostName)) {
         return $null
     }
 
+    $outputBackupType = Get-OutputBackupType -InternalBackupType $internalBackupType
+
     $objectNameOut = Get-DisplayObjectName -ObjectName $FlatObject.ObjectName
 
     $sourceNameOut = Resolve-SourceName `
-        -BackupType $backupType `
+        -InternalBackupType $internalBackupType `
         -ObjectName $FlatObject.ObjectName `
         -ParentName $FlatObject.ParentName `
         -SqlHostName $FlatObject.SqlHostName `
@@ -1408,8 +1477,18 @@ function Convert-FlatObjectToBackupRow {
         -GenericSourceName $FlatObject.GenericSourceName `
         -ParentSourceName $FlatObject.SourceName
 
-    if ($backupType -eq "Oracle" -and [string]::IsNullOrWhiteSpace($sourceNameOut)) {
+    if ($internalBackupType -eq "Oracle" -and [string]::IsNullOrWhiteSpace($sourceNameOut)) {
         return $null
+    }
+
+    if ($outputBackupType -eq "FS") {
+        $objectNameOut = Get-CanonicalNameIfAlias -Name $objectNameOut -CiAliases $CiAliases -DisplayName $Ci
+        $sourceNameOut = Get-CanonicalNameIfAlias -Name $sourceNameOut -CiAliases $CiAliases -DisplayName $Ci
+    }
+
+    if ($outputBackupType -eq "DB") {
+        $sourceNameOut = Get-CanonicalNameIfAlias -Name $sourceNameOut -CiAliases $CiAliases -DisplayName $Ci
+        $objectNameOut = Canonicalize-DbObjectNamePrefix -ObjectName $objectNameOut -CiAliases $CiAliases -DisplayName $Ci
     }
 
     if ($snap) {
@@ -1425,7 +1504,7 @@ function Convert-FlatObjectToBackupRow {
 
     return [pscustomobject]@{
         ServerName      = $Ci
-        BackupType      = $backupType
+        BackupType      = $outputBackupType
         ObjectName      = $objectNameOut
         SourceName      = $sourceNameOut
         ClusterName     = "$($CandidateCluster.clusterName)"
@@ -1506,8 +1585,9 @@ function Search-ProtectedObjectsOnClusters {
                 $ObjectsToCheck = @($MatchingFlatObjects)
             }
 
-            # Safe fallback only if there is exactly one object returned.
-            # Avoids unrelated broad search rows.
+            # Safe fallback:
+            # Only use all flat objects if exactly one object came back.
+            # This avoids unrelated rows from broad search results.
             if (-not $ObjectsToCheck -or $ObjectsToCheck.Count -eq 0) {
                 if ($FlatObjects.Count -eq 1) {
                     $ObjectsToCheck = $FlatObjects
@@ -1522,13 +1602,17 @@ function Search-ProtectedObjectsOnClusters {
                     continue
                 }
 
-                $row = Convert-FlatObjectToBackupRow -FlatObject $Flat -Ci $Ci -CandidateCluster $Clu
+                $row = Convert-FlatObjectToBackupRow `
+                    -FlatObject $Flat `
+                    -Ci $Ci `
+                    -CiAliases $CiAliases `
+                    -CandidateCluster $Clu
 
                 if ($null -eq $row) {
                     continue
                 }
 
-                if ($SqlOracleOnly -and $row.BackupType -notin @("SQL", "Oracle")) {
+                if ($SqlOracleOnly -and $row.BackupType -ne "DB") {
                     continue
                 }
 
@@ -1551,19 +1635,9 @@ function Get-BackupTypeRank {
         "HyperV"  { return 2 }
         "Nutanix" { return 3 }
         "VM"      { return 4 }
-        "SQL"     { return 5 }
-        "Oracle"  { return 6 }
+        "DB"      { return 5 }
         default   { return 9 }
     }
-}
-
-function Test-HasValidFs {
-    param($Rows)
-
-    return (@($Rows | Where-Object {
-        $_.BackupType -eq "FS" -and
-        (Is-ValidBackupTime -TimeText $_.LastBackupTime)
-    }).Count -gt 0)
 }
 
 function Test-HasAnyFs {
@@ -1574,11 +1648,11 @@ function Test-HasAnyFs {
     }).Count -gt 0)
 }
 
-function Test-HasValidSqlOrOracle {
+function Test-HasValidDb {
     param($Rows)
 
     return (@($Rows | Where-Object {
-        $_.BackupType -in @("SQL", "Oracle") -and
+        $_.BackupType -eq "DB" -and
         (Is-ValidBackupTime -TimeText $_.LastBackupTime)
     }).Count -gt 0)
 }
@@ -1776,6 +1850,8 @@ foreach ($CiGroup in $CiGroups) {
 
     # ------------------------------------------------------
     # Step 2: Normal protected-object search.
+    # Searches candidate clusters only.
+    # Does not use DB/CN pattern.
     # ------------------------------------------------------
     if ($CandidateClusters -and $CandidateClusters.Count -gt 0) {
         $CiRows += Search-ProtectedObjectsOnClusters `
@@ -1787,14 +1863,15 @@ foreach ($CiGroup in $CiGroups) {
     }
 
     # ------------------------------------------------------
-    # Step 3: Extra fallback only for SQL/Oracle if CI shortname has DB/CN.
+    # Step 3: Extra fallback only for DB, only if shortname has DB/CN.
+    # This fallback can only add DB rows.
     # ------------------------------------------------------
-    $HasSqlOrOracle = Test-HasValidSqlOrOracle -Rows $CiRows
+    $HasDbBackup = Test-HasValidDb -Rows $CiRows
     $CiLooksLikeDbServer = Test-CiLooksLikeDbServer -CiAliases $CiAliases
 
     if ($FallbackWhenDbMissingForDbNamedServer -and
         $CiLooksLikeDbServer -and
-        -not $HasSqlOrOracle) {
+        -not $HasDbBackup) {
 
         $AllClusterFallback = New-Object System.Collections.ArrayList
         $FallbackSeen = @{}
@@ -1805,12 +1882,12 @@ foreach ($CiGroup in $CiGroups) {
                 -Seen $FallbackSeen `
                 -ClusterId "$($Clu.clusterId)" `
                 -ClusterName "$($Clu.clusterName)" `
-                -SearchMode "SqlOracleFallbackNameMatched"
+                -SearchMode "DbFallbackNameMatched"
         }
 
         if ($AllClusterFallback.Count -gt 0) {
             if ($ShowProgress) {
-                Write-Host "  SQL/Oracle fallback because CI name contains DB/CN: $($AllClusterFallback.Count) clusters" -ForegroundColor DarkGray
+                Write-Host "  DB fallback because CI shortname contains DB/CN: $($AllClusterFallback.Count) clusters" -ForegroundColor DarkGray
             }
 
             $CiRows += Search-ProtectedObjectsOnClusters `
@@ -1860,10 +1937,10 @@ foreach ($CiGroup in $CiGroups) {
         }
     }
 
-    $HasSqlOrOracleBackup = Test-HasValidSqlOrOracle -Rows $DedupedRows
-    $HasAnyFS = Test-HasAnyFs -Rows $DedupedRows
+    $HasValidDb = Test-HasValidDb -Rows $DedupedRows
+    $HasAnyFS   = Test-HasAnyFs -Rows $DedupedRows
 
-    if ($HasSqlOrOracleBackup -and -not $HasAnyFS) {
+    if ($HasValidDb -and -not $HasAnyFS) {
         $Results += [pscustomobject]@{
             ServerName      = $Ci
             BackupType      = "FS"
