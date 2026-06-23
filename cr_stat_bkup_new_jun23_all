@@ -1,32 +1,24 @@
 # ==========================================================
 # Cohesity Backup Validation Report
-# GET ONLY | SQL + ORACLE + HYPERV + NUTANIX + FS
+# GET ONLY | FS + SQL + ORACLE + HYPERV + NUTANIX + VM
 #
-# Endpoints:
-# 1) GET /v2/mcm/cluster-mgmt/info
-# 2) GET /v2/data-protect/search/objects?searchString=<CI>&includeTenants=true&count=100
-# 3) GET /v2/data-protect/search/protected-objects?searchString=<CI_OR_SHORTNAME>
+# Input:
+#   X:\PowerShell\Data\Cohesity\BackupValidation\<ChangeID>.csv
+#
+# Required CSV column:
+#   ci_item
 #
 # Output:
-# ServerName, BackupType, ObjectName, SourceName, ClusterName, ProtectionGroup, LastBackupTime
+#   ServerName, BackupType, ObjectName, SourceName, ClusterName, ProtectionGroup, LastBackupTime
 #
-# Rules:
-# - SQL SourceName    = objects.mssqlParams.hostInfo.name first
-# - Oracle SourceName = objects.oracleParams.hostInfo.name ONLY
-# - Oracle rows without oracleParams.hostInfo.name are skipped
-# - Oracle container rows like Oracle Servers/kRACDatabase are not displayed
-# - Nutanix/AHV is classified as Nutanix
-# - Hyper-V is classified as HyperV
-# - No BackupLocation
-# - No replication columns
-# - No SyntheticReason
-#
-# Performance logic:
-# - Normal search checks FS + SQL + Oracle + HyperV + Nutanix + VM.
-# - Expensive all-cluster fallback runs only when:
-#     1) DB backup is missing
-#     2) CI/server name matches $DbServerNamePattern
-# - Current DB pattern: db OR cn
+# Important fixes:
+# - Shortname + FQDN are merged into one CI identity.
+# - FS is NOT classified as DB only because server/FQDN contains DB.
+# - Generic BackupType DB is removed.
+# - DB/CN fallback is only for SQL and Oracle.
+# - Oracle SourceName = objects.oracleParams.hostInfo.name only.
+# - SQL SourceName = objects.mssqlParams.hostInfo.name first.
+# - No Debug CSV.
 # ==========================================================
 
 $ErrorActionPreference = "Stop"
@@ -48,7 +40,6 @@ $InputTxt  = Join-Path $BaseDir "$ChangeID.txt"
 $TimeStamp = Get-Date -Format "yyyyMMdd_HHmmss"
 $OutputTxt = Join-Path $BaseDir "${ChangeID}_BackupReport_$TimeStamp.txt"
 $OutputCsv = Join-Path $BaseDir "${ChangeID}_BackupReport_$TimeStamp.csv"
-$DebugCsv  = Join-Path $BaseDir "${ChangeID}_BackupReport_Debug_$TimeStamp.csv"
 
 if (-not (Test-Path -Path $BaseDir -PathType Container)) {
     New-Item -Path $BaseDir -ItemType Directory -Force | Out-Null
@@ -81,20 +72,12 @@ $GlobalSearchCount                     = 100
 $FallbackWhenNoGlobalObject            = $true
 $FallbackWhenDbMissingForDbNamedServer = $true
 
-# DB fallback trigger.
-# Current rule: CI/server names containing DB or CN trigger expensive DB fallback.
-$DbServerNamePattern                   = '(?i)db|cn'
+# This only decides whether to do extra SQL/Oracle fallback.
+# It does NOT classify anything as DB.
+$DbServerNamePattern = '(?i)db|cn'
 
-$ShowProgress                          = $true
-$ReportTimeZoneId                      = "Eastern Standard Time"
-
-# -------------------------
-# Counters
-# -------------------------
-$GlobalSearchCalls    = 0
-$ProtectedSearchCalls = 0
-$FallbackCiCount      = 0
-$FailedGets           = 0
+$ShowProgress     = $true
+$ReportTimeZoneId = "Eastern Standard Time"
 
 # ==========================================================
 # Basic Helpers
@@ -123,8 +106,6 @@ function Invoke-HeliosJson {
         return ($resp.Content | ConvertFrom-Json)
     }
     catch {
-        $script:FailedGets++
-
         if (-not $Quiet) {
             Write-Host "GET failed:" -ForegroundColor DarkRed
             Write-Host $Uri -ForegroundColor DarkRed
@@ -160,12 +141,10 @@ function First-NonBlank {
         if ($v -is [array]) {
             foreach ($x in $v) {
                 $t = First-NonBlank -Values $x
-
                 if (-not [string]::IsNullOrWhiteSpace($t)) {
                     return "$t".Trim()
                 }
             }
-
             continue
         }
 
@@ -190,13 +169,11 @@ function First-NonBlank {
             )) {
                 if ($v.PSObject.Properties.Name -contains $p) {
                     $t = First-NonBlank -Values $v.$p
-
                     if (-not [string]::IsNullOrWhiteSpace($t)) {
                         return "$t".Trim()
                     }
                 }
             }
-
             continue
         }
 
@@ -352,18 +329,80 @@ function Is-ValidBackupTime {
         "NoBackupTime",
         "NoObject",
         "NoFSBackupFound",
-        "NoDbBackupFound"
+        "NoSqlOracleBackupFound"
     ))
 }
 
 function Test-CiLooksLikeDbServer {
+    param([string[]]$CiAliases)
+
+    foreach ($ci in @($CiAliases)) {
+        if ([string]::IsNullOrWhiteSpace($ci)) {
+            continue
+        }
+
+        $short = Get-ShortName -Value $ci
+
+        if ($short -match $DbServerNamePattern) {
+            return $true
+        }
+    }
+
+    return $false
+}
+
+function Get-CiIdentityKey {
     param([string]$Ci)
 
     if ([string]::IsNullOrWhiteSpace($Ci)) {
-        return $false
+        return ""
     }
 
-    return ($Ci -match $DbServerNamePattern)
+    return (Normalize-Name (Get-ShortName -Value $Ci))
+}
+
+function Get-PreferredCiDisplayName {
+    param([string[]]$Aliases)
+
+    $valid = @(
+        $Aliases |
+        Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+        ForEach-Object { "$_".Trim() } |
+        Sort-Object -Unique
+    )
+
+    if (-not $valid -or $valid.Count -eq 0) {
+        return ""
+    }
+
+    $fqdn = @($valid | Where-Object { $_ -match "\." } | Select-Object -First 1)
+
+    if ($fqdn.Count -gt 0) {
+        return $fqdn[0]
+    }
+
+    return $valid[0]
+}
+
+function Get-SearchTermsForCiAliases {
+    param([string[]]$Aliases)
+
+    $terms = @()
+
+    foreach ($a in @($Aliases)) {
+        if ([string]::IsNullOrWhiteSpace($a)) {
+            continue
+        }
+
+        $terms += "$a".Trim()
+        $terms += Get-ShortName -Value "$a"
+    }
+
+    return @(
+        $terms |
+        Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+        Sort-Object -Unique
+    )
 }
 
 # ==========================================================
@@ -541,18 +580,8 @@ function Get-CandidateClusterIdsFromGlobalSearch {
     return @($ids)
 }
 
-function Get-SearchTermsForCi {
-    param([string]$Ci)
-
-    $terms = @()
-    $terms += "$Ci"
-    $terms += Get-ShortName -Value "$Ci"
-
-    return @($terms | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Sort-Object -Unique)
-}
-
 # ==========================================================
-# DB / VM / Source Helpers
+# SQL / Oracle / VM / Source Helpers
 # ==========================================================
 function Get-SqlHostNameFromNode {
     param($Object)
@@ -734,10 +763,7 @@ function Resolve-SourceName {
 }
 
 function Get-DisplayObjectName {
-    param(
-        [string]$ObjectName,
-        [string]$BackupType
-    )
+    param([string]$ObjectName)
 
     if ([string]::IsNullOrWhiteSpace($ObjectName)) {
         return "-"
@@ -778,6 +804,25 @@ function Object-MatchesCiFlat {
     return $false
 }
 
+function Object-MatchesCiAliasesFlat {
+    param(
+        $FlatObject,
+        [string[]]$CiAliases
+    )
+
+    foreach ($alias in @($CiAliases)) {
+        if ([string]::IsNullOrWhiteSpace($alias)) {
+            continue
+        }
+
+        if (Object-MatchesCiFlat -FlatObject $FlatObject -CiName $alias) {
+            return $true
+        }
+    }
+
+    return $false
+}
+
 function Test-NonDisplayObject {
     param($FlatObject)
 
@@ -799,14 +844,27 @@ function Get-BackupType {
         return "Container"
     }
 
+    # Strict SQL detection.
     if (-not [string]::IsNullOrWhiteSpace($FlatObject.SqlHostName)) {
         return "SQL"
     }
 
+    # Strict Oracle detection.
     if (-not [string]::IsNullOrWhiteSpace($FlatObject.OracleHostName)) {
         return "Oracle"
     }
 
+    $envTypeText = "$($FlatObject.Environment) $($FlatObject.ObjectType)"
+
+    if ($envTypeText -match '(?i)kSQL') {
+        return "SQL"
+    }
+
+    if ($envTypeText -match '(?i)kOracle') {
+        return "Oracle"
+    }
+
+    # VM detection.
     $vmType = Get-VmBackupTypeFromText `
         -Environment $FlatObject.Environment `
         -ObjectType $FlatObject.ObjectType `
@@ -818,24 +876,12 @@ function Get-BackupType {
         return $vmType
     }
 
-    $text = "$($FlatObject.Environment) $($FlatObject.ObjectType) $($FlatObject.ObjectName) $($FlatObject.SourceName) $($FlatObject.SourceInfoName)"
-
-    if ($text -match '(?i)kOracle|oracle|kRAC|kNonRAC') {
-        return "Oracle"
-    }
-
-    if ($text -match '(?i)kSQL|mssql|sql server|sql') {
-        return "SQL"
-    }
-
-    if ($text -match '(?i)kDatabase|database|db') {
-        return "DB"
-    }
-
+    # Anything else is FS.
+    # Do NOT use object/source name containing "db" to classify as DB.
     return "FS"
 }
 
-function Test-DbLikeFlat {
+function Test-SqlOracleLikeFlat {
     param($FlatObject)
 
     if (Test-NonDisplayObject -FlatObject $FlatObject) {
@@ -844,7 +890,7 @@ function Test-DbLikeFlat {
 
     $bt = Get-BackupType -FlatObject $FlatObject
 
-    return ($bt -in @("SQL", "Oracle", "DB"))
+    return ($bt -in @("SQL", "Oracle"))
 }
 
 function Test-VmLikeFlat {
@@ -952,7 +998,7 @@ function Get-ProtectionGroupName {
 }
 
 # ==========================================================
-# Optional DB Name Extraction From Params
+# SQL / Oracle DB Name Extraction From Params Only
 # ==========================================================
 function Test-ValidDbName {
     param(
@@ -1096,19 +1142,21 @@ function Get-ParamDbRows {
         return @()
     }
 
+    $sqlHostName    = Get-SqlHostNameFromNode -Object $Object
+    $oracleHostName = Get-OracleHostNameFromNode -Object $Object
+
+    # Critical:
+    # Only create DB child rows if real SQL/Oracle params exist.
+    # Never create DB rows from physical FS objects just because name contains DB.
+    if ([string]::IsNullOrWhiteSpace($sqlHostName) -and
+        [string]::IsNullOrWhiteSpace($oracleHostName)) {
+        return @()
+    }
+
     $containers = @(
         $Object.mssqlParams,
         $Object.sqlParams,
-        $Object.mssql,
-        $Object.oracleParams,
-        $Object.databaseParams,
-        $Object.dbParams,
-        $Object.databaseInfo,
-        $Object.databases,
-        $Object.databaseList,
-        $Object.protectedDatabases,
-        $Object.selectedDatabases,
-        $Object.includedDatabases
+        $Object.oracleParams
     )
 
     $dbNames = @()
@@ -1141,8 +1189,8 @@ function Get-ParamDbRows {
             ParentEnvironment = $Environment
             Environment       = $Environment
             ObjectType        = "kDatabase"
-            SqlHostName       = Get-SqlHostNameFromNode -Object $Object
-            OracleHostName    = Get-OracleHostNameFromNode -Object $Object
+            SqlHostName       = $sqlHostName
+            OracleHostName    = $oracleHostName
             GenericSourceName = Get-GenericSourceNameFromNode -Object $Object
             SourceName        = $SourceName
             SourceInfoName    = $SourceName
@@ -1171,12 +1219,11 @@ function Get-FlatProtectedObjects {
         return @()
     }
 
-    $objectName = Get-ObjectNameFromNode -Object $Object
-    $env = Get-EnvironmentFromNode -Object $Object -ParentEnvironment $ParentEnvironment
-    $objectType = Get-ObjectTypeFromNode -Object $Object
-
-    $sqlHostName = Get-SqlHostNameFromNode -Object $Object
-    $oracleHostName = Get-OracleHostNameFromNode -Object $Object
+    $objectName        = Get-ObjectNameFromNode -Object $Object
+    $env               = Get-EnvironmentFromNode -Object $Object -ParentEnvironment $ParentEnvironment
+    $objectType        = Get-ObjectTypeFromNode -Object $Object
+    $sqlHostName       = Get-SqlHostNameFromNode -Object $Object
+    $oracleHostName    = Get-OracleHostNameFromNode -Object $Object
     $genericSourceName = Get-GenericSourceNameFromNode -Object $Object
 
     $preVmType = Get-VmBackupTypeFromText `
@@ -1186,7 +1233,7 @@ function Get-FlatProtectedObjects {
         -SourceName $genericSourceName `
         -SourceInfoName ""
 
-    $preType = ""
+    $preType = "FS"
 
     if (-not [string]::IsNullOrWhiteSpace($sqlHostName)) {
         $preType = "SQL"
@@ -1194,17 +1241,14 @@ function Get-FlatProtectedObjects {
     elseif (-not [string]::IsNullOrWhiteSpace($oracleHostName)) {
         $preType = "Oracle"
     }
-    elseif (-not [string]::IsNullOrWhiteSpace($preVmType)) {
-        $preType = $preVmType
-    }
-    elseif ("$env $objectType $objectName $genericSourceName" -match '(?i)kOracle|oracle|kRAC|kNonRAC') {
-        $preType = "Oracle"
-    }
-    elseif ("$env $objectType $objectName $genericSourceName" -match '(?i)kSQL|mssql|sql server|sql') {
+    elseif ("$env $objectType" -match '(?i)kSQL') {
         $preType = "SQL"
     }
-    else {
-        $preType = "FS"
+    elseif ("$env $objectType" -match '(?i)kOracle') {
+        $preType = "Oracle"
+    }
+    elseif (-not [string]::IsNullOrWhiteSpace($preVmType)) {
+        $preType = $preVmType
     }
 
     $sourceName = Resolve-SourceName `
@@ -1257,8 +1301,8 @@ function Convert-FlatObjectToBackupRow {
         $CandidateCluster
     )
 
-    $obj = $FlatObject.Object
-    $snap = Get-BestSnapshot -Object $obj
+    $obj        = $FlatObject.Object
+    $snap       = Get-BestSnapshot -Object $obj
     $backupType = Get-BackupType -FlatObject $FlatObject
 
     if ($backupType -eq "Container") {
@@ -1270,9 +1314,7 @@ function Convert-FlatObjectToBackupRow {
         return $null
     }
 
-    $objectNameOut = Get-DisplayObjectName `
-        -ObjectName $FlatObject.ObjectName `
-        -BackupType $backupType
+    $objectNameOut = Get-DisplayObjectName -ObjectName $FlatObject.ObjectName
 
     $sourceNameOut = Resolve-SourceName `
         -BackupType $backupType `
@@ -1313,10 +1355,11 @@ function Convert-FlatObjectToBackupRow {
 function Search-ProtectedObjectsOnClusters {
     param(
         [string]$Ci,
+        [string[]]$CiAliases,
         [string[]]$SearchTerms,
         [object[]]$CandidateClusters,
         [System.Collections.ArrayList]$SearchedClusterTermKeys,
-        [System.Collections.ArrayList]$DebugRows
+        [switch]$SqlOracleOnly
     )
 
     $Rows = @()
@@ -1331,15 +1374,13 @@ function Search-ProtectedObjectsOnClusters {
                 continue
             }
 
-            $searchKey = "$($Clu.clusterId)|$Term"
+            $searchKey = "$($Clu.clusterId)|$Term|$SqlOracleOnly"
 
             if ($SearchedClusterTermKeys.Contains($searchKey)) {
                 continue
             }
 
             [void]$SearchedClusterTermKeys.Add($searchKey)
-
-            $script:ProtectedSearchCalls++
 
             $ProtectedSearchUrl = "$BaseUrl/v2/data-protect/search/protected-objects?searchString=$([uri]::EscapeDataString($Term))"
 
@@ -1370,26 +1411,36 @@ function Search-ProtectedObjectsOnClusters {
             }
 
             $MatchingFlatObjects = @($FlatObjects | Where-Object {
-                Object-MatchesCiFlat -FlatObject $_ -CiName $Ci
-            })
-
-            $DbFlatObjects = @($FlatObjects | Where-Object {
-                Test-DbLikeFlat -FlatObject $_
+                Object-MatchesCiAliasesFlat -FlatObject $_ -CiAliases $CiAliases
             })
 
             $VmFlatObjects = @($FlatObjects | Where-Object {
                 Test-VmLikeFlat -FlatObject $_
             })
 
-            $ObjectsToCheck = @(
-                $MatchingFlatObjects
-                $DbFlatObjects
-                $VmFlatObjects
-            ) | Where-Object { $_ } |
-                Sort-Object ObjectName, SourceName, ObjectType -Unique
+            if ($SqlOracleOnly) {
+                $ObjectsToCheck = @($MatchingFlatObjects | Where-Object {
+                    Test-SqlOracleLikeFlat -FlatObject $_
+                })
+            }
+            else {
+                $ObjectsToCheck = @(
+                    $MatchingFlatObjects
+                    $VmFlatObjects
+                ) | Where-Object { $_ } |
+                    Sort-Object ObjectName, SourceName, ObjectType -Unique
+            }
 
+            # Safer fallback:
+            # Only use all flat objects if there is exactly one returned object.
+            # This avoids unrelated DB/FS rows from broad search results.
             if (-not $ObjectsToCheck -or $ObjectsToCheck.Count -eq 0) {
-                $ObjectsToCheck = $FlatObjects
+                if ($FlatObjects.Count -eq 1) {
+                    $ObjectsToCheck = $FlatObjects
+                }
+                else {
+                    continue
+                }
             }
 
             foreach ($Flat in $ObjectsToCheck) {
@@ -1403,32 +1454,11 @@ function Search-ProtectedObjectsOnClusters {
                     continue
                 }
 
-                $Rows += $row
+                if ($SqlOracleOnly -and $row.BackupType -notin @("SQL", "Oracle")) {
+                    continue
+                }
 
-                [void]$DebugRows.Add([pscustomobject]@{
-                    ServerName          = $Ci
-                    SearchTerm          = $Term
-                    SearchMode          = $Clu.searchMode
-                    SearchClusterId     = $Clu.clusterId
-                    SearchCluster       = $Clu.clusterName
-                    RawObjectName       = $Flat.ObjectName
-                    ParentName          = $Flat.ParentName
-                    SourceName          = $Flat.SourceName
-                    SourceInfoName      = $Flat.SourceInfoName
-                    SqlHostName         = $Flat.SqlHostName
-                    OracleHostName      = $Flat.OracleHostName
-                    GenericSourceName   = $Flat.GenericSourceName
-                    Environment         = $Flat.Environment
-                    ParentEnvironment   = $Flat.ParentEnvironment
-                    ObjectType          = $Flat.ObjectType
-                    Depth               = $Flat.Depth
-                    BackupType          = $row.BackupType
-                    ObjectName          = $row.ObjectName
-                    ClusterName         = $row.ClusterName
-                    ProtectionGroup     = $row.ProtectionGroup
-                    LastBackupTime      = $row.LastBackupTime
-                    LastBackupUsecs     = $row.LastBackupUsecs
-                })
+                $Rows += $row
             }
         }
     }
@@ -1449,7 +1479,6 @@ function Get-BackupTypeRank {
         "VM"      { return 4 }
         "SQL"     { return 5 }
         "Oracle"  { return 6 }
-        "DB"      { return 7 }
         default   { return 9 }
     }
 }
@@ -1463,17 +1492,17 @@ function Test-HasValidFs {
     }).Count -gt 0)
 }
 
-function Test-HasValidDb {
+function Test-HasValidSqlOrOracle {
     param($Rows)
 
     return (@($Rows | Where-Object {
-        $_.BackupType -in @("SQL", "Oracle", "DB") -and
+        $_.BackupType -in @("SQL", "Oracle") -and
         (Is-ValidBackupTime -TimeText $_.LastBackupTime)
     }).Count -gt 0)
 }
 
 # ==========================================================
-# Read CI List
+# Read CI List and Merge Shortname/FQDN
 # ==========================================================
 $CsvRows = @(Import-Csv -Path $InputCsv)
 
@@ -1485,28 +1514,43 @@ if (-not ($CsvRows[0].PSObject.Properties.Name -contains "ci_item")) {
     throw "Input CSV must contain column: ci_item"
 }
 
-$CiNames = @(
+$RawCiNames = @(
     $CsvRows |
     ForEach-Object { "$($_.ci_item)".Trim().Trim('"').Trim("'") } |
     Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
     Sort-Object -Unique
 )
 
-if (-not $CiNames -or $CiNames.Count -eq 0) {
+if (-not $RawCiNames -or $RawCiNames.Count -eq 0) {
     throw "No CI names found in CSV: $InputCsv"
 }
 
-$CiNames | Set-Content -Path $InputTxt -Encoding UTF8
+$CiGroups = @(
+    $RawCiNames |
+    Group-Object { Get-CiIdentityKey -Ci $_ } |
+    ForEach-Object {
+        $aliases = @($_.Group | Sort-Object -Unique)
+        $display = Get-PreferredCiDisplayName -Aliases $aliases
 
-$CiList = @(
-    Get-Content -Path $InputTxt |
-    ForEach-Object { $_.Trim().Trim('"').Trim("'") } |
-    Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+        [pscustomobject]@{
+            IdentityKey = $_.Name
+            DisplayName = $display
+            Aliases     = $aliases
+        }
+    } |
+    Where-Object { -not [string]::IsNullOrWhiteSpace($_.DisplayName) } |
+    Sort-Object DisplayName
 )
 
-if (-not $CiList -or $CiList.Count -eq 0) {
-    throw "No CI names found in TXT: $InputTxt"
+if (-not $CiGroups -or $CiGroups.Count -eq 0) {
+    throw "No CI groups built from CSV: $InputCsv"
 }
+
+$CiGroups |
+ForEach-Object {
+    "$($_.DisplayName) | Aliases: $($_.Aliases -join ', ')"
+} |
+Set-Content -Path $InputTxt -Encoding UTF8
 
 # ==========================================================
 # Get Clusters
@@ -1572,9 +1616,11 @@ Write-Host "Cluster map entries  : $($ClusterMap.Count)" -ForegroundColor Green
 # Main Processing
 # ==========================================================
 $Results = @()
-$DebugRows = New-Object System.Collections.ArrayList
 
-foreach ($Ci in $CiList) {
+foreach ($CiGroup in $CiGroups) {
+    $Ci        = $CiGroup.DisplayName
+    $CiAliases = @($CiGroup.Aliases)
+
     if ($ShowProgress) {
         Write-Host ""
         Write-Host "Processing: [$Ci]" -ForegroundColor Cyan
@@ -1582,38 +1628,36 @@ foreach ($Ci in $CiList) {
 
     $CiRows = @()
     $SearchedClusterTermKeys = New-Object System.Collections.ArrayList
-    $SearchTerms = @(Get-SearchTermsForCi -Ci $Ci)
+    $SearchTerms = @(Get-SearchTermsForCiAliases -Aliases $CiAliases)
 
     # ------------------------------------------------------
-    # Step 1: Global search only for cluster hint.
+    # Step 1: Global search for cluster hints using all aliases.
     # ------------------------------------------------------
-    $GlobalSearchCalls++
-
-    $GlobalSearchUrl = "$BaseUrl/v2/data-protect/search/objects?searchString=$([uri]::EscapeDataString($Ci))&includeTenants=true&count=$GlobalSearchCount"
-
-    $GlobalJson = Invoke-HeliosJson -Uri $GlobalSearchUrl -Headers @{
-        accept = "application/json"
-        apiKey = $ApiKey
-    } -Quiet
-
-    $CandidateClusterIds = @(Get-CandidateClusterIdsFromGlobalSearch -Json $GlobalJson -ClusterMap $ClusterMap)
-
     $CandidateClusters = New-Object System.Collections.ArrayList
     $CandidateSeen = @{}
 
-    foreach ($ClusterId in $CandidateClusterIds) {
-        Add-CandidateCluster `
-            -List $CandidateClusters `
-            -Seen $CandidateSeen `
-            -ClusterId "$ClusterId" `
-            -ClusterName (Get-ClusterNameFromMap -ClusterId "$ClusterId" -ClusterMap $ClusterMap) `
-            -SearchMode "Fast"
+    foreach ($alias in $SearchTerms) {
+        $GlobalSearchUrl = "$BaseUrl/v2/data-protect/search/objects?searchString=$([uri]::EscapeDataString($alias))&includeTenants=true&count=$GlobalSearchCount"
+
+        $GlobalJson = Invoke-HeliosJson -Uri $GlobalSearchUrl -Headers @{
+            accept = "application/json"
+            apiKey = $ApiKey
+        } -Quiet
+
+        $CandidateClusterIds = @(Get-CandidateClusterIdsFromGlobalSearch -Json $GlobalJson -ClusterMap $ClusterMap)
+
+        foreach ($ClusterId in $CandidateClusterIds) {
+            Add-CandidateCluster `
+                -List $CandidateClusters `
+                -Seen $CandidateSeen `
+                -ClusterId "$ClusterId" `
+                -ClusterName (Get-ClusterNameFromMap -ClusterId "$ClusterId" -ClusterMap $ClusterMap) `
+                -SearchMode "Fast"
+        }
     }
 
     if (-not $CandidateClusters -or $CandidateClusters.Count -eq 0) {
         if ($FallbackWhenNoGlobalObject) {
-            $FallbackCiCount++
-
             foreach ($Clu in $Clusters) {
                 Add-CandidateCluster `
                     -List $CandidateClusters `
@@ -1626,24 +1670,27 @@ foreach ($Ci in $CiList) {
     }
 
     # ------------------------------------------------------
-    # Step 2: Protected-object search on candidate clusters.
+    # Step 2: Normal protected-object search.
     # ------------------------------------------------------
     if ($CandidateClusters -and $CandidateClusters.Count -gt 0) {
         $CiRows += Search-ProtectedObjectsOnClusters `
             -Ci $Ci `
+            -CiAliases $CiAliases `
             -SearchTerms $SearchTerms `
             -CandidateClusters @($CandidateClusters) `
-            -SearchedClusterTermKeys $SearchedClusterTermKeys `
-            -DebugRows $DebugRows
+            -SearchedClusterTermKeys $SearchedClusterTermKeys
     }
 
     # ------------------------------------------------------
-    # Step 3: DB fallback only for DB/CN-named CIs.
+    # Step 3: Extra fallback only for SQL/Oracle and only if CI name has DB/CN.
     # ------------------------------------------------------
-    $HasDB = Test-HasValidDb -Rows $CiRows
-    $CiLooksLikeDbServer = Test-CiLooksLikeDbServer -Ci $Ci
+    $HasSqlOrOracle = Test-HasValidSqlOrOracle -Rows $CiRows
+    $CiLooksLikeDbServer = Test-CiLooksLikeDbServer -CiAliases $CiAliases
 
-    if ($FallbackWhenDbMissingForDbNamedServer -and $CiLooksLikeDbServer -and -not $HasDB) {
+    if ($FallbackWhenDbMissingForDbNamedServer -and
+        $CiLooksLikeDbServer -and
+        -not $HasSqlOrOracle) {
+
         $AllClusterFallback = New-Object System.Collections.ArrayList
         $FallbackSeen = @{}
 
@@ -1653,22 +1700,21 @@ foreach ($Ci in $CiList) {
                 -Seen $FallbackSeen `
                 -ClusterId "$($Clu.clusterId)" `
                 -ClusterName "$($Clu.clusterName)" `
-                -SearchMode "DbFallbackNameMatched"
+                -SearchMode "SqlOracleFallbackNameMatched"
         }
 
         if ($AllClusterFallback.Count -gt 0) {
-            $FallbackCiCount++
-
             if ($ShowProgress) {
-                Write-Host "  DB fallback because CI name contains DB/CN: $($AllClusterFallback.Count) clusters" -ForegroundColor DarkGray
+                Write-Host "  SQL/Oracle fallback because CI name contains DB/CN: $($AllClusterFallback.Count) clusters" -ForegroundColor DarkGray
             }
 
             $CiRows += Search-ProtectedObjectsOnClusters `
                 -Ci $Ci `
+                -CiAliases $CiAliases `
                 -SearchTerms $SearchTerms `
                 -CandidateClusters @($AllClusterFallback) `
                 -SearchedClusterTermKeys $SearchedClusterTermKeys `
-                -DebugRows $DebugRows
+                -SqlOracleOnly
         }
     }
 
@@ -1707,10 +1753,10 @@ foreach ($Ci in $CiList) {
         }
     }
 
-    $HasDbBackup = Test-HasValidDb -Rows $DedupedRows
+    $HasSqlOrOracleBackup = Test-HasValidSqlOrOracle -Rows $DedupedRows
     $HasFSBackup = Test-HasValidFs -Rows $DedupedRows
 
-    if ($HasDbBackup -and -not $HasFSBackup) {
+    if ($HasSqlOrOracleBackup -and -not $HasFSBackup) {
         $Results += [pscustomobject]@{
             ServerName      = $Ci
             BackupType      = "FS"
@@ -1727,24 +1773,7 @@ foreach ($Ci in $CiList) {
 # ==========================================================
 # Summary / Output
 # ==========================================================
-$TotalInputCIs = $CiList.Count
-$TotalBackupRows = $Results.Count
-
-$BackedUp = ($Results | Where-Object {
-    $_.LastBackupTime -notin @("NoBackup", "NoBackupTime", "NoObject", "NoFSBackupFound", "")
-}).Count
-
-$NoBackup = ($Results | Where-Object {
-    $_.LastBackupTime -in @("NoBackup", "NoBackupTime")
-}).Count
-
-$NoFSBackupFound = ($Results | Where-Object {
-    $_.LastBackupTime -eq "NoFSBackupFound"
-}).Count
-
-$NoObject = ($Results | Where-Object {
-    $_.LastBackupTime -eq "NoObject"
-}).Count
+$TotalInputCIs = $CiGroups.Count
 
 $SortedResults = $Results |
     Sort-Object ServerName, @{ Expression = { Get-BackupTypeRank -BackupType $_.BackupType } }, ObjectName, ClusterName, ProtectionGroup
@@ -1755,38 +1784,18 @@ $DetailsText = (
     Out-String -Width 420
 ).TrimEnd()
 
-# -------------------------
-# Write CSV Outputs
-# -------------------------
 $SortedResults |
     Select-Object ServerName, BackupType, ObjectName, SourceName, ClusterName, ProtectionGroup, LastBackupTime |
     Export-Csv -Path $OutputCsv -NoTypeInformation -Encoding UTF8
 
-$DebugRows |
-    Export-Csv -Path $DebugCsv -NoTypeInformation -Encoding UTF8
-
-# -------------------------
-# Build TXT Report
-# -------------------------
 $Report = @()
 $Report += "=========================================================="
 $Report += "Cohesity Backup Validation Report"
 $Report += "=========================================================="
-$Report += "Change Number          : $ChangeID"
-$Report += "Executed By            : $ExecutedBy"
-$Report += "Run Date               : $(Get-Date -Format 'dd-MMM-yyyy HH:mm:ss')"
-$Report += ""
-$Report += "Total Input CIs        : $TotalInputCIs"
-$Report += "Total Backup Rows      : $TotalBackupRows"
-$Report += "Backed Up              : $BackedUp"
-$Report += "No Backup              : $NoBackup"
-$Report += "No FS Backup Found     : $NoFSBackupFound"
-$Report += "No Object              : $NoObject"
-$Report += ""
-$Report += "Global Search Calls    : $GlobalSearchCalls"
-$Report += "Protected Search Calls : $ProtectedSearchCalls"
-$Report += "Fallback CI Count      : $FallbackCiCount"
-$Report += "Failed GETs            : $FailedGets"
+$Report += "Change Number     : $ChangeID"
+$Report += "Executed By       : $ExecutedBy"
+$Report += "Run Date          : $(Get-Date -Format 'dd-MMM-yyyy HH:mm:ss')"
+$Report += "Total Input CIs   : $TotalInputCIs"
 $Report += ""
 $Report += "----------------------------------------------------------"
 $Report += "Details"
@@ -1795,53 +1804,22 @@ $Report += ""
 $Report += $DetailsText
 $Report += ""
 $Report += "----------------------------------------------------------"
-$Report += "Summary Notes"
-$Report += "----------------------------------------------------------"
-$Report += "- SQL ObjectName     : Uses objects.name exactly as returned by Cohesity."
-$Report += "- SQL SourceName     : Uses objects.mssqlParams.hostInfo.name first."
-$Report += "- Oracle ObjectName  : Uses objects.name exactly as returned by Cohesity."
-$Report += "- Oracle SourceName  : Uses objects.oracleParams.hostInfo.name only."
-$Report += "- Oracle containers  : Oracle Servers/kRACDatabase and similar container rows are not displayed."
-$Report += "- HyperV             : kHyperV / Hyper-V objects are classified as HyperV."
-$Report += "- Nutanix            : kAcropolis / Nutanix / AHV objects are classified as Nutanix."
-$Report += "- VM                 : kVMware / kVirtualMachine objects are classified as VM."
-$Report += "- DB fallback        : Runs only when DB is missing and CI name contains DB or CN."
-$Report += "- Debug CSV          : RawObjectName confirms the original objects.name value."
-$Report += "- Search terms       : Protected search tries both ci_item and shortname(ci_item)."
-$Report += "- ClusterName        : Local/searched accessClusterId cluster only. No replication target is used."
-$Report += ""
-$Report += "----------------------------------------------------------"
 $Report += "Report Location"
 $Report += "----------------------------------------------------------"
-$Report += "TXT       : $OutputTxt"
-$Report += "CSV       : $OutputCsv"
-$Report += "Debug CSV : $DebugCsv"
+$Report += "TXT : $OutputTxt"
+$Report += "CSV : $OutputCsv"
 $Report += "=========================================================="
 
 $Report | Set-Content -Path $OutputTxt -Encoding UTF8
 
-# -------------------------
-# Display
-# -------------------------
 Write-Host ""
 Write-Host "=========================================================="
 Write-Host "Cohesity Backup Validation Report"
 Write-Host "=========================================================="
-Write-Host "Change Number          : $ChangeID"
-Write-Host "Executed By            : $ExecutedBy"
-Write-Host "Run Date               : $(Get-Date -Format 'dd-MMM-yyyy HH:mm:ss')"
-Write-Host ""
-Write-Host "Total Input CIs        : $TotalInputCIs"
-Write-Host "Total Backup Rows      : $TotalBackupRows"
-Write-Host "Backed Up              : $BackedUp"
-Write-Host "No Backup              : $NoBackup"
-Write-Host "No FS Backup Found     : $NoFSBackupFound"
-Write-Host "No Object              : $NoObject"
-Write-Host ""
-Write-Host "Global Search Calls    : $GlobalSearchCalls"
-Write-Host "Protected Search Calls : $ProtectedSearchCalls"
-Write-Host "Fallback CI Count      : $FallbackCiCount"
-Write-Host "Failed GETs            : $FailedGets"
+Write-Host "Change Number     : $ChangeID"
+Write-Host "Executed By       : $ExecutedBy"
+Write-Host "Run Date          : $(Get-Date -Format 'dd-MMM-yyyy HH:mm:ss')"
+Write-Host "Total Input CIs   : $TotalInputCIs"
 Write-Host ""
 Write-Host "----------------------------------------------------------"
 Write-Host "Details"
@@ -1852,7 +1830,6 @@ Write-Host ""
 Write-Host "----------------------------------------------------------"
 Write-Host "Report Location"
 Write-Host "----------------------------------------------------------"
-Write-Host "TXT       : $OutputTxt"
-Write-Host "CSV       : $OutputCsv"
-Write-Host "Debug CSV : $DebugCsv"
+Write-Host "TXT : $OutputTxt"
+Write-Host "CSV : $OutputCsv"
 Write-Host "=========================================================="
