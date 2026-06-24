@@ -1581,17 +1581,19 @@ foreach ($group in $CiGroups) {
 
     if (-not $CandidateClusters -or $CandidateClusters.Count -eq 0) {
         if ($FallbackWhenNoGlobalObject) {
-            $CandidateClusters = @()
+            $CandidateClustersList = New-Object System.Collections.ArrayList
             $seenFallback = @{}
 
             foreach ($clu in @($Clusters)) {
                 Add-CandidateCluster `
-                    -List ([System.Collections.ArrayList]$CandidateClusters) `
+                    -List $CandidateClustersList `
                     -Seen $seenFallback `
                     -ClusterId "$($clu.clusterId)" `
                     -ClusterName "$($clu.clusterName)" `
                     -SearchMode "AllClusterFallback"
             }
+
+            $CandidateClusters = @($CandidateClustersList)
         }
     }
 
@@ -1717,7 +1719,16 @@ $DetailsText = (
     Out-String -Width 420
 ).TrimEnd()
 
-$ReportNote = "Note: NAS backups are excluded from this server decommission validation. No Backup Found means no in-scope Cohesity backup object was found for the CI. DB Only / No Server Backup means a SQL/Oracle backup was found, but no FS, VM, Hyper-V, or Nutanix/AHV backup was found for the server. Servers with names containing db or cn may require DB-level backup review if only FS/VM backup is found."
+# -------------------------
+# Report Note
+# -------------------------
+$ReportNote = @(
+    "Note:"
+    "- NAS backups are excluded from this server decommission validation."
+    "- No Backup Found means no in-scope Cohesity backup object was found for the CI."
+    "- DB Only / No Server Backup means a SQL/Oracle backup was found, but no FS, VM, Hyper-V, or Nutanix/AHV backup was found for the server."
+    "- Servers with names containing db or cn may require DB-level backup review if only FS/VM backup is found."
+)
 
 $SortedResults |
     Select-Object ServerName, BackupType, ObjectName, SourceName, ClusterName, ProtectionGroup, LastBackupTime |
@@ -1772,7 +1783,9 @@ Write-Host "----------------------------------------------------------"
 Write-Host "Note"
 Write-Host "----------------------------------------------------------"
 Write-Host ""
-Write-Host $ReportNote
+foreach ($line in $ReportNote) {
+    Write-Host $line
+}
 Write-Host ""
 Write-Host "----------------------------------------------------------"
 Write-Host "Report Location"
