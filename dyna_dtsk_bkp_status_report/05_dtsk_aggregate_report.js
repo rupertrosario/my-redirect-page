@@ -244,16 +244,12 @@ export default async function () {
     ].join("\n");
   }
 
-  function makeNotesMarkdown(summary) {
-    const dbFallbackText = summary.dbCnFallbackAppliedCount > 0
-      ? `- DB/CN fallback applied to **${summary.dbCnFallbackAppliedCount}** CI(s); SQL/Oracle rows found by fallback: **${summary.dbCnFallbackRowsFound}**.`
-      : "- Servers with `db` or `cn` in the name get an additional SQL/Oracle fallback search when no DB backup is initially found.";
-
+  function makeNoteMarkdown() {
     return [
       "- NAS backups are excluded from this server decommission validation.",
       "- **No Backup Found** means no in-scope Cohesity backup object was found for the CI.",
       "- **DB Only / No Server Backup** means a SQL/Oracle backup was found, but no FS, VM, Hyper-V, or Nutanix/AHV backup was found for the server.",
-      dbFallbackText
+      "- Servers with naming patterns such as `db` or `cn` may require DB-level backup review if only FS/VM backup is found."
     ].join("\n");
   }
 
@@ -339,8 +335,8 @@ export default async function () {
         "## Details",
         finalRows.length > 0 ? makeMarkdownTable(finalRows) : "No rows returned.",
         "",
-        "## NOTE:",
-        makeNotesMarkdown(summary)
+        "NOTE:",
+        makeNoteMarkdown()
       ].join("\n");
 
   const output = {
