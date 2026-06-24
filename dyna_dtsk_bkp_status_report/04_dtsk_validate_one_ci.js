@@ -1,21 +1,20 @@
 // ==========================================================
 // Dynatrace JS Task
 // Task name: dtsk_validate_one_ci
-// Phase: Real Cohesity validation - version 1
+// Phase: Real Cohesity validation - version 2
 //
 // Purpose:
 // - Runs as LOOP task: one DTSK / one CI per iteration
-// - Reads one work item from the loop runtime input
-// - Uses dtsk_get_cluster_map result
-// - Searches Cohesity Helios for protected backup objects
-// - Returns normalized rows for final email aggregation
+// - Finds FS, SQL, Oracle, Hyper-V, Nutanix/AHV, and VM backups
+// - Produces one output row per protected backup object / DB object
+// - If SQL/Oracle DB backups exist but no FS backup exists, adds NoFSBackupFound
 //
 // Loop task settings:
 // - Item variable name: workItem
-// - List: {{ workItems }}
+// - List variable: workItems
 // - Concurrency: 1 initially
 //
-// Do NOT paste {{ }} expressions inside this JS code.
+// Strictly GET-only. Do not paste workflow expression braces inside this JS code.
 // ==========================================================
 
 import { result } from "@dynatrace-sdk/automation-utils";
@@ -28,7 +27,6 @@ export default async function (input = {}) {
   // -----------------------------
   const HELIOS_BASE_URL = "https://helios.cohesity.com";
   const COHESITY_API_KEY_CREDENTIAL_ID = "credentials_vault-312312";
-
   const OUTPUT_TIME_ZONE = "America/New_York";
   const GLOBAL_SEARCH_COUNT = 100;
   const FALLBACK_TO_ALL_CLUSTERS_WHEN_NO_GLOBAL_HIT = true;
@@ -104,8 +102,10 @@ export default async function (input = {}) {
     for (const value of values || []) {
       const text = String(value || "").trim();
       if (!text) continue;
+
       const key = text.toLowerCase();
       if (seen.has(key)) continue;
+
       seen.add(key);
       out.push(text);
     }
@@ -160,10 +160,12 @@ export default async function (input = {}) {
 
   function isBadCiName(value) {
     const ci = String(value || "").trim();
+
     if (!ci) return true;
     if (ci.toUpperCase() === "N/A") return true;
     if (/^https?:\/\//i.test(ci)) return true;
     if (/^[0-9a-f]{32}$/i.test(ci)) return true;
+
     return false;
   }
 
@@ -225,7 +227,7 @@ export default async function (input = {}) {
   }
 
   // -----------------------------
-  // Cohesity helpers
+  // API helpers
   // -----------------------------
   async function getApiKey() {
     const cred = await credentialVaultClient.getCredentialsDetails({
@@ -248,12 +250,17 @@ export default async function (input = {}) {
 
     if (!response.ok) {
       const bodyText = await response.text().catch(() => "");
-      throw new Error(`GET failed: ${response.status} ${response.statusText} URL=${url} BODY=${bodyText.substring(0, 300)}`);
+      throw new Error(
+        `GET failed: ${response.status} ${response.statusText} URL=${url} BODY=${bodyText.substring(0, 300)}`
+      );
     }
 
     return await response.json();
   }
 
+  // -----------------------------
+  // Cohesity object helpers
+  // -----------------------------
   function getClusterName(clusterMap, clusterId) {
     const cid = String(clusterId || "").trim();
     if (!cid) return "Unknown";
@@ -270,50 +277,6 @@ export default async function (input = {}) {
       node?.protectionSource?.clusterId,
       node?.sourceInfo?.clusterId
     );
-  }
-
-  function collectObjectsDeep(value, out = [], depth = 0) {
-    if (depth > 8 || value === null || value === undefined) return out;
-
-    if (Array.isArray(value)) {
-      for (const item of value) collectObjectsDeep(item, out, depth + 1);
-      return out;
-    }
-
-    if (typeof value !== "object") return out;
-
-    const possibleName = firstNonBlank(
-      value.name,
-      value.displayName,
-      value.objectName,
-      value.entityName,
-      value.hostName,
-      value?.object?.name,
-      value?.entity?.name
-    );
-
-    const hasUsefulFields = Boolean(
-      possibleName ||
-      value.clusterId ||
-      value.clusterIdentifier ||
-      value.protectionGroupName ||
-      value.jobName ||
-      value.environment ||
-      value.type ||
-      value.objectType ||
-      value.mssqlParams ||
-      value.oracleParams ||
-      value.localSnapshotInfo ||
-      value.snapshotInfo
-    );
-
-    if (hasUsefulFields) out.push(value);
-
-    for (const val of Object.values(value)) {
-      collectObjectsDeep(val, out, depth + 1);
-    }
-
-    return out;
   }
 
   function getObjectName(node) {
@@ -354,24 +317,107 @@ export default async function (input = {}) {
     ) || "N/A";
   }
 
-  function detectBackupType(node) {
-    const combined = JSON.stringify({
-      environment: node?.environment,
-      type: node?.type,
-      objectType: node?.objectType,
-      name: getObjectName(node),
-      mssqlParams: Boolean(node?.mssqlParams || node?.sqlParams),
-      oracleParams: Boolean(node?.oracleParams)
-    }).toLowerCase();
+  function getSignalText(node) {
+    const signalValues = [
+      node?.environment,
+      node?.type,
+      node?.objectType,
+      node?.entityType,
+      node?.sourceType,
+      node?.protectionSource?.environment,
+      node?.protectionSource?.type,
+      node?.sourceInfo?.environment,
+      node?.sourceInfo?.type,
+      node?.object?.environment,
+      node?.object?.type,
+      getObjectName(node)
+    ];
 
-    if (node?.mssqlParams || node?.sqlParams || combined.includes("ksql") || combined.includes("mssql") || combined.includes("sql")) return "SQL";
-    if (node?.oracleParams || combined.includes("koracle") || combined.includes("oracle")) return "Oracle";
-    if (combined.includes("khyperv") || combined.includes("hyperv")) return "HyperV";
-    if (combined.includes("kacropolis") || combined.includes("nutanix") || combined.includes("ahv")) return "Nutanix";
-    if (combined.includes("kvmware") || combined.includes("virtualmachine") || combined.includes("vm")) return "VM";
-    if (combined.includes("kphysical") || combined.includes("file") || combined.includes("volume")) return "FS";
+    return signalValues
+      .map(v => String(v || "").toLowerCase())
+      .filter(Boolean)
+      .join(" ");
+  }
+
+  function detectBackupType(node) {
+    const signal = getSignalText(node);
+
+    // Strong parameter signals first.
+    if (node?.mssqlParams || node?.sqlParams) return "SQL";
+    if (node?.oracleParams) return "Oracle";
+
+    // Environment/type/name signals only. Do not inspect JSON key names.
+    if (/\bksql\b|\bsql\b|mssql|sqlserver/.test(signal)) return "SQL";
+    if (/\bkoracle\b|\boracle\b|racdatabase|oracleinstance/.test(signal)) return "Oracle";
+    if (/khyperv|hyperv/.test(signal)) return "HyperV";
+    if (/kacropolis|nutanix|\bahv\b/.test(signal)) return "Nutanix";
+    if (/kvmware|virtualmachine|\bvm\b|vmware/.test(signal)) return "VM";
+    if (/kphysical|physical|file|volume|filesystem|\bfs\b/.test(signal)) return "FS";
 
     return "Unknown";
+  }
+
+  function isOracleContainerRow(node) {
+    const name = normalizeName(getObjectName(node));
+    const signal = getSignalText(node);
+
+    if (!name) return false;
+
+    if (name === "oracle servers") return true;
+    if (signal.includes("kracdatabase") && !node?.oracleParams?.hostInfo?.name) return true;
+    if (signal.includes("oracle servers") && !node?.oracleParams?.hostInfo?.name) return true;
+
+    return false;
+  }
+
+  function objectBelongsToCi(node, aliases, backupType) {
+    const objectName = getObjectName(node);
+    const sourceName = getSourceName(node);
+
+    if (["SQL", "Oracle"].includes(backupType)) {
+      // DB object name is usually the database name, not the server name.
+      // For DB rows, match primarily by host/source name.
+      return namesMatchAnyAlias(sourceName, aliases);
+    }
+
+    // FS/VM/HyperV/Nutanix rows normally match object or source.
+    return namesMatchAnyAlias(objectName, aliases) || namesMatchAnyAlias(sourceName, aliases);
+  }
+
+  function collectObjectsDeep(value, out = [], depth = 0) {
+    if (depth > 8 || value === null || value === undefined) return out;
+
+    if (Array.isArray(value)) {
+      for (const item of value) collectObjectsDeep(item, out, depth + 1);
+      return out;
+    }
+
+    if (typeof value !== "object") return out;
+
+    const possibleName = getObjectName(value);
+    const hasUsefulFields = Boolean(
+      possibleName ||
+      value.clusterId ||
+      value.clusterIdentifier ||
+      value.protectionGroupName ||
+      value.jobName ||
+      value.environment ||
+      value.type ||
+      value.objectType ||
+      value.mssqlParams ||
+      value.sqlParams ||
+      value.oracleParams ||
+      value.localSnapshotInfo ||
+      value.snapshotInfo
+    );
+
+    if (hasUsefulFields) out.push(value);
+
+    for (const val of Object.values(value)) {
+      collectObjectsDeep(val, out, depth + 1);
+    }
+
+    return out;
   }
 
   async function searchGlobalObjects(apiKey, aliases) {
@@ -387,8 +433,7 @@ export default async function (input = {}) {
           apiKey
         });
 
-        const nodes = collectObjectsDeep(json);
-        all.push(...nodes);
+        all.push(...collectObjectsDeep(json));
       } catch (e) {
         warnings.push(`Global search failed for ${term}: ${e.message}`);
       }
@@ -411,8 +456,7 @@ export default async function (input = {}) {
           accessClusterId: String(clusterId)
         });
 
-        const nodes = collectObjectsDeep(json);
-        all.push(...nodes);
+        all.push(...collectObjectsDeep(json));
       } catch (e) {
         warnings.push(`Protected search failed for ${term} on cluster ${clusterId}: ${e.message}`);
       }
@@ -426,7 +470,9 @@ export default async function (input = {}) {
 
     for (const node of globalObjects || []) {
       const name = getObjectName(node);
-      if (!namesMatchAnyAlias(name, aliases)) continue;
+      const source = getSourceName(node);
+
+      if (!namesMatchAnyAlias(name, aliases) && !namesMatchAnyAlias(source, aliases)) continue;
 
       const cid = getClusterIdFromNode(node);
       if (cid) ids.push(String(cid));
@@ -474,11 +520,33 @@ export default async function (input = {}) {
       ].map(v => String(v || "").toLowerCase()).join("|");
 
       if (seen.has(key)) continue;
+
       seen.add(key);
       out.push(row);
     }
 
     return out;
+  }
+
+  function sortRows(rows) {
+    const rank = {
+      FS: 10,
+      VM: 20,
+      HyperV: 30,
+      Nutanix: 40,
+      SQL: 50,
+      Oracle: 60,
+      NoFSBackupFound: 900,
+      NoObject: 950,
+      Unknown: 999
+    };
+
+    return [...rows].sort((a, b) => {
+      const ra = rank[a.BackupType] ?? 500;
+      const rb = rank[b.BackupType] ?? 500;
+      if (ra !== rb) return ra - rb;
+      return String(a.ObjectName || "").localeCompare(String(b.ObjectName || ""));
+    });
   }
 
   // -----------------------------
@@ -504,6 +572,7 @@ export default async function (input = {}) {
 
   if (isBadCiName(workItem.ciName)) {
     const row = makeBaseRow(workItem, "Unknown", "InvalidCI", "N/A", "N/A", "N/A", "InvalidCI");
+
     return {
       validationState: "InvalidCI",
       workItem,
@@ -529,7 +598,6 @@ export default async function (input = {}) {
   warnings.push(...globalResult.warnings);
 
   const candidateClusterIds = getCandidateClusterIds(globalResult.objects, aliases, clusters);
-
   const protectedObjects = [];
 
   for (const clusterId of candidateClusterIds) {
@@ -542,22 +610,29 @@ export default async function (input = {}) {
   }
 
   let rows = [];
+  let skippedOracleContainerRows = 0;
 
   for (const item of protectedObjects) {
     const node = item.node;
-    const objectName = getObjectName(node);
-    const sourceName = getSourceName(node);
+    const backupType = detectBackupType(node);
 
-    if (!namesMatchAnyAlias(objectName, aliases) && !namesMatchAnyAlias(sourceName, aliases)) {
+    if (backupType === "Oracle" && isOracleContainerRow(node)) {
+      skippedOracleContainerRows++;
       continue;
     }
 
+    if (!objectBelongsToCi(node, aliases, backupType)) {
+      continue;
+    }
+
+    const objectName = getObjectName(node);
+    const sourceName = getSourceName(node);
     const maxUsecs = findMaxUsecs(node);
     const lastBackupTime = usecsToEt(maxUsecs) || "NoBackupTime";
 
     rows.push(makeBaseRow(
       workItem,
-      detectBackupType(node),
+      backupType,
       objectName || sourceName || workItem.ciName,
       sourceName,
       getClusterName(clusterMap, item.clusterId),
@@ -567,20 +642,6 @@ export default async function (input = {}) {
   }
 
   rows = dedupeRows(rows);
-
-  if (rows.length === 0) {
-    const noObjectRow = makeBaseRow(
-      workItem,
-      "NoObject",
-      workItem.ciName,
-      "N/A",
-      candidateClusterIds.length > 0 ? `${candidateClusterIds.length} cluster(s) checked` : "N/A",
-      "N/A",
-      "NoBackupFound"
-    );
-
-    rows = [noObjectRow];
-  }
 
   const hasDbBackup = rows.some(r => ["SQL", "Oracle"].includes(r.BackupType));
   const hasFsBackup = rows.some(r => r.BackupType === "FS");
@@ -597,7 +658,21 @@ export default async function (input = {}) {
     ));
   }
 
-  const validationState = rows.some(r => r.BackupType !== "NoObject")
+  if (rows.length === 0) {
+    rows = [makeBaseRow(
+      workItem,
+      "NoObject",
+      workItem.ciName,
+      "N/A",
+      candidateClusterIds.length > 0 ? `${candidateClusterIds.length} cluster(s) checked` : "N/A",
+      "N/A",
+      "NoBackupFound"
+    )];
+  }
+
+  rows = sortRows(rows);
+
+  const validationState = rows.some(r => !["NoObject", "Unknown"].includes(r.BackupType))
     ? "Validated"
     : "NoBackupFound";
 
@@ -614,6 +689,12 @@ export default async function (input = {}) {
       candidateClusterCount: candidateClusterIds.length,
       protectedObjectCount: protectedObjects.length,
       rowCount: rows.length,
+      fsRowCount: rows.filter(r => r.BackupType === "FS").length,
+      sqlRowCount: rows.filter(r => r.BackupType === "SQL").length,
+      oracleRowCount: rows.filter(r => r.BackupType === "Oracle").length,
+      vmRowCount: rows.filter(r => ["VM", "HyperV", "Nutanix"].includes(r.BackupType)).length,
+      noFsBackupFound: rows.some(r => r.BackupType === "NoFSBackupFound"),
+      skippedOracleContainerRows,
       clustersChecked: candidateClusterIds.map(cid => ({
         clusterId: cid,
         clusterName: getClusterName(clusterMap, cid)
