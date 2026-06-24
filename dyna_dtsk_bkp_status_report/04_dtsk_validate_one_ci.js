@@ -1,13 +1,14 @@
 // ==========================================================
 // Dynatrace JS Task
 // Task name: dtsk_validate_one_ci
-// Phase: Real Cohesity validation - version 2
+// Phase: Real Cohesity validation - version 3
 //
 // Purpose:
 // - Runs as LOOP task: one DTSK / one CI per iteration
-// - Finds FS, SQL, Oracle, Hyper-V, Nutanix/AHV, and VM backups
-// - Produces one output row per protected backup object / DB object
-// - If SQL/Oracle DB backups exist but no FS backup exists, adds NoFSBackupFound
+// - Checks Cohesity backups for all required server/app types except NAS
+// - Required types: FS, VM, HyperV, Nutanix/AHV, SQL, Oracle
+// - Produces one simple output row per protected object / DB object
+// - Adds NoFSBackupFound only when DB exists and no server-level backup exists
 //
 // Loop task settings:
 // - Item variable name: workItem
@@ -31,8 +32,12 @@ export default async function (input = {}) {
   const GLOBAL_SEARCH_COUNT = 100;
   const FALLBACK_TO_ALL_CLUSTERS_WHEN_NO_GLOBAL_HIT = true;
 
+  const SERVER_LEVEL_BACKUP_TYPES = ["FS", "VM", "HyperV", "Nutanix"];
+  const DB_BACKUP_TYPES = ["SQL", "Oracle"];
+  const IN_SCOPE_BACKUP_TYPES = ["FS", "VM", "HyperV", "Nutanix", "SQL", "Oracle"];
+
   // -----------------------------
-  // Basic helpers
+  // Generic helpers
   // -----------------------------
   function asArray(value) {
     if (Array.isArray(value)) return value;
@@ -113,21 +118,6 @@ export default async function (input = {}) {
     return out;
   }
 
-  function buildAliases(workItem) {
-    const aliases = [];
-
-    for (const a of asArray(workItem?.aliases)) {
-      if (a) aliases.push(a);
-    }
-
-    if (workItem?.ciName) aliases.push(workItem.ciName);
-
-    const shortName = getShortName(workItem?.ciName);
-    if (shortName) aliases.push(shortName);
-
-    return uniqueStrings(aliases);
-  }
-
   function namesMatchAnyAlias(name, aliases) {
     const n = normalizeName(name);
     if (!n) return false;
@@ -156,6 +146,34 @@ export default async function (input = {}) {
       runtimeInput.value ||
       (runtimeInput.dtsk && runtimeInput.ciName ? runtimeInput : null) ||
       null;
+  }
+
+  function buildAliases(workItem) {
+    const aliases = [];
+
+    for (const a of asArray(workItem?.aliases)) {
+      if (a) aliases.push(a);
+    }
+
+    if (workItem?.ciName) aliases.push(workItem.ciName);
+
+    const shortName = getShortName(workItem?.ciName);
+    if (shortName) aliases.push(shortName);
+
+    return uniqueStrings(aliases);
+  }
+
+  function buildSearchTerms(workItem) {
+    const aliases = buildAliases(workItem);
+    const terms = [...aliases];
+
+    // PowerShell-style fallback: search both FQDN and shortname.
+    for (const alias of aliases) {
+      const shortName = getShortName(alias);
+      if (shortName) terms.push(shortName);
+    }
+
+    return uniqueStrings(terms);
   }
 
   function isBadCiName(value) {
@@ -303,7 +321,7 @@ export default async function (input = {}) {
       node?.sourceInfo?.name,
       node?.protectionSource?.name,
       node?.hostName
-    ) || "N/A";
+    );
   }
 
   function getProtectionGroupName(node) {
@@ -317,8 +335,8 @@ export default async function (input = {}) {
     ) || "N/A";
   }
 
-  function getSignalText(node) {
-    const signalValues = [
+  function getValueSignalText(node) {
+    const values = [
       node?.environment,
       node?.type,
       node?.objectType,
@@ -333,36 +351,54 @@ export default async function (input = {}) {
       getObjectName(node)
     ];
 
-    return signalValues
-      .map(v => String(v || "").toLowerCase())
-      .filter(Boolean)
-      .join(" ");
+    return values.map(v => String(v || "").toLowerCase()).filter(Boolean).join(" ");
+  }
+
+  function getEnvironmentSignalText(node) {
+    const values = [
+      node?.environment,
+      node?.type,
+      node?.objectType,
+      node?.entityType,
+      node?.sourceType,
+      node?.protectionSource?.environment,
+      node?.protectionSource?.type,
+      node?.sourceInfo?.environment,
+      node?.sourceInfo?.type,
+      node?.object?.environment,
+      node?.object?.type
+    ];
+
+    return values.map(v => String(v || "").toLowerCase()).filter(Boolean).join(" ");
   }
 
   function detectBackupType(node) {
-    const signal = getSignalText(node);
+    const valueSignal = getValueSignalText(node);
+    const envSignal = getEnvironmentSignalText(node);
+
+    // NAS is explicitly out of scope for this report.
+    if (/kgenericnas|kisilon|genericnas|isilon/.test(envSignal)) return "NAS";
 
     // Strong parameter signals first.
     if (node?.mssqlParams || node?.sqlParams) return "SQL";
     if (node?.oracleParams) return "Oracle";
 
-    // Environment/type/name signals only. Do not inspect JSON key names.
-    if (/\bksql\b|\bsql\b|mssql|sqlserver/.test(signal)) return "SQL";
-    if (/\bkoracle\b|\boracle\b|racdatabase|oracleinstance/.test(signal)) return "Oracle";
-    if (/khyperv|hyperv/.test(signal)) return "HyperV";
-    if (/kacropolis|nutanix|\bahv\b/.test(signal)) return "Nutanix";
-    if (/kvmware|virtualmachine|\bvm\b|vmware/.test(signal)) return "VM";
-    if (/kphysical|physical|file|volume|filesystem|\bfs\b/.test(signal)) return "FS";
+    // Cohesity environment/type/name values.
+    if (/\bksql\b|\bsql\b|mssql|sqlserver/.test(valueSignal)) return "SQL";
+    if (/\bkoracle\b|\boracle\b|racdatabase|oracleinstance/.test(valueSignal)) return "Oracle";
+    if (/khyperv|hyperv/.test(valueSignal)) return "HyperV";
+    if (/kacropolis|nutanix|\bahv\b/.test(valueSignal)) return "Nutanix";
+    if (/kvmware|virtualmachine|\bvm\b|vmware/.test(valueSignal)) return "VM";
+    if (/kphysical|physical|file|volume|filesystem|\bfs\b/.test(valueSignal)) return "FS";
 
     return "Unknown";
   }
 
   function isOracleContainerRow(node) {
     const name = normalizeName(getObjectName(node));
-    const signal = getSignalText(node);
+    const signal = getValueSignalText(node);
 
     if (!name) return false;
-
     if (name === "oracle servers") return true;
     if (signal.includes("kracdatabase") && !node?.oracleParams?.hostInfo?.name) return true;
     if (signal.includes("oracle servers") && !node?.oracleParams?.hostInfo?.name) return true;
@@ -370,17 +406,31 @@ export default async function (input = {}) {
     return false;
   }
 
+  function isInScopeType(backupType) {
+    return IN_SCOPE_BACKUP_TYPES.includes(backupType);
+  }
+
+  function getOutputSourceName(node, backupType, objectName) {
+    const sourceName = getSourceName(node);
+
+    if (sourceName) return sourceName;
+
+    // For VM/server-level rows, source is often not separately populated.
+    if (SERVER_LEVEL_BACKUP_TYPES.includes(backupType)) return objectName || "N/A";
+
+    return "N/A";
+  }
+
   function objectBelongsToCi(node, aliases, backupType) {
     const objectName = getObjectName(node);
     const sourceName = getSourceName(node);
 
-    if (["SQL", "Oracle"].includes(backupType)) {
-      // DB object name is usually the database name, not the server name.
-      // For DB rows, match primarily by host/source name.
+    if (DB_BACKUP_TYPES.includes(backupType)) {
+      // DB object name is usually DB name, so host/source name is the correct match.
       return namesMatchAnyAlias(sourceName, aliases);
     }
 
-    // FS/VM/HyperV/Nutanix rows normally match object or source.
+    // FS/VM/HyperV/Nutanix rows should match object or source.
     return namesMatchAnyAlias(objectName, aliases) || namesMatchAnyAlias(sourceName, aliases);
   }
 
@@ -420,11 +470,11 @@ export default async function (input = {}) {
     return out;
   }
 
-  async function searchGlobalObjects(apiKey, aliases) {
+  async function searchGlobalObjects(apiKey, searchTerms) {
     const all = [];
     const warnings = [];
 
-    for (const term of aliases) {
+    for (const term of searchTerms) {
       const url = `${HELIOS_BASE_URL}/v2/data-protect/search/objects?searchString=${encodeURIComponent(term)}&includeTenants=true&count=${GLOBAL_SEARCH_COUNT}`;
 
       try {
@@ -442,11 +492,11 @@ export default async function (input = {}) {
     return { objects: all, warnings };
   }
 
-  async function searchProtectedObjects(apiKey, clusterId, aliases) {
+  async function searchProtectedObjects(apiKey, clusterId, searchTerms) {
     const all = [];
     const warnings = [];
 
-    for (const term of aliases) {
+    for (const term of searchTerms) {
       const url = `${HELIOS_BASE_URL}/v2/data-protect/search/protected-objects?searchString=${encodeURIComponent(term)}`;
 
       try {
@@ -469,6 +519,9 @@ export default async function (input = {}) {
     const ids = [];
 
     for (const node of globalObjects || []) {
+      const backupType = detectBackupType(node);
+      if (backupType === "NAS") continue;
+
       const name = getObjectName(node);
       const source = getSourceName(node);
 
@@ -492,8 +545,6 @@ export default async function (input = {}) {
     return {
       DTSK: workItem?.dtsk || "N/A",
       DecomRequest: workItem?.decomRequest || "N/A",
-      AssignedTo: workItem?.assignedTo || "N/A",
-      AssignmentAction: workItem?.assignmentAction || "N/A",
       ServerName: workItem?.ciName || "N/A",
       BackupType: backupType || "Unknown",
       ObjectName: objectName || "N/A",
@@ -510,6 +561,7 @@ export default async function (input = {}) {
 
     for (const row of rows || []) {
       const key = [
+        row.DTSK,
         row.ServerName,
         row.BackupType,
         row.ObjectName,
@@ -520,7 +572,6 @@ export default async function (input = {}) {
       ].map(v => String(v || "").toLowerCase()).join("|");
 
       if (seen.has(key)) continue;
-
       seen.add(key);
       out.push(row);
     }
@@ -544,8 +595,13 @@ export default async function (input = {}) {
     return [...rows].sort((a, b) => {
       const ra = rank[a.BackupType] ?? 500;
       const rb = rank[b.BackupType] ?? 500;
+
       if (ra !== rb) return ra - rb;
-      return String(a.ObjectName || "").localeCompare(String(b.ObjectName || ""));
+
+      const objCompare = String(a.ObjectName || "").localeCompare(String(b.ObjectName || ""));
+      if (objCompare !== 0) return objCompare;
+
+      return String(a.ProtectionGroup || "").localeCompare(String(b.ProtectionGroup || ""));
     });
   }
 
@@ -569,14 +625,13 @@ export default async function (input = {}) {
   }
 
   const aliases = buildAliases(workItem);
+  const searchTerms = buildSearchTerms(workItem);
 
   if (isBadCiName(workItem.ciName)) {
     const row = makeBaseRow(workItem, "Unknown", "InvalidCI", "N/A", "N/A", "N/A", "InvalidCI");
 
     return {
       validationState: "InvalidCI",
-      workItem,
-      aliases,
       rows: [row],
       summary: {
         dtsk: workItem.dtsk || "N/A",
@@ -594,14 +649,14 @@ export default async function (input = {}) {
   const apiKey = await getApiKey();
   const warnings = [];
 
-  const globalResult = await searchGlobalObjects(apiKey, aliases);
+  const globalResult = await searchGlobalObjects(apiKey, searchTerms);
   warnings.push(...globalResult.warnings);
 
   const candidateClusterIds = getCandidateClusterIds(globalResult.objects, aliases, clusters);
   const protectedObjects = [];
 
   for (const clusterId of candidateClusterIds) {
-    const protectedResult = await searchProtectedObjects(apiKey, clusterId, aliases);
+    const protectedResult = await searchProtectedObjects(apiKey, clusterId, searchTerms);
     warnings.push(...protectedResult.warnings);
 
     for (const node of protectedResult.objects) {
@@ -610,11 +665,23 @@ export default async function (input = {}) {
   }
 
   let rows = [];
+  let skippedNasRows = 0;
   let skippedOracleContainerRows = 0;
+  let skippedOutOfScopeRows = 0;
 
   for (const item of protectedObjects) {
     const node = item.node;
     const backupType = detectBackupType(node);
+
+    if (backupType === "NAS") {
+      skippedNasRows++;
+      continue;
+    }
+
+    if (!isInScopeType(backupType)) {
+      skippedOutOfScopeRows++;
+      continue;
+    }
 
     if (backupType === "Oracle" && isOracleContainerRow(node)) {
       skippedOracleContainerRows++;
@@ -625,15 +692,15 @@ export default async function (input = {}) {
       continue;
     }
 
-    const objectName = getObjectName(node);
-    const sourceName = getSourceName(node);
+    const objectName = getObjectName(node) || workItem.ciName;
+    const sourceName = getOutputSourceName(node, backupType, objectName);
     const maxUsecs = findMaxUsecs(node);
     const lastBackupTime = usecsToEt(maxUsecs) || "NoBackupTime";
 
     rows.push(makeBaseRow(
       workItem,
       backupType,
-      objectName || sourceName || workItem.ciName,
+      objectName,
       sourceName,
       getClusterName(clusterMap, item.clusterId),
       getProtectionGroupName(node),
@@ -643,10 +710,10 @@ export default async function (input = {}) {
 
   rows = dedupeRows(rows);
 
-  const hasDbBackup = rows.some(r => ["SQL", "Oracle"].includes(r.BackupType));
-  const hasFsBackup = rows.some(r => r.BackupType === "FS");
+  const hasDbBackup = rows.some(r => DB_BACKUP_TYPES.includes(r.BackupType));
+  const hasServerLevelBackup = rows.some(r => SERVER_LEVEL_BACKUP_TYPES.includes(r.BackupType));
 
-  if (hasDbBackup && !hasFsBackup) {
+  if (hasDbBackup && !hasServerLevelBackup) {
     rows.push(makeBaseRow(
       workItem,
       "NoFSBackupFound",
@@ -672,29 +739,32 @@ export default async function (input = {}) {
 
   rows = sortRows(rows);
 
-  const validationState = rows.some(r => !["NoObject", "Unknown"].includes(r.BackupType))
+  const validationState = rows.some(r => IN_SCOPE_BACKUP_TYPES.includes(r.BackupType))
     ? "Validated"
     : "NoBackupFound";
 
   const output = {
     validationState,
-    workItem,
-    aliases,
     rows,
     summary: {
       dtsk: workItem.dtsk || "N/A",
       ciName: workItem.ciName || "N/A",
-      aliasCount: aliases.length,
+      rowCount: rows.length,
+      fsRowCount: rows.filter(r => r.BackupType === "FS").length,
+      vmRowCount: rows.filter(r => r.BackupType === "VM").length,
+      hyperVRowCount: rows.filter(r => r.BackupType === "HyperV").length,
+      nutanixRowCount: rows.filter(r => r.BackupType === "Nutanix").length,
+      sqlRowCount: rows.filter(r => r.BackupType === "SQL").length,
+      oracleRowCount: rows.filter(r => r.BackupType === "Oracle").length,
+      serverLevelBackupFound: rows.some(r => SERVER_LEVEL_BACKUP_TYPES.includes(r.BackupType)),
+      dbBackupFound: rows.some(r => DB_BACKUP_TYPES.includes(r.BackupType)),
+      noFsBackupFound: rows.some(r => r.BackupType === "NoFSBackupFound"),
+      skippedNasRows,
+      skippedOracleContainerRows,
+      skippedOutOfScopeRows,
       globalObjectCount: globalResult.objects.length,
       candidateClusterCount: candidateClusterIds.length,
       protectedObjectCount: protectedObjects.length,
-      rowCount: rows.length,
-      fsRowCount: rows.filter(r => r.BackupType === "FS").length,
-      sqlRowCount: rows.filter(r => r.BackupType === "SQL").length,
-      oracleRowCount: rows.filter(r => r.BackupType === "Oracle").length,
-      vmRowCount: rows.filter(r => ["VM", "HyperV", "Nutanix"].includes(r.BackupType)).length,
-      noFsBackupFound: rows.some(r => r.BackupType === "NoFSBackupFound"),
-      skippedOracleContainerRows,
       clustersChecked: candidateClusterIds.map(cid => ({
         clusterId: cid,
         clusterName: getClusterName(clusterMap, cid)
