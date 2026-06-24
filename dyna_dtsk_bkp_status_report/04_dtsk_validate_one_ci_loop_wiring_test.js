@@ -15,23 +15,32 @@
 // - Concurrency: 1 initially
 //
 // Important:
-// - This JS task has no separate input parameter box.
-// - The loop item is injected directly into the JS using {{ _.workItem }}.
+// - Do NOT paste workflow expressions like {{ _.workItem }} inside the JS code.
+// - Dynatrace validates the JS before expression substitution, so {{ }} causes a parse error.
+// - The loop item should be available to the action input/runtime based on the configured item variable name.
 // ==========================================================
 
 import { result } from "@dynatrace-sdk/automation-utils";
 
-export default async function () {
+export default async function (input = {}) {
 
   const clusterData = await result("dtsk_get_cluster_map");
 
-  // This comes from the loop item variable name configured on the task.
-  // If your item variable name is changed from workItem to item, replace this with:
-  // const workItem = {{ _.item }};
-  const workItem = {{ _.workItem }};
+  // With loop item variable name = workItem, Dynatrace should pass the loop item
+  // through the action input/runtime. This fallback also supports cases where
+  // the runtime passes the item itself as input.
+  const workItem =
+    input?.workItem ||
+    input?.item ||
+    input?.loopItem ||
+    input?.loopItemValue ||
+    (input?.dtsk && input?.ciName ? input : null) ||
+    null;
 
   const output = {
     phase: "LOOP_WIRING_TEST",
+    inputType: typeof input,
+    inputKeys: input && typeof input === "object" ? Object.keys(input) : [],
     loopItemReceived: Boolean(workItem),
     workItem: workItem || null,
     dtsk: workItem?.dtsk || "N/A",
@@ -39,7 +48,7 @@ export default async function () {
     aliases: Array.isArray(workItem?.aliases) ? workItem.aliases : [],
     clustersLoaded: clusterData?.summary?.clustersLoaded || 0,
     clusterMapEntries: clusterData?.summary?.clusterMapEntries || 0,
-    message: "If loopItemReceived=true and ciName is populated, loop wiring is working."
+    message: "If loopItemReceived=true and ciName is populated, loop wiring is working. If false, check the task Input tab for the exact loop item key."
   };
 
   console.log("==== DTSK VALIDATE ONE CI - LOOP WIRING TEST ====");
