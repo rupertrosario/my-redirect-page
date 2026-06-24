@@ -8,26 +8,27 @@
 // - Verify dtsk_get_cluster_map is visible to this task
 // - Does NOT call Cohesity protected-object search yet
 // - Replace this file with full validation logic after loop wiring is confirmed
+//
+// Dynatrace loop settings for this task:
+// - Item variable name: workItem
+// - List: {{ result("dtsk_prepare_work_items")["workItems"] }}
+// - Concurrency: 1 initially
+//
+// Important:
+// - This JS task has no separate input parameter box.
+// - The loop item is injected directly into the JS using {{ _.workItem }}.
 // ==========================================================
 
 import { result } from "@dynatrace-sdk/automation-utils";
 
-export default async function (input = {}) {
-
-  // ========================================================
-  // Expected input when configuring the loop task:
-  // {
-  //   "workItem": {{ _.item }}
-  // }
-  // ========================================================
+export default async function () {
 
   const clusterData = await result("dtsk_get_cluster_map");
 
-  const workItem =
-    input?.workItem ||
-    input?.loopItemValue ||
-    input?.item ||
-    null;
+  // This comes from the loop item variable name configured on the task.
+  // If your item variable name is changed from workItem to item, replace this with:
+  // const workItem = {{ _.item }};
+  const workItem = {{ _.workItem }};
 
   const output = {
     phase: "LOOP_WIRING_TEST",
