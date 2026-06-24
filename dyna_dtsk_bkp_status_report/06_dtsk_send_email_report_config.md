@@ -92,8 +92,11 @@ Generated: <timestamp> ET
 ## Details
 ...
 
-## NOTE:
-...
+NOTE:
+- NAS backups are excluded from this server decommission validation.
+- No Backup Found means no in-scope Cohesity backup object was found for the CI.
+- DB Only / No Server Backup means a SQL/Oracle backup was found, but no FS, VM, Hyper-V, or Nutanix/AHV backup was found for the server.
+- Servers with naming patterns such as db or cn may require DB-level backup review if only FS/VM backup is found.
 ```
 
 ## Recommended first test
@@ -106,7 +109,7 @@ Do not send to the team distribution list until these are confirmed:
 |---|---|
 | Subject | Shows DTSK count and row count |
 | No-DTSK run | Shows only Run Status table; no NOTE section |
-| Normal run | Shows Executive Summary, Backup Type Summary, Details, and NOTE: |
+| Normal run | Shows Executive Summary, Backup Type Summary, Details, and plain NOTE: |
 | Details table | Contains the same number of rows as `summary.totalRows` |
 | Formatting | Acceptable in email client |
 
