@@ -18,6 +18,7 @@
 # - Nutanix/AHV is classified as Nutanix
 # - Hyper-V is classified as HyperV
 # - Shortname + FQDN are merged into one CI identity
+# - DB@server CI values are split for DB and server-level search
 # - DB/CN fallback is only for SQL and Oracle
 # - FS is not classified as DB only because name/FQDN contains DB
 # - No BackupLocation
@@ -312,11 +313,58 @@ function Is-ValidBackupTime {
     ))
 }
 
+function Get-DbAtServerParts {
+    param([string]$Ci)
+
+    if ([string]::IsNullOrWhiteSpace($Ci)) {
+        return [pscustomobject]@{
+            IsDbAtServer = $false
+            DbName       = ""
+            ServerName   = ""
+        }
+    }
+
+    $v = "$Ci".Trim()
+
+    if ($v -notmatch "@") {
+        return [pscustomobject]@{
+            IsDbAtServer = $false
+            DbName       = ""
+            ServerName   = ""
+        }
+    }
+
+    $parts = $v -split "@", 2
+    $dbName = "$($parts[0])".Trim()
+    $server = "$($parts[1])".Trim()
+
+    if ([string]::IsNullOrWhiteSpace($dbName) -or
+        [string]::IsNullOrWhiteSpace($server)) {
+        return [pscustomobject]@{
+            IsDbAtServer = $false
+            DbName       = ""
+            ServerName   = ""
+        }
+    }
+
+    return [pscustomobject]@{
+        IsDbAtServer = $true
+        DbName       = $dbName
+        ServerName   = $server
+    }
+}
+
 function Test-CiLooksLikeDbServer {
     param([string]$Ci)
 
     if ([string]::IsNullOrWhiteSpace($Ci)) {
         return $false
+    }
+
+    $parts = Get-DbAtServerParts -Ci $Ci
+
+    if ($parts.IsDbAtServer) {
+        return $true
     }
 
     return ($Ci -match $DbServerNamePattern)
@@ -327,6 +375,12 @@ function Get-CiIdentityKey {
 
     if ([string]::IsNullOrWhiteSpace($Ci)) {
         return ""
+    }
+
+    $parts = Get-DbAtServerParts -Ci $Ci
+
+    if ($parts.IsDbAtServer) {
+        return (Normalize-Name (Get-ShortName -Value $parts.ServerName))
     }
 
     return (Normalize-Name (Get-ShortName -Value $Ci))
@@ -346,13 +400,32 @@ function Get-PreferredCiDisplayName {
         return ""
     }
 
-    $fqdn = @($valid | Where-Object { $_ -match "\." } | Select-Object -First 1)
+    $serverNames = @()
+
+    foreach ($v in $valid) {
+        $parts = Get-DbAtServerParts -Ci $v
+
+        if ($parts.IsDbAtServer) {
+            $serverNames += $parts.ServerName
+        }
+        else {
+            $serverNames += $v
+        }
+    }
+
+    $serverNames = @(
+        $serverNames |
+        Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+        Sort-Object -Unique
+    )
+
+    $fqdn = @($serverNames | Where-Object { $_ -match "\." } | Select-Object -First 1)
 
     if ($fqdn.Count -gt 0) {
         return $fqdn[0]
     }
 
-    return $valid[0]
+    return $serverNames[0]
 }
 
 function Get-SearchTermsForCiAliases {
@@ -365,8 +438,20 @@ function Get-SearchTermsForCiAliases {
             continue
         }
 
-        $terms += "$a".Trim()
-        $terms += Get-ShortName -Value "$a"
+        $alias = "$a".Trim()
+        $parts = Get-DbAtServerParts -Ci $alias
+
+        if ($parts.IsDbAtServer) {
+            # Preserve exact CR CI value and also search by server and DB names.
+            $terms += $alias
+            $terms += $parts.ServerName
+            $terms += Get-ShortName -Value $parts.ServerName
+            $terms += $parts.DbName
+        }
+        else {
+            $terms += $alias
+            $terms += Get-ShortName -Value $alias
+        }
     }
 
     return @(
@@ -1478,13 +1563,32 @@ foreach ($row in $RawCsv) {
         $CiAliasMap[$key] = New-Object System.Collections.ArrayList
     }
 
-    if (-not @($CiAliasMap[$key]) -contains $ci) {
-        [void]$CiAliasMap[$key].Add($ci)
+    $aliasesToAdd = @()
+    $aliasesToAdd += $ci
+
+    $parts = Get-DbAtServerParts -Ci $ci
+
+    if ($parts.IsDbAtServer) {
+        $aliasesToAdd += $parts.ServerName
+        $aliasesToAdd += Get-ShortName -Value $parts.ServerName
+        $aliasesToAdd += $parts.DbName
+
+        $shortDbAtServer = Get-ShortName -Value $ci
+        if (-not [string]::IsNullOrWhiteSpace($shortDbAtServer)) {
+            $aliasesToAdd += $shortDbAtServer
+        }
+    }
+    else {
+        $short = Get-ShortName -Value $ci
+        if (-not [string]::IsNullOrWhiteSpace($short)) {
+            $aliasesToAdd += $short
+        }
     }
 
-    $short = Get-ShortName -Value $ci
-    if (-not [string]::IsNullOrWhiteSpace($short) -and -not @($CiAliasMap[$key]) -contains $short) {
-        [void]$CiAliasMap[$key].Add($short)
+    foreach ($alias in @($aliasesToAdd | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Sort-Object -Unique)) {
+        if (-not @($CiAliasMap[$key]) -contains $alias) {
+            [void]$CiAliasMap[$key].Add($alias)
+        }
     }
 }
 
