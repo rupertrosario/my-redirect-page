@@ -1,7 +1,7 @@
 // ==========================================================
 // Dynatrace JS Task
 // Task name: dtsk_validate_one_ci
-// Phase: Real Cohesity validation - version 3
+// Phase: Real Cohesity validation - version 4
 //
 // Purpose:
 // - Runs as LOOP task: one DTSK / one CI per iteration
@@ -9,6 +9,7 @@
 // - Required types: FS, VM, HyperV, Nutanix/AHV, SQL, Oracle
 // - Produces one simple output row per protected object / DB object
 // - Adds NoFSBackupFound only when DB exists and no server-level backup exists
+// - Builds Protection Group name lookup per cluster so PG name is populated
 //
 // Loop task settings:
 // - Item variable name: workItem
@@ -23,9 +24,6 @@ import { credentialVaultClient } from "@dynatrace-sdk/client-classic-environment
 
 export default async function (input = {}) {
 
-  // -----------------------------
-  // Config
-  // -----------------------------
   const HELIOS_BASE_URL = "https://helios.cohesity.com";
   const COHESITY_API_KEY_CREDENTIAL_ID = "credentials_vault-312312";
   const OUTPUT_TIME_ZONE = "America/New_York";
@@ -36,9 +34,6 @@ export default async function (input = {}) {
   const DB_BACKUP_TYPES = ["SQL", "Oracle"];
   const IN_SCOPE_BACKUP_TYPES = ["FS", "VM", "HyperV", "Nutanix", "SQL", "Oracle"];
 
-  // -----------------------------
-  // Generic helpers
-  // -----------------------------
   function asArray(value) {
     if (Array.isArray(value)) return value;
     if (value === null || value === undefined) return [];
@@ -72,7 +67,6 @@ export default async function (input = {}) {
         const t = toText(c);
         if (t) return t;
       }
-
       return "";
     }
 
@@ -116,6 +110,14 @@ export default async function (input = {}) {
     }
 
     return out;
+  }
+
+  function addMapKey(map, key, value) {
+    const k = String(key || "").trim();
+    const v = String(value || "").trim();
+    if (!k || !v) return;
+    map[k] = v;
+    map[k.toLowerCase()] = v;
   }
 
   function namesMatchAnyAlias(name, aliases) {
@@ -167,7 +169,6 @@ export default async function (input = {}) {
     const aliases = buildAliases(workItem);
     const terms = [...aliases];
 
-    // PowerShell-style fallback: search both FQDN and shortname.
     for (const alias of aliases) {
       const shortName = getShortName(alias);
       if (shortName) terms.push(shortName);
@@ -187,16 +188,12 @@ export default async function (input = {}) {
     return false;
   }
 
-  // -----------------------------
-  // Time helpers
-  // -----------------------------
   function usecsToEt(usecs) {
     const n = Number(usecs);
     if (!Number.isFinite(n) || n <= 0) return "";
 
     const millis = Math.floor(n / 1000);
     const date = new Date(millis);
-
     if (Number.isNaN(date.getTime())) return "";
 
     return new Intl.DateTimeFormat("en-US", {
@@ -244,9 +241,6 @@ export default async function (input = {}) {
     return max;
   }
 
-  // -----------------------------
-  // API helpers
-  // -----------------------------
   async function getApiKey() {
     const cred = await credentialVaultClient.getCredentialsDetails({
       id: COHESITY_API_KEY_CREDENTIAL_ID
@@ -261,10 +255,7 @@ export default async function (input = {}) {
   }
 
   async function getJson(url, headers) {
-    const response = await fetch(url, {
-      method: "GET",
-      headers
-    });
+    const response = await fetch(url, { method: "GET", headers });
 
     if (!response.ok) {
       const bodyText = await response.text().catch(() => "");
@@ -276,9 +267,6 @@ export default async function (input = {}) {
     return await response.json();
   }
 
-  // -----------------------------
-  // Cohesity object helpers
-  // -----------------------------
   function getClusterName(clusterMap, clusterId) {
     const cid = String(clusterId || "").trim();
     if (!cid) return "Unknown";
@@ -324,15 +312,67 @@ export default async function (input = {}) {
     );
   }
 
-  function getProtectionGroupName(node) {
+  function getProtectionGroupDirectName(node) {
     return firstNonBlank(
       node?.protectionGroupName,
-      node?.jobName,
       node?.protectionGroup?.name,
-      node?.job?.name,
+      node?.protectionGroup?.displayName,
       node?.protectionJobName,
-      node?.groupName
-    ) || "N/A";
+      node?.jobName,
+      node?.job?.name,
+      node?.job?.displayName,
+      node?.groupName,
+      node?.policyName,
+      node?.protectionPolicyName,
+      node?.object?.protectionGroupName,
+      node?.object?.jobName,
+      node?.entity?.protectionGroupName,
+      node?.entity?.jobName,
+      node?.sourceInfo?.protectionGroupName,
+      node?.sourceInfo?.jobName
+    );
+  }
+
+  function getProtectionGroupCandidateIds(node) {
+    return uniqueStrings([
+      node?.protectionGroupId,
+      node?.protectionGroupID,
+      node?.protectionGroupUid,
+      node?.protectionGroupUID,
+      node?.protectionGroup?.id,
+      node?.protectionGroup?.uid,
+      node?.protectionGroup?.uid?.id,
+      node?.protectionGroup?.uid?.clusterId,
+      node?.protectionJobId,
+      node?.jobId,
+      node?.jobUid,
+      node?.jobUID,
+      node?.job?.id,
+      node?.job?.uid,
+      node?.job?.uid?.id,
+      node?.object?.protectionGroupId,
+      node?.object?.protectionGroupUid,
+      node?.object?.jobId,
+      node?.entity?.protectionGroupId,
+      node?.entity?.protectionGroupUid,
+      node?.entity?.jobId,
+      node?.sourceInfo?.protectionGroupId,
+      node?.sourceInfo?.protectionGroupUid,
+      node?.sourceInfo?.jobId
+    ]);
+  }
+
+  function getProtectionGroupName(node, clusterPgMap) {
+    const directName = getProtectionGroupDirectName(node);
+    if (directName) return directName;
+
+    const ids = getProtectionGroupCandidateIds(node);
+    for (const id of ids) {
+      const name = clusterPgMap?.[id] || clusterPgMap?.[String(id).toLowerCase()];
+      if (name) return name;
+    }
+
+    return "N/A";
   }
 
   function getValueSignalText(node) {
@@ -376,14 +416,11 @@ export default async function (input = {}) {
     const valueSignal = getValueSignalText(node);
     const envSignal = getEnvironmentSignalText(node);
 
-    // NAS is explicitly out of scope for this report.
     if (/kgenericnas|kisilon|genericnas|isilon/.test(envSignal)) return "NAS";
 
-    // Strong parameter signals first.
     if (node?.mssqlParams || node?.sqlParams) return "SQL";
     if (node?.oracleParams) return "Oracle";
 
-    // Cohesity environment/type/name values.
     if (/\bksql\b|\bsql\b|mssql|sqlserver/.test(valueSignal)) return "SQL";
     if (/\bkoracle\b|\boracle\b|racdatabase|oracleinstance/.test(valueSignal)) return "Oracle";
     if (/khyperv|hyperv/.test(valueSignal)) return "HyperV";
@@ -412,12 +449,8 @@ export default async function (input = {}) {
 
   function getOutputSourceName(node, backupType, objectName) {
     const sourceName = getSourceName(node);
-
     if (sourceName) return sourceName;
-
-    // For VM/server-level rows, source is often not separately populated.
     if (SERVER_LEVEL_BACKUP_TYPES.includes(backupType)) return objectName || "N/A";
-
     return "N/A";
   }
 
@@ -426,11 +459,9 @@ export default async function (input = {}) {
     const sourceName = getSourceName(node);
 
     if (DB_BACKUP_TYPES.includes(backupType)) {
-      // DB object name is usually DB name, so host/source name is the correct match.
       return namesMatchAnyAlias(sourceName, aliases);
     }
 
-    // FS/VM/HyperV/Nutanix rows should match object or source.
     return namesMatchAnyAlias(objectName, aliases) || namesMatchAnyAlias(sourceName, aliases);
   }
 
@@ -450,7 +481,10 @@ export default async function (input = {}) {
       value.clusterId ||
       value.clusterIdentifier ||
       value.protectionGroupName ||
+      value.protectionGroupId ||
+      value.protectionGroupUid ||
       value.jobName ||
+      value.jobId ||
       value.environment ||
       value.type ||
       value.objectType ||
@@ -470,6 +504,75 @@ export default async function (input = {}) {
     return out;
   }
 
+  function collectProtectionGroupsDeep(value, out = [], depth = 0) {
+    if (depth > 8 || value === null || value === undefined) return out;
+
+    if (Array.isArray(value)) {
+      for (const item of value) collectProtectionGroupsDeep(item, out, depth + 1);
+      return out;
+    }
+
+    if (typeof value !== "object") return out;
+
+    const name = firstNonBlank(value.name, value.displayName, value.protectionGroupName, value.jobName);
+    const hasId = Boolean(value.id || value.protectionGroupId || value.uid || value.uid?.id || value.jobId);
+
+    if (name && hasId) out.push(value);
+
+    for (const val of Object.values(value)) {
+      collectProtectionGroupsDeep(val, out, depth + 1);
+    }
+
+    return out;
+  }
+
+  async function buildProtectionGroupMap(apiKey, clusterId) {
+    const map = {};
+    const warnings = [];
+
+    const url = `${HELIOS_BASE_URL}/v2/data-protect/protection-groups?isDeleted=false&includeLastRunInfo=false`;
+
+    try {
+      const json = await getJson(url, {
+        accept: "application/json",
+        apiKey,
+        accessClusterId: String(clusterId)
+      });
+
+      const pgs = collectProtectionGroupsDeep(json);
+
+      for (const pg of pgs) {
+        const name = firstNonBlank(pg.name, pg.displayName, pg.protectionGroupName, pg.jobName);
+        if (!name) continue;
+
+        const candidateIds = uniqueStrings([
+          pg.id,
+          pg.protectionGroupId,
+          pg.protectionGroupID,
+          pg.protectionGroupUid,
+          pg.protectionGroupUID,
+          pg.uid,
+          pg.uid?.id,
+          pg.uid?.clusterId,
+          pg.jobId,
+          pg.jobUid,
+          pg.jobUID,
+          pg.job?.id,
+          pg.job?.uid,
+          pg.job?.uid?.id
+        ]);
+
+        for (const id of candidateIds) {
+          addMapKey(map, id, name);
+        }
+      }
+    } catch (e) {
+      warnings.push(`Protection group map failed for cluster ${clusterId}: ${e.message}`);
+    }
+
+    return { map, warnings };
+  }
+
   async function searchGlobalObjects(apiKey, searchTerms) {
     const all = [];
     const warnings = [];
@@ -478,11 +581,7 @@ export default async function (input = {}) {
       const url = `${HELIOS_BASE_URL}/v2/data-protect/search/objects?searchString=${encodeURIComponent(term)}&includeTenants=true&count=${GLOBAL_SEARCH_COUNT}`;
 
       try {
-        const json = await getJson(url, {
-          accept: "application/json",
-          apiKey
-        });
-
+        const json = await getJson(url, { accept: "application/json", apiKey });
         all.push(...collectObjectsDeep(json));
       } catch (e) {
         warnings.push(`Global search failed for ${term}: ${e.message}`);
@@ -595,7 +694,6 @@ export default async function (input = {}) {
     return [...rows].sort((a, b) => {
       const ra = rank[a.BackupType] ?? 500;
       const rb = rank[b.BackupType] ?? 500;
-
       if (ra !== rb) return ra - rb;
 
       const objCompare = String(a.ObjectName || "").localeCompare(String(b.ObjectName || ""));
@@ -605,9 +703,6 @@ export default async function (input = {}) {
     });
   }
 
-  // -----------------------------
-  // Main
-  // -----------------------------
   const workItem = getWorkItem(input);
   const clusterData = await result("dtsk_get_cluster_map");
   const clusters = Array.isArray(clusterData?.clusters) ? clusterData.clusters : [];
@@ -654,8 +749,13 @@ export default async function (input = {}) {
 
   const candidateClusterIds = getCandidateClusterIds(globalResult.objects, aliases, clusters);
   const protectedObjects = [];
+  const pgMapsByCluster = {};
 
   for (const clusterId of candidateClusterIds) {
+    const pgMapResult = await buildProtectionGroupMap(apiKey, clusterId);
+    pgMapsByCluster[String(clusterId)] = pgMapResult.map;
+    warnings.push(...pgMapResult.warnings);
+
     const protectedResult = await searchProtectedObjects(apiKey, clusterId, searchTerms);
     warnings.push(...protectedResult.warnings);
 
@@ -668,6 +768,9 @@ export default async function (input = {}) {
   let skippedNasRows = 0;
   let skippedOracleContainerRows = 0;
   let skippedOutOfScopeRows = 0;
+  let directPgNameCount = 0;
+  let mappedPgNameCount = 0;
+  let missingPgNameCount = 0;
 
   for (const item of protectedObjects) {
     const node = item.node;
@@ -697,13 +800,20 @@ export default async function (input = {}) {
     const maxUsecs = findMaxUsecs(node);
     const lastBackupTime = usecsToEt(maxUsecs) || "NoBackupTime";
 
+    const directPgName = getProtectionGroupDirectName(node);
+    const protectionGroup = getProtectionGroupName(node, pgMapsByCluster[String(item.clusterId)] || {});
+
+    if (directPgName) directPgNameCount++;
+    else if (protectionGroup !== "N/A") mappedPgNameCount++;
+    else missingPgNameCount++;
+
     rows.push(makeBaseRow(
       workItem,
       backupType,
       objectName,
       sourceName,
       getClusterName(clusterMap, item.clusterId),
-      getProtectionGroupName(node),
+      protectionGroup,
       lastBackupTime
     ));
   }
@@ -743,6 +853,9 @@ export default async function (input = {}) {
     ? "Validated"
     : "NoBackupFound";
 
+  const pgMapEntryCount = Object.values(pgMapsByCluster)
+    .reduce((sum, m) => sum + Object.keys(m || {}).length, 0);
+
   const output = {
     validationState,
     rows,
@@ -762,6 +875,11 @@ export default async function (input = {}) {
       skippedNasRows,
       skippedOracleContainerRows,
       skippedOutOfScopeRows,
+      directPgNameCount,
+      mappedPgNameCount,
+      missingPgNameCount,
+      pgMapClusterCount: Object.keys(pgMapsByCluster).length,
+      pgMapEntryCount,
       globalObjectCount: globalResult.objects.length,
       candidateClusterCount: candidateClusterIds.length,
       protectedObjectCount: protectedObjects.length,
