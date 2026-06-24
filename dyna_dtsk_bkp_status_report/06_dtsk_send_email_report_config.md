@@ -31,8 +31,10 @@ Do not use a loop for this task.
 
 ## Subject
 
+Use dot notation because this Dynatrace email action does not accept bracket notation.
+
 ```jinja
-Cohesity Backup Validation - Decommission DTSKs - {{ result("dtsk_aggregate_report")["summary"]["totalDtsks"] }} DTSKs / {{ result("dtsk_aggregate_report")["summary"]["totalRows"] }} Rows
+Cohesity Backup Validation - Decommission DTSKs - {{ result("dtsk_aggregate_report").summary.totalDtsks }} DTSKs / {{ result("dtsk_aggregate_report").summary.totalRows }} Rows
 ```
 
 Example:
@@ -44,7 +46,7 @@ Cohesity Backup Validation - Decommission DTSKs - 15 DTSKs / 28 Rows
 ## Body
 
 ```jinja
-{{ result("dtsk_aggregate_report")["markdown"] }}
+{{ result("dtsk_aggregate_report").markdown }}
 
 ---
 
