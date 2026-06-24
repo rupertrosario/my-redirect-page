@@ -8,6 +8,7 @@
 // - Collects all loop outputs
 // - Flattens all rows into one simple report
 // - Creates Markdown table for review/email task later
+// - Clearly reports when there are no active decommission DTSKs
 //
 // Workflow position:
 // dtsk_snow_search
@@ -293,6 +294,7 @@ export default async function () {
       "ServerName"
     ),
 
+    noActiveDecomDtsks: workItems.length === 0,
     warningCount: warnings.length,
 
     // Diagnostics only. Useful if loop aggregation shape changes.
@@ -301,10 +303,16 @@ export default async function () {
     validateRawKeys: getObjectKeys(validateRaw)
   };
 
+  const noDtskMessage = summary.noActiveDecomDtsks
+    ? "No active decommission DTSKs were assigned to the backup team for this run. No backup validation was required."
+    : "";
+
   const markdown = [
     `# Cohesity Backup Validation - Decommission DTSKs`,
     `Generated: ${summary.generatedAtEt} ET`,
     "",
+    summary.noActiveDecomDtsks ? `**${noDtskMessage}**` : "",
+    summary.noActiveDecomDtsks ? "" : "",
     "## Summary",
     makeSummaryMarkdown(summary),
     "",
@@ -312,8 +320,8 @@ export default async function () {
     makeTypeMarkdown(summary),
     "",
     "## Details",
-    finalRows.length > 0 ? makeMarkdownTable(finalRows) : "No rows returned."
-  ].join("\n");
+    summary.noActiveDecomDtsks ? noDtskMessage : (finalRows.length > 0 ? makeMarkdownTable(finalRows) : "No rows returned.")
+  ].filter(line => line !== null && line !== undefined).join("\n");
 
   const output = {
     reportTitle: "Cohesity Backup Validation - Decommission DTSKs",
