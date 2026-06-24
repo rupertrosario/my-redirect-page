@@ -1,13 +1,14 @@
 // ==========================================================
 // Dynatrace JS Task
 // Task name: dtsk_validate_one_ci
-// Phase: Real Cohesity validation - version 5
+// Phase: Real Cohesity validation - version 6
 //
 // Corrected to match PowerShell logic:
 // - Uses protected-objects search as source of protected object rows
 // - Flattens childObjects and DB params
 // - Gets ProtectionGroup from latestSnapshotsInfo/protectionGroupName first
-// - Does not depend on protection-groups mapping for PG name
+// - Adds DB/CN fallback search for SQL/Oracle objects across all clusters
+// - Does not add a failure row for DB-missing yet; report-only monitoring
 // - GET only
 // ==========================================================
 
@@ -20,6 +21,12 @@ export default async function (input = {}) {
   const OUTPUT_TIME_ZONE = "America/New_York";
   const GLOBAL_SEARCH_COUNT = 100;
   const FALLBACK_WHEN_NO_GLOBAL_OBJECT = true;
+
+  // Environment naming rule confirmed by user:
+  // - db in CI name indicates DB server
+  // - cn in CI name indicates SQL cluster node/name
+  // Oracle -scan is not added here because Oracle backup uses the same server name in this workflow.
+  const DB_NAMED_SERVER_PATTERN = /db|cn/i;
 
   const SERVER_LEVEL_BACKUP_TYPES = ["FS", "VM", "HyperV", "Nutanix"];
   const DB_BACKUP_TYPES = ["SQL", "Oracle"];
@@ -103,6 +110,10 @@ export default async function (input = {}) {
     if (!t || !n) return false;
     const ns = normalizeName(shortName(name));
     return t === n || (ns && t === ns) || t.includes(n) || (ns && t.includes(ns));
+  }
+
+  function isDbNamedServer(aliases) {
+    return asArray(aliases).some(a => DB_NAMED_SERVER_PATTERN.test(String(a || "")));
   }
 
   function testOracleContainerName(name) {
@@ -223,7 +234,6 @@ export default async function (input = {}) {
   }
 
   function getProtectionGroupName(object, snapshot) {
-    // This matches the PowerShell script. PG name is normally on latestSnapshotsInfo, not on protection-groups map.
     const pg = firstNonBlank(
       snapshot?.protectionGroupName,
       snapshot?.protectionGroup?.name,
@@ -606,17 +616,18 @@ export default async function (input = {}) {
     return asArray(allClusters).map(c => ({ clusterId: String(c.clusterId || ""), clusterName: c.clusterName || getClusterName(clusterMap, c.clusterId), searchMode: "fallback" })).filter(c => c.clusterId);
   }
 
-  async function searchProtectedObjectsOnClusters(apiKey, ci, ciAliases, searchTerms, candidateClusters, workItem) {
+  async function searchProtectedObjectsOnClusters(apiKey, ci, ciAliases, searchTerms, candidateClusters, workItem, options = {}) {
     const rows = [];
     const warnings = [];
     const searched = new Set();
+    const dbOnly = options.dbOnly === true;
 
     for (const clu of candidateClusters) {
       if (!clu.clusterId) continue;
 
       for (const term of searchTerms) {
         if (!term) continue;
-        const searchKey = `${clu.clusterId}|${term}`;
+        const searchKey = `${dbOnly ? "dbonly" : "normal"}|${clu.clusterId}|${term}`;
         if (searched.has(searchKey)) continue;
         searched.add(searchKey);
 
@@ -638,17 +649,24 @@ export default async function (input = {}) {
         flatObjects = flatObjects.filter(f => !testNonDisplayObject(f));
         if (flatObjects.length === 0) continue;
 
-        const matchingFlatObjects = flatObjects.filter(f => objectMatchesCiAliasesFlat(f, ciAliases));
-        const dbFlatObjects = flatObjects.filter(testDbLikeFlat);
-        const vmFlatObjects = flatObjects.filter(testVmLikeFlat);
-        let objectsToCheck = dedupeFlatObjects([...matchingFlatObjects, ...dbFlatObjects, ...vmFlatObjects]);
-        if (objectsToCheck.length === 0) objectsToCheck = flatObjects;
+        let objectsToCheck = [];
+        if (dbOnly) {
+          // PowerShell-style DB/CN fallback: only check SQL/Oracle rows, and require source/object match to CI aliases.
+          objectsToCheck = flatObjects.filter(f => testDbLikeFlat(f) && objectMatchesCiAliasesFlat(f, ciAliases));
+        } else {
+          const matchingFlatObjects = flatObjects.filter(f => objectMatchesCiAliasesFlat(f, ciAliases));
+          const dbFlatObjects = flatObjects.filter(testDbLikeFlat);
+          const vmFlatObjects = flatObjects.filter(testVmLikeFlat);
+          objectsToCheck = dedupeFlatObjects([...matchingFlatObjects, ...dbFlatObjects, ...vmFlatObjects]);
+          if (objectsToCheck.length === 0) objectsToCheck = flatObjects;
+        }
 
         for (const flat of objectsToCheck) {
           if (testNonDisplayObject(flat)) continue;
           const row = convertFlatObjectToBackupRow(flat, ci, { ...clu, workItem });
           if (!row) continue;
           if (!IN_SCOPE_BACKUP_TYPES.includes(row.BackupType)) continue;
+          if (dbOnly && !DB_BACKUP_TYPES.includes(row.BackupType)) continue;
           rows.push(row);
         }
       }
@@ -714,6 +732,7 @@ export default async function (input = {}) {
   const apiKey = await getApiKey();
   const aliases = buildAliases(workItem);
   const searchTerms = buildSearchTerms(workItem);
+  const dbNamedServer = isDbNamedServer(aliases);
   const warnings = [];
 
   const globalResult = await searchGlobalObjects(apiKey, searchTerms);
@@ -723,7 +742,42 @@ export default async function (input = {}) {
   const searchResult = await searchProtectedObjectsOnClusters(apiKey, workItem.ciName, aliases, searchTerms, candidateClusters, workItem);
   warnings.push(...searchResult.warnings);
 
-  let rows = sortRows(dedupeRows(searchResult.rows));
+  let workingRows = [...searchResult.rows];
+  let dbCnFallbackApplied = false;
+  let dbCnFallbackRowsFound = 0;
+  let dbCnFallbackSearchedClusterTermCount = 0;
+
+  const dbRowsFoundBeforeFallback = workingRows.filter(r => DB_BACKUP_TYPES.includes(r.BackupType)).length;
+
+  if (dbNamedServer && dbRowsFoundBeforeFallback === 0) {
+    dbCnFallbackApplied = true;
+
+    // PowerShell-style fallback: for DB/CN-named servers, scan all clusters again for SQL/Oracle rows.
+    const allClusterCandidates = clusters
+      .map(c => ({
+        clusterId: String(c.clusterId || ""),
+        clusterName: c.clusterName || getClusterName(clusterMap, c.clusterId),
+        searchMode: "db-cn-fallback"
+      }))
+      .filter(c => c.clusterId);
+
+    const fallbackResult = await searchProtectedObjectsOnClusters(
+      apiKey,
+      workItem.ciName,
+      aliases,
+      searchTerms,
+      allClusterCandidates,
+      workItem,
+      { dbOnly: true }
+    );
+
+    warnings.push(...fallbackResult.warnings);
+    dbCnFallbackRowsFound = fallbackResult.rows.length;
+    dbCnFallbackSearchedClusterTermCount = fallbackResult.searchedClusterTermCount;
+    workingRows.push(...fallbackResult.rows);
+  }
+
+  let rows = sortRows(dedupeRows(workingRows));
 
   const hasDbBackup = rows.some(r => DB_BACKUP_TYPES.includes(r.BackupType));
   const hasServerLevelBackup = rows.some(r => SERVER_LEVEL_BACKUP_TYPES.includes(r.BackupType));
@@ -759,6 +813,10 @@ export default async function (input = {}) {
       serverLevelBackupFound: rows.some(r => SERVER_LEVEL_BACKUP_TYPES.includes(r.BackupType)),
       dbBackupFound: rows.some(r => DB_BACKUP_TYPES.includes(r.BackupType)),
       noFsBackupFound: rows.some(r => r.BackupType === "NoFSBackupFound"),
+      dbNamedServer,
+      dbCnFallbackApplied,
+      dbCnFallbackRowsFound,
+      dbCnFallbackSearchedClusterTermCount,
       pgNamePopulatedCount,
       pgNameMissingCount,
       globalObjectCount: globalResult.objects.length,
