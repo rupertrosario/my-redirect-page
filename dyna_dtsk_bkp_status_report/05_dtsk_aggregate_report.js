@@ -210,10 +210,7 @@ export default async function () {
       "## Run Status",
       "| Status | Active Decommission DTSKs | Backup Validation |",
       "|---|---:|---|",
-      "| **NO DTSKs** | **0** | **Not Required** |",
-      "",
-      "## NOTES",
-      "No active decommission DTSKs were assigned to the backup team for this run. No backup validation was required."
+      "| **NO DTSKs** | **0** | **Not Required** |"
     ].join("\n");
   }
 
@@ -342,7 +339,7 @@ export default async function () {
         "## Details",
         finalRows.length > 0 ? makeMarkdownTable(finalRows) : "No rows returned.",
         "",
-        "## NOTES",
+        "## NOTE:",
         makeNotesMarkdown(summary)
       ].join("\n");
 
