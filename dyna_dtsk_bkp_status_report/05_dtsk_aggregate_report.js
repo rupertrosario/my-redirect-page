@@ -7,7 +7,7 @@
 // - Runs after loop task dtsk_validate_one_ci
 // - Collects all loop outputs
 // - Flattens all rows into one simple report
-// - Creates Markdown table for review/email task later
+// - Creates manager-friendly Markdown for email
 // - Clearly reports when there are no active decommission DTSKs
 //
 // Workflow position:
@@ -24,9 +24,6 @@ import { result } from "@dynatrace-sdk/automation-utils";
 
 export default async function () {
 
-  // -----------------------------
-  // Helpers
-  // -----------------------------
   function nowEt() {
     return new Intl.DateTimeFormat("en-US", {
       timeZone: "America/New_York",
@@ -59,11 +56,20 @@ export default async function () {
   }
 
   function normalizeRow(row) {
+    const backupTypeRaw = safeText(row?.BackupType);
+    const displayMap = {
+      NoObject: "No Backup Found",
+      NoFSBackupFound: "DB Only / No Server Backup",
+      HyperV: "Hyper-V",
+      Nutanix: "Nutanix/AHV"
+    };
+
     return {
       DTSK: safeText(row?.DTSK),
       DecomRequest: safeText(row?.DecomRequest),
       ServerName: safeText(row?.ServerName),
-      BackupType: safeText(row?.BackupType),
+      BackupType: backupTypeRaw,
+      BackupTypeDisplay: displayMap[backupTypeRaw] || backupTypeRaw,
       ObjectName: safeText(row?.ObjectName),
       SourceName: safeText(row?.SourceName),
       ClusterName: safeText(row?.ClusterName),
@@ -139,20 +145,15 @@ export default async function () {
     return values.size;
   }
 
-  // Dynatrace loop result shapes can vary by runtime/version.
-  // This extractor accepts arrays and common wrappers and searches for objects with a rows[] field.
   function extractValidationOutputs(value, out = [], depth = 0, seen = new Set()) {
     if (depth > 10 || value === null || value === undefined) return out;
-
     if (typeof value !== "object") return out;
 
     if (seen.has(value)) return out;
     seen.add(value);
 
     if (Array.isArray(value)) {
-      for (const item of value) {
-        extractValidationOutputs(item, out, depth + 1, seen);
-      }
+      for (const item of value) extractValidationOutputs(item, out, depth + 1, seen);
       return out;
     }
 
@@ -162,21 +163,11 @@ export default async function () {
     }
 
     const preferredKeys = [
-      "results",
-      "result",
-      "outputs",
-      "output",
-      "values",
-      "items",
-      "executions",
-      "tasks",
-      "data"
+      "results", "result", "outputs", "output", "values", "items", "executions", "tasks", "data"
     ];
 
     for (const key of preferredKeys) {
-      if (value[key] !== undefined) {
-        extractValidationOutputs(value[key], out, depth + 1, seen);
-      }
+      if (value[key] !== undefined) extractValidationOutputs(value[key], out, depth + 1, seen);
     }
 
     return out;
@@ -189,62 +180,86 @@ export default async function () {
 
   function makeMarkdownTable(rows) {
     const headers = [
-      "DTSK",
-      "DecomRequest",
-      "ServerName",
-      "BackupType",
-      "ObjectName",
-      "SourceName",
-      "ClusterName",
-      "ProtectionGroup",
-      "LastBackupTime"
+      ["DTSK", "DTSK"],
+      ["Decom Request", "DecomRequest"],
+      ["Server", "ServerName"],
+      ["Backup Type", "BackupTypeDisplay"],
+      ["Object", "ObjectName"],
+      ["Source", "SourceName"],
+      ["Cluster", "ClusterName"],
+      ["Protection Group", "ProtectionGroup"],
+      ["Latest Backup", "LastBackupTime"]
     ];
 
     const lines = [];
-    lines.push(`| ${headers.join(" | ")} |`);
+    lines.push(`| ${headers.map(h => h[0]).join(" | ")} |`);
     lines.push(`| ${headers.map(() => "---").join(" | ")} |`);
 
     for (const row of rows) {
-      lines.push(`| ${headers.map(h => markdownEscape(row[h])).join(" | ")} |`);
+      lines.push(`| ${headers.map(h => markdownEscape(row[h[1]])).join(" | ")} |`);
     }
 
     return lines.join("\n");
   }
 
-  function makeSummaryMarkdown(summary) {
+  function makeNoDtskMarkdown(summary) {
+    return [
+      `# Cohesity Backup Validation - Decommission DTSKs`,
+      `Generated: ${summary.generatedAtEt} ET`,
+      "",
+      "## Run Status",
+      "| Status | Active Decommission DTSKs | Backup Validation |",
+      "|---|---:|---|",
+      "| **NO DTSKs** | **0** | **Not Required** |",
+      "",
+      "## NOTES",
+      "No active decommission DTSKs were assigned to the backup team for this run. No backup validation was required."
+    ].join("\n");
+  }
+
+  function makeExecutiveSummaryMarkdown(summary) {
     return [
       "| Metric | Count |",
       "|---|---:|",
-      `| DTSKs from ServiceNow | ${summary.totalDtsks} |`,
-      `| Validation outputs received | ${summary.validationOutputCount} |`,
-      `| Total report rows | ${summary.totalRows} |`,
-      `| Server-level protected CIs | ${summary.serverLevelProtectedCiCount} |`,
-      `| DB-protected CIs | ${summary.dbProtectedCiCount} |`,
-      `| No backup found rows | ${summary.noObjectRowCount} |`,
-      `| DB exists but no server-level backup | ${summary.noFsBackupFoundRowCount} |`,
-      `| Warning count | ${summary.warningCount} |`
+      `| **DTSKs reviewed** | **${summary.totalDtsks}** |`,
+      `| **Total validation rows** | **${summary.totalRows}** |`,
+      `| **Server-level protected CIs** | **${summary.serverLevelProtectedCiCount}** |`,
+      `| **DB-protected CIs** | **${summary.dbProtectedCiCount}** |`,
+      `| **No backup found** | **${summary.noObjectRowCount}** |`,
+      `| **DB backup found but no server-level backup** | **${summary.noFsBackupFoundRowCount}** |`,
+      `| **Warnings** | **${summary.warningCount}** |`
     ].join("\n");
   }
 
   function makeTypeMarkdown(summary) {
     return [
-      "| BackupType | Rows |",
+      "| Backup Type | Rows |",
       "|---|---:|",
       `| FS | ${summary.fsRowCount} |`,
       `| VM | ${summary.vmRowCount} |`,
-      `| HyperV | ${summary.hyperVRowCount} |`,
-      `| Nutanix | ${summary.nutanixRowCount} |`,
+      `| Hyper-V | ${summary.hyperVRowCount} |`,
+      `| Nutanix/AHV | ${summary.nutanixRowCount} |`,
       `| SQL | ${summary.sqlRowCount} |`,
       `| Oracle | ${summary.oracleRowCount} |`,
-      `| NoFSBackupFound | ${summary.noFsBackupFoundRowCount} |`,
-      `| NoObject | ${summary.noObjectRowCount} |`,
+      `| **No Backup Found** | **${summary.noObjectRowCount}** |`,
+      `| **DB Only / No Server Backup** | **${summary.noFsBackupFoundRowCount}** |`,
       `| Unknown | ${summary.unknownRowCount} |`
     ].join("\n");
   }
 
-  // -----------------------------
-  // Read previous task outputs
-  // -----------------------------
+  function makeNotesMarkdown(summary) {
+    const dbFallbackText = summary.dbCnFallbackAppliedCount > 0
+      ? `- DB/CN fallback applied to **${summary.dbCnFallbackAppliedCount}** CI(s); SQL/Oracle rows found by fallback: **${summary.dbCnFallbackRowsFound}**.`
+      : "- Servers with `db` or `cn` in the name get an additional SQL/Oracle fallback search when no DB backup is initially found.";
+
+    return [
+      "- NAS backups are excluded from this server decommission validation.",
+      "- **No Backup Found** means no in-scope Cohesity backup object was found for the CI.",
+      "- **DB Only / No Server Backup** means a SQL/Oracle backup was found, but no FS, VM, Hyper-V, or Nutanix/AHV backup was found for the server.",
+      dbFallbackText
+    ].join("\n");
+  }
+
   const prepareResult = await result("dtsk_prepare_work_items");
   const validateRaw = await result("dtsk_validate_one_ci");
 
@@ -254,10 +269,17 @@ export default async function () {
   const warnings = [];
   const rows = [];
 
+  let dbNamedServerCount = 0;
+  let dbCnFallbackAppliedCount = 0;
+  let dbCnFallbackRowsFound = 0;
+
   for (const output of validationOutputs) {
-    for (const row of asArray(output?.rows)) {
-      rows.push(normalizeRow(row));
-    }
+    for (const row of asArray(output?.rows)) rows.push(normalizeRow(row));
+
+    const s = output?.summary || {};
+    if (s.dbNamedServer === true) dbNamedServerCount += 1;
+    if (s.dbCnFallbackApplied === true) dbCnFallbackAppliedCount += 1;
+    dbCnFallbackRowsFound += Number(s.dbCnFallbackRowsFound || 0);
 
     for (const warning of asArray(output?.warnings)) {
       const text = safeText(warning);
@@ -294,34 +316,35 @@ export default async function () {
       "ServerName"
     ),
 
+    dbNamedServerCount,
+    dbCnFallbackAppliedCount,
+    dbCnFallbackRowsFound,
     noActiveDecomDtsks: workItems.length === 0,
     warningCount: warnings.length,
 
-    // Diagnostics only. Useful if loop aggregation shape changes.
     validateRawIsArray: Array.isArray(validateRaw),
     validateRawType: typeof validateRaw,
     validateRawKeys: getObjectKeys(validateRaw)
   };
 
-  const noDtskMessage = summary.noActiveDecomDtsks
-    ? "No active decommission DTSKs were assigned to the backup team for this run. No backup validation was required."
-    : "";
-
-  const markdown = [
-    `# Cohesity Backup Validation - Decommission DTSKs`,
-    `Generated: ${summary.generatedAtEt} ET`,
-    "",
-    summary.noActiveDecomDtsks ? `**${noDtskMessage}**` : "",
-    summary.noActiveDecomDtsks ? "" : "",
-    "## Summary",
-    makeSummaryMarkdown(summary),
-    "",
-    "## Backup Type Counts",
-    makeTypeMarkdown(summary),
-    "",
-    "## Details",
-    summary.noActiveDecomDtsks ? noDtskMessage : (finalRows.length > 0 ? makeMarkdownTable(finalRows) : "No rows returned.")
-  ].filter(line => line !== null && line !== undefined).join("\n");
+  const markdown = summary.noActiveDecomDtsks
+    ? makeNoDtskMarkdown(summary)
+    : [
+        `# Cohesity Backup Validation - Decommission DTSKs`,
+        `Generated: ${summary.generatedAtEt} ET`,
+        "",
+        "## Executive Summary",
+        makeExecutiveSummaryMarkdown(summary),
+        "",
+        "## Backup Type Summary",
+        makeTypeMarkdown(summary),
+        "",
+        "## Details",
+        finalRows.length > 0 ? makeMarkdownTable(finalRows) : "No rows returned.",
+        "",
+        "## NOTES",
+        makeNotesMarkdown(summary)
+      ].join("\n");
 
   const output = {
     reportTitle: "Cohesity Backup Validation - Decommission DTSKs",
