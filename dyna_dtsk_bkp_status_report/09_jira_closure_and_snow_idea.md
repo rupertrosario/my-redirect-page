@@ -9,7 +9,6 @@ Completed the initial report-only Dynatrace Workflow for Cohesity backup validat
 - Workflow fetches active decommission DTSKs from ServiceNow table `x_alfi_decom_decom_task`.
 - Workflow validates backup status from Cohesity Helios using read-only API checks.
 - Workflow sends an email report with backup evidence.
-- Initial testing was completed using ServiceNow Development.
 - Generated workflow emails are attached as evidence.
 
 ### Current scope
@@ -26,13 +25,13 @@ The decommission backup stage includes:
 
 - validating backup status
 - updating the DTSK with validation evidence
-- supporting removal or unregistration of the CI from backup where applicable
+- supporting CI removal from backup where applicable
 
 Future update behavior will need to be controlled by workload type and eligibility. Some DTSKs may be eligible for automation, while others may require manual review or additional backup cleanup before closure.
 
 A ServiceNow idea/request will be opened to request:
 
-- ServiceNow DEV access for prototype testing
+- approved test path for prototype testing
 - approval to update DTSK `work_notes`
 - approval to read existing notes for duplicate prevention
 - approval for eligible `CR Required = No` and state updates
@@ -47,7 +46,7 @@ This JIRA is being closed for the initial report-only validation and email repor
 
 ### Idea Title
 
-Automate DTSK updates for Cohesity backup validation and CI removal from backup through Dynatrace Workflow
+Allow Dynatrace Workflow to update decommission DTSKs for backup validation and CI removal from backup
 
 ### Targeted Release Date
 
@@ -63,43 +62,57 @@ ServiceNow (PRODUCTION)
 
 ### Idea Description
 
-The initial report-only Dynatrace Workflow for decommission DTSK backup validation has been completed and tested with ServiceNow Development.
+Requesting ServiceNow review and approval to allow Dynatrace Workflow to perform controlled updates on eligible decommission DTSKs.
 
-The current workflow uses a ServiceNow search task to read active decommission DTSKs from `x_alfi_decom_decom_task`. It then validates backup status from Cohesity Helios using read-only API checks and sends an email report with backup evidence.
+The requested capability is to support the backup decommission stage, which includes:
 
-The next phase is to build a working prototype in ServiceNow DEV for controlled DTSK updates before any PROD implementation is considered.
+- validating backup status
+- updating the DTSK with backup validation evidence
+- supporting CI removal from backup where applicable
+- avoiding duplicate DTSK updates
+- updating eligible DTSKs only when approved rules are met
 
-Requesting ServiceNow review and DEV access to validate the approved approach for:
+Requested ServiceNow access/update review:
 
-- updating DTSK `work_notes`
-- checking existing notes to prevent duplicate updates
-- updating eligible DTSKs with `CR Required = No`
-- updating DTSK state only for approved scenarios
-- reviewing possible assignment logic using active backup-team users
-- supporting future CI removal or unregistration from backup where applicable
-
-This is not only a backup validation use case. The decommission backup stage includes both backup validation and CI removal from backup where applicable.
+- read decommission DTSKs from `x_alfi_decom_decom_task`
+- update DTSK `work_notes`
+- read existing DTSK work notes to prevent duplicate notes
+- use a unique identifier in workflow-created notes to avoid duplicate updates
+- update `CR Required = No` only for eligible DTSKs
+- update state only for approved scenarios
+- review active backup-team user assignment logic
+- review the approved path for future production implementation
 
 Reference JIRA: `<JIRA_KEY>`
 
 ### Acceptance Criteria
 
-- ServiceNow confirms whether Dynatrace Workflow can be tested in ServiceNow DEV for a working prototype.
-- ServiceNow confirms whether the approved DEV prototype can later be replicated to PROD through the standard change/release process.
-- ServiceNow confirms whether Dynatrace Workflow can update DTSK `work_notes`.
-- ServiceNow confirms whether existing DTSK notes can be read to prevent duplicate workflow updates.
-- ServiceNow confirms whether marker-based duplicate prevention is acceptable.
-- ServiceNow confirms whether `CR Required = No` can be updated for eligible DTSKs.
-- ServiceNow confirms whether DTSK state updates can be performed only for approved scenarios.
-- ServiceNow confirms whether active backup-team users can be fetched for possible assignment logic.
-- ServiceNow confirms any access, role, integration-user, business rule, or approval requirement before implementation.
-
-### Update behavior to review
-
-- Automatic updates should apply only when backup validation gives a clear and eligible result.
-- Some workloads may require additional backup cleanup or CI removal from backup before closure.
-- Where additional cleanup or manual review is required, the workflow should update `work_notes` with validation evidence but should not automatically close the DTSK.
-- Auto-close behavior should be limited to scenarios approved by ServiceNow and the process owner.
+- Approved test path is available for Dynatrace Workflow prototype testing.
+- Dynatrace Workflow can read required DTSK details from `x_alfi_decom_decom_task`, including:
+  - `sys_id`
+  - DTSK number
+  - CI/server name
+  - decommission request details
+  - created date
+  - assignment group
+  - state/status
+  - `CR Required`
+- Dynatrace Workflow can update DTSK `work_notes` with backup validation evidence.
+- Existing DTSK work notes can be checked before adding new notes.
+- `sys_journal_field` can be used to check existing work notes using the DTSK `sys_id`.
+- Workflow-created work notes include a unique identifier so the workflow can detect previous updates and avoid adding duplicate notes on reruns.
+- `CR Required = No` can be updated only for eligible DTSKs.
+- DTSK state updates can be tested only for approved scenarios.
+- State values to review:
+  - `2 = Work in Progress`
+  - `3 = Closed Complete`
+- DTSKs requiring manual review or CI removal from backup should receive work notes only and should not be auto-closed.
+- Assignment logic can be reviewed using:
+  - `sys_user_group` for the backup group
+  - `sys_user_grmember` for group members
+  - `sys_user` for active user details and user `sys_id`
+- Required roles, ACLs, integration-user permissions, business rules, and release process are identified before production implementation.
+- Production implementation proceeds only after prototype testing and ServiceNow approval.
 
 ### Business Value
 
@@ -112,7 +125,7 @@ Expected benefits:
 - Avoids duplicate notes by checking existing entries before writing.
 - Supports controlled update of `CR Required = No` when eligible.
 - Improves audit trail and operational consistency.
-- Creates a controlled path for future CI removal from backup or backup cleanup where applicable.
+- Creates a controlled path for future CI removal from backup where applicable.
 
 ### Will this update help reduce costs?
 
