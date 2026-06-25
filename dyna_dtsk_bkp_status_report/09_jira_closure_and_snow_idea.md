@@ -2,98 +2,134 @@
 
 ## JIRA Closure Update
 
-Completed the initial automation for Cohesity backup validation for decommission DTSKs.
+Completed the initial report-only Dynatrace Workflow for Cohesity backup validation for decommission DTSKs.
 
 ### Completed
 
-- Built the initial report-only validation workflow for decommission DTSKs.
-- Workflow fetches DTSKs from ServiceNow table `x_alfi_decom_decom_task`.
-- Added read-only Cohesity Helios validation for FS, VM, Hyper-V, Nutanix/AHV, SQL, and Oracle backups.
-- Added email reporting with backup evidence and summary output.
-- Added handling for backup found, no backup found, DB only / no server backup, and no active DTSKs found.
-- Generated workflow emails are attached to the JIRA as evidence.
+- Workflow fetches active decommission DTSKs from ServiceNow table `x_alfi_decom_decom_task`.
+- Workflow validates backup status from Cohesity Helios using read-only API checks.
+- Workflow sends an email report with backup evidence.
+- Initial testing was completed using ServiceNow Development.
+- Generated workflow emails are attached as evidence.
 
-### Current phase
+### Current scope
 
-- Current implementation is report-only.
-- ServiceNow fetch/read is enabled.
-- Cohesity validation is read-only.
-- Email reporting is enabled.
-- DTSK updates are not implemented in this phase.
-- `work_notes` update is allowed, but not implemented in this phase.
-- `CR Required = No`, state update, and assignment update are not implemented in this phase.
+This phase is report-only.
 
-### Holdback / future enhancement
+No ServiceNow DTSK update is performed yet. No automatic close, assignment, `CR Required = No`, or backup-infrastructure removal action is implemented in this phase.
 
-The update portion is being held for a separate ServiceNow review because update behavior needs ServiceNow confirmation and approval before implementation.
+### Future enhancement
 
-Future ServiceNow update items to review:
+The next phase will require ServiceNow review and approval before implementation.
 
-- Add validation result to DTSK `work_notes`.
-- Read existing notes from `sys_journal_field` to prevent duplicate updates.
-- Use marker `[COHESITY_BACKUP_VALIDATION_WORKFLOW]` for duplicate prevention.
-- Set `CR Required = No` only when backup is confirmed.
-- Use DTSK state values `2 = Work in Progress` and `3 = Closed Complete` only after update rules are approved.
-- Consider assignment logic later by fetching active ServiceNow users from the backup team. This is only a proposed option.
+The decommission backup stage includes:
 
-### Next action
+- validating backup status
+- updating the DTSK with validation evidence
+- supporting removal or unregistration of the CI from backup infrastructure where applicable
 
-A ServiceNow idea/request will be opened to confirm feasibility and approval for the DTSK update phase. The ServiceNow idea/request will reference this JIRA and will cover `work_notes`, duplicate prevention, `CR Required = No`, state update, and possible assignment logic.
+Future update behavior will need to be controlled by workload type and eligibility. Some DTSKs may be eligible for automation, while others may require manual review or additional backup cleanup before closure.
 
-This JIRA is being closed for the initial Cohesity backup validation and email reporting automation.
+A ServiceNow idea/request will be opened to request:
+
+- ServiceNow DEV access for prototype testing
+- approval to update DTSK `work_notes`
+- approval to read existing notes for duplicate prevention
+- approval for eligible `CR Required = No` and state updates
+- review of assignment logic
+- review of future backup-infrastructure removal handling
+
+This JIRA is being closed for the initial report-only validation and email reporting workflow. A separate implementation enhancement will be created after ServiceNow confirms the approved approach.
 
 ---
 
-## ServiceNow Idea / Request
+## ServiceNow Idea Form
 
-### Title
+### Idea Title
 
-Feasibility review for automated DTSK update from Cohesity backup validation workflow
+Automate DTSK updates for Cohesity backup validation and backup-infrastructure removal through Dynatrace Workflow
 
-### Request
+### Targeted Release Date
 
-Requesting ServiceNow review for a future enhancement to update decommission DTSKs after automated Cohesity backup validation.
+31-Jul-2026
+
+### Configuration Item
+
+ServiceNow (PRODUCTION)
+
+### Priority
+
+4 - Low
+
+### Idea Description
+
+The initial report-only Dynatrace Workflow for decommission DTSK backup validation has been completed and tested with ServiceNow Development.
+
+The current workflow uses a ServiceNow search task to read active decommission DTSKs from `x_alfi_decom_decom_task`. It then validates backup status from Cohesity Helios using read-only API checks and sends an email report with backup evidence.
+
+The next phase is to build a working prototype in ServiceNow DEV for controlled DTSK updates before any PROD implementation is considered.
+
+Requesting ServiceNow review and DEV access to validate the approved approach for:
+
+- updating DTSK `work_notes`
+- checking existing notes to prevent duplicate updates
+- updating eligible DTSKs with `CR Required = No`
+- updating DTSK state only for approved scenarios
+- reviewing possible assignment logic using active backup-team users
+- supporting future CI removal or unregistration from backup infrastructure where applicable
+
+This is not only a backup validation use case. The decommission backup stage includes both backup validation and backup-side cleanup or removal readiness for the CI.
 
 Reference JIRA: `<JIRA_KEY>`
 
-### Current status
+### Acceptance Criteria
 
-The current workflow is completed as report-only.
+- ServiceNow confirms whether Dynatrace Workflow can be tested in ServiceNow DEV for a working prototype.
+- ServiceNow confirms whether the approved DEV prototype can later be replicated to PROD through the standard change/release process.
+- ServiceNow confirms whether Dynatrace Workflow can update DTSK `work_notes`.
+- ServiceNow confirms whether existing DTSK notes can be read to prevent duplicate workflow updates.
+- ServiceNow confirms whether marker-based duplicate prevention is acceptable.
+- ServiceNow confirms whether `CR Required = No` can be updated for eligible DTSKs.
+- ServiceNow confirms whether DTSK state updates can be performed only for approved scenarios.
+- ServiceNow confirms whether active backup-team users can be fetched for possible assignment logic.
+- ServiceNow confirms any access, role, integration-user, business rule, or approval requirement before implementation.
 
-Current workflow:
+### Update behavior to review
 
-- dtsk_snow_search
-- dtsk_prepare_work_items
-- dtsk_get_cluster_map
-- dtsk_validate_one_ci
-- dtsk_aggregate_report
-- dtsk_send_email_report
+- Automatic updates should apply only when backup validation gives a clear and eligible result.
+- Some workloads may require additional backup-infrastructure cleanup before closure.
+- Where additional cleanup or manual review is required, the workflow should update `work_notes` with validation evidence but should not automatically close the DTSK.
+- Auto-close behavior should be limited to scenarios approved by ServiceNow and the process owner.
 
-Current DTSK table: `x_alfi_decom_decom_task`
+### Business Value
 
-The workflow currently reads DTSKs, validates backup status from Cohesity Helios, and sends an email report. No DTSK update is performed today.
+This enhancement will reduce manual effort for decommission DTSK handling by allowing validated backup results to be recorded directly on the related DTSK.
 
-### Feasibility items requested from ServiceNow
+Expected benefits:
 
-Please confirm whether the following updates are feasible and allowed.
+- Reduces manual backup validation follow-up.
+- Adds consistent backup evidence into DTSK work notes.
+- Avoids duplicate notes by checking existing entries before writing.
+- Supports controlled update of `CR Required = No` when eligible.
+- Improves audit trail and operational consistency.
+- Creates a controlled path for future backup-infrastructure removal or cleanup where applicable.
 
-- Update DTSK `work_notes` using `x_alfi_decom_decom_task.work_notes`.
-- Read existing work notes from `sys_journal_field` for duplicate prevention.
-- Use `element_id = DTSK sys_id` and `element = work_notes` when checking existing notes.
-- Use marker `[COHESITY_BACKUP_VALIDATION_WORKFLOW]` to avoid duplicate notes on reruns.
-- Set `CR Required = No` when backup is confirmed.
-- Update DTSK state when eligible using `2 = Work in Progress` and `3 = Closed Complete`.
-- Review possible assignment logic by fetching active ServiceNow users from the backup team. Possible source tables are `sys_user`, `sys_user_grmember`, and `sys_user_group`.
+### Will this update help reduce costs?
 
-### Expected future behavior
+Yes
 
-- Backup confirmed: write validation note, set `CR Required = No`, update state only if approved, assign only if assignment logic is approved.
-- No backup found: write validation note only; do not close automatically.
-- SQL/Oracle only with no server-level backup: write validation note only; do not close automatically unless approved later.
-- Validation error: write validation note only; do not close automatically.
+### Will this update help save time?
 
-### Requested outcome
+Yes
 
-Please confirm whether these ServiceNow update actions are feasible and what permissions, field behavior, ACLs, or process approvals are required.
+### How much time can be saved?
 
-After ServiceNow approval, a separate implementation JIRA will be created for the DTSK update phase.
+In the last 12 months, approximately **2,390 decommission DTSKs** were processed.
+
+Based on an estimated **3-5 minutes of manual validation/update effort per DTSK**, the expected time saving is approximately **120-200 hours annually**.
+
+### Is this for an external/internal audit or risk mitigation?
+
+Yes
+
+This supports internal operational control, audit evidence, and risk reduction for server decommission backup validation and backup-infrastructure cleanup readiness.
