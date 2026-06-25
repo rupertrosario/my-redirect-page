@@ -16,7 +16,7 @@ Completed the initial report-only Dynatrace Workflow for Cohesity backup validat
 
 This phase is report-only.
 
-No ServiceNow DTSK update is performed yet. No automatic close, assignment, `CR Required = No`, or backup-infrastructure removal action is implemented in this phase.
+No ServiceNow DTSK update is performed yet. No automatic close, assignment, `CR Required = No`, or CI removal from backup action is implemented in this phase.
 
 ### Future enhancement
 
@@ -26,7 +26,7 @@ The decommission backup stage includes:
 
 - validating backup status
 - updating the DTSK with validation evidence
-- supporting removal or unregistration of the CI from backup infrastructure where applicable
+- supporting removal or unregistration of the CI from backup where applicable
 
 Future update behavior will need to be controlled by workload type and eligibility. Some DTSKs may be eligible for automation, while others may require manual review or additional backup cleanup before closure.
 
@@ -37,7 +37,7 @@ A ServiceNow idea/request will be opened to request:
 - approval to read existing notes for duplicate prevention
 - approval for eligible `CR Required = No` and state updates
 - review of assignment logic
-- review of future backup-infrastructure removal handling
+- review of future CI removal from backup handling
 
 This JIRA is being closed for the initial report-only validation and email reporting workflow. A separate implementation enhancement will be created after ServiceNow confirms the approved approach.
 
@@ -47,7 +47,7 @@ This JIRA is being closed for the initial report-only validation and email repor
 
 ### Idea Title
 
-Automate DTSK updates for Cohesity backup validation and backup-infrastructure removal through Dynatrace Workflow
+Automate DTSK updates for Cohesity backup validation and CI removal from backup through Dynatrace Workflow
 
 ### Targeted Release Date
 
@@ -76,9 +76,9 @@ Requesting ServiceNow review and DEV access to validate the approved approach fo
 - updating eligible DTSKs with `CR Required = No`
 - updating DTSK state only for approved scenarios
 - reviewing possible assignment logic using active backup-team users
-- supporting future CI removal or unregistration from backup infrastructure where applicable
+- supporting future CI removal or unregistration from backup where applicable
 
-This is not only a backup validation use case. The decommission backup stage includes both backup validation and backup-side cleanup or removal readiness for the CI.
+This is not only a backup validation use case. The decommission backup stage includes both backup validation and CI removal from backup where applicable.
 
 Reference JIRA: `<JIRA_KEY>`
 
@@ -97,7 +97,7 @@ Reference JIRA: `<JIRA_KEY>`
 ### Update behavior to review
 
 - Automatic updates should apply only when backup validation gives a clear and eligible result.
-- Some workloads may require additional backup-infrastructure cleanup before closure.
+- Some workloads may require additional backup cleanup or CI removal from backup before closure.
 - Where additional cleanup or manual review is required, the workflow should update `work_notes` with validation evidence but should not automatically close the DTSK.
 - Auto-close behavior should be limited to scenarios approved by ServiceNow and the process owner.
 
@@ -112,7 +112,7 @@ Expected benefits:
 - Avoids duplicate notes by checking existing entries before writing.
 - Supports controlled update of `CR Required = No` when eligible.
 - Improves audit trail and operational consistency.
-- Creates a controlled path for future backup-infrastructure removal or cleanup where applicable.
+- Creates a controlled path for future CI removal from backup or backup cleanup where applicable.
 
 ### Will this update help reduce costs?
 
@@ -132,4 +132,4 @@ Based on an estimated **3-5 minutes of manual validation/update effort per DTSK*
 
 Yes
 
-This supports internal operational control, audit evidence, and risk reduction for server decommission backup validation and backup-infrastructure cleanup readiness.
+This supports internal operational control, audit evidence, and risk reduction for server decommission backup validation and CI removal from backup readiness.
