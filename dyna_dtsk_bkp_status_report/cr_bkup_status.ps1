@@ -1716,12 +1716,12 @@ foreach ($group in $CiGroups) {
         continue
     }
 
-    $CiRows = Search-ProtectedObjectsOnClusters `
+    $CiRows = @(Search-ProtectedObjectsOnClusters `
         -Ci $Ci `
         -CiAliases $CiAliases `
         -SearchTerms $SearchTerms `
         -CandidateClusters $CandidateClusters `
-        -SearchedClusterTermKeys $SearchedClusterTermKeys
+        -SearchedClusterTermKeys $SearchedClusterTermKeys)
 
     $HasDbNamedServer = @($CiAliases | Where-Object { Test-CiLooksLikeDbServer -Ci $_ }).Count -gt 0
     $HasDbRows = @($CiRows | Where-Object { $_.BackupType -in @("SQL", "Oracle") }).Count -gt 0
