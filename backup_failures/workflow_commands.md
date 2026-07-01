@@ -1,0 +1,192 @@
+
+const fingerprint =
+  rows
+    .map(r =>
+      r.IP + "|" + r.BondSlave
+    )
+    .sort()
+    .join(",");
+
+fingerprint:
+  fingerprint,
+
+
+const fingerprint =
+  rows
+    .map(r =>
+      r.IP + "|" + r.BondSlave
+    )
+    .sort()
+    .join(",");
+
+const fingerprint =
+  rows
+    .map(r =>
+      r.IP + "|" + r.BondSlave
+    )
+    .sort()
+    .join(",");
+
+
+{ (result('get_alerts').results | selectattr('AlertCode','equalto','CE030601105') | list | length > 0) or (result('get_alerts').results | selectattr('AlertCode','equalto','CE02513023') | list | length > 0) }}
+
+short_descriptionLIKECohesity Interface DOWN^short_descriptionLIKE{{ result("compute_window").windowKey }}^stateNOT IN6,7^ORDERBYDESCsys_updated_on
+
+short_descriptionLIKECohesity Interface DOWN^short_descriptionLIKEIP: {{ result("validate_interfaces").teamIncident.ipKey }}^stateNOT IN6,7^ORDERBYDESCsys_updated_on
+short_descriptionLIKECohesity Interface DOWN^short_descriptionLIKEIP: {{ item.ipKey }}^stateNOT IN6,7^ORDERBYDESCsys_updated_on
+
+
+correlation_id=COHESITY_LONGRUNNING_JOBS^sys_created_onONToday@javascript:gs.beginningOfToday()@javascript:gs.endOfToday()^ORDERBYDESCsys_created_on
+
+
+
+{{ result("compute_window").correlationId }}
+
+{{ result("compute_window").shortDescKey }}
+
+
+correlation_id={{ result("compute_window").correlationId }}^short_descriptionLIKE{{ result("compute_window").windowKey }}^ORDERBYDESCsys_created_on
+
+
+{{ result("serac_incidents_1")[0].sys_id }}
+
+
+{{ result("serac_incidents_1")[0].sys_id }}
+
+
+{{ result("serac_incidents_1")[0].sys_id }}
+
+{{ result("compute_window").correlationId }}
+
+{{ result("compute_window").shortDescKey }}
+
+{{ result("cohesity_failures").incidentText }}
+
+{{ result("serac_incidents_1")[0].number }}
+
+{{ result("snow_create_1").number }}
+
+{{ result("cohesity_failures").markdownTable }}
+
+Cohesity Backup Failures | {{ result("serac_incidents_1")[0].number }}
+
+Cohesity Backup Failures | {{ result("snow_create_1").number }}
+
+
+{{ result("serac_incidents_1")[0].sys_id != null }}
+{{ result("serac_incidents_1").length > 0 }}
+
+
+
+{{ result("serac_incidents_1")[0].sys_id == null }}
+{{ result("serac_incidents_1").length == 0 }}
+
+
+Cohesity Backup Failures | Window Starting {{ result("compute_window").windowLabel }} [{{ result("compute_window").windowKey }}]
+correlation_id=Cohesity_Backup_Failures^short_descriptionLIKE{{ result("compute_window").windowKey }}^ORDERBYDESCsys_created_on
+
+Cohesity Backup Failures | Window Starting 2025-12-17 18:00 ET → 2025-12-18 18:00 ET [2025-12-17_1800ET]
+
+
+{{ "correlation_id=Cohesity_Backup_Failures^short_descriptionLIKE" ~ result("compute_window").windowKey ~ "^ORDERBYDESCsys_created_on" }}
+{{ "correlation_id=Cohesity_Backup_Failures^short_descriptionLIKE" ~ result("compute_window").windowKey ~ "^ORDERBYDESCsys_created_on" }}
+
+
+{{ "correlation_id=Cohesity_Backup_Failures^short_descriptionLIKE" + result("compute_window").windowKey + "^ORDERBYDESCsys_created_on" }}
+
+{{ "correlation_id=Cohesity_Backup_Failures^short_descriptionLIKE" + result("compute_window").windowKey + "^ORDERBYDESCsys_created_on" }}
+
+{{ "correlation_id=Cohesity_Backup_Failures^short_descriptionLIKE" ~ result("compute_window").windowKey ~ "^ORDERBYDESCsys_created_on" }}
+
+sys_id,number,short_description,sys_created_on,state
+
+
+{{ (result("serac_incidents_1") | length) > 0
+   and (result("compute_window").windowKey in result("serac_incidents_1")[0].short_description) }}
+
+
+{{ (result("serac_incidents_1") | length) == 0
+   or (result("compute_window").windowKey not in result("serac_incidents_1")[0].short_description) }}
+
+
+{{
+  (result("serac_incidents_1") | length) > 0
+  and (result("compute_window").windowKey in result("serac_incidents_1")[0].short_description)
+  and (result("serac_incidents_1")[0].sys_created_on >= result("compute_window").snStartUtc)
+  and (result("serac_incidents_1")[0].sys_created_on <  result("compute_window").snEndUtc)
+}}
+
+
+{{
+  (result("serac_incidents_1") | length) == 0
+  or not (result("compute_window").windowKey in result("serac_incidents_1")[0].short_description)
+  or (result("serac_incidents_1")[0].sys_created_on <  result("compute_window").snStartUtc)
+  or (result("serac_incidents_1")[0].sys_created_on >= result("compute_window").snEndUtc)
+}}
+
+Cohesity Backup Failures | Window Starting {{ result("compute_window").windowLabel }} [{{ result("compute_window").windowKey }}]
+
+{{ result("cohesity_failures").incidentText }}
+
+
+Cohesity Backup Failures | {{ result("compute_window").windowLabel }} | {{ result("snow_create").number }}
+
+Incident: {{ result("snow_create").number }}
+Failures count: {{ result("cohesity_backup_failures").count }}
+
+{{ result("cohesity_backup_failures").markdownTable }}
+
+
+Cohesity Backup Failures | {{ result("compute_window").windowLabel }} | {{ result("snow_update").number }}
+
+Incident: {{ result("snow_update").number }}
+Failures count: {{ result("cohesity_backup_failures").count }}
+
+{{ result("cohesity_backup_failures").markdownTable }}
+
+Incident: {{ result("serac_incidents_1")[0].number }}
+Failures count: {{ result("cohesity_backup_failures").count }}
+
+{{ result("cohesity_backup_failures").markdownTable }}
+
+active=true^correlation_id=Cohesity_Backup_Failures^short_descriptionLIKE{{ result("compute_window").windowKey }}^ORDERBYDESCsys_created_on
+
+active=true^correlation_id=Cohesity_Backup_Failures_{{ result("compute_window").windowKey }}^ORDERBYDESCsys_created_on
+
+
+{{ (result("serac_incidents_1") | length) > 0 and (result("serac_incidents_1")[0].active == "true" or result("serac_incidents_1")[0].active == true) }}
+
+correlation_id=Cohesity_Backup_Failures_{{ result("compute_window").windowKey }}^stateNOT IN6,7^ORDERBYDESCsys_created_on
+
+{{ result("Get_Alerts").results | selectattr("AlertCode","equalto","1105") | list }}
+
+
+{{ result("Get_Alerts").results | selectattr("AlertCode","equalto","CE3601105") | list }}
+
+{{ result("Get_Alerts").results
+   | selectattr("AlertCode","in",["CE3601105","CE36011001"])
+   | list }}
+
+{{ result("Get_Alerts").results
+   | selectattr("AlertCode","search","1105")
+   | list }}
+
+{{ result("Get_Alerts").results
+   | selectattr("AlertCode","search","1105")
+   | list }}
+
+{{ result("Get_Alerts").results
+   | selectattr("AlertCode","search","CE3601105")
+   | list }}
+
+
+
+alertTargets = {{ result("Get_Alerts").results | selectattr("AlertCode","search","CE3601105") | list }}
+
+{{ (result("Get_Alerts").results | selectattr("AlertCode","search","CE3601105") | list | length) > 0 }}
+
+
+
+
+
+
