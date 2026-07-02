@@ -22,21 +22,15 @@ create_team_incident
 
 ## Purpose
 
-`create_team_incident` creates a new Team incident only when `normalize_team_search` confirms that no active Team incident exists for the cluster correlation ID.
+Create a Team incident only when `normalize_team_search` puts an item into `createTeamIncidents[]`.
 
-Normal case:
-
-```text
-SNOW search found 0 active incidents
-  → normalize_team_search.createTeamIncidents[]
-  → create_team_incident
-```
+Do not create directly from `validate_interfaces`.
 
 ## Loop configuration
 
-Loop must be enabled on this task.
+Loop must be enabled.
 
-Loop input:
+Loop input / item list:
 
 ```text
 result("normalize_team_search").createTeamIncidents
@@ -45,70 +39,38 @@ result("normalize_team_search").createTeamIncidents
 Condition:
 
 ```text
-result("normalize_team_search").createTeamIncidents | length > 0
+blank
 ```
 
-Each loop item is one Team incident to create.
+Do not use `| length > 0` in the loop input. The loop input must be the array itself.
 
 ## ServiceNow field mapping
 
-### short_description
+Use Dynatrace loop variable `_.item`.
 
-```text
-{{ _.loopItemValue.short_description }}
+| ServiceNow field | Dynatrace mapping |
+|---|---|
+| Short description | `{{ _.item.short_description }}` |
+| Description | `{{ _.item.description }}` |
+| Correlation ID | `{{ _.item.correlation_id }}` |
+| Comment / Work notes | `{{ _.item.comment }}` |
+
+## Expected loop item shape
+
+`normalize_team_search.createTeamIncidents[]` returns flat objects only:
+
+```json
+[
+  {
+    "short_description": "Cohesity Interface DOWN - Team - <cluster>",
+    "description": "<details>",
+    "correlation_id": "cohesity_ifdown_team_<cluster_id>",
+    "comment": "<details>"
+  }
+]
 ```
 
-### description
-
-```text
-{{ _.loopItemValue.description }}
-```
-
-### correlation_id
-
-```text
-{{ _.loopItemValue.correlation_id }}
-```
-
-### work_notes
-
-```text
-{{ _.loopItemValue.work_notes }}
-```
-
-If `work_notes` is not available in the Dynatrace UI mapping, use:
-
-```text
-{{ _.loopItemValue.description }}
-```
-
-## Optional useful fields
-
-Use these only if they are required in your ServiceNow environment:
-
-```text
-category
-subcategory
-assignment_group
-impact
-urgency
-caller_id
-contact_type
-```
-
-## Important rules
-
-Do not create an incident directly from `validate_interfaces`.
-
-Create only from:
-
-```text
-result("normalize_team_search").createTeamIncidents
-```
-
-This prevents duplicate incidents.
-
-## Expected result for current test scenario
+## Current test scenario
 
 If Ashburn already has a Team incident and San Antonio does not:
 
@@ -117,4 +79,4 @@ createTeamIncidents[] contains San Antonio only
 updateTeamIncidents[] contains Ashburn only
 ```
 
-So this task should create only the San Antonio Team incident.
+So this task creates only the San Antonio Team incident.
