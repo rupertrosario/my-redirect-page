@@ -2,6 +2,12 @@
 // Current workflow:
 //   get_alerts -> validate_interfaces -> snow_search_team -> normalize_team_search
 //
+// IMPORTANT:
+// - snow_search_team is a looped ServiceNow Search task.
+// - normalize_team_search is NOT looped.
+// - This task pairs validate_interfaces.teamIncidents[index]
+//   with snow_search_team loop result[index].
+//
 // Purpose:
 // - Read Team incident candidates from validate_interfaces.teamIncidents[]
 // - Read looped ServiceNow results from snow_search_team
@@ -20,73 +26,222 @@ export default async function () {
     return String(v).trim();
   }
 
-  function getExecResult(execObj) {
-    if (!execObj) return {};
-    return execObj.result || execObj;
+  function isPlainObject(v) {
+    return v !== null && typeof v === "object" && !Array.isArray(v);
   }
 
-  function extractLoopResults(searchResult) {
-    if (!searchResult) return [];
+  function keysOf(v) {
+    return isPlainObject(v) ? Object.keys(v).sort() : [];
+  }
 
-    // Some Dynatrace looped actions return an array directly.
-    if (Array.isArray(searchResult)) return searchResult;
+  function unwrapExecution(v) {
+    if (!v) return {};
 
-    // Common wrapper names for looped task results.
-    if (Array.isArray(searchResult.results)) return searchResult.results;
-    if (Array.isArray(searchResult.loopResults)) return searchResult.loopResults;
-    if (Array.isArray(searchResult.executions)) return searchResult.executions;
-    if (Array.isArray(searchResult.items)) return searchResult.items;
+    // Dynatrace execution() usually exposes task output under .result.
+    if (v.result !== undefined) return v.result;
 
-    // If not looped, treat the single result as one search result.
-    return [searchResult];
+    // Keep the original object if there is no .result wrapper.
+    return v;
+  }
+
+  function findArrayByName(obj, names, maxDepth) {
+    if (!obj || maxDepth < 0) return null;
+
+    if (Array.isArray(obj)) return null;
+    if (!isPlainObject(obj)) return null;
+
+    for (const n of names) {
+      if (Array.isArray(obj[n])) return obj[n];
+    }
+
+    for (const k of Object.keys(obj)) {
+      const child = obj[k];
+      if (isPlainObject(child)) {
+        const found = findArrayByName(child, names, maxDepth - 1);
+        if (found) return found;
+      }
+    }
+
+    return null;
+  }
+
+  function getTeamCandidates(validateExecRaw, validateResult) {
+    const names = [
+      "teamIncidents",
+      "teamIncident",
+      "teamincident",
+      "team_incidents"
+    ];
+
+    const fromResult = findArrayByName(validateResult, names, 3);
+    if (fromResult) return fromResult;
+
+    const fromRaw = findArrayByName(validateExecRaw, names, 4);
+    if (fromRaw) return fromRaw;
+
+    return [];
+  }
+
+  function looksLikeSnowRecordArray(arr) {
+    if (!Array.isArray(arr)) return false;
+    if (arr.length === 0) return true;
+
+    const first = arr[0];
+    if (!isPlainObject(first)) return false;
+
+    return (
+      first.sys_id !== undefined ||
+      first.number !== undefined ||
+      first.correlation_id !== undefined ||
+      first.short_description !== undefined ||
+      first.state !== undefined
+    );
   }
 
   function extractRecords(searchItem) {
     if (!searchItem) return [];
 
-    // ServiceNow table API common shapes.
-    if (Array.isArray(searchItem.result)) return searchItem.result;
-    if (Array.isArray(searchItem.records)) return searchItem.records;
+    // Sometimes the item itself is already the ServiceNow result array.
+    if (looksLikeSnowRecordArray(searchItem)) return searchItem;
+
+    if (!isPlainObject(searchItem)) return [];
+
+    // ServiceNow Table API common shape.
+    if (looksLikeSnowRecordArray(searchItem.result)) return searchItem.result;
+    if (looksLikeSnowRecordArray(searchItem.records)) return searchItem.records;
 
     // Dynatrace / HTTP / connector wrappers.
-    if (searchItem.body) {
-      if (Array.isArray(searchItem.body.result)) return searchItem.body.result;
-      if (Array.isArray(searchItem.body.records)) return searchItem.body.records;
-    }
+    const wrappers = ["body", "response", "output", "data", "value"];
 
-    if (searchItem.response) {
-      if (Array.isArray(searchItem.response.result)) return searchItem.response.result;
-      if (Array.isArray(searchItem.response.records)) return searchItem.response.records;
-      if (searchItem.response.body) {
-        if (Array.isArray(searchItem.response.body.result)) return searchItem.response.body.result;
-        if (Array.isArray(searchItem.response.body.records)) return searchItem.response.body.records;
-      }
-    }
+    for (const w of wrappers) {
+      const child = searchItem[w];
+      if (!child) continue;
 
-    if (searchItem.output) {
-      if (Array.isArray(searchItem.output.result)) return searchItem.output.result;
-      if (Array.isArray(searchItem.output.records)) return searchItem.output.records;
-      if (searchItem.output.body) {
-        if (Array.isArray(searchItem.output.body.result)) return searchItem.output.body.result;
-        if (Array.isArray(searchItem.output.body.records)) return searchItem.output.body.records;
+      if (looksLikeSnowRecordArray(child)) return child;
+
+      if (isPlainObject(child)) {
+        if (looksLikeSnowRecordArray(child.result)) return child.result;
+        if (looksLikeSnowRecordArray(child.records)) return child.records;
+
+        if (child.body) {
+          if (looksLikeSnowRecordArray(child.body)) return child.body;
+          if (isPlainObject(child.body)) {
+            if (looksLikeSnowRecordArray(child.body.result)) return child.body.result;
+            if (looksLikeSnowRecordArray(child.body.records)) return child.body.records;
+          }
+        }
       }
     }
 
     return [];
   }
 
+  function looksLikeLoopItem(v) {
+    if (!isPlainObject(v)) return false;
+
+    if (v.loopItemValue !== undefined) return true;
+    if (v.iteration !== undefined) return true;
+    if (v.item !== undefined && (v.result !== undefined || v.output !== undefined || v.body !== undefined)) return true;
+    if (v.executionId !== undefined && (v.result !== undefined || v.output !== undefined)) return true;
+    if (v.taskExecutionId !== undefined && (v.result !== undefined || v.output !== undefined)) return true;
+
+    // A ServiceNow search loop item can also just be an object that contains result/body/output.
+    if (v.result !== undefined || v.records !== undefined || v.body !== undefined || v.response !== undefined || v.output !== undefined) return true;
+
+    return false;
+  }
+
+  function pickBestLoopArray(candidates, expectedCount) {
+    if (!candidates.length) return [];
+
+    // Prefer an array matching teamIncidents count.
+    for (const c of candidates) {
+      if (expectedCount > 0 && c.arr.length === expectedCount) return c.arr;
+    }
+
+    // Then prefer arrays whose members look like loop/search results.
+    for (const c of candidates) {
+      if (c.arr.some(looksLikeLoopItem)) return c.arr;
+    }
+
+    return candidates[0].arr;
+  }
+
+  function collectArrays(obj, path, out, maxDepth) {
+    if (!obj || maxDepth < 0) return;
+
+    if (Array.isArray(obj)) {
+      out.push({ path: path, arr: obj });
+      return;
+    }
+
+    if (!isPlainObject(obj)) return;
+
+    for (const k of Object.keys(obj)) {
+      collectArrays(obj[k], path ? path + "." + k : k, out, maxDepth - 1);
+    }
+  }
+
+  function getSearchLoopResults(searchExecRaw, searchResult, expectedCount) {
+    // If execution().result itself is an array, this is the normal loop wrapper.
+    if (Array.isArray(searchResult)) return searchResult;
+
+    const commonNames = [
+      "iterations",
+      "loopResults",
+      "loopExecutions",
+      "taskExecutions",
+      "executionResults",
+      "results",
+      "items"
+    ];
+
+    const direct = findArrayByName(searchResult, commonNames, 2);
+    if (direct && !looksLikeSnowRecordArray(direct)) return direct;
+
+    const directRaw = findArrayByName(searchExecRaw, commonNames, 3);
+    if (directRaw && !looksLikeSnowRecordArray(directRaw)) return directRaw;
+
+    const all = [];
+    collectArrays(searchResult, "result", all, 4);
+    collectArrays(searchExecRaw, "raw", all, 5);
+
+    // Exclude ServiceNow record arrays from being treated as loop arrays unless this is a single expected item.
+    const loopCandidates = all.filter(function (c) {
+      if (!Array.isArray(c.arr)) return false;
+      if (expectedCount === 1 && looksLikeSnowRecordArray(c.arr)) return true;
+      return !looksLikeSnowRecordArray(c.arr);
+    });
+
+    const picked = pickBestLoopArray(loopCandidates, expectedCount);
+    if (picked.length) return picked;
+
+    // Non-loop/single-result fallback.
+    if (isPlainObject(searchResult) && (searchResult.result !== undefined || searchResult.records !== undefined || searchResult.body !== undefined || searchResult.output !== undefined)) {
+      return [searchResult];
+    }
+
+    return [];
+  }
+
+  function searchItemDebug(searchItem) {
+    const records = extractRecords(searchItem);
+    return {
+      keys: keysOf(searchItem),
+      recordCount: records.length,
+      firstRecordKeys: records.length ? keysOf(records[0]) : []
+    };
+  }
+
   try {
-    const validateExec = await execution("validate_interfaces");
-    const validateResult = getExecResult(validateExec);
+    const validateExecRaw = await execution("validate_interfaces");
+    const validateResult = unwrapExecution(validateExecRaw);
 
-    const searchExec = await execution("snow_search_team");
-    const searchResult = getExecResult(searchExec);
+    const searchExecRaw = await execution("snow_search_team");
+    const searchResult = unwrapExecution(searchExecRaw);
 
-    const teamCandidates = Array.isArray(validateResult.teamIncidents)
-      ? validateResult.teamIncidents
-      : [];
-
-    const searchLoopResults = extractLoopResults(searchResult);
+    const teamCandidates = getTeamCandidates(validateExecRaw, validateResult);
+    const searchLoopResults = getSearchLoopResults(searchExecRaw, searchResult, teamCandidates.length);
 
     const createTeamIncidents = [];
     const updateTeamIncidents = [];
@@ -166,7 +321,17 @@ export default async function () {
       noWriteCount: noWriteTeamIncidents.length,
       createTeamIncidents: createTeamIncidents,
       updateTeamIncidents: updateTeamIncidents,
-      noWriteTeamIncidents: noWriteTeamIncidents
+      noWriteTeamIncidents: noWriteTeamIncidents,
+
+      debug: {
+        validateRawKeys: keysOf(validateExecRaw),
+        validateResultKeys: keysOf(validateResult),
+        searchRawKeys: keysOf(searchExecRaw),
+        searchResultKeys: keysOf(searchResult),
+        firstTeamCandidateKeys: teamCandidates.length ? keysOf(teamCandidates[0]) : [],
+        firstSearchItem: searchLoopResults.length ? searchItemDebug(searchLoopResults[0]) : null,
+        secondSearchItem: searchLoopResults.length > 1 ? searchItemDebug(searchLoopResults[1]) : null
+      }
     };
 
   } catch (e) {
