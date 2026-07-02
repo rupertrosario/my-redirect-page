@@ -1,10 +1,13 @@
 // Dynatrace JS action: Normalize Team ServiceNow search results
+// Current workflow:
+//   get_alerts -> validate_interfaces -> snow_search_team -> normalize_team_search
+//
 // Purpose:
 // - Read Team incident candidates from validate_interfaces.teamIncidents[]
 // - Read looped ServiceNow results from snow_search_team
 // - Split Team items into create/update/no-write arrays
 //
-// Expected normal cases per Team item:
+// Expected cases per Team item:
 // - 0 active incidents found => createTeamIncidents[]
 // - 1 active incident found  => updateTeamIncidents[]
 // - 2+ active incidents      => noWriteTeamIncidents[] safety guard
@@ -12,11 +15,6 @@
 import { execution } from "@dynatrace-sdk/automation-utils";
 
 export default async function () {
-  function toArray(v) {
-    if (!v) return [];
-    return Array.isArray(v) ? v : [v];
-  }
-
   function norm(v) {
     if (v === null || v === undefined) return "";
     return String(v).trim();
@@ -25,20 +23,6 @@ export default async function () {
   function getExecResult(execObj) {
     if (!execObj) return {};
     return execObj.result || execObj;
-  }
-
-  function pickTeamCandidates(validateResult, teamResult) {
-    // Preferred current design: snow_search_team loops directly on validate_interfaces.teamIncidents[]
-    if (validateResult && Array.isArray(validateResult.teamIncidents)) {
-      return validateResult.teamIncidents;
-    }
-
-    // Fallback if team_iterations is still being used as a bridge.
-    if (teamResult && Array.isArray(teamResult.teamIncidents)) {
-      return teamResult.teamIncidents;
-    }
-
-    return [];
   }
 
   function extractLoopResults(searchResult) {
@@ -53,18 +37,18 @@ export default async function () {
     if (Array.isArray(searchResult.executions)) return searchResult.executions;
     if (Array.isArray(searchResult.items)) return searchResult.items;
 
-    // If not looped, treat the single result as one loop result.
+    // If not looped, treat the single result as one search result.
     return [searchResult];
   }
 
   function extractRecords(searchItem) {
     if (!searchItem) return [];
 
-    // ServiceNow table API common shape: { result: [...] }
+    // ServiceNow table API common shapes.
     if (Array.isArray(searchItem.result)) return searchItem.result;
     if (Array.isArray(searchItem.records)) return searchItem.records;
 
-    // HTTP/custom action wrappers.
+    // Dynatrace / HTTP / connector wrappers.
     if (searchItem.body) {
       if (Array.isArray(searchItem.body.result)) return searchItem.body.result;
       if (Array.isArray(searchItem.body.records)) return searchItem.body.records;
@@ -95,18 +79,13 @@ export default async function () {
     const validateExec = await execution("validate_interfaces");
     const validateResult = getExecResult(validateExec);
 
-    let teamResult = {};
-    try {
-      const teamExec = await execution("team_iterations");
-      teamResult = getExecResult(teamExec);
-    } catch (eTeam) {
-      teamResult = {};
-    }
-
     const searchExec = await execution("snow_search_team");
     const searchResult = getExecResult(searchExec);
 
-    const teamCandidates = pickTeamCandidates(validateResult, teamResult);
+    const teamCandidates = Array.isArray(validateResult.teamIncidents)
+      ? validateResult.teamIncidents
+      : [];
+
     const searchLoopResults = extractLoopResults(searchResult);
 
     const createTeamIncidents = [];
