@@ -22,32 +22,22 @@ update_team_incident
 
 ## Purpose
 
-`update_team_incident` updates existing active Team incidents when `normalize_team_search` confirms that exactly one active incident exists for each Team correlation ID.
+Update existing active Team incidents when `normalize_team_search` puts items into `updateTeamIncidents[]`.
 
-This task can update more than one incident when it is looped.
+This task can update multiple incidents because it is looped.
 
 Example:
 
 ```text
-Ashburn has one existing Team incident
-San Antonio has one existing Team incident
-
-normalize_team_search.updateTeamIncidents[] has 2 items
+updateTeamIncidents[] has 2 items
 update_team_incident loop runs 2 times
-```
-
-Result:
-
-```text
-Loop 1 updates Ashburn incident
-Loop 2 updates San Antonio incident
 ```
 
 ## Loop configuration
 
-Loop must be enabled on this task.
+Loop must be enabled.
 
-Loop input:
+Loop input / item list:
 
 ```text
 result("normalize_team_search").updateTeamIncidents
@@ -56,10 +46,10 @@ result("normalize_team_search").updateTeamIncidents
 Condition:
 
 ```text
-result("normalize_team_search").updateTeamIncidents | length > 0
+blank
 ```
 
-Each loop item is one existing Team incident to update.
+Do not use `| length > 0` in the loop input. The loop input must be the array itself.
 
 ## ServiceNow field mapping
 
@@ -70,25 +60,25 @@ Incident number
 Comment
 ```
 
-Use this mapping:
+Use Dynatrace loop variable `_.item`.
 
 | ServiceNow field | Dynatrace mapping |
 |---|---|
-| Incident number | `{{ _.loopItemValue.number }}` |
-| Comment | `{{ _.loopItemValue.comment }}` |
+| Incident number | `{{ _.item.number }}` |
+| Comment | `{{ _.item.comment }}` |
 
-## Where `comment` comes from
+## Expected loop item shape
 
-`normalize_team_search` now adds this field to every update item:
+`normalize_team_search.updateTeamIncidents[]` returns flat objects only:
 
-```js
-comment: candidate.comment || candidate.work_notes || candidate.description || fallback text
-```
-
-So the update task should use:
-
-```text
-{{ _.loopItemValue.comment }}
+```json
+[
+  {
+    "number": "INCxxxxxxx",
+    "comment": "<details>",
+    "correlation_id": "cohesity_ifdown_team_<cluster_id>"
+  }
+]
 ```
 
 ## Important rule: multiple updates vs duplicate incidents
@@ -125,18 +115,16 @@ noWriteTeamIncidents[]
 
 The workflow must not update either incident because duplicate active incidents exist for the same correlation ID.
 
-## Do not use sys_id for this action
-
-Your ServiceNow Update Incident action expects incident number, so use:
-
-```text
-{{ _.loopItemValue.number }}
-```
+## Do not map from snow_search_team directly
 
 Do not use:
 
 ```text
-{{ _.loopItemValue.sys_id }}
+result("snow_search_team")[0].number
 ```
 
-unless you switch to a ServiceNow update action that specifically expects `sys_id`.
+The update task must use the normalized loop item:
+
+```text
+{{ _.item.number }}
+```
