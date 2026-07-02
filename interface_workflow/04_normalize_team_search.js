@@ -8,6 +8,12 @@
 // - Dynatrace previous task results must be read from the current workflow execution:
 //     const ex = await execution(execution_id)
 //     const previous = await ex.result("task_id")
+//
+// Output contract:
+// - createTeamIncidents[] is used by create_team_incident.
+// - updateTeamIncidents[] is used by update_team_incident.
+// - update_team_incident can update multiple incidents as long as the task is looped.
+// - Each updateTeamIncidents[] item includes number and comment.
 
 import { execution } from "@dynatrace-sdk/automation-utils";
 
@@ -114,7 +120,7 @@ export default async function ({ execution_id }) {
     if (first.correlation_id !== undefined || first.CorrelationId !== undefined) score += 10;
     if (first.cluster_id !== undefined || first.ClusterId !== undefined) score += 5;
     if (first.short_description !== undefined) score += 3;
-    if (first.description !== undefined || first.work_notes !== undefined) score += 2;
+    if (first.description !== undefined || first.work_notes !== undefined || first.comment !== undefined) score += 2;
     if (first.type === "TEAM") score += 2;
     return score;
   }
@@ -263,6 +269,20 @@ export default async function ({ execution_id }) {
     return best;
   }
 
+  function buildComment(candidate) {
+    const comment = norm(candidate.comment || candidate.work_notes || candidate.description);
+    if (comment) return comment;
+
+    const cluster = norm(candidate.clusterName || candidate.ClusterName || candidate.cluster_name || candidate.Cluster);
+    const correlation = norm(candidate.correlation_id || candidate.CorrelationId);
+
+    return [
+      "Cohesity Interface DOWN workflow update.",
+      cluster ? "Cluster: " + cluster : "",
+      correlation ? "Correlation ID: " + correlation : ""
+    ].filter(Boolean).join("\n");
+  }
+
   function searchItemDebug(item) {
     const records = extractRecords(item);
     return {
@@ -332,10 +352,12 @@ export default async function ({ execution_id }) {
       const searchItem = searchLoopResults[i] || {};
       const records = extractRecords(searchItem);
       const correlation_id = norm(candidate.correlation_id || candidate.CorrelationId);
+      const comment = buildComment(candidate);
 
       if (!correlation_id) {
         noWriteTeamIncidents.push({
           ...candidate,
+          comment: comment,
           action: "no_write",
           reason: "missing_correlation_id",
           matchedCount: records.length
@@ -347,6 +369,7 @@ export default async function ({ execution_id }) {
         createTeamIncidents.push({
           ...candidate,
           correlation_id: correlation_id,
+          comment: comment,
           action: "create",
           reason: "no_active_incident_found",
           matchedCount: 0
@@ -360,6 +383,7 @@ export default async function ({ execution_id }) {
         updateTeamIncidents.push({
           ...candidate,
           correlation_id: correlation_id,
+          comment: comment,
           action: "update",
           reason: "one_active_incident_found",
           matchedCount: 1,
@@ -376,6 +400,7 @@ export default async function ({ execution_id }) {
       noWriteTeamIncidents.push({
         ...candidate,
         correlation_id: correlation_id,
+        comment: comment,
         action: "no_write",
         reason: "duplicate_active_incidents_found",
         matchedCount: records.length,
