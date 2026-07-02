@@ -22,14 +22,25 @@ update_team_incident
 
 ## Purpose
 
-`update_team_incident` updates an existing active Team incident when `normalize_team_search` confirms that exactly one active incident exists for the cluster correlation ID.
+`update_team_incident` updates existing active Team incidents when `normalize_team_search` confirms that exactly one active incident exists for each Team correlation ID.
 
-Normal case:
+This task can update more than one incident when it is looped.
+
+Example:
 
 ```text
-SNOW search found 1 active incident
-  → normalize_team_search.updateTeamIncidents[]
-  → update_team_incident
+Ashburn has one existing Team incident
+San Antonio has one existing Team incident
+
+normalize_team_search.updateTeamIncidents[] has 2 items
+update_team_incident loop runs 2 times
+```
+
+Result:
+
+```text
+Loop 1 updates Ashburn incident
+Loop 2 updates San Antonio incident
 ```
 
 ## Loop configuration
@@ -50,73 +61,82 @@ result("normalize_team_search").updateTeamIncidents | length > 0
 
 Each loop item is one existing Team incident to update.
 
-## ServiceNow record identifier
-
-Use the `sys_id` from normalize output.
-
-```text
-{{ _.loopItemValue.sys_id }}
-```
-
-This `sys_id` comes from the matching ServiceNow search result.
-
 ## ServiceNow field mapping
 
-### sys_id / Record ID
+Your ServiceNow Update Incident action has only these fields:
 
 ```text
-{{ _.loopItemValue.sys_id }}
+Incident number
+Comment
 ```
 
-### work_notes
+Use this mapping:
+
+| ServiceNow field | Dynatrace mapping |
+|---|---|
+| Incident number | `{{ _.loopItemValue.number }}` |
+| Comment | `{{ _.loopItemValue.comment }}` |
+
+## Where `comment` comes from
+
+`normalize_team_search` now adds this field to every update item:
+
+```js
+comment: candidate.comment || candidate.work_notes || candidate.description || fallback text
+```
+
+So the update task should use:
 
 ```text
-{{ _.loopItemValue.work_notes }}
+{{ _.loopItemValue.comment }}
 ```
 
-If `work_notes` is not available in the Dynatrace UI mapping, use:
+## Important rule: multiple updates vs duplicate incidents
+
+These are different cases.
+
+### Valid case: two different incidents need update
 
 ```text
-{{ _.loopItemValue.description }}
+Ashburn correlation_id returns 1 active incident
+San Antonio correlation_id returns 1 active incident
 ```
 
-## Optional fields
-
-Usually do not update `short_description` unless you want the latest cluster details reflected in the title.
-
-If needed:
+Expected normalize output:
 
 ```text
-short_description = {{ _.loopItemValue.short_description }}
+updateCount = 2
+updateTeamIncidents[] = [Ashburn item, San Antonio item]
 ```
 
-## Important rules
+This is valid. The update task loops twice.
 
-Do not update directly from `snow_search_team`.
-
-Update only from:
+### Unsafe case: one correlation_id returns two active incidents
 
 ```text
-result("normalize_team_search").updateTeamIncidents
+Ashburn correlation_id returns 2 active incidents
 ```
 
-This ensures the workflow updates only when exactly one active incident exists.
-
-Do not update if normalize sends the item to:
+Expected normalize output:
 
 ```text
 noWriteTeamIncidents[]
 ```
 
-`noWriteTeamIncidents[]` means the search result was unsafe, usually because of duplicate active incidents or missing correlation ID.
+The workflow must not update either incident because duplicate active incidents exist for the same correlation ID.
 
-## Expected result for current test scenario
+## Do not use sys_id for this action
 
-If Ashburn already has a Team incident and San Antonio does not:
+Your ServiceNow Update Incident action expects incident number, so use:
 
 ```text
-createTeamIncidents[] contains San Antonio only
-updateTeamIncidents[] contains Ashburn only
+{{ _.loopItemValue.number }}
 ```
 
-So this task should update only the Ashburn Team incident.
+Do not use:
+
+```text
+{{ _.loopItemValue.sys_id }}
+```
+
+unless you switch to a ServiceNow update action that specifically expects `sys_id`.
