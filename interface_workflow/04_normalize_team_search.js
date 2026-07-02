@@ -5,14 +5,13 @@
 // IMPORTANT:
 // - snow_search_team / snow_search is a LOOPED ServiceNow Search task.
 // - normalize_team_search is NOT looped.
-// - This task pairs validate teamIncidents[index] with SNOW search loop result[index].
-//
-// This version tries multiple possible Dynatrace task IDs because execution("task_id")
-// must match the exact task ID on the canvas.
+// - Dynatrace previous task results must be read from the current workflow execution:
+//     const ex = await execution(execution_id)
+//     const previous = await ex.result("task_id")
 
 import { execution } from "@dynatrace-sdk/automation-utils";
 
-export default async function () {
+export default async function ({ execution_id }) {
   const validateTaskIds = [
     "validate_interfaces",
     "validate"
@@ -37,42 +36,6 @@ export default async function () {
 
   function keysOf(v) {
     return isObj(v) ? Object.keys(v).sort() : [];
-  }
-
-  function unwrap(v) {
-    if (!v) return {};
-    if (v.result !== undefined) return v.result;
-    return v;
-  }
-
-  async function getFirstExecution(taskIds) {
-    const errors = [];
-
-    for (const taskId of taskIds) {
-      try {
-        const raw = await execution(taskId);
-        return {
-          found: true,
-          taskId: taskId,
-          raw: raw,
-          result: unwrap(raw),
-          errors: errors
-        };
-      } catch (e) {
-        errors.push({
-          taskId: taskId,
-          error: String(e && e.message ? e.message : e)
-        });
-      }
-    }
-
-    return {
-      found: false,
-      taskId: "",
-      raw: {},
-      result: {},
-      errors: errors
-    };
   }
 
   function pathGet(obj, path) {
@@ -100,22 +63,46 @@ export default async function () {
     }
   }
 
-  function summarizeArrays(raw, result) {
-    const found = [];
-    const values = [];
-    collectArrayValues(result, "result", values, 6);
-    collectArrayValues(raw, "raw", values, 7);
+  function summarizeArrays(value) {
+    const arrays = [];
+    collectArrayValues(value, "result", arrays, 8);
 
-    for (const item of values.slice(0, 30)) {
+    return arrays.slice(0, 30).map(function (item) {
       const a = item.value;
-      found.push({
+      return {
         path: item.path,
         length: Array.isArray(a) ? a.length : 0,
         firstKeys: Array.isArray(a) && a.length && isObj(a[0]) ? keysOf(a[0]) : []
-      });
+      };
+    });
+  }
+
+  async function getTaskResult(ex, taskIds) {
+    const errors = [];
+
+    for (const taskId of taskIds) {
+      try {
+        const result = await ex.result(taskId);
+        return {
+          found: true,
+          taskId: taskId,
+          result: result,
+          errors: errors
+        };
+      } catch (e) {
+        errors.push({
+          taskId: taskId,
+          error: String(e && e.message ? e.message : e)
+        });
+      }
     }
 
-    return found;
+    return {
+      found: false,
+      taskId: "",
+      result: {},
+      errors: errors
+    };
   }
 
   function scoreTeamArray(a) {
@@ -132,7 +119,7 @@ export default async function () {
     return score;
   }
 
-  function getTeamCandidates(validateRaw, validateResult) {
+  function getTeamCandidates(validateResult) {
     const directPaths = [
       "teamIncidents",
       "result.teamIncidents",
@@ -144,16 +131,12 @@ export default async function () {
     ];
 
     for (const p of directPaths) {
-      const v1 = pathGet(validateResult, p);
-      if (Array.isArray(v1)) return { path: "validateResult." + p, value: v1 };
-
-      const v2 = pathGet(validateRaw, p);
-      if (Array.isArray(v2)) return { path: "validateRaw." + p, value: v2 };
+      const v = pathGet(validateResult, p);
+      if (Array.isArray(v)) return { path: p, value: v };
     }
 
     const arrays = [];
-    collectArrayValues(validateResult, "validateResult", arrays, 7);
-    collectArrayValues(validateRaw, "validateRaw", arrays, 8);
+    collectArrayValues(validateResult, "validateResult", arrays, 8);
 
     let best = { path: "not_found", value: [] };
     let bestScore = 0;
@@ -232,7 +215,7 @@ export default async function () {
     return score;
   }
 
-  function getSearchLoopResults(searchRaw, searchResult, expectedCount) {
+  function getSearchLoopResults(searchResult, expectedCount) {
     if (Array.isArray(searchResult) && !isSnowRecordArray(searchResult)) {
       return { path: "searchResult", value: searchResult };
     }
@@ -253,16 +236,12 @@ export default async function () {
     ];
 
     for (const p of directPaths) {
-      const v1 = pathGet(searchResult, p);
-      if (Array.isArray(v1) && !isSnowRecordArray(v1)) return { path: "searchResult." + p, value: v1 };
-
-      const v2 = pathGet(searchRaw, p);
-      if (Array.isArray(v2) && !isSnowRecordArray(v2)) return { path: "searchRaw." + p, value: v2 };
+      const v = pathGet(searchResult, p);
+      if (Array.isArray(v) && !isSnowRecordArray(v)) return { path: p, value: v };
     }
 
     const arrays = [];
-    collectArrayValues(searchResult, "searchResult", arrays, 7);
-    collectArrayValues(searchRaw, "searchRaw", arrays, 8);
+    collectArrayValues(searchResult, "searchResult", arrays, 8);
 
     let best = { path: "not_found", value: [] };
     let bestScore = 0;
@@ -294,13 +273,30 @@ export default async function () {
   }
 
   try {
-    const validateExec = await getFirstExecution(validateTaskIds);
-    const searchExec = await getFirstExecution(snowSearchTaskIds);
+    if (!execution_id) {
+      return {
+        ok: false,
+        error: "Missing execution_id. Use export default async function ({ execution_id }) in the Dynatrace JS task.",
+        inputTeamCount: 0,
+        searchLoopCount: 0,
+        createCount: 0,
+        updateCount: 0,
+        noWriteCount: 0,
+        createTeamIncidents: [],
+        updateTeamIncidents: [],
+        noWriteTeamIncidents: []
+      };
+    }
+
+    const ex = await execution(execution_id);
+
+    const validateExec = await getTaskResult(ex, validateTaskIds);
+    const searchExec = await getTaskResult(ex, snowSearchTaskIds);
 
     if (!validateExec.found || !searchExec.found) {
       return {
         ok: false,
-        error: "Required previous task execution not found",
+        error: "Required previous task result not found in this workflow execution",
         inputTeamCount: 0,
         searchLoopCount: 0,
         createCount: 0,
@@ -310,6 +306,7 @@ export default async function () {
         updateTeamIncidents: [],
         noWriteTeamIncidents: [],
         debug: {
+          execution_id: execution_id,
           selectedValidateTask: validateExec.taskId,
           selectedSearchTask: searchExec.taskId,
           validateTried: validateTaskIds,
@@ -320,10 +317,10 @@ export default async function () {
       };
     }
 
-    const teamPick = getTeamCandidates(validateExec.raw, validateExec.result);
+    const teamPick = getTeamCandidates(validateExec.result);
     const teamCandidates = teamPick.value;
 
-    const searchPick = getSearchLoopResults(searchExec.raw, searchExec.result, teamCandidates.length);
+    const searchPick = getSearchLoopResults(searchExec.result, teamCandidates.length);
     const searchLoopResults = searchPick.value;
 
     const createTeamIncidents = [];
@@ -398,6 +395,8 @@ export default async function () {
       ok: true,
       selectedValidateTask: validateExec.taskId,
       selectedSearchTask: searchExec.taskId,
+      selectedTeamPath: teamPick.path,
+      selectedSearchLoopPath: searchPick.path,
       inputTeamCount: teamCandidates.length,
       searchLoopCount: searchLoopResults.length,
       createCount: createTeamIncidents.length,
@@ -407,16 +406,11 @@ export default async function () {
       updateTeamIncidents: updateTeamIncidents,
       noWriteTeamIncidents: noWriteTeamIncidents,
       debug: {
-        selectedValidateTask: validateExec.taskId,
-        selectedSearchTask: searchExec.taskId,
-        selectedTeamPath: teamPick.path,
-        selectedSearchLoopPath: searchPick.path,
-        validateRawKeys: keysOf(validateExec.raw),
+        execution_id: execution_id,
         validateResultKeys: keysOf(validateExec.result),
-        searchRawKeys: keysOf(searchExec.raw),
         searchResultKeys: keysOf(searchExec.result),
-        validateArrayPaths: summarizeArrays(validateExec.raw, validateExec.result),
-        searchArrayPaths: summarizeArrays(searchExec.raw, searchExec.result),
+        validateArrayPaths: summarizeArrays(validateExec.result),
+        searchArrayPaths: summarizeArrays(searchExec.result),
         firstTeamCandidateKeys: teamCandidates.length ? keysOf(teamCandidates[0]) : [],
         firstSearchItem: searchLoopResults.length ? searchItemDebug(searchLoopResults[0]) : null,
         secondSearchItem: searchLoopResults.length > 1 ? searchItemDebug(searchLoopResults[1]) : null
