@@ -1,292 +1,359 @@
 #requires -Version 5.1
 <#
-Active Cohesity Physical protection group inventory.
-GET-only. Output: console, GridView, CSV.
+.SYNOPSIS
+    Active Cohesity Physical Protection Group inventory.
+
+.DESCRIPTION
+    GET-only Helios report for active kPhysical Protection Groups.
+    Uses the documented physical schema directly:
+      physicalParams.protectionType
+      physicalParams.fileProtectionTypeParams.objects[].filePaths[].includedPath
+      physicalParams.fileProtectionTypeParams.objects[].filePaths[].excludedPaths
+      physicalParams.fileProtectionTypeParams.globalExcludePaths
+      physicalParams.volumeProtectionTypeParams.objects[].volumeGuids
+
+    Output: console preview, Out-GridView, and CSV.
 #>
 
 [CmdletBinding()]
 param(
-    [string]$HeliosUrl = 'https://helios.cohesity.com',
-    [string]$KeyFilePath = (Join-Path 'X:\PowerShell\Cohesity_API_Scripts\DO_NOT_Delete' ('api' + 'key.txt')),
+    [string]$HeliosUrl  = 'https://helios.cohesity.com',
+    [string]$ApiKeyPath = (Join-Path 'X:\PowerShell\Cohesity_API_Scripts\DO_NOT_Delete' ('api' + 'key.txt')),
     [string]$OutputRoot = 'X:\PowerShell\cohesity_automation\protection_group_inventory\by_type\physical',
     [switch]$NoGridView
 )
 
 $ErrorActionPreference = 'Stop'
 
-function Get-Val {
-    param([object]$Obj, [string[]]$Names)
-    if ($null -eq $Obj) { return $null }
-    foreach ($n in $Names) {
-        $p = $Obj.PSObject.Properties | Where-Object { $_.Name -ieq $n } | Select-Object -First 1
-        if ($p -and $null -ne $p.Value -and -not [string]::IsNullOrWhiteSpace([string]$p.Value)) { return $p.Value }
+function Get-Value {
+    param([object]$Object, [string[]]$Names)
+    if ($null -eq $Object) { return $null }
+    foreach ($name in $Names) {
+        $prop = $Object.PSObject.Properties | Where-Object { $_.Name -ieq $name } | Select-Object -First 1
+        if ($null -ne $prop -and $null -ne $prop.Value -and -not [string]::IsNullOrWhiteSpace([string]$prop.Value)) {
+            return $prop.Value
+        }
     }
     return $null
 }
 
-function Is-List {
-    param([object]$Val)
-    return ($null -ne $Val -and $Val -is [System.Collections.IEnumerable] -and -not ($Val -is [string]) -and -not ($Val -is [hashtable]))
+function Get-NestedValue {
+    param([object]$Object, [string[]]$Path)
+    $current = $Object
+    foreach ($part in $Path) {
+        $current = Get-Value $current @($part)
+        if ($null -eq $current) { return $null }
+    }
+    return $current
 }
 
-function To-ET {
+function To-List {
+    param([object]$Value)
+    if ($null -eq $Value) { return @() }
+    if ($Value -is [string]) { return @($Value) }
+    if ($Value -is [System.Collections.IEnumerable]) { return @($Value) }
+    return @($Value)
+}
+
+function Join-List {
+    param([object]$Value)
+    $items = foreach ($item in (To-List $Value)) {
+        if ($null -eq $item) { continue }
+        if ($item -is [string]) { $item; continue }
+
+        $simple = Get-Value $item @('includedPath','path','filePath','name','displayName','value','id')
+        if ($null -ne $simple) { [string]$simple }
+        else { $item | ConvertTo-Json -Compress -Depth 8 }
+    }
+    return (($items | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique) -join '; ')
+}
+
+function Convert-UsecsToET {
     param([object]$Usecs)
     if ($null -eq $Usecs -or [string]::IsNullOrWhiteSpace([string]$Usecs)) { return '' }
     try {
         $dto = [DateTimeOffset]::FromUnixTimeMilliseconds([int64]([double]$Usecs / 1000))
-        $tz  = [TimeZoneInfo]::FindSystemTimeZoneById('Eastern Standard Time')
+        $tz = [TimeZoneInfo]::FindSystemTimeZoneById('Eastern Standard Time')
         return ([TimeZoneInfo]::ConvertTime($dto, $tz)).ToString('yyyy-MM-dd HH:mm:ss')
-    } catch { return '' }
-}
-
-function Join-Any {
-    param([object]$Val)
-    if ($null -eq $Val) { return '' }
-    if ($Val -is [string]) { return $Val }
-    if (Is-List $Val) {
-        $x = foreach ($v in @($Val)) { Join-Any $v }
-        return (($x | Where-Object { $_ } | Select-Object -Unique) -join '; ')
+    } catch {
+        return ''
     }
-    $simple = Get-Val $Val @('path','filePath','includePath','includedPath','excludePath','excludedPath','name','displayName','value')
-    if ($simple) { return [string]$simple }
-    return ($Val | ConvertTo-Json -Compress -Depth 8)
 }
 
-function Find-ByName {
-    param(
-        [object]$Root,
-        [string[]]$Names,
-        [string[]]$Skip = @(),
-        [int]$Depth = 6
-    )
-    if ($null -eq $Root -or $Depth -lt 0 -or $Root -is [string]) { return @() }
-
-    $out = New-Object System.Collections.Generic.List[object]
-    if (Is-List $Root) {
-        foreach ($i in @($Root)) {
-            foreach ($v in @(Find-ByName -Root $i -Names $Names -Skip $Skip -Depth ($Depth - 1))) { [void]$out.Add($v) }
-        }
-        return @($out)
-    }
-
-    foreach ($p in @($Root.PSObject.Properties)) {
-        if ($Skip | Where-Object { $_ -ieq $p.Name }) { continue }
-        if ($Names | Where-Object { $_ -ieq $p.Name }) { if ($null -ne $p.Value) { [void]$out.Add($p.Value) } }
-        if ($null -ne $p.Value -and -not ($p.Value -is [string])) {
-            foreach ($v in @(Find-ByName -Root $p.Value -Names $Names -Skip $Skip -Depth ($Depth - 1))) { [void]$out.Add($v) }
-        }
-    }
-    return @($out)
-}
-
-function Join-Found {
-    param([object]$Root, [string[]]$Names, [string[]]$Skip = @(), [int]$Depth = 6)
-    $flat = foreach ($v in @(Find-ByName -Root $Root -Names $Names -Skip $Skip -Depth $Depth)) { Join-Any $v }
-    return (($flat | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique) -join '; ')
-}
-
-function Get-Array {
-    param([object]$Resp, [string[]]$Props)
-    if ($null -eq $Resp) { return @() }
-    if ($Resp -is [array]) { return @($Resp) }
-    foreach ($p in $Props) {
-        $v = Get-Val $Resp @($p)
-        if ($null -ne $v) { return @($v) }
-    }
-    return @($Resp)
-}
-
-function Invoke-Get {
+function Invoke-CohesityGet {
     param([string]$Uri, [hashtable]$Headers)
     Invoke-RestMethod -Method Get -Uri $Uri -Headers $Headers -TimeoutSec 120
 }
 
-function Find-ClustersDeep {
-    param([object]$Root, [int]$Depth = 8)
-    if ($null -eq $Root -or $Depth -lt 0 -or $Root -is [string]) { return @() }
+function Get-ArrayFromResponse {
+    param([object]$Response)
+    if ($null -eq $Response) { return @() }
+    foreach ($name in @('protectionGroups','data','items')) {
+        $value = Get-Value $Response @($name)
+        if ($null -ne $value) { return @(To-List $value) }
+    }
+    if ($Response -is [array]) { return @($Response) }
+    return @($Response)
+}
 
-    $out = New-Object System.Collections.Generic.List[object]
-    if (Is-List $Root) {
-        foreach ($i in @($Root)) {
-            foreach ($c in @(Find-ClustersDeep -Root $i -Depth ($Depth - 1))) { [void]$out.Add($c) }
+function Get-ProtectionGroups {
+    param([string]$HeliosUrl, [hashtable]$Headers)
+
+    $groups = New-Object System.Collections.Generic.List[object]
+    $cookie = $null
+
+    do {
+        $uri = "$HeliosUrl/v2/data-protect/protection-groups?environments=kPhysical&isDeleted=false&isActive=true&includeTenants=true&includeLastRunInfo=true&maxResultCount=1000"
+        if (-not [string]::IsNullOrWhiteSpace([string]$cookie)) {
+            $uri = "$uri&paginationCookie=$([uri]::EscapeDataString([string]$cookie))"
         }
-        return @($out)
-    }
 
-    $name = Get-Val $Root @('clusterName','name','displayName','clusterDisplayName','fqdn')
-    $id   = Get-Val $Root @('clusterId','id','clusterIdentifier','clusterUuid','uuid','clusterIncarnationId')
-    if ($name -and $id) {
-        [void]$out.Add([pscustomobject]@{ ClusterName = [string]$name; ClusterId = [string]$id })
-    }
+        $response = Invoke-CohesityGet -Uri $uri -Headers $Headers
+        foreach ($group in (Get-ArrayFromResponse $response)) { [void]$groups.Add($group) }
+        $cookie = Get-Value $response @('paginationCookie','nextPageCookie','nextPaginationCookie')
+    } while (-not [string]::IsNullOrWhiteSpace([string]$cookie))
 
-    foreach ($p in @($Root.PSObject.Properties)) {
-        if ($null -ne $p.Value -and -not ($p.Value -is [string])) {
-            foreach ($c in @(Find-ClustersDeep -Root $p.Value -Depth ($Depth - 1))) { [void]$out.Add($c) }
-        }
-    }
-    return @($out)
+    return @($groups)
 }
 
-function Get-Clusters {
-    param([string]$HeliosUrl, [hashtable]$Headers, [string]$OutputRoot)
-    $uri = "$HeliosUrl/v2/mcm/cluster-mgmt/info"
-    try { $resp = Invoke-Get -Uri $uri -Headers $Headers }
-    catch { throw "Cluster discovery failed from $uri. $($_.Exception.Message)" }
+function Get-ClusterNameFromPG {
+    param([object]$PG)
 
-    $direct = Get-Array $resp @('clusterInfos','clusterInfoList','clusters','registeredClusters','mcmClusterConnectionDetails','clusterConnectionInfos','data','items')
-    $clusters = @(Find-ClustersDeep $direct; Find-ClustersDeep $resp) |
-        Where-Object { $_.ClusterName -and $_.ClusterId } |
-        Sort-Object ClusterName, ClusterId -Unique
+    $value = Get-Value $PG @('clusterName','clusterDisplayName','sourceClusterName')
+    if ($value) { return [string]$value }
 
-    if ($clusters.Count -eq 0) {
-        $debug = Join-Path $OutputRoot ('DEBUG_cluster_discovery_{0}.json' -f (Get-Date -Format 'yyyyMMdd_HHmmss'))
-        $resp | ConvertTo-Json -Depth 30 | Out-File -FilePath $debug -Encoding UTF8
-        throw "No clusters parsed. Debug file written: $debug"
+    foreach ($path in @(
+        @('cluster','name'),
+        @('clusterInfo','name'),
+        @('clusterIdentifier','name'),
+        @('clusterIdentifier','clusterName')
+    )) {
+        $value = Get-NestedValue $PG $path
+        if ($value) { return [string]$value }
     }
-    return @($clusters)
+
+    $id = Get-ClusterIdFromPG $PG
+    if ($id) { return "ClusterId_$id" }
+    return 'Helios'
 }
 
-function Resolve-Part {
-    param([string]$Part, [int]$Max)
-    $Part = $Part.Trim()
-    if ($Part -match '^(\d+)\s*-\s*(\d+)$') {
-        $a = [int]$Matches[1]; $b = [int]$Matches[2]
-        if ($a -lt 1 -or $b -gt $Max -or $a -gt $b) { throw "Invalid cluster range: $Part" }
-        return @($a..$b)
-    }
-    $n = 0
-    if ([int]::TryParse($Part, [ref]$n)) {
-        if ($n -lt 1 -or $n -gt $Max) { throw "Cluster selection out of range: $Part" }
-        return @($n)
-    }
-    throw "Invalid cluster selection: $Part"
-}
+function Get-ClusterIdFromPG {
+    param([object]$PG)
 
-function Select-Clusters {
-    param([object[]]$Clusters)
-    Write-Host ''
-    Write-Host 'Select cluster scope:' -ForegroundColor Cyan
-    Write-Host '[0] ALL'
-    for ($i = 0; $i -lt $Clusters.Count; $i++) { Write-Host ('[{0}] {1}' -f ($i + 1), $Clusters[$i].ClusterName) }
-    Write-Host 'Examples: 1,3,5 or 2-4' -ForegroundColor DarkGray
-    $choice = (Read-Host 'Enter selection').Trim()
-    if ($choice -eq '0') { return @($Clusters) }
-    $idx = foreach ($part in ($choice -split ',')) { Resolve-Part -Part $part -Max $Clusters.Count }
-    return @($idx | Select-Object -Unique | Sort-Object | ForEach-Object { $Clusters[$_ - 1] })
-}
+    $value = Get-Value $PG @('clusterId','accessClusterId','sourceClusterId')
+    if ($value) { return [string]$value }
 
-function Get-PhysicalObjects {
-    param([object]$Group)
-    $p = Get-Val $Group @('physicalParams')
-    $lists = @(
-        (Get-Val $p @('objects','sourceParamsList','sources','physicalSources','objectParams','objectParamsList')),
-        (Get-Val (Get-Val $p @('fileProtectionTypeParams')) @('objects','sourceParamsList','sources','physicalSources','objectParams','objectParamsList')),
-        (Get-Val (Get-Val $p @('volumeProtectionTypeParams')) @('objects','sourceParamsList','sources','physicalSources','objectParams','objectParamsList')),
-        (Get-Val (Get-Val $p @('systemProtectionTypeParams')) @('objects','sourceParamsList','sources','physicalSources','objectParams','objectParamsList')),
-        (Get-Val $Group @('objects','protectedObjects','entities'))
-    )
-    foreach ($l in $lists) { if ($null -ne $l -and @($l).Count -gt 0) { return @($l) } }
-    return @()
-}
-
-function Get-ServerName {
-    param([object]$Object)
-    $n = Get-Val $Object @('name','serverName','hostName','sourceName','displayName')
-    if ($n) { return [string]$n }
-    foreach ($x in @('entity','physicalEntity','source','protectionSource','rootEntity','protectedObject')) {
-        $child = Get-Val $Object @($x)
-        $n = Get-Val $child @('name','displayName','hostName','sourceName')
-        if ($n) { return [string]$n }
+    foreach ($path in @(
+        @('cluster','id'),
+        @('clusterInfo','id'),
+        @('clusterIdentifier','id'),
+        @('clusterIdentifier','clusterId')
+    )) {
+        $value = Get-NestedValue $PG $path
+        if ($value) { return [string]$value }
     }
+
     return ''
 }
 
-function Get-LastRun {
-    param([object]$Group)
-    $last = Get-Val $Group @('lastRun','lastRunInfo','latestRun','latestRunInfo')
-    $status = Get-Val $last @('status','runStatus')
-    $end = Get-Val $last @('endTimeUsecs','runEndTimeUsecs')
-    if (-not $end) { $end = Get-Val (Get-Val $last @('localBackupInfo')) @('endTimeUsecs','runEndTimeUsecs') }
-    [pscustomobject]@{ Status = [string]$status; EndET = To-ET $end }
+function Resolve-SelectionPart {
+    param([string]$Part, [int]$Max)
+
+    $Part = $Part.Trim()
+    if ([string]::IsNullOrWhiteSpace($Part)) { return @() }
+
+    if ($Part -match '^(\d+)\s*-\s*(\d+)$') {
+        $start = [int]$Matches[1]
+        $end = [int]$Matches[2]
+        if ($start -lt 1 -or $end -gt $Max -or $start -gt $end) { throw "Invalid cluster range: $Part" }
+        return @($start..$end)
+    }
+
+    $number = 0
+    if ([int]::TryParse($Part, [ref]$number)) {
+        if ($number -lt 1 -or $number -gt $Max) { throw "Cluster selection out of range: $Part" }
+        return @($number)
+    }
+
+    throw "Invalid cluster selection: $Part"
 }
 
-function To-Int {
-    param([object]$Value)
-    $n = 0
-    if ($null -ne $Value -and [int]::TryParse([string]$Value, [ref]$n)) { return $n }
-    return 0
+function Select-ClusterScope {
+    param([object[]]$ProtectionGroups)
+
+    $clusters = @(
+        foreach ($pg in $ProtectionGroups) {
+            $name = Get-ClusterNameFromPG $pg
+            $id = Get-ClusterIdFromPG $pg
+            [pscustomobject]@{
+                ClusterName = $name
+                ClusterId = $id
+                Key = "$name|$id"
+            }
+        }
+    ) | Sort-Object ClusterName, ClusterId -Unique
+
+    if ($clusters.Count -le 1) { return @($ProtectionGroups) }
+
+    Write-Host ''
+    Write-Host 'Select cluster scope:' -ForegroundColor Cyan
+    Write-Host '[0] ALL'
+    for ($i = 0; $i -lt $clusters.Count; $i++) {
+        Write-Host ('[{0}] {1}' -f ($i + 1), $clusters[$i].ClusterName)
+    }
+    Write-Host 'Examples: 1,3,5 or 2-4' -ForegroundColor DarkGray
+
+    $choice = (Read-Host 'Enter selection').Trim()
+    if ($choice -eq '0') { return @($ProtectionGroups) }
+
+    $indexes = foreach ($part in ($choice -split ',')) { Resolve-SelectionPart -Part $part -Max $clusters.Count }
+    $selectedKeys = @($indexes | Select-Object -Unique | ForEach-Object { $clusters[$_ - 1].Key })
+
+    return @($ProtectionGroups | Where-Object {
+        $key = "$(Get-ClusterNameFromPG $_)|$(Get-ClusterIdFromPG $_)"
+        $selectedKeys -contains $key
+    })
 }
 
-function New-Row {
-    param([object]$Cluster, [object]$Group, [object]$Object, [int]$Count)
-    $p = Get-Val $Group @('physicalParams')
-    $r = Get-LastRun $Group
-    $objectListNames = @('objects','sourceParamsList','sources','protectionSources','physicalSources','objectParams','objectParamsList','entities','protectedObjects')
+function Get-LastRunSummary {
+    param([object]$PG)
+
+    $lastRun = Get-Value $PG @('lastRun','lastRunInfo','latestRun','latestRunInfo')
+    $local = Get-Value $lastRun @('localBackupInfo','localSnapshotInfo')
+
+    $status = Get-Value $local @('status','runStatus')
+    if (-not $status) { $status = Get-Value $lastRun @('status','runStatus','lastRunAnyStatus') }
+
+    $endUsecs = Get-Value $local @('endTimeUsecs','runEndTimeUsecs','endTimeInUsecs')
+    if (-not $endUsecs) { $endUsecs = Get-Value $lastRun @('endTimeUsecs','runEndTimeUsecs','endTimeInUsecs') }
 
     [pscustomobject]@{
-        Cluster            = $Cluster.ClusterName
-        Environment        = 'kPhysical'
-        PGName             = [string](Get-Val $Group @('name','protectionGroupName'))
-        PolicyName         = [string](Get-Val $Group @('policyName'))
-        ProtectionType     = [string](Get-Val $p @('protectionType'))
-        PGObjectCount      = $Count
-        ServerName         = Get-ServerName $Object
-        ObjectSelection    = Join-Found -Root $Object -Names @('includePaths','includedPaths','selectedPaths','filePaths','paths','volumePaths','selectedVolumes','volumes') -Skip @('excludePaths','excludedPaths','exclusionPaths') -Depth 5
-        ObjectExcludePaths = Join-Found -Root $Object -Names @('excludePaths','excludedPaths','exclusionPaths') -Depth 5
-        GlobalExcludePaths = Join-Found -Root $p -Names @('globalExcludePaths','globalExcludedPaths','globalExclusionPaths','excludePaths','excludedPaths','exclusionPaths') -Skip $objectListNames -Depth 6
-        DirectiveFile      = Join-Found -Root $Object -Names @('directiveFile','directiveFilePath','directivePath','directiveFileName') -Depth 5
-        IsActive           = [string](Get-Val $Group @('isActive'))
-        IsPaused           = [string](Get-Val $Group @('isPaused'))
-        LastRunStatus      = $r.Status
-        LastRunEndET       = $r.EndET
+        Status = [string]$status
+        EndET = Convert-UsecsToET $endUsecs
     }
 }
 
-function Get-InventoryForCluster {
-    param([object]$Cluster, [string]$HeliosUrl, [hashtable]$BaseHeaders)
-    $headers = @{}
-    foreach ($k in $BaseHeaders.Keys) { $headers[$k] = $BaseHeaders[$k] }
-    $headers['accessClusterId'] = $Cluster.ClusterId
+function New-FileRows {
+    param([object]$PG)
 
-    $uri = "$HeliosUrl/v2/data-protect/protection-groups?environments=kPhysical&isDeleted=false&isActive=true&includeLastRunInfo=true"
-    $resp = Invoke-Get -Uri $uri -Headers $headers
-    $groups = Get-Array $resp @('protectionGroups','data','items')
+    $physical = Get-Value $PG @('physicalParams')
+    $fileParams = Get-Value $physical @('fileProtectionTypeParams')
+    $objects = @(To-List (Get-Value $fileParams @('objects')))
+    $objectCount = $objects.Count
+    $globalExcludePaths = Join-List (Get-Value $fileParams @('globalExcludePaths'))
+    $globalExcludeFS = Join-List (Get-Value $fileParams @('globalExcludeFS'))
+    $jobVss = Join-List (Get-Value $fileParams @('excludedVssWriters'))
+    $last = Get-LastRunSummary $PG
 
-    foreach ($g in $groups) {
-        if ([string](Get-Val $g @('isActive')) -notmatch '^(True|true|1)$') { continue }
-        $objs = @(Get-PhysicalObjects $g)
-        $count = if ($objs.Count -gt 0) { $objs.Count } else { To-Int (Get-Val $g @('objectCount','numObjects','numProtectedObjects','protectedObjectCount')) }
-        if ($objs.Count -eq 0) { New-Row -Cluster $Cluster -Group $g -Object $null -Count $count }
-        else { foreach ($o in $objs) { New-Row -Cluster $Cluster -Group $g -Object $o -Count $count } }
+    foreach ($object in $objects) {
+        $filePaths = @(To-List (Get-Value $object @('filePaths')))
+        if ($filePaths.Count -eq 0) { $filePaths = @($null) }
+
+        foreach ($filePath in $filePaths) {
+            [pscustomobject]@{
+                Cluster                  = Get-ClusterNameFromPG $PG
+                ClusterId                = Get-ClusterIdFromPG $PG
+                Environment              = 'kPhysical'
+                PGName                   = [string](Get-Value $PG @('name','protectionGroupName'))
+                PolicyName               = [string](Get-Value $PG @('policyName'))
+                ProtectionType           = [string](Get-Value $physical @('protectionType'))
+                PGObjectCount            = $objectCount
+                ObjectId                 = [string](Get-Value $object @('id','sourceId'))
+                ObjectName               = [string](Get-Value $object @('name','sourceName','hostName'))
+                IncludedPath             = [string](Get-Value $filePath @('includedPath'))
+                ObjectExcludedPaths      = Join-List (Get-Value $filePath @('excludedPaths'))
+                SkipNestedVolumes        = [string](Get-Value $filePath @('skipNestedVolumes'))
+                ObjectExcludedVssWriters = Join-List (Get-Value $object @('excludedVssWriters'))
+                GlobalExcludePaths       = $globalExcludePaths
+                GlobalExcludeFS          = $globalExcludeFS
+                JobExcludedVssWriters    = $jobVss
+                IsActive                 = [string](Get-Value $PG @('isActive'))
+                IsPaused                 = [string](Get-Value $PG @('isPaused'))
+                LastRunStatus            = $last.Status
+                LastRunEndET             = $last.EndET
+            }
+        }
     }
 }
 
-if (-not (Test-Path $KeyFilePath)) { throw "Key file not found: $KeyFilePath" }
-$key = (Get-Content $KeyFilePath -Raw).Trim()
-if ([string]::IsNullOrWhiteSpace($key)) { throw "Key file is empty: $KeyFilePath" }
+function New-VolumeRows {
+    param([object]$PG)
+
+    $physical = Get-Value $PG @('physicalParams')
+    $volumeParams = Get-Value $physical @('volumeProtectionTypeParams')
+    $objects = @(To-List (Get-Value $volumeParams @('objects')))
+    $objectCount = $objects.Count
+    $jobVss = Join-List (Get-Value $volumeParams @('excludedVssWriters'))
+    $last = Get-LastRunSummary $PG
+
+    foreach ($object in $objects) {
+        [pscustomobject]@{
+            Cluster                  = Get-ClusterNameFromPG $PG
+            ClusterId                = Get-ClusterIdFromPG $PG
+            Environment              = 'kPhysical'
+            PGName                   = [string](Get-Value $PG @('name','protectionGroupName'))
+            PolicyName               = [string](Get-Value $PG @('policyName'))
+            ProtectionType           = [string](Get-Value $physical @('protectionType'))
+            PGObjectCount            = $objectCount
+            ObjectId                 = [string](Get-Value $object @('id','sourceId'))
+            ObjectName               = [string](Get-Value $object @('name','sourceName','hostName'))
+            IncludedPath             = Join-List (Get-Value $object @('volumeGuids'))
+            ObjectExcludedPaths      = ''
+            SkipNestedVolumes        = ''
+            ObjectExcludedVssWriters = Join-List (Get-Value $object @('excludedVssWriters'))
+            GlobalExcludePaths       = ''
+            GlobalExcludeFS          = ''
+            JobExcludedVssWriters    = $jobVss
+            IsActive                 = [string](Get-Value $PG @('isActive'))
+            IsPaused                 = [string](Get-Value $PG @('isPaused'))
+            LastRunStatus            = $last.Status
+            LastRunEndET             = $last.EndET
+        }
+    }
+}
+
+if (-not (Test-Path $ApiKeyPath)) { throw "API key file not found: $ApiKeyPath" }
+$apiKey = (Get-Content $ApiKeyPath -Raw).Trim()
+if ([string]::IsNullOrWhiteSpace($apiKey)) { throw "API key file is empty: $ApiKeyPath" }
 
 New-Item -ItemType Directory -Path $OutputRoot -Force | Out-Null
+
 $headers = @{ accept = 'application/json' }
-$headers[('api' + 'Key')] = $key
+$headers[('api' + 'Key')] = $apiKey
 
-$clusters = @(Get-Clusters -HeliosUrl $HeliosUrl -Headers $headers -OutputRoot $OutputRoot)
-$selected = @(Select-Clusters -Clusters $clusters)
-
-$rows = foreach ($c in $selected) {
-    Write-Host "Collecting ACTIVE Physical inventory from $($c.ClusterName)..." -ForegroundColor Yellow
-    Get-InventoryForCluster -Cluster $c -HeliosUrl $HeliosUrl -BaseHeaders $headers
+$pgs = @(Get-ProtectionGroups -HeliosUrl $HeliosUrl -Headers $headers)
+if ($pgs.Count -eq 0) {
+    Write-Warning 'No active kPhysical Protection Groups returned by Helios.'
+    return
 }
 
-$rows = @($rows | Sort-Object Cluster, PGName, ServerName)
-$csv = Join-Path $OutputRoot ('Physical_PG_Inventory_Active_{0}.csv' -f (Get-Date -Format 'yyyyMMdd_HHmmss'))
-$rows | Export-Csv -Path $csv -NoTypeInformation -Encoding UTF8
+$selectedPgs = @(Select-ClusterScope -ProtectionGroups $pgs)
+
+$rows = foreach ($pg in $selectedPgs) {
+    $physical = Get-Value $pg @('physicalParams')
+    $type = [string](Get-Value $physical @('protectionType'))
+
+    if ($type -eq 'kVolume') { New-VolumeRows -PG $pg }
+    else { New-FileRows -PG $pg }
+}
+
+$rows = @($rows | Sort-Object Cluster, PGName, ObjectName, IncludedPath)
+$csvPath = Join-Path $OutputRoot ('Physical_PG_Inventory_Active_{0}.csv' -f (Get-Date -Format 'yyyyMMdd_HHmmss'))
+$rows | Export-Csv -Path $csvPath -NoTypeInformation -Encoding UTF8
 
 Write-Host ''
-Write-Host "Rows: $($rows.Count)" -ForegroundColor Green
-Write-Host "CSV : $csv" -ForegroundColor Green
-$rows | Format-Table Cluster, PGName, PGObjectCount, ServerName, ObjectSelection, ObjectExcludePaths, GlobalExcludePaths -AutoSize
+Write-Host "Protection Groups: $($selectedPgs.Count)" -ForegroundColor Green
+Write-Host "Rows             : $($rows.Count)" -ForegroundColor Green
+Write-Host "CSV              : $csvPath" -ForegroundColor Green
+
+$rows |
+    Select-Object Cluster, PGName, ProtectionType, PGObjectCount, ObjectName, IncludedPath, ObjectExcludedPaths, GlobalExcludePaths |
+    Format-Table -AutoSize
 
 if (-not $NoGridView) {
-    try { $rows | Out-GridView -Title 'Cohesity ACTIVE Physical Inventory' }
-    catch { Write-Warning 'Out-GridView unavailable. CSV was still created.' }
+    try {
+        $rows | Out-GridView -Title 'Cohesity Active Physical PG Inventory'
+    } catch {
+        Write-Warning 'Out-GridView is unavailable. CSV was still created.'
+    }
 }
