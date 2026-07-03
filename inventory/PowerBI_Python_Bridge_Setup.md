@@ -2,23 +2,32 @@
 
 This is the optional advanced setup where Power BI Desktop Refresh runs the PowerShell collector first.
 
-## What this gives you
+## Recommended design
 
-Power BI Desktop can run a Python script as a data source.
+Use Power BI slicers for cluster filtering.
 
-The Python script can call PowerShell, wait for the CSV files to be updated, and then load the CSV files into Power BI.
+Do not run the collector per cluster from Power BI unless you are testing.
 
-Flow:
+Recommended flow:
 
 ```text
 Power BI Refresh
-  -> Python data source runs
-  -> Python calls Invoke-PhysicalPGInventoryHeadless.ps1
-  -> PowerShell collects Cohesity data using GET-only calls
+  -> Python bridge runs
+  -> Python calls PowerShell headless wrapper
+  -> PowerShell collects ALL clusters using GET-only calls
   -> Latest CSVs are overwritten
   -> Python reads the CSVs into pandas DataFrames
   -> Power BI loads the DataFrames
+  -> Power BI slicers filter Cluster / PG / Policy / Status
 ```
+
+Keep this setting in `PowerBI_PhysicalPGInventory_Bridge.py` for normal use:
+
+```python
+CLUSTER_SELECTION = "0"
+```
+
+`0` means all clusters. Power BI should handle filtering after the data is loaded.
 
 ## Files involved
 
@@ -128,6 +137,61 @@ Physical_PG_Object_Detail[PGKey]
 
 Use single-direction filtering from summary to detail.
 
+This relationship is what allows a selected PG or cluster in the summary table to filter the object detail table.
+
+## Cluster filter / slicer setup
+
+Add a Slicer visual using:
+
+```text
+Physical_PG_Summary[Cluster]
+```
+
+This is the main cluster filter.
+
+When one cluster is selected:
+
+```text
+Cluster slicer
+  -> filters Physical_PG_Summary
+  -> relationship filters Physical_PG_Object_Detail through PGKey
+```
+
+Do not use a separate Python run per cluster for normal usage. It is slower and makes the model harder to manage.
+
+## Recommended slicers
+
+Add these slicers on the report page:
+
+```text
+Cluster
+PolicyName
+ProtectionType
+LastRunStatus
+IsPaused
+```
+
+Optional slicers:
+
+```text
+PGName
+ObjectName
+LastSuccessfulBackupStatus
+```
+
+Recommended source fields:
+
+```text
+Cluster                       = Physical_PG_Summary[Cluster]
+PolicyName                    = Physical_PG_Summary[PolicyName]
+ProtectionType                = Physical_PG_Summary[ProtectionType]
+LastRunStatus                 = Physical_PG_Summary[LastRunStatus]
+IsPaused                      = Physical_PG_Summary[IsPaused]
+PGName                        = Physical_PG_Summary[PGName]
+ObjectName                    = Physical_PG_Object_Detail[ObjectName]
+LastSuccessfulBackupStatus    = Physical_PG_Object_Detail[LastSuccessfulBackupStatus]
+```
+
 ## Report layout
 
 ### PG Summary table
@@ -203,9 +267,9 @@ Network/API timeout
 
 The headless wrapper prevents the cluster prompt by overriding Read-Host for the run.
 
-## Recommended first test
+## Testing with one cluster only
 
-Use a single cluster first if all clusters takes too long.
+Use a single cluster only for testing if all clusters takes too long.
 
 Example:
 
@@ -219,8 +283,10 @@ Then set this in `PowerBI_PhysicalPGInventory_Bridge.py`:
 CLUSTER_SELECTION = "1"
 ```
 
-After stable testing, switch back to:
+After stable testing, switch back to all clusters:
 
 ```python
 CLUSTER_SELECTION = "0"
 ```
+
+For the final Power BI report, the intended setup is all-cluster collection plus Cluster slicer filtering inside Power BI.
