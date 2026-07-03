@@ -2,6 +2,9 @@
 # Branch: Cohesity_Automations
 # Folder: inventory
 # Cohesity API scope: GET-only
+# Output:
+#   1. PG summary CSV + GridView
+#   2. Object include/exclude detail CSV
 
 $ErrorActionPreference = 'Stop'
 
@@ -46,6 +49,7 @@ function Join-Text {
 
     return (@($Values) |
         Where-Object { $null -ne $_ -and -not [string]::IsNullOrWhiteSpace([string]$_) } |
+        ForEach-Object { [string]$_ } |
         Select-Object -Unique) -join '; '
 }
 
@@ -149,6 +153,7 @@ New-Item -ItemType Directory -Path $OutputDir -Force | Out-Null
 
 $SelectedClusters = Get-SelectedClusters $ClustersAvailable
 $SummaryRows = @()
+$DetailRows = @()
 $PolicyCache = @{}
 
 foreach ($Cluster in $SelectedClusters) {
@@ -176,10 +181,12 @@ foreach ($Cluster in $SelectedClusters) {
         if ($ProtectionType -eq 'kVolume') {
             $Objects = @($VolumeParams.objects | Where-Object { $_ })
             $GlobalExcludePaths = ''
+            $JobExcludedVssWriters = Join-Text $VolumeParams.excludedVssWriters
         }
         else {
             $Objects = @($FileParams.objects | Where-Object { $_ })
             $GlobalExcludePaths = Join-Text $FileParams.globalExcludePaths
+            $JobExcludedVssWriters = Join-Text $FileParams.excludedVssWriters
         }
 
         $LastRun = $Pg.lastRun
@@ -204,28 +211,83 @@ foreach ($Cluster in $SelectedClusters) {
         }
 
         $SummaryRows += [PSCustomObject]@{
-            Cluster            = $ClusterName
-            PGName             = $Pg.name
-            PolicyName         = $PolicyName
-            ProtectionType     = $ProtectionType
-            PGObjectCount      = @($Objects).Count
-            GlobalExcludePaths = $GlobalExcludePaths
-            IsActive           = $Pg.isActive
-            IsPaused           = $Pg.isPaused
-            LastRunStatus      = $LastRunStatus
-            LastRunEndET       = Convert-UsecsToET $EndTimeUsecs
+            Cluster               = $ClusterName
+            PGName                = $Pg.name
+            PolicyName            = $PolicyName
+            ProtectionType        = $ProtectionType
+            PGObjectCount         = @($Objects).Count
+            GlobalExcludePaths    = $GlobalExcludePaths
+            JobExcludedVssWriters = $JobExcludedVssWriters
+            IsActive              = $Pg.isActive
+            IsPaused              = $Pg.isPaused
+            LastRunStatus         = $LastRunStatus
+            LastRunEndET          = Convert-UsecsToET $EndTimeUsecs
+        }
+
+        foreach ($Obj in $Objects) {
+            $ObjectName = $Obj.name
+            if ([string]::IsNullOrWhiteSpace([string]$ObjectName)) { $ObjectName = $Obj.sourceName }
+            if ([string]::IsNullOrWhiteSpace([string]$ObjectName)) { $ObjectName = $Obj.hostName }
+            if ([string]::IsNullOrWhiteSpace([string]$ObjectName)) { $ObjectName = $Obj.id }
+
+            $ObjectId = $Obj.id
+            if ([string]::IsNullOrWhiteSpace([string]$ObjectId)) { $ObjectId = $Obj.sourceId }
+
+            $ObjectExcludedVssWriters = Join-Text $Obj.excludedVssWriters
+
+            if ($ProtectionType -eq 'kVolume') {
+                $DetailRows += [PSCustomObject]@{
+                    Cluster                  = $ClusterName
+                    PGName                   = $Pg.name
+                    PolicyName               = $PolicyName
+                    ProtectionType           = $ProtectionType
+                    ObjectName               = $ObjectName
+                    ObjectId                 = $ObjectId
+                    IncludedPath             = Join-Text $Obj.volumeGuids
+                    ObjectExcludedPaths      = ''
+                    SkipNestedVolumes        = ''
+                    GlobalExcludePaths       = $GlobalExcludePaths
+                    ObjectExcludedVssWriters = $ObjectExcludedVssWriters
+                    JobExcludedVssWriters    = $JobExcludedVssWriters
+                }
+            }
+            else {
+                foreach ($FilePath in ($Obj.filePaths | Where-Object { $_ })) {
+                    $DetailRows += [PSCustomObject]@{
+                        Cluster                  = $ClusterName
+                        PGName                   = $Pg.name
+                        PolicyName               = $PolicyName
+                        ProtectionType           = $ProtectionType
+                        ObjectName               = $ObjectName
+                        ObjectId                 = $ObjectId
+                        IncludedPath             = $FilePath.includedPath
+                        ObjectExcludedPaths      = Join-Text $FilePath.excludedPaths
+                        SkipNestedVolumes        = $FilePath.skipNestedVolumes
+                        GlobalExcludePaths       = $GlobalExcludePaths
+                        ObjectExcludedVssWriters = $ObjectExcludedVssWriters
+                        JobExcludedVssWriters    = $JobExcludedVssWriters
+                    }
+                }
+            }
         }
     }
 }
 
 $SummaryRows = $SummaryRows | Sort-Object Cluster, PGName
+$DetailRows = $DetailRows | Sort-Object Cluster, PGName, ObjectName, IncludedPath
+
 $Stamp = Get-Date -Format 'yyyy-MM-dd_HHmm'
 $SummaryCsv = Join-Path $OutputDir "Physical_PG_Summary_$Stamp.csv"
+$DetailCsv = Join-Path $OutputDir "Physical_PG_Object_Detail_$Stamp.csv"
+
 $SummaryRows | Export-Csv -Path $SummaryCsv -NoTypeInformation
+$DetailRows | Export-Csv -Path $DetailCsv -NoTypeInformation
 
 Write-Host ''
 Write-Host "Summary rows: $(@($SummaryRows).Count)" -ForegroundColor Green
+Write-Host "Detail rows : $(@($DetailRows).Count)" -ForegroundColor Green
 Write-Host "Summary CSV : $SummaryCsv" -ForegroundColor Green
+Write-Host "Detail CSV  : $DetailCsv" -ForegroundColor Green
 
 $SummaryRows | Format-Table Cluster, PGName, PolicyName, ProtectionType, PGObjectCount, GlobalExcludePaths, IsPaused, LastRunStatus, LastRunEndET -AutoSize
 $SummaryRows | Out-GridView -Title 'Cohesity Physical PG Summary'
