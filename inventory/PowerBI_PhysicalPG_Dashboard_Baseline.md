@@ -105,6 +105,14 @@ JobExcludedVssWriters
 
 ## DAX measures
 
+Recommended measure home table in Power BI:
+
+```text
+Physical_PG_Summary_Latest
+```
+
+This keeps the KPI measures grouped with the PG Summary data. The home table is only an organizational setting; the DAX expression controls which table is actually queried.
+
 ### Total PGs
 
 ```DAX
