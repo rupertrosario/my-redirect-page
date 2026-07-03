@@ -1,13 +1,8 @@
 # =====================================================================
-# Cohesity Helios — Physical PG Inventory with Object Include/Exclude UI
+# Cohesity Helios — Physical PG Inventory with Object Include/Exclude Grid
 # STRICTLY READ-ONLY / GET-only
 #
-# Included:
-# - Automatic Helios cluster index using /v2/mcm/cluster-mgmt/info
-# - Active Physical Protection Groups
-# - PG summary CSV
-# - Object detail CSV with object-level include/exclude and latest successful backup
-# - Simple WinForms UI: click PG on left, object details show on right
+# Uses only Out-GridView for grid display. No Windows Forms. No Add-Type.
 # =====================================================================
 
 $ErrorActionPreference = "Stop"
@@ -22,7 +17,6 @@ $apikeypath = "X:\PowerShell\Cohesity_API_Scripts\DO_NOT_Delete\apikey.txt"
 $baseUrl    = "https://helios.cohesity.com"
 
 # Number of PG run pages to inspect for latest object-level successful backup.
-# Increase only if old objects do not show a success date.
 $MaxRunPagesPerPG = 5
 
 $script:ErrorRows = @()
@@ -62,12 +56,8 @@ function Add-ErrorRow {
 
     $message = ""
 
-    try {
-        $message = $ErrorObject.Exception.Message
-    }
-    catch {
-        $message = "$ErrorObject"
-    }
+    try { $message = $ErrorObject.Exception.Message }
+    catch { $message = "$ErrorObject" }
 
     $script:ErrorRows += [PSCustomObject]@{
         Stage        = $Stage
@@ -126,19 +116,14 @@ function Invoke-HeliosGetJson {
 function As-Array {
     param([object]$Value)
 
-    if ($null -eq $Value) {
-        return @()
-    }
-
+    if ($null -eq $Value) { return @() }
     return @($Value)
 }
 
 function To-FlatString {
     param([object]$Value)
 
-    if ($null -eq $Value) {
-        return ""
-    }
+    if ($null -eq $Value) { return "" }
 
     $items = @()
 
@@ -148,9 +133,7 @@ function To-FlatString {
         }
     }
 
-    if ($items.Count -eq 0) {
-        return ""
-    }
+    if ($items.Count -eq 0) { return "" }
 
     return (($items | Select-Object -Unique) -join ";")
 }
@@ -172,25 +155,16 @@ function Get-FirstNonEmpty {
 function To-Number {
     param($Value)
 
-    if ($null -eq $Value -or "$Value".Trim() -eq "") {
-        return 0
-    }
+    if ($null -eq $Value -or "$Value".Trim() -eq "") { return 0 }
 
-    try {
-        return [double]$Value
-    }
-    catch {
-        return 0
-    }
+    try { return [double]$Value }
+    catch { return 0 }
 }
 
 function Normalize-Key {
     param([string]$Value)
 
-    if ([string]::IsNullOrWhiteSpace($Value)) {
-        return ""
-    }
-
+    if ([string]::IsNullOrWhiteSpace($Value)) { return "" }
     return $Value.Trim().ToUpper()
 }
 
@@ -214,18 +188,13 @@ function Convert-UsecsToET {
             return ($dtUtc.ToString("yyyy-MM-dd HH:mm:ss") + " UTC")
         }
     }
-    catch {
-        return ""
-    }
+    catch { return "" }
 }
 
 function Test-SuccessStatus {
     param([string]$Status)
 
-    if ([string]::IsNullOrWhiteSpace($Status)) {
-        return $false
-    }
-
+    if ([string]::IsNullOrWhiteSpace($Status)) { return $false }
     return ($Status -match '(?i)success|succeed|succeededwithwarning|warning')
 }
 
@@ -270,9 +239,9 @@ function Get-ObjectKeys {
         $Object.sourceName,
         $Object.hostName,
         $Object.displayName,
-        $Object.object.name,
         $Object.object.id,
         $Object.object.sourceId,
+        $Object.object.name,
         $Object.protectedObject.id,
         $Object.protectedObject.name
     )
@@ -331,9 +300,7 @@ function Get-LatestObjectSuccessMap {
 
     $map = New-Object System.Collections.Hashtable ([StringComparer]::OrdinalIgnoreCase)
 
-    if ([string]::IsNullOrWhiteSpace($PgId)) {
-        return $map
-    }
+    if ([string]::IsNullOrWhiteSpace($PgId)) { return $map }
 
     $page = 0
     $cookie = ""
@@ -357,19 +324,15 @@ function Get-LatestObjectSuccessMap {
         foreach ($run in @($runsJson.runs | Where-Object { $_ })) {
             $runObjects = @($run.objects | Where-Object { $_ })
 
-            # Some API responses may not expose run.objects. In that case, no object-level date can be mapped.
             foreach ($ro in $runObjects) {
                 $status = Get-ObjectRunStatus -RunObject $ro -Run $run
-                if (-not (Test-SuccessStatus -Status $status)) {
-                    continue
-                }
+
+                if (-not (Test-SuccessStatus -Status $status)) { continue }
 
                 $endUsecs = Get-ObjectRunEndUsecs -RunObject $ro -Run $run
                 $endNum = To-Number $endUsecs
 
-                if ($endNum -le 0) {
-                    continue
-                }
+                if ($endNum -le 0) { continue }
 
                 foreach ($key in (Get-ObjectKeys -Object $ro)) {
                     if (-not $map.ContainsKey($key) -or $endNum -gt [double]$map[$key].Usecs) {
@@ -422,13 +385,9 @@ function Get-PolicyName {
         [string]$PGName
     )
 
-    if ([string]::IsNullOrWhiteSpace($PolicyId)) {
-        return ""
-    }
+    if ([string]::IsNullOrWhiteSpace($PolicyId)) { return "" }
 
-    if ($PolicyCache.ContainsKey($PolicyId)) {
-        return $PolicyCache[$PolicyId]
-    }
+    if ($PolicyCache.ContainsKey($PolicyId)) { return $PolicyCache[$PolicyId] }
 
     $policyUri = "$baseUrl/v2/data-protect/policies?ids=$PolicyId"
 
@@ -441,9 +400,7 @@ function Get-PolicyName {
             Select-Object -ExpandProperty name -First 1
         )
 
-        if ([string]::IsNullOrWhiteSpace($policyName)) {
-            $policyName = $PolicyId
-        }
+        if ([string]::IsNullOrWhiteSpace($policyName)) { $policyName = $PolicyId }
 
         $PolicyCache[$PolicyId] = $policyName
         return $policyName
@@ -494,222 +451,56 @@ function Get-PhysicalProtectionGroups {
     return @($all)
 }
 
-function ConvertTo-UiDataTable {
-    param(
-        [object[]]$Rows,
-        [string[]]$Columns
-    )
-
-    $dt = New-Object System.Data.DataTable
-
-    foreach ($col in $Columns) {
-        [void]$dt.Columns.Add($col, [string])
-    }
-
-    foreach ($row in @($Rows)) {
-        $dr = $dt.NewRow()
-
-        foreach ($col in $Columns) {
-            $value = $null
-
-            if ($null -ne $row -and ($row.PSObject.Properties.Name -contains $col)) {
-                $value = $row.$col
-            }
-
-            if ($null -eq $value) {
-                $dr[$col] = ""
-            }
-            else {
-                $dr[$col] = [string]$value
-            }
-        }
-
-        [void]$dt.Rows.Add($dr)
-    }
-
-    return $dt
-}
-
-function Set-GridDefaults {
-    param([System.Windows.Forms.DataGridView]$Grid)
-
-    $Grid.ReadOnly = $true
-    $Grid.AllowUserToAddRows = $false
-    $Grid.AllowUserToDeleteRows = $false
-    $Grid.MultiSelect = $false
-    $Grid.SelectionMode = [System.Windows.Forms.DataGridViewSelectionMode]::FullRowSelect
-    $Grid.AutoSizeColumnsMode = [System.Windows.Forms.DataGridViewAutoSizeColumnsMode]::DisplayedCells
-    $Grid.AutoSizeRowsMode = [System.Windows.Forms.DataGridViewAutoSizeRowsMode]::DisplayedCells
-    $Grid.ScrollBars = [System.Windows.Forms.ScrollBars]::Both
-    $Grid.RowHeadersVisible = $false
-}
-
-function Show-PhysicalInventoryUI {
+function Show-PhysicalInventoryGrid {
     param(
         [object[]]$SummaryRows,
-        [object[]]$DetailRows,
-        [string]$SummaryCsv,
-        [string]$DetailCsv
+        [object[]]$DetailRows
     )
 
-    try {
-        Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
-        Add-Type -AssemblyName System.Drawing -ErrorAction Stop
-    }
-    catch {
-        Write-Warning "Windows Forms UI is unavailable in this PowerShell host. Use the CSV files instead."
+    if (-not (Get-Command Out-GridView -ErrorAction SilentlyContinue)) {
+        Write-Warning "Out-GridView is not available in this PowerShell host. CSV files were still created."
         return
     }
 
-    if ($null -eq $SummaryRows -or @($SummaryRows).Count -eq 0) {
-        Write-Warning "No PG summary rows available for UI."
-        return
-    }
+    while ($true) {
+        $selectedPg = $SummaryRows |
+            Select-Object PGIndex, Cluster, PGName, PolicyName, ProtectionType, PGObjectCount, GlobalExcludePaths, JobExcludedVssWriters, IsPaused, LastRunStatus, LastRunStartET, LastRunEndET, LastRunMessage |
+            Out-GridView -Title "Physical PG Summary - select one PG and click OK. Close/Cancel to exit." -PassThru
 
-    $summaryColumns = @(
-        "PGIndex",
-        "Cluster",
-        "PGName",
-        "PolicyName",
-        "ProtectionType",
-        "PGObjectCount",
-        "GlobalExcludePaths",
-        "JobExcludedVssWriters",
-        "IsPaused",
-        "LastRunStatus",
-        "LastRunStartET",
-        "LastRunEndET",
-        "LastRunMessage"
-    )
-
-    $detailColumns = @(
-        "ObjectName",
-        "LastSuccessfulBackupStatus",
-        "LastSuccessfulBackupEndET",
-        "ObjectIncludedPaths",
-        "ObjectExcludedPathsAll",
-        "IncludedPath",
-        "ExcludedPathsUnderIncludedPath",
-        "SkipNestedVolumes",
-        "GlobalExcludePaths",
-        "ObjectExcludedVssWriters",
-        "JobExcludedVssWriters"
-    )
-
-    $summaryTable = ConvertTo-UiDataTable -Rows $SummaryRows -Columns $summaryColumns
-    $emptyDetailTable = ConvertTo-UiDataTable -Rows @() -Columns $detailColumns
-
-    [System.Windows.Forms.Application]::EnableVisualStyles()
-
-    $form = New-Object System.Windows.Forms.Form
-    $form.Text = "Cohesity Physical PG Inventory"
-    $form.StartPosition = "CenterScreen"
-    $form.Width = 1650
-    $form.Height = 900
-    $form.MinimumSize = New-Object System.Drawing.Size(1200, 700)
-
-    $mainLayout = New-Object System.Windows.Forms.TableLayoutPanel
-    $mainLayout.Dock = [System.Windows.Forms.DockStyle]::Fill
-    $mainLayout.RowCount = 2
-    $mainLayout.ColumnCount = 1
-    [void]$mainLayout.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Percent, 100)))
-    [void]$mainLayout.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Absolute, 28)))
-
-    $split = New-Object System.Windows.Forms.SplitContainer
-    $split.Dock = [System.Windows.Forms.DockStyle]::Fill
-    $split.Orientation = [System.Windows.Forms.Orientation]::Vertical
-    $split.SplitterDistance = 760
-
-    $leftLayout = New-Object System.Windows.Forms.TableLayoutPanel
-    $leftLayout.Dock = [System.Windows.Forms.DockStyle]::Fill
-    $leftLayout.RowCount = 2
-    $leftLayout.ColumnCount = 1
-    [void]$leftLayout.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Absolute, 28)))
-    [void]$leftLayout.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Percent, 100)))
-
-    $rightLayout = New-Object System.Windows.Forms.TableLayoutPanel
-    $rightLayout.Dock = [System.Windows.Forms.DockStyle]::Fill
-    $rightLayout.RowCount = 2
-    $rightLayout.ColumnCount = 1
-    [void]$rightLayout.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Absolute, 28)))
-    [void]$rightLayout.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Percent, 100)))
-
-    $pgLabel = New-Object System.Windows.Forms.Label
-    $pgLabel.Text = "Protection Groups - click a PG to show object-level status/include/exclude"
-    $pgLabel.Dock = [System.Windows.Forms.DockStyle]::Fill
-    $pgLabel.TextAlign = [System.Drawing.ContentAlignment]::MiddleLeft
-
-    $detailLabel = New-Object System.Windows.Forms.Label
-    $detailLabel.Text = "Object details"
-    $detailLabel.Dock = [System.Windows.Forms.DockStyle]::Fill
-    $detailLabel.TextAlign = [System.Drawing.ContentAlignment]::MiddleLeft
-
-    $pgGrid = New-Object System.Windows.Forms.DataGridView
-    $pgGrid.Dock = [System.Windows.Forms.DockStyle]::Fill
-    Set-GridDefaults -Grid $pgGrid
-    $pgGrid.DataSource = $summaryTable
-
-    $detailGrid = New-Object System.Windows.Forms.DataGridView
-    $detailGrid.Dock = [System.Windows.Forms.DockStyle]::Fill
-    Set-GridDefaults -Grid $detailGrid
-    $detailGrid.DataSource = $emptyDetailTable
-
-    $statusLabel = New-Object System.Windows.Forms.Label
-    $statusLabel.Dock = [System.Windows.Forms.DockStyle]::Fill
-    $statusLabel.TextAlign = [System.Drawing.ContentAlignment]::MiddleLeft
-    $statusLabel.Text = "Summary CSV: $SummaryCsv    |    Detail CSV: $DetailCsv"
-
-    [void]$leftLayout.Controls.Add($pgLabel, 0, 0)
-    [void]$leftLayout.Controls.Add($pgGrid, 0, 1)
-
-    [void]$rightLayout.Controls.Add($detailLabel, 0, 0)
-    [void]$rightLayout.Controls.Add($detailGrid, 0, 1)
-
-    [void]$split.Panel1.Controls.Add($leftLayout)
-    [void]$split.Panel2.Controls.Add($rightLayout)
-
-    [void]$mainLayout.Controls.Add($split, 0, 0)
-    [void]$mainLayout.Controls.Add($statusLabel, 0, 1)
-
-    [void]$form.Controls.Add($mainLayout)
-
-    $updateDetails = {
-        if ($pgGrid.SelectedRows.Count -eq 0) {
-            return
-        }
-
-        $selectedRow = $pgGrid.SelectedRows[0]
-        $selectedCluster = [string]$selectedRow.Cells["Cluster"].Value
-        $selectedPgName  = [string]$selectedRow.Cells["PGName"].Value
+        if ($null -eq $selectedPg) { break }
 
         $pgDetails = @(
             $DetailRows |
             Where-Object {
-                $_.Cluster -eq $selectedCluster -and
-                $_.PGName  -eq $selectedPgName
-            }
+                $_.Cluster -eq $selectedPg.Cluster -and
+                $_.PGName  -eq $selectedPg.PGName
+            } |
+            Select-Object ObjectName, LastSuccessfulBackupStatus, LastSuccessfulBackupEndET, ObjectIncludedPaths, ObjectExcludedPathsAll, IncludedPath, ExcludedPathsUnderIncludedPath, SkipNestedVolumes, GlobalExcludePaths, ObjectExcludedVssWriters, JobExcludedVssWriters
         )
 
-        $detailGrid.DataSource = ConvertTo-UiDataTable -Rows $pgDetails -Columns $detailColumns
-        $detailLabel.Text = "Object details - $selectedCluster / $selectedPgName ($($pgDetails.Count) rows)"
-    }
-
-    $pgGrid.Add_SelectionChanged($updateDetails)
-
-    $form.Add_Shown({
-        if ($pgGrid.Rows.Count -gt 0) {
-            $pgGrid.ClearSelection()
-            $pgGrid.Rows[0].Selected = $true
-            $pgGrid.CurrentCell = $pgGrid.Rows[0].Cells[0]
-            & $updateDetails
+        if ($pgDetails.Count -eq 0) {
+            [PSCustomObject]@{
+                ObjectName = ""
+                LastSuccessfulBackupStatus = ""
+                LastSuccessfulBackupEndET = ""
+                ObjectIncludedPaths = ""
+                ObjectExcludedPathsAll = ""
+                IncludedPath = ""
+                ExcludedPathsUnderIncludedPath = ""
+                SkipNestedVolumes = ""
+                GlobalExcludePaths = ""
+                ObjectExcludedVssWriters = ""
+                JobExcludedVssWriters = ""
+            } | Out-GridView -Title "Object details for $($selectedPg.Cluster) / $($selectedPg.PGName)"
         }
-    })
-
-    [void]$form.ShowDialog()
+        else {
+            $pgDetails | Out-GridView -Title "Object details for $($selectedPg.Cluster) / $($selectedPg.PGName)"
+        }
+    }
 }
 
 # =====================================================================
-# 1) Cluster menu — same working pattern as Oracle inventory
+# 1) Cluster menu
 # =====================================================================
 $cluJson = Invoke-HeliosGetJson -Uri "$baseUrl/v2/mcm/cluster-mgmt/info" -Headers $commonHeaders
 $json_clu = @($cluJson.cohesityClusters)
@@ -734,9 +525,7 @@ $clusters = $json_clu | ForEach-Object {
         Where-Object { $_ } |
         Select-Object -First 1
 
-    if (-not $name) {
-        $name = "Unknown-$cid"
-    }
+    if (-not $name) { $name = "Unknown-$cid" }
 
     [PSCustomObject]@{
         ClusterName = $name
@@ -762,9 +551,7 @@ Write-Host "[X] Exit" -ForegroundColor Yellow
 while ($true) {
     $selection = Read-Host "Select cluster: 0 for ALL, 1-$($clusterMenu.Count) for single, or X"
 
-    if ($selection -match '^(x|X|q|Q)$') {
-        return
-    }
+    if ($selection -match '^(x|X|q|Q)$') { return }
 
     $n = 0
 
@@ -814,14 +601,10 @@ foreach ($c in $SelectedClusters) {
     foreach ($pg in (@($pgs) | Where-Object { $_ })) {
 
         $physical = $pg.physicalParams
-
-        if ($null -eq $physical) {
-            continue
-        }
+        if ($null -eq $physical) { continue }
 
         $pgIndex++
         $pgId = Get-PgIdFromProtectionGroup -Pg $pg
-
         $protectionType = Get-FirstNonEmpty -Values @($physical.protectionType)
 
         $fileParams   = $physical.fileProtectionTypeParams
@@ -840,10 +623,7 @@ foreach ($c in $SelectedClusters) {
 
         $lastRun = $pg.lastRun
         $localInfo = $lastRun.localBackupInfo
-
-        if ($null -eq $localInfo) {
-            $localInfo = $lastRun.localSnapshotInfo
-        }
+        if ($null -eq $localInfo) { $localInfo = $lastRun.localSnapshotInfo }
 
         $lastRunStatus = Get-FirstNonEmpty -Values @($localInfo.status, $lastRun.status)
         $startTimeUsecs = Get-FirstNonEmpty -Values @($localInfo.startTimeUsecs, $lastRun.startTimeUsecs)
@@ -892,7 +672,6 @@ foreach ($c in $SelectedClusters) {
             )
 
             $objectSuccess = Find-LatestObjectSuccess -ObjectSuccessMap $objectSuccessMap -Object $obj
-
             $objectExcludedVssWriters = To-FlatString $obj.excludedVssWriters
             $filePaths = @(As-Array $obj.filePaths | Where-Object { $_ })
 
@@ -1001,7 +780,7 @@ Write-Host "Detail rows  : $(@($detailRows).Count)" -ForegroundColor Green
 Write-Host "Summary CSV  : $summaryCsv" -ForegroundColor Green
 Write-Host "Detail CSV   : $detailCsv" -ForegroundColor Green
 
-Show-PhysicalInventoryUI -SummaryRows $summaryRows -DetailRows $detailRows -SummaryCsv $summaryCsv -DetailCsv $detailCsv
+Show-PhysicalInventoryGrid -SummaryRows $summaryRows -DetailRows $detailRows
 
 # =====================================================================
 # 4) Error exception output
