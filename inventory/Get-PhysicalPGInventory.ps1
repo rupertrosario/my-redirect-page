@@ -3,6 +3,10 @@
 # STRICTLY READ-ONLY / GET-only
 #
 # Uses only Out-GridView for grid display. No Windows Forms. No Add-Type.
+# Power BI ready output:
+# - Physical_PG_Summary_Latest.csv
+# - Physical_PG_Object_Detail_Latest.csv
+# - PGKey exists in both files for relationship mapping.
 # =====================================================================
 
 $ErrorActionPreference = "Stop"
@@ -166,6 +170,15 @@ function Normalize-Key {
 
     if ([string]::IsNullOrWhiteSpace($Value)) { return "" }
     return $Value.Trim().ToUpper()
+}
+
+function Get-PGKey {
+    param(
+        [string]$Cluster,
+        [string]$PGName
+    )
+
+    return (("{0}|{1}" -f $Cluster, $PGName).Trim())
 }
 
 function Convert-UsecsToET {
@@ -472,8 +485,7 @@ function Show-PhysicalInventoryGrid {
         $pgDetails = @(
             $DetailRows |
             Where-Object {
-                $_.Cluster -eq $selectedPg.Cluster -and
-                $_.PGName  -eq $selectedPg.PGName
+                $_.PGKey -eq (Get-PGKey -Cluster $selectedPg.Cluster -PGName $selectedPg.PGName)
             } |
             Select-Object ObjectName, LastSuccessfulBackupStatus, LastSuccessfulBackupEndET, ObjectIncludedPaths, ObjectExcludedPathsAll, IncludedPath, ExcludedPathsUnderIncludedPath, SkipNestedVolumes, GlobalExcludePaths, ObjectExcludedVssWriters, JobExcludedVssWriters
         )
@@ -606,6 +618,7 @@ foreach ($c in $SelectedClusters) {
         $pgIndex++
         $pgId = Get-PgIdFromProtectionGroup -Pg $pg
         $protectionType = Get-FirstNonEmpty -Values @($physical.protectionType)
+        $pgKey = Get-PGKey -Cluster $cluster_name -PGName $pg.name
 
         $fileParams   = $physical.fileProtectionTypeParams
         $volumeParams = $physical.volumeProtectionTypeParams
@@ -645,6 +658,7 @@ foreach ($c in $SelectedClusters) {
         $objectSuccessMap = Get-LatestObjectSuccessMap -PgId $pgId -Headers $headers -ClusterName $cluster_name -PGName $pg.name
 
         $summaryRows += [PSCustomObject]@{
+            PGKey                 = $pgKey
             PGIndex               = $pgIndex
             Cluster               = $cluster_name
             PGName                = $pg.name
@@ -689,54 +703,57 @@ foreach ($c in $SelectedClusters) {
 
             if ($protectionType -eq "kVolume") {
                 $detailRows += [PSCustomObject]@{
-                    Cluster                         = $cluster_name
-                    PGName                          = $pg.name
-                    ObjectName                      = $objectName
-                    LastSuccessfulBackupStatus      = $objectSuccess.Status
-                    LastSuccessfulBackupEndET       = $objectSuccess.EndET
-                    ObjectIncludedPaths             = To-FlatString $obj.volumeGuids
-                    ObjectExcludedPathsAll          = ""
-                    IncludedPath                    = To-FlatString $obj.volumeGuids
-                    ExcludedPathsUnderIncludedPath  = ""
-                    SkipNestedVolumes               = ""
-                    GlobalExcludePaths              = $globalExcludePaths
-                    ObjectExcludedVssWriters        = $objectExcludedVssWriters
-                    JobExcludedVssWriters           = $jobExcludedVssWriters
+                    PGKey                          = $pgKey
+                    Cluster                        = $cluster_name
+                    PGName                         = $pg.name
+                    ObjectName                     = $objectName
+                    LastSuccessfulBackupStatus     = $objectSuccess.Status
+                    LastSuccessfulBackupEndET      = $objectSuccess.EndET
+                    ObjectIncludedPaths            = To-FlatString $obj.volumeGuids
+                    ObjectExcludedPathsAll         = ""
+                    IncludedPath                   = To-FlatString $obj.volumeGuids
+                    ExcludedPathsUnderIncludedPath = ""
+                    SkipNestedVolumes              = ""
+                    GlobalExcludePaths             = $globalExcludePaths
+                    ObjectExcludedVssWriters       = $objectExcludedVssWriters
+                    JobExcludedVssWriters          = $jobExcludedVssWriters
                 }
             }
             elseif ($filePaths.Count -eq 0) {
                 $detailRows += [PSCustomObject]@{
-                    Cluster                         = $cluster_name
-                    PGName                          = $pg.name
-                    ObjectName                      = $objectName
-                    LastSuccessfulBackupStatus      = $objectSuccess.Status
-                    LastSuccessfulBackupEndET       = $objectSuccess.EndET
-                    ObjectIncludedPaths             = ""
-                    ObjectExcludedPathsAll          = ""
-                    IncludedPath                    = ""
-                    ExcludedPathsUnderIncludedPath  = ""
-                    SkipNestedVolumes               = ""
-                    GlobalExcludePaths              = $globalExcludePaths
-                    ObjectExcludedVssWriters        = $objectExcludedVssWriters
-                    JobExcludedVssWriters           = $jobExcludedVssWriters
+                    PGKey                          = $pgKey
+                    Cluster                        = $cluster_name
+                    PGName                         = $pg.name
+                    ObjectName                     = $objectName
+                    LastSuccessfulBackupStatus     = $objectSuccess.Status
+                    LastSuccessfulBackupEndET      = $objectSuccess.EndET
+                    ObjectIncludedPaths            = ""
+                    ObjectExcludedPathsAll         = ""
+                    IncludedPath                   = ""
+                    ExcludedPathsUnderIncludedPath = ""
+                    SkipNestedVolumes              = ""
+                    GlobalExcludePaths             = $globalExcludePaths
+                    ObjectExcludedVssWriters       = $objectExcludedVssWriters
+                    JobExcludedVssWriters          = $jobExcludedVssWriters
                 }
             }
             else {
                 foreach ($fp in $filePaths) {
                     $detailRows += [PSCustomObject]@{
-                        Cluster                         = $cluster_name
-                        PGName                          = $pg.name
-                        ObjectName                      = $objectName
-                        LastSuccessfulBackupStatus      = $objectSuccess.Status
-                        LastSuccessfulBackupEndET       = $objectSuccess.EndET
-                        ObjectIncludedPaths             = $objectIncludedPaths
-                        ObjectExcludedPathsAll          = $objectExcludedPathsAll
-                        IncludedPath                    = $fp.includedPath
-                        ExcludedPathsUnderIncludedPath  = To-FlatString $fp.excludedPaths
-                        SkipNestedVolumes               = $fp.skipNestedVolumes
-                        GlobalExcludePaths              = $globalExcludePaths
-                        ObjectExcludedVssWriters        = $objectExcludedVssWriters
-                        JobExcludedVssWriters           = $jobExcludedVssWriters
+                        PGKey                          = $pgKey
+                        Cluster                        = $cluster_name
+                        PGName                         = $pg.name
+                        ObjectName                     = $objectName
+                        LastSuccessfulBackupStatus     = $objectSuccess.Status
+                        LastSuccessfulBackupEndET      = $objectSuccess.EndET
+                        ObjectIncludedPaths            = $objectIncludedPaths
+                        ObjectExcludedPathsAll         = $objectExcludedPathsAll
+                        IncludedPath                   = $fp.includedPath
+                        ExcludedPathsUnderIncludedPath = To-FlatString $fp.excludedPaths
+                        SkipNestedVolumes              = $fp.skipNestedVolumes
+                        GlobalExcludePaths             = $globalExcludePaths
+                        ObjectExcludedVssWriters       = $objectExcludedVssWriters
+                        JobExcludedVssWriters          = $jobExcludedVssWriters
                     }
                 }
             }
@@ -754,8 +771,16 @@ $stamp      = Get-Date -Format "yyyy-MM-dd_HHmm"
 $summaryCsv = Join-Path $outDir "Physical_PG_Summary_$stamp.csv"
 $detailCsv  = Join-Path $outDir "Physical_PG_Object_Detail_$stamp.csv"
 
+$summaryLatestCsv = Join-Path $outDir "Physical_PG_Summary_Latest.csv"
+$detailLatestCsv  = Join-Path $outDir "Physical_PG_Object_Detail_Latest.csv"
+
+# Timestamped history outputs
 $summaryRows | Export-Csv -Path $summaryCsv -NoTypeInformation -Encoding utf8
 $detailRows  | Export-Csv -Path $detailCsv  -NoTypeInformation -Encoding utf8
+
+# Fixed Power BI outputs. Point Power BI Desktop to these files.
+$summaryRows | Export-Csv -Path $summaryLatestCsv -NoTypeInformation -Encoding utf8
+$detailRows  | Export-Csv -Path $detailLatestCsv  -NoTypeInformation -Encoding utf8
 
 try {
     $raw = $Host.UI.RawUI
@@ -775,10 +800,13 @@ $summaryRows |
     Out-String -Width 10000 |
     Write-Host
 
-Write-Host "Summary rows : $(@($summaryRows).Count)" -ForegroundColor Green
-Write-Host "Detail rows  : $(@($detailRows).Count)" -ForegroundColor Green
-Write-Host "Summary CSV  : $summaryCsv" -ForegroundColor Green
-Write-Host "Detail CSV   : $detailCsv" -ForegroundColor Green
+Write-Host "Summary rows       : $(@($summaryRows).Count)" -ForegroundColor Green
+Write-Host "Detail rows        : $(@($detailRows).Count)" -ForegroundColor Green
+Write-Host "Summary CSV        : $summaryCsv" -ForegroundColor Green
+Write-Host "Detail CSV         : $detailCsv" -ForegroundColor Green
+Write-Host "Power BI Summary   : $summaryLatestCsv" -ForegroundColor Green
+Write-Host "Power BI Detail    : $detailLatestCsv" -ForegroundColor Green
+Write-Host "Power BI relation  : Physical_PG_Summary_Latest[PGKey] 1 -> * Physical_PG_Object_Detail_Latest[PGKey]" -ForegroundColor Cyan
 
 Show-PhysicalInventoryGrid -SummaryRows $summaryRows -DetailRows $detailRows
 
