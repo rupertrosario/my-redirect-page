@@ -119,11 +119,13 @@ Total Objects = COUNTROWS('Physical_PG_Object_Detail_Latest')
 
 ### Paused PGs
 
+Working version when `IsPaused` is imported as TRUE/FALSE boolean in Power BI:
+
 ```DAX
 Paused PGs =
 CALCULATE(
     DISTINCTCOUNT('Physical_PG_Summary_Latest'[PGKey]),
-    'Physical_PG_Summary_Latest'[IsPaused] = "True"
+    'Physical_PG_Summary_Latest'[IsPaused] = TRUE()
 )
 ```
 
