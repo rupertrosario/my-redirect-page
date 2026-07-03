@@ -8,8 +8,7 @@
 # - PG summary CSV
 # - Object detail CSV with object-level include/exclude and path-level include/exclude
 # - Global exclude paths
-# - Object excluded VSS writers
-# - Job excluded VSS writers
+# - Drill-down GridView: select PG -> object details grid
 # =====================================================================
 
 $ErrorActionPreference = "Stop"
@@ -23,7 +22,6 @@ $outDir     = "X:\PowerShell\Cohesity_API_Scripts\inventory"
 $apikeypath = "X:\PowerShell\Cohesity_API_Scripts\DO_NOT_Delete\apikey.txt"
 $baseUrl    = "https://helios.cohesity.com"
 
-# Error collection
 $script:ErrorRows = @()
 
 # -------------------------------
@@ -274,6 +272,53 @@ function Get-PhysicalProtectionGroups {
     return @($all)
 }
 
+function Show-PgDrillDownGrid {
+    param(
+        [object[]]$SummaryRows,
+        [object[]]$DetailRows
+    )
+
+    if (-not (Get-Command Out-GridView -ErrorAction SilentlyContinue)) {
+        Write-Warning "Out-GridView is unavailable in this PowerShell host. Use the CSV files for details."
+        return
+    }
+
+    if ($null -eq $SummaryRows -or @($SummaryRows).Count -eq 0) {
+        Write-Warning "No PG summary rows available for GridView."
+        return
+    }
+
+    while ($true) {
+        $selectedPg = $SummaryRows |
+            Select-Object Cluster, PGName, PolicyName, ProtectionType, PGObjectCount, GlobalExcludePaths, IsPaused, LastRunStatus, LastRunEndET |
+            Out-GridView -Title "Physical PG Summary - select one PG and click OK. Close/Cancel to exit." -PassThru
+
+        if ($null -eq $selectedPg) {
+            break
+        }
+
+        $pgDetails = @(
+            $DetailRows |
+            Where-Object {
+                $_.Cluster -eq $selectedPg.Cluster -and
+                $_.PGName  -eq $selectedPg.PGName
+            } |
+            Select-Object Cluster, PGName, PolicyName, ProtectionType, ObjectName, ObjectId, ObjectIncludedPaths, ObjectExcludedPathsAll, IncludedPath, ExcludedPathsUnderIncludedPath, SkipNestedVolumes, GlobalExcludePaths, ObjectExcludedVssWriters, JobExcludedVssWriters
+        )
+
+        if ($pgDetails.Count -eq 0) {
+            [PSCustomObject]@{
+                Cluster = $selectedPg.Cluster
+                PGName  = $selectedPg.PGName
+                Message = "No object-level detail rows found for this PG."
+            } | Out-GridView -Title "Object details for $($selectedPg.Cluster) / $($selectedPg.PGName)"
+        }
+        else {
+            $pgDetails | Out-GridView -Title "Object details for $($selectedPg.Cluster) / $($selectedPg.PGName)"
+        }
+    }
+}
+
 # =====================================================================
 # 1) Cluster menu — same working pattern as Oracle inventory
 # =====================================================================
@@ -290,7 +335,7 @@ $clusters = $json_clu | ForEach-Object {
         $_.clusterName,
         $_.displayName
     ) |
-        Where-Object { $_ -and "$_.".Trim() -ne "" } |
+        Where-Object { $_ -and "$($_)".Trim() -ne "" } |
         Select-Object -First 1
 
     $cid = @(
@@ -467,57 +512,57 @@ foreach ($c in $SelectedClusters) {
 
             if ($protectionType -eq "kVolume") {
                 $detailRows += [PSCustomObject]@{
-                    Cluster                    = $cluster_name
-                    PGName                     = $pg.name
-                    PolicyName                 = $policyName
-                    ProtectionType             = $protectionType
-                    ObjectName                 = $objectName
-                    ObjectId                   = $objectId
-                    ObjectIncludedPaths        = To-FlatString $obj.volumeGuids
-                    ObjectExcludedPathsAll     = ""
-                    IncludedPath               = To-FlatString $obj.volumeGuids
-                    ExcludedPathsUnderIncludedPath = ""
-                    SkipNestedVolumes          = ""
-                    GlobalExcludePaths         = $globalExcludePaths
-                    ObjectExcludedVssWriters   = $objectExcludedVssWriters
-                    JobExcludedVssWriters      = $jobExcludedVssWriters
+                    Cluster                         = $cluster_name
+                    PGName                          = $pg.name
+                    PolicyName                      = $policyName
+                    ProtectionType                  = $protectionType
+                    ObjectName                      = $objectName
+                    ObjectId                        = $objectId
+                    ObjectIncludedPaths             = To-FlatString $obj.volumeGuids
+                    ObjectExcludedPathsAll          = ""
+                    IncludedPath                    = To-FlatString $obj.volumeGuids
+                    ExcludedPathsUnderIncludedPath  = ""
+                    SkipNestedVolumes               = ""
+                    GlobalExcludePaths              = $globalExcludePaths
+                    ObjectExcludedVssWriters        = $objectExcludedVssWriters
+                    JobExcludedVssWriters           = $jobExcludedVssWriters
                 }
             }
             elseif ($filePaths.Count -eq 0) {
                 $detailRows += [PSCustomObject]@{
-                    Cluster                    = $cluster_name
-                    PGName                     = $pg.name
-                    PolicyName                 = $policyName
-                    ProtectionType             = $protectionType
-                    ObjectName                 = $objectName
-                    ObjectId                   = $objectId
-                    ObjectIncludedPaths        = ""
-                    ObjectExcludedPathsAll     = ""
-                    IncludedPath               = ""
-                    ExcludedPathsUnderIncludedPath = ""
-                    SkipNestedVolumes          = ""
-                    GlobalExcludePaths         = $globalExcludePaths
-                    ObjectExcludedVssWriters   = $objectExcludedVssWriters
-                    JobExcludedVssWriters      = $jobExcludedVssWriters
+                    Cluster                         = $cluster_name
+                    PGName                          = $pg.name
+                    PolicyName                      = $policyName
+                    ProtectionType                  = $protectionType
+                    ObjectName                      = $objectName
+                    ObjectId                        = $objectId
+                    ObjectIncludedPaths             = ""
+                    ObjectExcludedPathsAll          = ""
+                    IncludedPath                    = ""
+                    ExcludedPathsUnderIncludedPath  = ""
+                    SkipNestedVolumes               = ""
+                    GlobalExcludePaths              = $globalExcludePaths
+                    ObjectExcludedVssWriters        = $objectExcludedVssWriters
+                    JobExcludedVssWriters           = $jobExcludedVssWriters
                 }
             }
             else {
                 foreach ($fp in $filePaths) {
                     $detailRows += [PSCustomObject]@{
-                        Cluster                    = $cluster_name
-                        PGName                     = $pg.name
-                        PolicyName                 = $policyName
-                        ProtectionType             = $protectionType
-                        ObjectName                 = $objectName
-                        ObjectId                   = $objectId
-                        ObjectIncludedPaths        = $objectIncludedPaths
-                        ObjectExcludedPathsAll     = $objectExcludedPathsAll
-                        IncludedPath               = $fp.includedPath
-                        ExcludedPathsUnderIncludedPath = To-FlatString $fp.excludedPaths
-                        SkipNestedVolumes          = $fp.skipNestedVolumes
-                        GlobalExcludePaths         = $globalExcludePaths
-                        ObjectExcludedVssWriters   = $objectExcludedVssWriters
-                        JobExcludedVssWriters      = $jobExcludedVssWriters
+                        Cluster                         = $cluster_name
+                        PGName                          = $pg.name
+                        PolicyName                      = $policyName
+                        ProtectionType                  = $protectionType
+                        ObjectName                      = $objectName
+                        ObjectId                        = $objectId
+                        ObjectIncludedPaths             = $objectIncludedPaths
+                        ObjectExcludedPathsAll          = $objectExcludedPathsAll
+                        IncludedPath                    = $fp.includedPath
+                        ExcludedPathsUnderIncludedPath  = To-FlatString $fp.excludedPaths
+                        SkipNestedVolumes               = $fp.skipNestedVolumes
+                        GlobalExcludePaths              = $globalExcludePaths
+                        ObjectExcludedVssWriters        = $objectExcludedVssWriters
+                        JobExcludedVssWriters           = $jobExcludedVssWriters
                     }
                 }
             }
@@ -561,12 +606,7 @@ Write-Host "Detail rows  : $(@($detailRows).Count)" -ForegroundColor Green
 Write-Host "Summary CSV  : $summaryCsv" -ForegroundColor Green
 Write-Host "Detail CSV   : $detailCsv" -ForegroundColor Green
 
-try {
-    $summaryRows | Out-GridView -Title "Cohesity Physical PG Summary"
-}
-catch {
-    Write-Warning "Out-GridView is unavailable in this PowerShell host. CSV files were still created."
-}
+Show-PgDrillDownGrid -SummaryRows $summaryRows -DetailRows $detailRows
 
 # =====================================================================
 # 4) Error exception output
