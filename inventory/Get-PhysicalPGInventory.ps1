@@ -1,5 +1,5 @@
 # =====================================================================
-# Cohesity Helios — Physical PG Inventory with Object Include/Exclude
+# Cohesity Helios — Physical PG Inventory with Object Include/Exclude UI
 # STRICTLY READ-ONLY / GET-only
 #
 # Included:
@@ -7,8 +7,7 @@
 # - Active Physical Protection Groups
 # - PG summary CSV
 # - Object detail CSV with object-level include/exclude and path-level include/exclude
-# - Global exclude paths
-# - Drill-down GridView: select PG -> object details grid
+# - Simple WinForms UI: click PG on left, object details show on right
 # =====================================================================
 
 $ErrorActionPreference = "Stop"
@@ -272,51 +271,217 @@ function Get-PhysicalProtectionGroups {
     return @($all)
 }
 
-function Show-PgDrillDownGrid {
+function ConvertTo-UiDataTable {
     param(
-        [object[]]$SummaryRows,
-        [object[]]$DetailRows
+        [object[]]$Rows,
+        [string[]]$Columns
     )
 
-    if (-not (Get-Command Out-GridView -ErrorAction SilentlyContinue)) {
-        Write-Warning "Out-GridView is unavailable in this PowerShell host. Use the CSV files for details."
+    $dt = New-Object System.Data.DataTable
+
+    foreach ($col in $Columns) {
+        [void]$dt.Columns.Add($col, [string])
+    }
+
+    foreach ($row in @($Rows)) {
+        $dr = $dt.NewRow()
+
+        foreach ($col in $Columns) {
+            $value = $null
+
+            if ($null -ne $row -and ($row.PSObject.Properties.Name -contains $col)) {
+                $value = $row.$col
+            }
+
+            if ($null -eq $value) {
+                $dr[$col] = ""
+            }
+            else {
+                $dr[$col] = [string]$value
+            }
+        }
+
+        [void]$dt.Rows.Add($dr)
+    }
+
+    return $dt
+}
+
+function Set-GridDefaults {
+    param([System.Windows.Forms.DataGridView]$Grid)
+
+    $Grid.ReadOnly = $true
+    $Grid.AllowUserToAddRows = $false
+    $Grid.AllowUserToDeleteRows = $false
+    $Grid.MultiSelect = $false
+    $Grid.SelectionMode = [System.Windows.Forms.DataGridViewSelectionMode]::FullRowSelect
+    $Grid.AutoSizeColumnsMode = [System.Windows.Forms.DataGridViewAutoSizeColumnsMode]::DisplayedCells
+    $Grid.AutoSizeRowsMode = [System.Windows.Forms.DataGridViewAutoSizeRowsMode]::DisplayedCells
+    $Grid.ScrollBars = [System.Windows.Forms.ScrollBars]::Both
+    $Grid.RowHeadersVisible = $false
+}
+
+function Show-PhysicalInventoryUI {
+    param(
+        [object[]]$SummaryRows,
+        [object[]]$DetailRows,
+        [string]$SummaryCsv,
+        [string]$DetailCsv
+    )
+
+    try {
+        Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
+        Add-Type -AssemblyName System.Drawing -ErrorAction Stop
+    }
+    catch {
+        Write-Warning "Windows Forms UI is unavailable in this PowerShell host. Use the CSV files instead."
         return
     }
 
     if ($null -eq $SummaryRows -or @($SummaryRows).Count -eq 0) {
-        Write-Warning "No PG summary rows available for GridView."
+        Write-Warning "No PG summary rows available for UI."
         return
     }
 
-    while ($true) {
-        $selectedPg = $SummaryRows |
-            Select-Object Cluster, PGName, PolicyName, ProtectionType, PGObjectCount, GlobalExcludePaths, IsPaused, LastRunStatus, LastRunEndET |
-            Out-GridView -Title "Physical PG Summary - select one PG and click OK. Close/Cancel to exit." -PassThru
+    $summaryColumns = @(
+        "Cluster",
+        "PGName",
+        "PolicyName",
+        "ProtectionType",
+        "PGObjectCount",
+        "GlobalExcludePaths",
+        "IsPaused",
+        "LastRunStatus",
+        "LastRunEndET"
+    )
 
-        if ($null -eq $selectedPg) {
-            break
+    $detailColumns = @(
+        "Cluster",
+        "PGName",
+        "PolicyName",
+        "ProtectionType",
+        "ObjectName",
+        "ObjectId",
+        "ObjectIncludedPaths",
+        "ObjectExcludedPathsAll",
+        "IncludedPath",
+        "ExcludedPathsUnderIncludedPath",
+        "SkipNestedVolumes",
+        "GlobalExcludePaths",
+        "ObjectExcludedVssWriters",
+        "JobExcludedVssWriters"
+    )
+
+    $summaryTable = ConvertTo-UiDataTable -Rows $SummaryRows -Columns $summaryColumns
+    $emptyDetailTable = ConvertTo-UiDataTable -Rows @() -Columns $detailColumns
+
+    [System.Windows.Forms.Application]::EnableVisualStyles()
+
+    $form = New-Object System.Windows.Forms.Form
+    $form.Text = "Cohesity Physical PG Inventory"
+    $form.StartPosition = "CenterScreen"
+    $form.Width = 1600
+    $form.Height = 900
+    $form.MinimumSize = New-Object System.Drawing.Size(1200, 700)
+
+    $mainLayout = New-Object System.Windows.Forms.TableLayoutPanel
+    $mainLayout.Dock = [System.Windows.Forms.DockStyle]::Fill
+    $mainLayout.RowCount = 2
+    $mainLayout.ColumnCount = 1
+    [void]$mainLayout.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Percent, 100)))
+    [void]$mainLayout.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Absolute, 28)))
+
+    $split = New-Object System.Windows.Forms.SplitContainer
+    $split.Dock = [System.Windows.Forms.DockStyle]::Fill
+    $split.Orientation = [System.Windows.Forms.Orientation]::Vertical
+    $split.SplitterDistance = 650
+
+    $leftLayout = New-Object System.Windows.Forms.TableLayoutPanel
+    $leftLayout.Dock = [System.Windows.Forms.DockStyle]::Fill
+    $leftLayout.RowCount = 2
+    $leftLayout.ColumnCount = 1
+    [void]$leftLayout.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Absolute, 28)))
+    [void]$leftLayout.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Percent, 100)))
+
+    $rightLayout = New-Object System.Windows.Forms.TableLayoutPanel
+    $rightLayout.Dock = [System.Windows.Forms.DockStyle]::Fill
+    $rightLayout.RowCount = 2
+    $rightLayout.ColumnCount = 1
+    [void]$rightLayout.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Absolute, 28)))
+    [void]$rightLayout.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Percent, 100)))
+
+    $pgLabel = New-Object System.Windows.Forms.Label
+    $pgLabel.Text = "Protection Groups - click a PG to show object-level include/exclude details"
+    $pgLabel.Dock = [System.Windows.Forms.DockStyle]::Fill
+    $pgLabel.TextAlign = [System.Drawing.ContentAlignment]::MiddleLeft
+
+    $detailLabel = New-Object System.Windows.Forms.Label
+    $detailLabel.Text = "Object details"
+    $detailLabel.Dock = [System.Windows.Forms.DockStyle]::Fill
+    $detailLabel.TextAlign = [System.Drawing.ContentAlignment]::MiddleLeft
+
+    $pgGrid = New-Object System.Windows.Forms.DataGridView
+    $pgGrid.Dock = [System.Windows.Forms.DockStyle]::Fill
+    Set-GridDefaults -Grid $pgGrid
+    $pgGrid.DataSource = $summaryTable
+
+    $detailGrid = New-Object System.Windows.Forms.DataGridView
+    $detailGrid.Dock = [System.Windows.Forms.DockStyle]::Fill
+    Set-GridDefaults -Grid $detailGrid
+    $detailGrid.DataSource = $emptyDetailTable
+
+    $statusLabel = New-Object System.Windows.Forms.Label
+    $statusLabel.Dock = [System.Windows.Forms.DockStyle]::Fill
+    $statusLabel.TextAlign = [System.Drawing.ContentAlignment]::MiddleLeft
+    $statusLabel.Text = "Summary CSV: $SummaryCsv    |    Detail CSV: $DetailCsv"
+
+    [void]$leftLayout.Controls.Add($pgLabel, 0, 0)
+    [void]$leftLayout.Controls.Add($pgGrid, 0, 1)
+
+    [void]$rightLayout.Controls.Add($detailLabel, 0, 0)
+    [void]$rightLayout.Controls.Add($detailGrid, 0, 1)
+
+    [void]$split.Panel1.Controls.Add($leftLayout)
+    [void]$split.Panel2.Controls.Add($rightLayout)
+
+    [void]$mainLayout.Controls.Add($split, 0, 0)
+    [void]$mainLayout.Controls.Add($statusLabel, 0, 1)
+
+    [void]$form.Controls.Add($mainLayout)
+
+    $updateDetails = {
+        if ($pgGrid.SelectedRows.Count -eq 0) {
+            return
         }
+
+        $selectedRow = $pgGrid.SelectedRows[0]
+        $selectedCluster = [string]$selectedRow.Cells["Cluster"].Value
+        $selectedPgName  = [string]$selectedRow.Cells["PGName"].Value
 
         $pgDetails = @(
             $DetailRows |
             Where-Object {
-                $_.Cluster -eq $selectedPg.Cluster -and
-                $_.PGName  -eq $selectedPg.PGName
-            } |
-            Select-Object Cluster, PGName, PolicyName, ProtectionType, ObjectName, ObjectId, ObjectIncludedPaths, ObjectExcludedPathsAll, IncludedPath, ExcludedPathsUnderIncludedPath, SkipNestedVolumes, GlobalExcludePaths, ObjectExcludedVssWriters, JobExcludedVssWriters
+                $_.Cluster -eq $selectedCluster -and
+                $_.PGName  -eq $selectedPgName
+            }
         )
 
-        if ($pgDetails.Count -eq 0) {
-            [PSCustomObject]@{
-                Cluster = $selectedPg.Cluster
-                PGName  = $selectedPg.PGName
-                Message = "No object-level detail rows found for this PG."
-            } | Out-GridView -Title "Object details for $($selectedPg.Cluster) / $($selectedPg.PGName)"
-        }
-        else {
-            $pgDetails | Out-GridView -Title "Object details for $($selectedPg.Cluster) / $($selectedPg.PGName)"
-        }
+        $detailGrid.DataSource = ConvertTo-UiDataTable -Rows $pgDetails -Columns $detailColumns
+        $detailLabel.Text = "Object details - $selectedCluster / $selectedPgName ($($pgDetails.Count) rows)"
     }
+
+    $pgGrid.Add_SelectionChanged($updateDetails)
+
+    $form.Add_Shown({
+        if ($pgGrid.Rows.Count -gt 0) {
+            $pgGrid.ClearSelection()
+            $pgGrid.Rows[0].Selected = $true
+            $pgGrid.CurrentCell = $pgGrid.Rows[0].Cells[0]
+            & $updateDetails
+        }
+    })
+
+    [void]$form.ShowDialog()
 }
 
 # =====================================================================
@@ -606,7 +771,7 @@ Write-Host "Detail rows  : $(@($detailRows).Count)" -ForegroundColor Green
 Write-Host "Summary CSV  : $summaryCsv" -ForegroundColor Green
 Write-Host "Detail CSV   : $detailCsv" -ForegroundColor Green
 
-Show-PgDrillDownGrid -SummaryRows $summaryRows -DetailRows $detailRows
+Show-PhysicalInventoryUI -SummaryRows $summaryRows -DetailRows $detailRows -SummaryCsv $summaryCsv -DetailCsv $detailCsv
 
 # =====================================================================
 # 4) Error exception output
