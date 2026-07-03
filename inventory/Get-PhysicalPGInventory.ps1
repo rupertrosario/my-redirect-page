@@ -25,26 +25,20 @@ function Invoke-CohesityGet {
 function Convert-UsecsToET {
     param($Usecs)
 
-    if ($null -eq $Usecs -or [string]::IsNullOrWhiteSpace([string]$Usecs)) {
-        return ''
-    }
+    if ($null -eq $Usecs -or [string]::IsNullOrWhiteSpace([string]$Usecs)) { return '' }
 
     try {
         $Dto = [DateTimeOffset]::FromUnixTimeMilliseconds([int64]([double]$Usecs / 1000))
         $Tz  = [TimeZoneInfo]::FindSystemTimeZoneById('Eastern Standard Time')
         return ([TimeZoneInfo]::ConvertTime($Dto, $Tz)).ToString('yyyy-MM-dd HH:mm:ss')
     }
-    catch {
-        return ''
-    }
+    catch { return '' }
 }
 
 function Join-Text {
     param($Values)
 
-    if ($null -eq $Values) {
-        return ''
-    }
+    if ($null -eq $Values) { return '' }
 
     return (@($Values) |
         Where-Object { $null -ne $_ -and -not [string]::IsNullOrWhiteSpace([string]$_) } |
@@ -58,9 +52,7 @@ function Get-Value {
         [string[]]$Names
     )
 
-    if ($null -eq $Object) {
-        return $null
-    }
+    if ($null -eq $Object) { return $null }
 
     foreach ($Name in $Names) {
         if ($Object.PSObject.Properties.Name -contains $Name) {
@@ -74,35 +66,101 @@ function Get-Value {
     return $null
 }
 
-function Get-ClusterItemsFromResponse {
-    param($Json)
+function Find-ClusterCandidatesRecursive {
+    param($Node)
 
-    $Items = @()
+    $Found = @()
 
-    if ($Json -is [System.Array]) {
-        $Items += @($Json)
+    if ($null -eq $Node) { return @() }
+
+    if ($Node -is [System.Array]) {
+        foreach ($Item in $Node) {
+            $Found += @(Find-ClusterCandidatesRecursive -Node $Item)
+        }
+        return @($Found)
     }
-    else {
-        foreach ($PropertyName in @('clusters', 'clusterInfo', 'clusterInfos', 'clusterInfoList', 'items', 'data')) {
-            if ($Json.PSObject.Properties.Name -contains $PropertyName) {
-                if ($null -ne $Json.$PropertyName) {
-                    $Items += @($Json.$PropertyName)
+
+    if ($Node -isnot [psobject]) { return @() }
+
+    $PropertyNames = @($Node.PSObject.Properties.Name)
+    if ($PropertyNames.Count -eq 0) { return @() }
+
+    $ClusterId = Get-Value $Node @(
+        'clusterId',
+        'accessClusterId',
+        'id',
+        'clusterUid',
+        'clusterUUID',
+        'clusterUuid',
+        'uuid'
+    )
+
+    $ClusterName = Get-Value $Node @(
+        'clusterName',
+        'name',
+        'displayName',
+        'clusterDisplayName'
+    )
+
+    if ([string]::IsNullOrWhiteSpace([string]$ClusterId)) {
+        foreach ($Prop in $PropertyNames) {
+            if ($Prop -match '(?i)cluster.*id|id.*cluster|accessClusterId') {
+                $Value = $Node.$Prop
+                if ($null -ne $Value -and -not [string]::IsNullOrWhiteSpace([string]$Value) -and $Value -isnot [System.Array]) {
+                    $ClusterId = $Value
+                    break
                 }
             }
         }
+    }
 
-        if ($Items.Count -eq 0) {
-            $Items += @($Json)
+    if ([string]::IsNullOrWhiteSpace([string]$ClusterName)) {
+        foreach ($Prop in $PropertyNames) {
+            if ($Prop -match '(?i)cluster.*name|name.*cluster|display.*name') {
+                $Value = $Node.$Prop
+                if ($null -ne $Value -and -not [string]::IsNullOrWhiteSpace([string]$Value) -and $Value -isnot [System.Array]) {
+                    $ClusterName = $Value
+                    break
+                }
+            }
         }
     }
 
-    return @($Items | Where-Object { $_ })
+    if ([string]::IsNullOrWhiteSpace([string]$ClusterId) -and ($PropertyNames -contains 'clusterIdentifier')) {
+        $ClusterId = Get-Value $Node.clusterIdentifier @('clusterId', 'id', 'uuid')
+        if ([string]::IsNullOrWhiteSpace([string]$ClusterName)) {
+            $ClusterName = Get-Value $Node.clusterIdentifier @('clusterName', 'name', 'displayName')
+        }
+    }
+
+    $LooksLikeClusterObject = ($PropertyNames | Where-Object { $_ -match '(?i)cluster' }).Count -gt 0
+
+    if (-not [string]::IsNullOrWhiteSpace([string]$ClusterId) -and $LooksLikeClusterObject) {
+        if ([string]::IsNullOrWhiteSpace([string]$ClusterName)) {
+            $ClusterName = $ClusterId
+        }
+
+        $Found += [PSCustomObject]@{
+            ClusterId   = [string]$ClusterId
+            ClusterName = [string]$ClusterName
+        }
+    }
+
+    foreach ($Prop in $PropertyNames) {
+        $Child = $Node.$Prop
+        if ($null -ne $Child -and $Child -isnot [string]) {
+            $Found += @(Find-ClusterCandidatesRecursive -Node $Child)
+        }
+    }
+
+    return @($Found)
 }
 
 function Get-ClusterIndex {
     param(
         [string]$HeliosUrl,
-        [string]$ApiKey
+        [string]$ApiKey,
+        [string]$OutputDir
     )
 
     $Headers = @{
@@ -110,31 +168,25 @@ function Get-ClusterIndex {
         accept = 'application/json'
     }
 
+    $Uri = "$HeliosUrl/v2/mcm/cluster-mgmt/info"
+    $DebugFile = Join-Path $OutputDir 'ClusterIndex_Debug.json'
+
     Write-Host 'Getting cluster index from Helios...' -ForegroundColor Yellow
-    $Json = Invoke-CohesityGet -Uri "$HeliosUrl/v2/mcm/cluster-mgmt/info" -Headers $Headers
+    Write-Host "Cluster index URI: $Uri" -ForegroundColor DarkGray
+
+    $Response = Invoke-WebRequest -Method Get -Uri $Uri -Headers $Headers -TimeoutSec 120
+    $Response.Content | Out-File -FilePath $DebugFile -Encoding utf8
+    $Json = $Response.Content | ConvertFrom-Json
 
     $ClusterMap = @{}
+    $Candidates = @(Find-ClusterCandidatesRecursive -Node $Json)
 
-    foreach ($Item in (Get-ClusterItemsFromResponse $Json)) {
-        $ClusterId = Get-Value $Item @('clusterId', 'id', 'accessClusterId')
-        $ClusterName = Get-Value $Item @('clusterName', 'name', 'displayName')
-
-        if ([string]::IsNullOrWhiteSpace([string]$ClusterId) -and ($Item.PSObject.Properties.Name -contains 'clusterIdentifier')) {
-            $ClusterId = Get-Value $Item.clusterIdentifier @('clusterId', 'id')
-            if ([string]::IsNullOrWhiteSpace([string]$ClusterName)) {
-                $ClusterName = Get-Value $Item.clusterIdentifier @('clusterName', 'name')
-            }
-        }
-
-        if (-not [string]::IsNullOrWhiteSpace([string]$ClusterId)) {
-            if ([string]::IsNullOrWhiteSpace([string]$ClusterName)) {
-                $ClusterName = $ClusterId
-            }
-
-            if (-not $ClusterMap.ContainsKey([string]$ClusterId)) {
-                $ClusterMap[[string]$ClusterId] = [PSCustomObject]@{
-                    ClusterId   = [string]$ClusterId
-                    ClusterName = [string]$ClusterName
+    foreach ($Candidate in $Candidates) {
+        if (-not [string]::IsNullOrWhiteSpace([string]$Candidate.ClusterId)) {
+            if (-not $ClusterMap.ContainsKey($Candidate.ClusterId)) {
+                $ClusterMap[$Candidate.ClusterId] = [PSCustomObject]@{
+                    ClusterId   = $Candidate.ClusterId
+                    ClusterName = $Candidate.ClusterName
                 }
             }
         }
@@ -143,9 +195,10 @@ function Get-ClusterIndex {
     $Clusters = @($ClusterMap.Values | Sort-Object ClusterName)
 
     if ($Clusters.Count -eq 0) {
-        throw 'No clusters returned from /v2/mcm/cluster-mgmt/info.'
+        throw "No clusters parsed from /v2/mcm/cluster-mgmt/info. Raw response saved to: $DebugFile"
     }
 
+    Write-Host "Clusters found: $($Clusters.Count)" -ForegroundColor Green
     return $Clusters
 }
 
@@ -163,9 +216,7 @@ function Select-Clusters {
     Write-Host 'Examples: 1 or 1,3,5 or 2-4' -ForegroundColor DarkGray
     $Choice = (Read-Host 'Enter selection').Trim()
 
-    if ([string]::IsNullOrWhiteSpace($Choice) -or $Choice -eq '0') {
-        return @($Clusters)
-    }
+    if ([string]::IsNullOrWhiteSpace($Choice) -or $Choice -eq '0') { return @($Clusters) }
 
     $SelectedNumbers = @()
 
@@ -175,25 +226,15 @@ function Select-Clusters {
         if ($Part -match '^(\d+)\s*-\s*(\d+)$') {
             $Start = [int]$Matches[1]
             $End   = [int]$Matches[2]
-
-            if ($Start -lt 1 -or $End -gt $Clusters.Count -or $Start -gt $End) {
-                throw "Invalid cluster range: $Part"
-            }
-
+            if ($Start -lt 1 -or $End -gt $Clusters.Count -or $Start -gt $End) { throw "Invalid cluster range: $Part" }
             $SelectedNumbers += $Start..$End
         }
         elseif ($Part -match '^\d+$') {
             $Number = [int]$Part
-
-            if ($Number -lt 1 -or $Number -gt $Clusters.Count) {
-                throw "Invalid cluster number: $Part"
-            }
-
+            if ($Number -lt 1 -or $Number -gt $Clusters.Count) { throw "Invalid cluster number: $Part" }
             $SelectedNumbers += $Number
         }
-        else {
-            throw "Invalid selection: $Part"
-        }
+        else { throw "Invalid selection: $Part" }
     }
 
     $SelectedNumbers = $SelectedNumbers | Sort-Object -Unique
@@ -207,22 +248,14 @@ function Get-PolicyName {
         [hashtable]$PolicyCache
     )
 
-    if ([string]::IsNullOrWhiteSpace([string]$PolicyId)) {
-        return ''
-    }
+    if ([string]::IsNullOrWhiteSpace([string]$PolicyId)) { return '' }
 
-    if ($PolicyCache.ContainsKey([string]$PolicyId)) {
-        return $PolicyCache[[string]$PolicyId]
-    }
+    if ($PolicyCache.ContainsKey([string]$PolicyId)) { return $PolicyCache[[string]$PolicyId] }
 
     try {
         $Json = Invoke-CohesityGet -Uri "$HeliosUrl/v2/data-protect/policies?ids=$PolicyId" -Headers $Headers
         $PolicyName = ($Json.policies | Where-Object { $_.id -eq $PolicyId } | Select-Object -ExpandProperty name -First 1)
-
-        if ([string]::IsNullOrWhiteSpace([string]$PolicyName)) {
-            $PolicyName = $PolicyId
-        }
-
+        if ([string]::IsNullOrWhiteSpace([string]$PolicyName)) { $PolicyName = $PolicyId }
         $PolicyCache[[string]$PolicyId] = $PolicyName
         return $PolicyName
     }
@@ -262,18 +295,14 @@ function Get-PhysicalProtectionGroups {
 }
 
 # ---------- MAIN ----------
-if (-not (Test-Path $ApiKeyFile)) {
-    throw "API key file not found: $ApiKeyFile"
-}
+if (-not (Test-Path $ApiKeyFile)) { throw "API key file not found: $ApiKeyFile" }
 
 $ApiKey = (Get-Content $ApiKeyFile -Raw).Trim()
-if ([string]::IsNullOrWhiteSpace($ApiKey)) {
-    throw "API key file is empty: $ApiKeyFile"
-}
+if ([string]::IsNullOrWhiteSpace($ApiKey)) { throw "API key file is empty: $ApiKeyFile" }
 
 New-Item -ItemType Directory -Path $OutputDir -Force | Out-Null
 
-$ClusterIndex = Get-ClusterIndex -HeliosUrl $HeliosUrl -ApiKey $ApiKey
+$ClusterIndex = Get-ClusterIndex -HeliosUrl $HeliosUrl -ApiKey $ApiKey -OutputDir $OutputDir
 $SelectedClusters = Select-Clusters -Clusters $ClusterIndex
 
 $SummaryRows = @()
@@ -292,9 +321,7 @@ foreach ($Cluster in $SelectedClusters) {
 
     foreach ($Pg in ($ProtectionGroups | Where-Object { $_ })) {
         $PhysicalParams = $Pg.physicalParams
-        if ($null -eq $PhysicalParams) {
-            continue
-        }
+        if ($null -eq $PhysicalParams) { continue }
 
         $ProtectionType = $PhysicalParams.protectionType
         $FileParams = $PhysicalParams.fileProtectionTypeParams
@@ -313,19 +340,13 @@ foreach ($Cluster in $SelectedClusters) {
 
         $LastRun = $Pg.lastRun
         $LocalInfo = $LastRun.localBackupInfo
-        if ($null -eq $LocalInfo) {
-            $LocalInfo = $LastRun.localSnapshotInfo
-        }
+        if ($null -eq $LocalInfo) { $LocalInfo = $LastRun.localSnapshotInfo }
 
         $LastRunStatus = $LocalInfo.status
-        if ([string]::IsNullOrWhiteSpace([string]$LastRunStatus)) {
-            $LastRunStatus = $LastRun.status
-        }
+        if ([string]::IsNullOrWhiteSpace([string]$LastRunStatus)) { $LastRunStatus = $LastRun.status }
 
         $EndTimeUsecs = $LocalInfo.endTimeUsecs
-        if ($null -eq $EndTimeUsecs) {
-            $EndTimeUsecs = $LastRun.endTimeUsecs
-        }
+        if ($null -eq $EndTimeUsecs) { $EndTimeUsecs = $LastRun.endTimeUsecs }
 
         $PolicyName = $Pg.policyName
         if ([string]::IsNullOrWhiteSpace([string]$PolicyName)) {
