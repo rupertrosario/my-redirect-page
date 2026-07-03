@@ -2,19 +2,26 @@
 # Branch: Cohesity_Automations
 # Folder: inventory
 # Cohesity API scope: GET-only
-# Cluster list: auto-discovered from Helios /v2/mcm/cluster-mgmt/info
-# Output:
-#   1. PG summary CSV + GridView
-#   2. Object include/exclude detail CSV
+# Output folder: X:\PowerShell\Cohesity_API_Scripts\inventory
 
 $ErrorActionPreference = 'Stop'
 
 # ---------- CONFIG ----------
 $HeliosUrl  = 'https://helios.cohesity.com'
 $ApiKeyFile = 'X:\PowerShell\Cohesity_API_Scripts\DO_NOT_Delete\apikey.txt'
-$OutputDir  = $PSScriptRoot
+$OutputDir  = 'X:\PowerShell\Cohesity_API_Scripts\inventory'
 
 # ---------- HELPERS ----------
+function Invoke-CohesityGet {
+    param(
+        [string]$Uri,
+        [hashtable]$Headers
+    )
+
+    $Response = Invoke-WebRequest -Method Get -Uri $Uri -Headers $Headers -TimeoutSec 120
+    return ($Response.Content | ConvertFrom-Json)
+}
+
 function Convert-UsecsToET {
     param($Usecs)
 
@@ -23,9 +30,9 @@ function Convert-UsecsToET {
     }
 
     try {
-        $DateTimeOffset = [DateTimeOffset]::FromUnixTimeMilliseconds([int64]([double]$Usecs / 1000))
-        $TimeZone = [TimeZoneInfo]::FindSystemTimeZoneById('Eastern Standard Time')
-        return ([TimeZoneInfo]::ConvertTime($DateTimeOffset, $TimeZone)).ToString('yyyy-MM-dd HH:mm:ss')
+        $Dto = [DateTimeOffset]::FromUnixTimeMilliseconds([int64]([double]$Usecs / 1000))
+        $Tz  = [TimeZoneInfo]::FindSystemTimeZoneById('Eastern Standard Time')
+        return ([TimeZoneInfo]::ConvertTime($Dto, $Tz)).ToString('yyyy-MM-dd HH:mm:ss')
     }
     catch {
         return ''
@@ -45,8 +52,11 @@ function Join-Text {
         Select-Object -Unique) -join '; '
 }
 
-function Get-FirstValue {
-    param($Object, [string[]]$Names)
+function Get-Value {
+    param(
+        $Object,
+        [string[]]$Names
+    )
 
     if ($null -eq $Object) {
         return $null
@@ -64,52 +74,55 @@ function Get-FirstValue {
     return $null
 }
 
-function Get-ClusterCandidates {
-    param($ClusterJson)
+function Get-ClusterItemsFromResponse {
+    param($Json)
 
-    $Candidates = @()
+    $Items = @()
 
-    foreach ($PropertyName in @('clusters', 'clusterInfo', 'clusterInfoList', 'clusterInfos', 'items', 'data')) {
-        if ($ClusterJson.PSObject.Properties.Name -contains $PropertyName) {
-            $Value = $ClusterJson.$PropertyName
-            if ($null -ne $Value) {
-                $Candidates += @($Value)
+    if ($Json -is [System.Array]) {
+        $Items += @($Json)
+    }
+    else {
+        foreach ($PropertyName in @('clusters', 'clusterInfo', 'clusterInfos', 'clusterInfoList', 'items', 'data')) {
+            if ($Json.PSObject.Properties.Name -contains $PropertyName) {
+                if ($null -ne $Json.$PropertyName) {
+                    $Items += @($Json.$PropertyName)
+                }
             }
+        }
+
+        if ($Items.Count -eq 0) {
+            $Items += @($Json)
         }
     }
 
-    if ($Candidates.Count -eq 0) {
-        $Candidates += @($ClusterJson)
-    }
-
-    return @($Candidates | Where-Object { $_ })
+    return @($Items | Where-Object { $_ })
 }
 
 function Get-ClusterIndex {
-    param($HeliosUrl, $ApiKey)
+    param(
+        [string]$HeliosUrl,
+        [string]$ApiKey
+    )
 
     $Headers = @{
         apiKey = $ApiKey
         accept = 'application/json'
     }
 
-    $Uri = "$HeliosUrl/v2/mcm/cluster-mgmt/info"
-    Write-Host "Getting cluster index from Helios ..." -ForegroundColor Yellow
+    Write-Host 'Getting cluster index from Helios...' -ForegroundColor Yellow
+    $Json = Invoke-CohesityGet -Uri "$HeliosUrl/v2/mcm/cluster-mgmt/info" -Headers $Headers
 
-    $Response = Invoke-WebRequest -Method Get -Uri $Uri -Headers $Headers
-    $ClusterJson = $Response.Content | ConvertFrom-Json
+    $ClusterMap = @{}
 
-    $Clusters = @()
-    foreach ($ClusterItem in (Get-ClusterCandidates $ClusterJson)) {
-        $ClusterId = Get-FirstValue $ClusterItem @('id', 'clusterId', 'accessClusterId')
-        $ClusterName = Get-FirstValue $ClusterItem @('name', 'clusterName', 'displayName')
+    foreach ($Item in (Get-ClusterItemsFromResponse $Json)) {
+        $ClusterId = Get-Value $Item @('clusterId', 'id', 'accessClusterId')
+        $ClusterName = Get-Value $Item @('clusterName', 'name', 'displayName')
 
-        if ([string]::IsNullOrWhiteSpace([string]$ClusterId)) {
-            if ($ClusterItem.PSObject.Properties.Name -contains 'clusterIdentifier') {
-                $ClusterId = Get-FirstValue $ClusterItem.clusterIdentifier @('id', 'clusterId')
-                if ([string]::IsNullOrWhiteSpace([string]$ClusterName)) {
-                    $ClusterName = Get-FirstValue $ClusterItem.clusterIdentifier @('name', 'clusterName')
-                }
+        if ([string]::IsNullOrWhiteSpace([string]$ClusterId) -and ($Item.PSObject.Properties.Name -contains 'clusterIdentifier')) {
+            $ClusterId = Get-Value $Item.clusterIdentifier @('clusterId', 'id')
+            if ([string]::IsNullOrWhiteSpace([string]$ClusterName)) {
+                $ClusterName = Get-Value $Item.clusterIdentifier @('clusterName', 'name')
             }
         }
 
@@ -118,30 +131,32 @@ function Get-ClusterIndex {
                 $ClusterName = $ClusterId
             }
 
-            $Clusters += [PSCustomObject]@{
-                ClusterId   = [string]$ClusterId
-                ClusterName = [string]$ClusterName
+            if (-not $ClusterMap.ContainsKey([string]$ClusterId)) {
+                $ClusterMap[[string]$ClusterId] = [PSCustomObject]@{
+                    ClusterId   = [string]$ClusterId
+                    ClusterName = [string]$ClusterName
+                }
             }
         }
     }
 
-    $Clusters = $Clusters | Sort-Object ClusterName -Unique
+    $Clusters = @($ClusterMap.Values | Sort-Object ClusterName)
 
-    if ($null -eq $Clusters -or @($Clusters).Count -eq 0) {
-        throw 'No clusters returned from /v2/mcm/cluster-mgmt/info. Check the API key and Helios access.'
+    if ($Clusters.Count -eq 0) {
+        throw 'No clusters returned from /v2/mcm/cluster-mgmt/info.'
     }
 
-    return @($Clusters)
+    return $Clusters
 }
 
-function Get-SelectedClusters {
+function Select-Clusters {
     param($Clusters)
 
     Write-Host ''
     Write-Host 'Select cluster scope:' -ForegroundColor Cyan
     Write-Host '[0] ALL'
 
-    for ($i = 0; $i -lt @($Clusters).Count; $i++) {
+    for ($i = 0; $i -lt $Clusters.Count; $i++) {
         Write-Host ('[{0}] {1}' -f ($i + 1), $Clusters[$i].ClusterName)
     }
 
@@ -161,7 +176,7 @@ function Get-SelectedClusters {
             $Start = [int]$Matches[1]
             $End   = [int]$Matches[2]
 
-            if ($Start -lt 1 -or $End -gt @($Clusters).Count -or $Start -gt $End) {
+            if ($Start -lt 1 -or $End -gt $Clusters.Count -or $Start -gt $End) {
                 throw "Invalid cluster range: $Part"
             }
 
@@ -170,7 +185,7 @@ function Get-SelectedClusters {
         elseif ($Part -match '^\d+$') {
             $Number = [int]$Part
 
-            if ($Number -lt 1 -or $Number -gt @($Clusters).Count) {
+            if ($Number -lt 1 -or $Number -gt $Clusters.Count) {
                 throw "Invalid cluster number: $Part"
             }
 
@@ -186,49 +201,54 @@ function Get-SelectedClusters {
 }
 
 function Get-PolicyName {
-    param($PolicyId, $Headers, $PolicyCache)
+    param(
+        $PolicyId,
+        [hashtable]$Headers,
+        [hashtable]$PolicyCache
+    )
 
     if ([string]::IsNullOrWhiteSpace([string]$PolicyId)) {
         return ''
     }
 
-    if ($PolicyCache.ContainsKey($PolicyId)) {
-        return $PolicyCache[$PolicyId]
+    if ($PolicyCache.ContainsKey([string]$PolicyId)) {
+        return $PolicyCache[[string]$PolicyId]
     }
 
     try {
-        $PolicyUri = "$HeliosUrl/v2/data-protect/policies?ids=$PolicyId"
-        $PolicyResponse = Invoke-WebRequest -Method Get -Uri $PolicyUri -Headers $Headers
-        $PolicyJson = $PolicyResponse.Content | ConvertFrom-Json
-        $PolicyName = ($PolicyJson.policies | Where-Object { $_.id -eq $PolicyId } | Select-Object -ExpandProperty name -First 1)
+        $Json = Invoke-CohesityGet -Uri "$HeliosUrl/v2/data-protect/policies?ids=$PolicyId" -Headers $Headers
+        $PolicyName = ($Json.policies | Where-Object { $_.id -eq $PolicyId } | Select-Object -ExpandProperty name -First 1)
 
         if ([string]::IsNullOrWhiteSpace([string]$PolicyName)) {
             $PolicyName = $PolicyId
         }
 
-        $PolicyCache[$PolicyId] = $PolicyName
+        $PolicyCache[[string]$PolicyId] = $PolicyName
         return $PolicyName
     }
     catch {
-        $PolicyCache[$PolicyId] = $PolicyId
+        $PolicyCache[[string]$PolicyId] = $PolicyId
         return $PolicyId
     }
 }
 
 function Get-PhysicalProtectionGroups {
-    param($HeliosUrl, $Headers)
+    param(
+        [string]$HeliosUrl,
+        [hashtable]$Headers
+    )
 
     $AllGroups = @()
     $Cookie = $null
 
     do {
         $Uri = "$HeliosUrl/v2/data-protect/protection-groups?environments=kPhysical&isDeleted=false&isActive=true&includeLastRunInfo=true&maxResultCount=1000"
+
         if (-not [string]::IsNullOrWhiteSpace([string]$Cookie)) {
             $Uri = "$Uri&paginationCookie=$([uri]::EscapeDataString([string]$Cookie))"
         }
 
-        $Response = Invoke-WebRequest -Method Get -Uri $Uri -Headers $Headers
-        $Json = $Response.Content | ConvertFrom-Json
+        $Json = Invoke-CohesityGet -Uri $Uri -Headers $Headers
 
         if ($Json.protectionGroups) {
             $AllGroups += @($Json.protectionGroups | Where-Object { $_ })
@@ -254,30 +274,29 @@ if ([string]::IsNullOrWhiteSpace($ApiKey)) {
 New-Item -ItemType Directory -Path $OutputDir -Force | Out-Null
 
 $ClusterIndex = Get-ClusterIndex -HeliosUrl $HeliosUrl -ApiKey $ApiKey
-$SelectedClusters = Get-SelectedClusters -Clusters $ClusterIndex
+$SelectedClusters = Select-Clusters -Clusters $ClusterIndex
 
 $SummaryRows = @()
 $DetailRows = @()
 $PolicyCache = @{}
 
 foreach ($Cluster in $SelectedClusters) {
-    $ClusterId = $Cluster.ClusterId
-    $ClusterName = $Cluster.ClusterName
-
     $Headers = @{
         apiKey          = $ApiKey
-        accessClusterId = $ClusterId
+        accessClusterId = $Cluster.ClusterId
         accept          = 'application/json'
     }
 
-    Write-Host "Collecting active Physical PGs from $ClusterName ..." -ForegroundColor Yellow
-
+    Write-Host "Collecting active Physical PGs from $($Cluster.ClusterName)..." -ForegroundColor Yellow
     $ProtectionGroups = Get-PhysicalProtectionGroups -HeliosUrl $HeliosUrl -Headers $Headers
 
     foreach ($Pg in ($ProtectionGroups | Where-Object { $_ })) {
         $PhysicalParams = $Pg.physicalParams
-        $ProtectionType = $PhysicalParams.protectionType
+        if ($null -eq $PhysicalParams) {
+            continue
+        }
 
+        $ProtectionType = $PhysicalParams.protectionType
         $FileParams = $PhysicalParams.fileProtectionTypeParams
         $VolumeParams = $PhysicalParams.volumeProtectionTypeParams
 
@@ -293,17 +312,17 @@ foreach ($Cluster in $SelectedClusters) {
         }
 
         $LastRun = $Pg.lastRun
-        $LocalBackupInfo = $LastRun.localBackupInfo
-        if ($null -eq $LocalBackupInfo) {
-            $LocalBackupInfo = $LastRun.localSnapshotInfo
+        $LocalInfo = $LastRun.localBackupInfo
+        if ($null -eq $LocalInfo) {
+            $LocalInfo = $LastRun.localSnapshotInfo
         }
 
-        $LastRunStatus = $LocalBackupInfo.status
+        $LastRunStatus = $LocalInfo.status
         if ([string]::IsNullOrWhiteSpace([string]$LastRunStatus)) {
             $LastRunStatus = $LastRun.status
         }
 
-        $EndTimeUsecs = $LocalBackupInfo.endTimeUsecs
+        $EndTimeUsecs = $LocalInfo.endTimeUsecs
         if ($null -eq $EndTimeUsecs) {
             $EndTimeUsecs = $LastRun.endTimeUsecs
         }
@@ -314,7 +333,7 @@ foreach ($Cluster in $SelectedClusters) {
         }
 
         $SummaryRows += [PSCustomObject]@{
-            Cluster               = $ClusterName
+            Cluster               = $Cluster.ClusterName
             PGName                = $Pg.name
             PolicyName            = $PolicyName
             ProtectionType        = $ProtectionType
@@ -340,7 +359,7 @@ foreach ($Cluster in $SelectedClusters) {
 
             if ($ProtectionType -eq 'kVolume') {
                 $DetailRows += [PSCustomObject]@{
-                    Cluster                  = $ClusterName
+                    Cluster                  = $Cluster.ClusterName
                     PGName                   = $Pg.name
                     PolicyName               = $PolicyName
                     ProtectionType           = $ProtectionType
@@ -357,7 +376,7 @@ foreach ($Cluster in $SelectedClusters) {
             else {
                 foreach ($FilePath in ($Obj.filePaths | Where-Object { $_ })) {
                     $DetailRows += [PSCustomObject]@{
-                        Cluster                  = $ClusterName
+                        Cluster                  = $Cluster.ClusterName
                         PGName                   = $Pg.name
                         PolicyName               = $PolicyName
                         ProtectionType           = $ProtectionType
@@ -387,10 +406,17 @@ $SummaryRows | Export-Csv -Path $SummaryCsv -NoTypeInformation
 $DetailRows | Export-Csv -Path $DetailCsv -NoTypeInformation
 
 Write-Host ''
-Write-Host "Summary rows: $(@($SummaryRows).Count)" -ForegroundColor Green
-Write-Host "Detail rows : $(@($DetailRows).Count)" -ForegroundColor Green
-Write-Host "Summary CSV : $SummaryCsv" -ForegroundColor Green
-Write-Host "Detail CSV  : $DetailCsv" -ForegroundColor Green
+Write-Host "Output folder: $OutputDir" -ForegroundColor Green
+Write-Host "Summary rows : $(@($SummaryRows).Count)" -ForegroundColor Green
+Write-Host "Detail rows  : $(@($DetailRows).Count)" -ForegroundColor Green
+Write-Host "Summary CSV  : $SummaryCsv" -ForegroundColor Green
+Write-Host "Detail CSV   : $DetailCsv" -ForegroundColor Green
 
 $SummaryRows | Format-Table Cluster, PGName, PolicyName, ProtectionType, PGObjectCount, GlobalExcludePaths, IsPaused, LastRunStatus, LastRunEndET -AutoSize
-$SummaryRows | Out-GridView -Title 'Cohesity Physical PG Summary'
+
+try {
+    $SummaryRows | Out-GridView -Title 'Cohesity Physical PG Summary'
+}
+catch {
+    Write-Warning 'Out-GridView is unavailable in this PowerShell host. CSV files were still created.'
+}
