@@ -6,7 +6,7 @@
 # - Automatic Helios cluster index using /v2/mcm/cluster-mgmt/info
 # - Active Physical Protection Groups
 # - PG summary CSV
-# - Object detail CSV with object-level include/exclude and path-level include/exclude
+# - Object detail CSV with object-level include/exclude and latest successful backup
 # - Simple WinForms UI: click PG on left, object details show on right
 # =====================================================================
 
@@ -20,6 +20,10 @@ $FormatEnumerationLimit = -1
 $outDir     = "X:\PowerShell\Cohesity_API_Scripts\inventory"
 $apikeypath = "X:\PowerShell\Cohesity_API_Scripts\DO_NOT_Delete\apikey.txt"
 $baseUrl    = "https://helios.cohesity.com"
+
+# Number of PG run pages to inspect for latest object-level successful backup.
+# Increase only if old objects do not show a success date.
+$MaxRunPagesPerPG = 5
 
 $script:ErrorRows = @()
 
@@ -165,6 +169,31 @@ function Get-FirstNonEmpty {
     return ""
 }
 
+function To-Number {
+    param($Value)
+
+    if ($null -eq $Value -or "$Value".Trim() -eq "") {
+        return 0
+    }
+
+    try {
+        return [double]$Value
+    }
+    catch {
+        return 0
+    }
+}
+
+function Normalize-Key {
+    param([string]$Value)
+
+    if ([string]::IsNullOrWhiteSpace($Value)) {
+        return ""
+    }
+
+    return $Value.Trim().ToUpper()
+}
+
 function Convert-UsecsToET {
     param($Usecs)
 
@@ -187,6 +216,200 @@ function Convert-UsecsToET {
     }
     catch {
         return ""
+    }
+}
+
+function Test-SuccessStatus {
+    param([string]$Status)
+
+    if ([string]::IsNullOrWhiteSpace($Status)) {
+        return $false
+    }
+
+    return ($Status -match '(?i)success|succeed|succeededwithwarning|warning')
+}
+
+function Get-RunMessage {
+    param([object]$Run)
+
+    return To-FlatString @(
+        $Run.message,
+        $Run.messages,
+        $Run.errorMessage,
+        $Run.failureMessage,
+        $Run.localBackupInfo.message,
+        $Run.localBackupInfo.messages,
+        $Run.localSnapshotInfo.message,
+        $Run.localSnapshotInfo.messages
+    )
+}
+
+function Get-PgIdFromProtectionGroup {
+    param([object]$Pg)
+
+    return Get-FirstNonEmpty -Values @(
+        $Pg.id,
+        $Pg.protectionGroupId,
+        $Pg.lastRun.protectionGroupId,
+        $Pg.lastRun.originProtectionGroupId,
+        $Pg.runs.protectionGroupId,
+        $Pg.runs.originProtectionGroupId
+    )
+}
+
+function Get-ObjectKeys {
+    param([object]$Object)
+
+    $keys = @()
+
+    $values = @(
+        $Object.id,
+        $Object.sourceId,
+        $Object.objectId,
+        $Object.name,
+        $Object.sourceName,
+        $Object.hostName,
+        $Object.displayName,
+        $Object.object.name,
+        $Object.object.id,
+        $Object.object.sourceId,
+        $Object.protectedObject.id,
+        $Object.protectedObject.name
+    )
+
+    foreach ($v in @($values)) {
+        if ($null -ne $v -and "$v".Trim() -ne "") {
+            $keys += (Normalize-Key "$v")
+        }
+    }
+
+    return @($keys | Where-Object { $_ -and $_.Trim() -ne "" } | Select-Object -Unique)
+}
+
+function Get-ObjectRunStatus {
+    param(
+        [object]$RunObject,
+        [object]$Run
+    )
+
+    return Get-FirstNonEmpty -Values @(
+        $RunObject.localBackupInfo.status,
+        $RunObject.localSnapshotInfo.status,
+        $RunObject.snapshotInfo.status,
+        $RunObject.status,
+        $Run.localBackupInfo.status,
+        $Run.localSnapshotInfo.status,
+        $Run.status
+    )
+}
+
+function Get-ObjectRunEndUsecs {
+    param(
+        [object]$RunObject,
+        [object]$Run
+    )
+
+    return Get-FirstNonEmpty -Values @(
+        $RunObject.localBackupInfo.endTimeUsecs,
+        $RunObject.localSnapshotInfo.endTimeUsecs,
+        $RunObject.localSnapshotInfo.snapshotInfo.endTimeUsecs,
+        $RunObject.snapshotInfo.endTimeUsecs,
+        $RunObject.endTimeUsecs,
+        $Run.localBackupInfo.endTimeUsecs,
+        $Run.localSnapshotInfo.endTimeUsecs,
+        $Run.endTimeUsecs
+    )
+}
+
+function Get-LatestObjectSuccessMap {
+    param(
+        [string]$PgId,
+        [hashtable]$Headers,
+        [string]$ClusterName,
+        [string]$PGName
+    )
+
+    $map = New-Object System.Collections.Hashtable ([StringComparer]::OrdinalIgnoreCase)
+
+    if ([string]::IsNullOrWhiteSpace($PgId)) {
+        return $map
+    }
+
+    $page = 0
+    $cookie = ""
+
+    do {
+        $page++
+        $runsUri = "$baseUrl/v2/data-protect/protection-groups/$PgId/runs"
+
+        if (-not [string]::IsNullOrWhiteSpace($cookie)) {
+            $runsUri = "$runsUri`?paginationCookie=$([uri]::EscapeDataString($cookie))"
+        }
+
+        try {
+            $runsJson = Invoke-HeliosGetJson -Uri $runsUri -Headers $Headers
+        }
+        catch {
+            Add-ErrorRow -Stage "RunsLookup" -Cluster $ClusterName -PGName $PGName -Uri $runsUri -ErrorObject $_
+            break
+        }
+
+        foreach ($run in @($runsJson.runs | Where-Object { $_ })) {
+            $runObjects = @($run.objects | Where-Object { $_ })
+
+            # Some API responses may not expose run.objects. In that case, no object-level date can be mapped.
+            foreach ($ro in $runObjects) {
+                $status = Get-ObjectRunStatus -RunObject $ro -Run $run
+                if (-not (Test-SuccessStatus -Status $status)) {
+                    continue
+                }
+
+                $endUsecs = Get-ObjectRunEndUsecs -RunObject $ro -Run $run
+                $endNum = To-Number $endUsecs
+
+                if ($endNum -le 0) {
+                    continue
+                }
+
+                foreach ($key in (Get-ObjectKeys -Object $ro)) {
+                    if (-not $map.ContainsKey($key) -or $endNum -gt [double]$map[$key].Usecs) {
+                        $map[$key] = [PSCustomObject]@{
+                            Status = $status
+                            Usecs  = $endNum
+                            EndET  = Convert-UsecsToET $endUsecs
+                        }
+                    }
+                }
+            }
+        }
+
+        $cookie = Get-FirstNonEmpty -Values @($runsJson.paginationCookie)
+
+        if ($runsJson.isResponseTruncated -ne $true -and [string]::IsNullOrWhiteSpace($cookie)) {
+            break
+        }
+
+    } while (-not [string]::IsNullOrWhiteSpace($cookie) -and $page -lt $MaxRunPagesPerPG)
+
+    return $map
+}
+
+function Find-LatestObjectSuccess {
+    param(
+        [hashtable]$ObjectSuccessMap,
+        [object]$Object
+    )
+
+    foreach ($key in (Get-ObjectKeys -Object $Object)) {
+        if ($ObjectSuccessMap.ContainsKey($key)) {
+            return $ObjectSuccessMap[$key]
+        }
+    }
+
+    return [PSCustomObject]@{
+        Status = ""
+        Usecs  = 0
+        EndET  = ""
     }
 }
 
@@ -344,24 +567,25 @@ function Show-PhysicalInventoryUI {
     }
 
     $summaryColumns = @(
+        "PGIndex",
         "Cluster",
         "PGName",
         "PolicyName",
         "ProtectionType",
         "PGObjectCount",
         "GlobalExcludePaths",
+        "JobExcludedVssWriters",
         "IsPaused",
         "LastRunStatus",
-        "LastRunEndET"
+        "LastRunStartET",
+        "LastRunEndET",
+        "LastRunMessage"
     )
 
     $detailColumns = @(
-        "Cluster",
-        "PGName",
-        "PolicyName",
-        "ProtectionType",
         "ObjectName",
-        "ObjectId",
+        "LastSuccessfulBackupStatus",
+        "LastSuccessfulBackupEndET",
         "ObjectIncludedPaths",
         "ObjectExcludedPathsAll",
         "IncludedPath",
@@ -380,7 +604,7 @@ function Show-PhysicalInventoryUI {
     $form = New-Object System.Windows.Forms.Form
     $form.Text = "Cohesity Physical PG Inventory"
     $form.StartPosition = "CenterScreen"
-    $form.Width = 1600
+    $form.Width = 1650
     $form.Height = 900
     $form.MinimumSize = New-Object System.Drawing.Size(1200, 700)
 
@@ -394,7 +618,7 @@ function Show-PhysicalInventoryUI {
     $split = New-Object System.Windows.Forms.SplitContainer
     $split.Dock = [System.Windows.Forms.DockStyle]::Fill
     $split.Orientation = [System.Windows.Forms.Orientation]::Vertical
-    $split.SplitterDistance = 650
+    $split.SplitterDistance = 760
 
     $leftLayout = New-Object System.Windows.Forms.TableLayoutPanel
     $leftLayout.Dock = [System.Windows.Forms.DockStyle]::Fill
@@ -411,7 +635,7 @@ function Show-PhysicalInventoryUI {
     [void]$rightLayout.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Percent, 100)))
 
     $pgLabel = New-Object System.Windows.Forms.Label
-    $pgLabel.Text = "Protection Groups - click a PG to show object-level include/exclude details"
+    $pgLabel.Text = "Protection Groups - click a PG to show object-level status/include/exclude"
     $pgLabel.Dock = [System.Windows.Forms.DockStyle]::Fill
     $pgLabel.TextAlign = [System.Drawing.ContentAlignment]::MiddleLeft
 
@@ -570,6 +794,7 @@ while ($true) {
 $summaryRows = @()
 $detailRows  = @()
 $policyCache = @{}
+$pgIndex = 0
 
 foreach ($c in $SelectedClusters) {
 
@@ -593,6 +818,9 @@ foreach ($c in $SelectedClusters) {
         if ($null -eq $physical) {
             continue
         }
+
+        $pgIndex++
+        $pgId = Get-PgIdFromProtectionGroup -Pg $pg
 
         $protectionType = Get-FirstNonEmpty -Values @($physical.protectionType)
 
@@ -618,7 +846,9 @@ foreach ($c in $SelectedClusters) {
         }
 
         $lastRunStatus = Get-FirstNonEmpty -Values @($localInfo.status, $lastRun.status)
+        $startTimeUsecs = Get-FirstNonEmpty -Values @($localInfo.startTimeUsecs, $lastRun.startTimeUsecs)
         $endTimeUsecs  = Get-FirstNonEmpty -Values @($localInfo.endTimeUsecs, $lastRun.endTimeUsecs)
+        $lastRunMessage = Get-RunMessage -Run $lastRun
 
         $policyName = Get-FirstNonEmpty -Values @($pg.policyName)
 
@@ -631,7 +861,11 @@ foreach ($c in $SelectedClusters) {
                 -PGName $pg.name
         }
 
+        Write-Host "  Reading latest object success dates for PG: $($pg.name)" -ForegroundColor DarkGray
+        $objectSuccessMap = Get-LatestObjectSuccessMap -PgId $pgId -Headers $headers -ClusterName $cluster_name -PGName $pg.name
+
         $summaryRows += [PSCustomObject]@{
+            PGIndex               = $pgIndex
             Cluster               = $cluster_name
             PGName                = $pg.name
             PolicyName            = $policyName
@@ -642,7 +876,9 @@ foreach ($c in $SelectedClusters) {
             IsActive              = $pg.isActive
             IsPaused              = $pg.isPaused
             LastRunStatus         = $lastRunStatus
+            LastRunStartET        = Convert-UsecsToET $startTimeUsecs
             LastRunEndET          = Convert-UsecsToET $endTimeUsecs
+            LastRunMessage        = $lastRunMessage
         }
 
         foreach ($obj in $objects) {
@@ -655,10 +891,7 @@ foreach ($c in $SelectedClusters) {
                 $obj.id
             )
 
-            $objectId = Get-FirstNonEmpty -Values @(
-                $obj.id,
-                $obj.sourceId
-            )
+            $objectSuccess = Find-LatestObjectSuccess -ObjectSuccessMap $objectSuccessMap -Object $obj
 
             $objectExcludedVssWriters = To-FlatString $obj.excludedVssWriters
             $filePaths = @(As-Array $obj.filePaths | Where-Object { $_ })
@@ -679,10 +912,9 @@ foreach ($c in $SelectedClusters) {
                 $detailRows += [PSCustomObject]@{
                     Cluster                         = $cluster_name
                     PGName                          = $pg.name
-                    PolicyName                      = $policyName
-                    ProtectionType                  = $protectionType
                     ObjectName                      = $objectName
-                    ObjectId                        = $objectId
+                    LastSuccessfulBackupStatus      = $objectSuccess.Status
+                    LastSuccessfulBackupEndET       = $objectSuccess.EndET
                     ObjectIncludedPaths             = To-FlatString $obj.volumeGuids
                     ObjectExcludedPathsAll          = ""
                     IncludedPath                    = To-FlatString $obj.volumeGuids
@@ -697,10 +929,9 @@ foreach ($c in $SelectedClusters) {
                 $detailRows += [PSCustomObject]@{
                     Cluster                         = $cluster_name
                     PGName                          = $pg.name
-                    PolicyName                      = $policyName
-                    ProtectionType                  = $protectionType
                     ObjectName                      = $objectName
-                    ObjectId                        = $objectId
+                    LastSuccessfulBackupStatus      = $objectSuccess.Status
+                    LastSuccessfulBackupEndET       = $objectSuccess.EndET
                     ObjectIncludedPaths             = ""
                     ObjectExcludedPathsAll          = ""
                     IncludedPath                    = ""
@@ -716,10 +947,9 @@ foreach ($c in $SelectedClusters) {
                     $detailRows += [PSCustomObject]@{
                         Cluster                         = $cluster_name
                         PGName                          = $pg.name
-                        PolicyName                      = $policyName
-                        ProtectionType                  = $protectionType
                         ObjectName                      = $objectName
-                        ObjectId                        = $objectId
+                        LastSuccessfulBackupStatus      = $objectSuccess.Status
+                        LastSuccessfulBackupEndET       = $objectSuccess.EndET
                         ObjectIncludedPaths             = $objectIncludedPaths
                         ObjectExcludedPathsAll          = $objectExcludedPathsAll
                         IncludedPath                    = $fp.includedPath
@@ -762,7 +992,7 @@ Write-Host ""
 Write-Host "Physical PG Summary" -ForegroundColor Cyan
 
 $summaryRows |
-    Format-Table Cluster, PGName, PolicyName, ProtectionType, PGObjectCount, GlobalExcludePaths, IsPaused, LastRunStatus, LastRunEndET -AutoSize -Wrap |
+    Format-Table PGIndex, Cluster, PGName, PolicyName, ProtectionType, PGObjectCount, GlobalExcludePaths, IsPaused, LastRunStatus, LastRunStartET, LastRunEndET -AutoSize -Wrap |
     Out-String -Width 10000 |
     Write-Host
 
