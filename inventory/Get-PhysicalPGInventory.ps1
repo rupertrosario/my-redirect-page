@@ -181,9 +181,10 @@ function Get-PhysicalPGs {
             $all += @($json.protectionGroups | Where-Object { $_ })
         }
 
-        $cookie = FirstValue @($json.paginationCookie)
+        $cookie = FirstValue @((Get-PropValue -Object $json -Names @("paginationCookie")))
+        $isResponseTruncated = Get-PropValue -Object $json -Names @("isResponseTruncated")
 
-        if ($json.isResponseTruncated -ne $true -and [string]::IsNullOrWhiteSpace($cookie)) {
+        if ($isResponseTruncated -ne $true -and [string]::IsNullOrWhiteSpace($cookie)) {
             break
         }
     } while (-not [string]::IsNullOrWhiteSpace($cookie))
