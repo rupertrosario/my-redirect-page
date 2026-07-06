@@ -10,7 +10,7 @@ param(
   [string]$OutputRoot = "X:\PowerShell\Data\Cohesity\BackupFailureWindow",
   [string]$HelperPath = "X:\PowerShell\Cohesity_API_Scripts\Common\ApiKeyAesHelper.ps1",
   [string]$EncryptedFile = "X:\PowerShell\Cohesity_API_Scripts\Common\Secure\cohesity_apikey.enc",
-  [int]$NumRuns = 60,
+  [int]$NumRuns = 30,
   [int]$MaxClusters = 0,
   [int]$MaxProtectionGroupsPerCluster = 0,
   [string]$ClusterName = "",
