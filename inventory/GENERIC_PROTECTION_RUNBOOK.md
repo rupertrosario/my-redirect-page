@@ -1,25 +1,34 @@
 # Generic Cohesity Protection Inventory Runbook
 
-Current focus: Power BI slicer-ready output.
+Current focus: single environment run model.
 
 Current script: inventory/Get-CohesityProtectionInventory.ps1
 
-Main report table uses shared PG fields only.
+Environment selection must be one environment at a time.
 
-Power BI slicers needed:
+Allowed environment choices:
+
+- Physical
+- Hyper-V
+- Nutanix AHV
+
+Remove the All environments option from the script.
+
+Power BI slicers:
 
 - Cluster
 - Environment
-- Policy
-- Active or paused state
 
-Main fields needed:
+Main table:
 
-- Protection group
-- Object count
-- Backup status
-- Latest backup time
+- Cluster
+- Environment
+- ProtectionGroup
+- PolicyName
+- IsActive
+- IsPaused
+- ObjectCount
+- LastRunStatus
+- LastSuccessfulBackupET
 
-Platform-specific settings stay in separate output files.
-
-Wait for output structure review before next report work.
+Environment-specific details should appear only when that environment is selected.
