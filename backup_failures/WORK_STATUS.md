@@ -54,6 +54,23 @@ Do not directly read the API key as plain text in new PowerShell scripts.
 - Added actual work status file:
   - `WORK_STATUS.md`
 
+## Current Plan
+
+Phase 1 is to prove the local PowerShell foundation before adding backup-failure logic.
+
+Current sequence:
+
+1. Run the Helios connection test.
+2. Confirm AES API-key helper works locally.
+3. Confirm the Helios cluster-list GET endpoint works.
+4. Confirm cluster names and IDs print correctly.
+5. Only after this succeeds, add compute-window printing in PowerShell.
+6. Then add protection-group listing for one selected cluster.
+7. Then add run listing for one selected protection group.
+8. Then add failure-classification logic.
+9. Then add CSV output.
+10. Then add incident/work-note formatting.
+
 ## Current Test Step
 
 Run only the connection test.
@@ -64,17 +81,6 @@ Expected result:
 Cluster count: <number>
 ClusterName / ClusterId table
 ```
-
-## Next Fixes / Next Build Steps
-
-After connection test works:
-
-1. Add compute-window print test in PowerShell.
-2. List protection groups for one manually selected cluster.
-3. List runs for one manually selected protection group.
-4. Only then add failure classification logic.
-5. Only after logic works, add CSV output.
-6. Only after CSV works, add incident/work-note formatting.
 
 ## Current Stop Point
 
