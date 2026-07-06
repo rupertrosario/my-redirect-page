@@ -58,9 +58,11 @@ Do not directly read the API key as plain text in new PowerShell scripts.
   - Object-level latest-uncleared failure logic.
   - Object success clear tracking.
   - SQL/Oracle database and host-level failure handling.
-  - Run-level failed row when no object details are returned.
+  - Run-level fallback row when no object failure is captured from a failed run.
+  - Diagnostic counters for failed runs and captured rows.
   - CSV output.
-- Updated current runbook for object-level latest-uncleared testing.
+- Standardized run lookup to 30 runs per protection group.
+- Updated current runbook for the 30-run standard.
 
 ## Current Script Behavior
 
@@ -76,6 +78,12 @@ Menu behavior:
 [0] All clusters
 [1..N] One selected cluster
 [X] Exit
+```
+
+Run lookup:
+
+```text
+numRuns=30
 ```
 
 Output:
@@ -94,12 +102,13 @@ It does not simply dump every failed attempt.
 
 Process per protection group:
 
-1. Pull recent runs with object details.
+1. Pull 30 recent runs with object details.
 2. Sort runs newest to oldest.
 3. For each object, mark newer successful snapshots as cleared.
 4. Capture the first/newest failure not cleared by a newer success.
 5. Skip older failures for that same object.
-6. Filter final rows to the current 18:00 ET compute window.
+6. Add run-level fallback row if a failed run has no captured object failure.
+7. Filter final rows to the current 18:00 ET compute window.
 
 Object key priority:
 
@@ -126,10 +135,15 @@ The user cannot paste full output from the client network. They only need to man
 
 ```text
 Menu: yes/no
+Runs/PG shows 30: yes/no
 Selected cluster processed: yes/no
 PG count shown: yes/no
-LatestUnclearedRows shown: yes/no
-Failure rows count: number or not shown
+FailedRunsSeen: number
+FailedRunsInWindow: number
+ObjectsWithFailedAttempt: number
+ObjectRowsCaptured: number
+RunFallbackRowsCaptured: number
+LatestUnclearedRows: number
 CSV saved: yes/no
 Error: exact short error if any
 ```
@@ -141,7 +155,7 @@ After the one-cluster run:
 1. Fix any PowerShell syntax/runtime issue.
 2. Confirm cluster menu works.
 3. Confirm PG count is reasonable.
-4. Confirm latest-uncleared row count is reasonable.
+4. Confirm failed-run counters and latest-uncleared row count are reasonable.
 5. Confirm CSV path is created.
 6. Review whether failure rows are correct.
 7. Improve classification if needed:
