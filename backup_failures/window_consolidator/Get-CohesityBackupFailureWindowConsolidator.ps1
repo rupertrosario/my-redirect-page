@@ -3,18 +3,18 @@
   Cohesity Backup Failure Window Consolidator.
 
 .DESCRIPTION
-  Operator-focused tool. It is not a duplicate of the Cohesity UI.
-  It locks one incident to one compute window, tracks failure/recovery lifecycle,
-  creates one XLSX workbook, one work_notes TXT file, one JSON state file, and one consolidated GridView.
+  Operator-focused incident evidence tool for Cohesity backup failures.
+  It locks one ServiceNow incident to one Dynatrace compute window and consolidates
+  failed, recovered, still-failing, new, repeated, running, and cancelled backup activity.
 
-  The engineer enters the incident only once when a new compute window starts.
-  Later runs in the same window reuse the locked mapping.
+  The engineer enters the incident only once when a new Dynatrace compute window starts.
+  Later runs in the same window reuse the locked mapping from the registry.
 
 .DEFAULTS
   Helios URL : https://helios.cohesity.com
   API key    : X:\PowerShell\Cohesity_API_Scripts\DO_NOT_Delete\apikey.txt
   Output     : X:\PowerShell\Data\Cohesity\BackupFailureWindow
-  Windows    : 6-hour ET windows aligned to 00/06/12/18
+  Window     : Dynatrace compute_window, America/New_York, 18:00 ET -> next day 18:00 ET
 #>
 
 [CmdletBinding()]
@@ -22,12 +22,9 @@ param(
     [string]$HeliosBaseUrl = 'https://helios.cohesity.com',
     [string]$ApiKeyPath = 'X:\PowerShell\Cohesity_API_Scripts\DO_NOT_Delete\apikey.txt',
     [string]$OutputRoot = 'X:\PowerShell\Data\Cohesity\BackupFailureWindow',
-    [int]$WindowDurationHours = 6,
-    [int]$AnchorHourET = 0,
-    [Nullable[datetime]]$WindowStartET = $null,
-    [Nullable[datetime]]$WindowEndET = $null,
     [string]$IncidentNumber,
-    [int]$MaxRunsPerProtectionGroup = 50,
+    [int]$DynatraceWindowStartHourET = 18,
+    [int]$MaxRunsPerProtectionGroup = 120,
     [int]$MaxClusters = 0,
     [int]$MaxProtectionGroupsPerCluster = 0,
     [bool]$ShowGridView = $true,
@@ -38,8 +35,8 @@ Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 
 function Get-EasternTimeZone {
-    try { [System.TimeZoneInfo]::FindSystemTimeZoneById('Eastern Standard Time') }
-    catch { [System.TimeZoneInfo]::FindSystemTimeZoneById('America/New_York') }
+    try { return [System.TimeZoneInfo]::FindSystemTimeZoneById('Eastern Standard Time') }
+    catch { return [System.TimeZoneInfo]::FindSystemTimeZoneById('America/New_York') }
 }
 
 function Get-NowET {
@@ -51,28 +48,49 @@ function Format-ET($Value) {
     try { return ([datetime]$Value).ToString('yyyy-MM-dd HH:mm:ss') } catch { return [string]$Value }
 }
 
+function Format-UtcForSnow([datetime]$UtcValue) {
+    $UtcValue.ToUniversalTime().ToString('yyyy-MM-dd HH:mm:ss')
+}
+
+function Convert-ETToUtc([datetime]$EtValue) {
+    $tz = Get-EasternTimeZone
+    $unspecified = [datetime]::SpecifyKind($EtValue, [DateTimeKind]::Unspecified)
+    [System.TimeZoneInfo]::ConvertTimeToUtc($unspecified, $tz)
+}
+
 function Convert-UsecsToET($Usecs) {
     if ($null -eq $Usecs -or [string]::IsNullOrWhiteSpace([string]$Usecs)) { return $null }
-    $epoch = [datetime]::SpecifyKind([datetime]'1970-01-01T00:00:00Z', [DateTimeKind]::Utc)
-    $utc = $epoch.AddSeconds(([double]$Usecs) / 1000000)
-    [System.TimeZoneInfo]::ConvertTimeFromUtc($utc, (Get-EasternTimeZone))
+    try {
+        $epoch = [datetime]::SpecifyKind([datetime]'1970-01-01T00:00:00Z', [DateTimeKind]::Utc)
+        $utc = $epoch.AddSeconds(([double]$Usecs) / 1000000)
+        return [System.TimeZoneInfo]::ConvertTimeFromUtc($utc, (Get-EasternTimeZone))
+    } catch { return $null }
 }
 
-function Get-WindowKey([datetime]$StartET, [datetime]$EndET) {
-    '{0}_{1}' -f $StartET.ToString('yyyyMMdd_HHmm'), $EndET.ToString('yyyyMMdd_HHmm')
+function Get-WindowKey([datetime]$StartET) {
+    # Must match Dynatrace compute_window output shape: yyyy-MM-dd_1800ET
+    '{0}_{1}ET' -f $StartET.ToString('yyyy-MM-dd'), $StartET.ToString('HHmm')
 }
 
-function Get-ComputeWindow {
-    if ($WindowStartET.HasValue -and $WindowEndET.HasValue) {
-        return [pscustomobject]@{ StartET = $WindowStartET.Value; EndET = $WindowEndET.Value; Source = 'ManualOverride' }
+function Get-DynatraceComputeWindow {
+    # Mirrors DT compute_window:
+    # Time zone America/New_York, daily boundary 18:00 ET, DST-aware.
+    $nowEt = Get-NowET
+    $todayBoundary = $nowEt.Date.AddHours($DynatraceWindowStartHourET)
+    if ($nowEt -lt $todayBoundary) { $start = $todayBoundary.AddDays(-1) } else { $start = $todayBoundary }
+    $end = $start.AddDays(1)
+    $startUtc = Convert-ETToUtc $start
+    $endUtc = Convert-ETToUtc $end
+
+    [pscustomobject]@{
+        StartET = $start
+        EndET = $end
+        WindowKey = Get-WindowKey $start
+        WindowLabel = ('{0} ET -> {1} ET' -f $start.ToString('yyyy-MM-dd HH:mm'), $end.ToString('yyyy-MM-dd HH:mm'))
+        SnStartUtc = Format-UtcForSnow $startUtc
+        SnEndUtc = Format-UtcForSnow $endUtc
+        Source = 'Dynatrace_compute_window'
     }
-
-    $now = Get-NowET
-    $base = $now.Date.AddHours($AnchorHourET)
-    if ($now -lt $base) { $base = $base.AddDays(-1) }
-    $slot = [math]::Floor((($now - $base).TotalHours) / $WindowDurationHours)
-    $start = $base.AddHours($slot * $WindowDurationHours)
-    [pscustomobject]@{ StartET = $start; EndET = $start.AddHours($WindowDurationHours); Source = 'Detected' }
 }
 
 function Read-Json($Path, $Default) {
@@ -86,12 +104,12 @@ function Read-Json($Path, $Default) {
 function Write-Json($Object, $Path) {
     $folder = Split-Path -Path $Path -Parent
     if (-not (Test-Path $folder)) { New-Item -ItemType Directory -Path $folder -Force | Out-Null }
-    $Object | ConvertTo-Json -Depth 40 | Set-Content -Path $Path -Encoding UTF8
+    $Object | ConvertTo-Json -Depth 50 | Set-Content -Path $Path -Encoding UTF8
 }
 
 function Sanitize-Name([string]$Name) {
     if ([string]::IsNullOrWhiteSpace($Name)) { return 'Unknown' }
-    (($Name -replace '[\\/:*?"<>|]', '_') -replace '\s+', '_')
+    (($Name.Trim() -replace '[\\/:*?"<>|]', '_') -replace '\s+', '_')
 }
 
 function Ensure-Array($Value) {
@@ -105,7 +123,7 @@ function Get-Prop($Obj, [string[]]$Names) {
     foreach ($name in $Names) {
         if ($Obj.PSObject.Properties.Name -contains $name) { return $Obj.$name }
     }
-    $null
+    return $null
 }
 
 function First-Array($Obj, [string[]]$Names) {
@@ -120,7 +138,7 @@ function Normalize-Status($Status) {
     if ($null -eq $Status) { return 'Unknown' }
     $s = ([string]$Status).Trim() -replace '^k', ''
     switch -Regex ($s) {
-        'Succeeded|Success|SucceededWithWarning|Warning' { 'Succeeded'; break }
+        'SucceededWithWarning|Succeeded|Success|Warning' { 'Succeeded'; break }
         'Fail|Failed|Failure|Error' { 'Failed'; break }
         'Cancel|Canceled|Cancelled' { 'Canceled'; break }
         'Running|Accepted|Started|InProgress' { 'Running'; break }
@@ -145,13 +163,18 @@ function Normalize-Environment($Env) {
     switch -Regex ($s) {
         'Acropolis' { 'Nutanix'; break }
         'GenericNas' { 'NAS'; break }
+        'Isilon' { 'Isilon'; break }
+        'Physical' { 'Physical'; break }
+        'SQL' { 'SQL'; break }
+        'Oracle' { 'Oracle'; break }
+        'HyperV' { 'HyperV'; break }
         default { $s }
     }
 }
 
 function Get-Message($Obj) {
     if ($null -eq $Obj) { return '' }
-    foreach ($f in @('errorMessage','message','errorMsg','failureMessage','warningMessage','reason')) {
+    foreach ($f in @('errorMessage','message','errorMsg','failureMessage','warningMessage','reason','description')) {
         $v = Get-Prop $Obj @($f)
         if ($v) { return [string]$v }
     }
@@ -159,7 +182,7 @@ function Get-Message($Obj) {
         $x = Get-Prop $Obj @($f)
         if ($x) {
             $first = @(Ensure-Array $x)[0]
-            foreach ($m in @('errorMsg','message','errorMessage')) {
+            foreach ($m in @('errorMsg','message','errorMessage','reason')) {
                 $v = Get-Prop $first @($m)
                 if ($v) { return [string]$v }
             }
@@ -181,14 +204,14 @@ function Get-RunType($Run) {
 }
 
 function Get-RunStartET($Run) {
-    $u = Get-Prop $Run @('startTimeUsecs','runStartTimeUsecs')
-    if (-not $u) { $u = Get-Prop (Get-Prop $Run @('localBackupInfo')) @('startTimeUsecs') }
+    $u = Get-Prop $Run @('startTimeUsecs','runStartTimeUsecs','runStartTime')
+    if (-not $u) { $u = Get-Prop (Get-Prop $Run @('localBackupInfo')) @('startTimeUsecs','runStartTimeUsecs') }
     Convert-UsecsToET $u
 }
 
 function Get-RunEndET($Run) {
-    $u = Get-Prop $Run @('endTimeUsecs','endUsecs','runEndTimeUsecs')
-    if (-not $u) { $u = Get-Prop (Get-Prop $Run @('localBackupInfo')) @('endTimeUsecs') }
+    $u = Get-Prop $Run @('endTimeUsecs','endUsecs','runEndTimeUsecs','runEndTime')
+    if (-not $u) { $u = Get-Prop (Get-Prop $Run @('localBackupInfo')) @('endTimeUsecs','runEndTimeUsecs') }
     if (-not $u) { $u = Get-Prop $Run @('startTimeUsecs','runStartTimeUsecs') }
     Convert-UsecsToET $u
 }
@@ -197,7 +220,7 @@ function Get-RunObjects($Run) {
     $objects = First-Array $Run @('objects','objectRuns','objectRunList','tasks','taskRuns')
     if ($objects.Count -eq 0) {
         $inner = Get-Prop $Run @('run','protectionRun','backupRun')
-        if ($inner) { $objects = First-Array $inner @('objects','objectRuns','tasks','taskRuns') }
+        if ($inner) { $objects = First-Array $inner @('objects','objectRuns','objectRunList','tasks','taskRuns') }
     }
     $objects
 }
@@ -212,8 +235,8 @@ function Get-ObjectName($Obj) {
 
 function Get-ObjectId($Obj) {
     $o = Get-Prop $Obj @('object','entity','source')
-    $id = Get-Prop $Obj @('id','objectId','entityId','sourceId')
-    if (-not $id) { $id = Get-Prop $o @('id','objectId','entityId','sourceId') }
+    $id = Get-Prop $Obj @('id','objectId','entityId','sourceId','uid')
+    if (-not $id) { $id = Get-Prop $o @('id','objectId','entityId','sourceId','uid') }
     [string]$id
 }
 
@@ -236,7 +259,11 @@ function Get-HostName($Obj) {
 
 function Get-ObjectStatus($Obj, $RunStatus) {
     $s = Get-Prop $Obj @('status','runStatus','protectionStatus','backupStatus')
-    if (-not $s) { $s = Get-Prop (Get-Prop $Obj @('localSnapshotInfo','snapshotInfo')) @('status') }
+    if (-not $s) {
+        $lsi = Get-Prop $Obj @('localSnapshotInfo')
+        $si = Get-Prop $lsi @('snapshotInfo')
+        if ($si) { $s = Get-Prop $si @('status','snapshotStatus') }
+    }
     if (-not $s) { $s = $RunStatus }
     Normalize-Status $s
 }
@@ -300,14 +327,33 @@ function Get-Runs($Headers, $PgId) {
 function Resolve-WindowMapping($Window) {
     if (-not (Test-Path $OutputRoot)) { New-Item -ItemType Directory -Path $OutputRoot -Force | Out-Null }
     $registryPath = Join-Path $OutputRoot 'BackupFailure_WindowRegistry.json'
-    $default = [pscustomobject]@{ TimeZone='America/New_York'; WindowMode='DynatraceComputeWindow'; WindowDurationHours=$WindowDurationHours; AnchorHourET=$AnchorHourET; Windows=[pscustomobject]@{} }
+    $default = [pscustomobject]@{
+        TimeZone = 'America/New_York'
+        WindowMode = 'DynatraceDaily18ET'
+        WindowDurationHours = 24
+        WindowStartHourET = $DynatraceWindowStartHourET
+        Windows = [pscustomobject]@{}
+    }
     $registry = Read-Json $registryPath $default
-    if (-not ($registry.PSObject.Properties.Name -contains 'Windows')) { $registry | Add-Member -MemberType NoteProperty -Name Windows -Value ([pscustomobject]@{}) }
+    foreach ($required in @('Windows')) {
+        if (-not ($registry.PSObject.Properties.Name -contains $required)) { $registry | Add-Member -MemberType NoteProperty -Name $required -Value ([pscustomobject]@{}) }
+    }
+    foreach ($field in @('TimeZone','WindowMode','WindowDurationHours','WindowStartHourET')) {
+        if (-not ($registry.PSObject.Properties.Name -contains $field)) {
+            $registry | Add-Member -MemberType NoteProperty -Name $field -Value $default.$field
+        }
+    }
+    $registry.TimeZone = 'America/New_York'
+    $registry.WindowMode = 'DynatraceDaily18ET'
+    $registry.WindowDurationHours = 24
+    $registry.WindowStartHourET = $DynatraceWindowStartHourET
 
-    $key = Get-WindowKey $Window.StartET $Window.EndET
+    $key = $Window.WindowKey
     if ($registry.Windows.PSObject.Properties.Name -contains $key) {
         $m = $registry.Windows.$key
-        if ($IncidentNumber -and $IncidentNumber -ne $m.IncidentNumber) { throw "Window $key is locked to $($m.IncidentNumber). Use a new incident only when the compute window changes." }
+        if ($IncidentNumber -and $IncidentNumber.Trim() -ne $m.IncidentNumber) {
+            throw "Window $key is already locked to $($m.IncidentNumber). Do not change the incident until the next Dynatrace compute window."
+        }
         $m.LastRunET = Format-ET (Get-NowET)
         Write-Json $registry $registryPath
         return [pscustomobject]@{ RegistryPath=$registryPath; WindowKey=$key; Mapping=$m; IsNew=$false }
@@ -315,10 +361,11 @@ function Resolve-WindowMapping($Window) {
 
     $inc = $IncidentNumber
     if (-not $inc) {
-        Write-Host "New compute window detected: $(Format-ET $Window.StartET) ET to $(Format-ET $Window.EndET) ET" -ForegroundColor Yellow
+        Write-Host "New Dynatrace compute window detected: $($Window.WindowLabel)" -ForegroundColor Yellow
         $inc = Read-Host 'Enter incident number for this window'
     }
-    if ([string]::IsNullOrWhiteSpace($inc)) { throw 'Incident number is required for a new compute window.' }
+    if ([string]::IsNullOrWhiteSpace($inc)) { throw 'Incident number is required for a new Dynatrace compute window.' }
+    $inc = $inc.Trim().ToUpper()
 
     $previous = $null
     foreach ($p in $registry.Windows.PSObject.Properties) {
@@ -334,13 +381,20 @@ function Resolve-WindowMapping($Window) {
     if (-not (Test-Path $folder)) { New-Item -ItemType Directory -Path $folder -Force | Out-Null }
     $m = [pscustomobject]@{
         IncidentNumber = $inc
+        WindowKey = $key
+        WindowLabel = $Window.WindowLabel
         WindowStartET = Format-ET $Window.StartET
         WindowEndET = Format-ET $Window.EndET
+        SnStartUtc = $Window.SnStartUtc
+        SnEndUtc = $Window.SnEndUtc
         WindowLocked = $true
         WindowSource = $Window.Source
         FirstRunET = Format-ET (Get-NowET)
         LastRunET = Format-ET (Get-NowET)
         CarryForwardFromIncident = $(if ($previous) { $previous.IncidentNumber } else { '' })
+        CarryForwardToIncident = ''
+        SnowSysId = ''
+        SnowWorkNotesReadEnabled = $false
         OutputFolder = $folder
     }
     $registry.Windows | Add-Member -MemberType NoteProperty -Name $key -Value $m
@@ -377,21 +431,25 @@ function Collect-Events($Headers,$Window,$Incident) {
             foreach ($run in $runs) {
                 $runStart = Get-RunStartET $run
                 $runEnd = Get-RunEndET $run
-                $time = if ($runEnd) { $runEnd } else { $runStart }
-                if (-not $time) { continue }
-                if (-not $oldest -or $time -lt $oldest) { $oldest = $time }
-                if ($time -lt $Window.StartET -or $time -ge $Window.EndET) { continue }
+                $eventTime = if ($runEnd) { $runEnd } else { $runStart }
+                if (-not $eventTime) { continue }
+                if (-not $oldest -or $eventTime -lt $oldest) { $oldest = $eventTime }
+                if ($eventTime -lt $Window.StartET -or $eventTime -ge $Window.EndET) { continue }
 
                 $runStatus = Get-RunStatus $run
                 $runType = Get-RunType $run
                 $objects = Get-RunObjects $run
-                $runEvidence += [pscustomobject]@{ IncidentNumber=$Incident; Cluster=$clusterName; Environment=$env; ProtectionGroup=$pgName; RunType=$runType; RunStatus=$runStatus; RunStartET=Format-ET $runStart; RunEndET=Format-ET $runEnd; ObjectDetailCount=$objects.Count; Message=Get-Message $run }
+                $runEvidence += [pscustomobject]@{
+                    IncidentNumber=$Incident; Cluster=$clusterName; Environment=$env; ProtectionGroup=$pgName;
+                    RunType=$runType; RunStatus=$runStatus; RunStartET=Format-ET $runStart; RunEndET=Format-ET $runEnd;
+                    ObjectDetailCount=$objects.Count; Message=Get-Message $run
+                }
 
                 if ($objects.Count -eq 0) {
-                    if ($runStatus -in @('Failed','Canceled','Running')) {
-                        $eventType = if ($runStatus -eq 'Failed') { 'Failed' } elseif ($runStatus -eq 'Canceled') { 'CancelledRun' } else { 'RunningRun' }
+                    if ($runStatus -in @('Failed','Canceled','Running','Succeeded')) {
+                        $eventType = if ($runStatus -eq 'Failed') { 'Failed' } elseif ($runStatus -eq 'Canceled') { 'CancelledRun' } elseif ($runStatus -eq 'Running') { 'RunningRun' } else { 'Succeeded' }
                         $key = "$clusterId|$env|$pgId|PG_LEVEL|$runType"
-                        $events += New-Event $Incident $time $clusterId $clusterName $env $pgId $pgName '' $pgName 'ProtectionGroup' '' $key $runType $eventType (Get-Message $run) $runStart $runEnd
+                        $events += New-Event $Incident $eventTime $clusterId $clusterName $env $pgId $pgName '' $pgName 'ProtectionGroup' '' $key $runType $eventType (Get-Message $run) $runStart $runEnd
                     }
                     continue
                 }
@@ -408,7 +466,7 @@ function Collect-Events($Headers,$Window,$Incident) {
                     $objName = Get-ObjectName $obj; $objId = Get-ObjectId $obj; $objType = Get-ObjectType $obj $env; $host = Get-HostName $obj
                     $key = Get-ObjectKey $clusterId $env $pgId $pgName $obj
                     $msg = Get-Message $obj; if (-not $msg) { $msg = Get-Message $run }
-                    $events += New-Event $Incident $time $clusterId $clusterName $env $pgId $pgName $host $objName $objType $objId $key $runType $eventType $msg $runStart $runEnd
+                    $events += New-Event $Incident $eventTime $clusterId $clusterName $env $pgId $pgName $host $objName $objType $objId $key $runType $eventType $msg $runStart $runEnd
                 }
             }
             if ($oldest -and $oldest -gt $Window.StartET) { $warnings += "PG $pgName on $clusterName may be truncated; oldest returned run is after window start. Increase MaxRunsPerProtectionGroup." }
@@ -429,7 +487,9 @@ function New-SectionRow($Event,$Section,$Status,$FirstFailedET,$LastFailedET,$Re
 function Build-Tables($Events,$PreviousState,$Window,$Incident,$RunEvidence,$Warnings) {
     $prevFailing = @{}
     if ($PreviousState -and ($PreviousState.PSObject.Properties.Name -contains 'Objects')) {
-        foreach ($p in @($PreviousState.Objects)) { if ($p.CurrentStatus -eq 'StillFailing') { $prevFailing[[string]$p.ObjectKey] = $p } }
+        foreach ($p in @($PreviousState.Objects)) {
+            if ($p.CurrentStatus -in @('StillFailing','ReFailed')) { $prevFailing[[string]$p.ObjectKey] = $p }
+        }
     }
 
     $byKey = @{}
@@ -458,28 +518,36 @@ function Build-Tables($Events,$PreviousState,$Window,$Incident,$RunEvidence,$War
             if ($prevFailing.ContainsKey($key)) { $newRec += New-SectionRow $lastFail 'New Recovery' 'NewlyRecoveredThisCheck' $firstFail.EventTimeET $lastFail.EventTimeET $laterSuccess.EventTimeET $consecCount }
             $state += [pscustomobject]@{ ObjectKey=$key; Cluster=$lastFail.Cluster; Environment=$lastFail.Environment; ProtectionGroup=$lastFail.ProtectionGroup; Host=$lastFail.Host; ObjectName=$lastFail.ObjectName; ObjectType=$lastFail.ObjectType; RunType=$lastFail.RunType; CurrentStatus='RecoveredInWindow'; FirstFailedET=$firstFail.EventTimeET; LastFailedET=$lastFail.EventTimeET; RecoveredET=$laterSuccess.EventTimeET; ConsecutiveFailureCount=$consecCount; LastMessage=$lastFail.Message }
         } else {
-            $row = New-SectionRow $lastFail 'Current Still Failing' 'StillFailing' $firstFail.EventTimeET $lastFail.EventTimeET '' $consecCount
+            $status = if ($lastSuccessBefore) { 'ReFailed' } else { 'StillFailing' }
+            $row = New-SectionRow $lastFail 'Current Still Failing' $status $firstFail.EventTimeET $lastFail.EventTimeET '' $consecCount
             $current += $row
             if (-not $prevFailing.ContainsKey($key)) { $newFail += New-SectionRow $lastFail 'New Failure' 'NewlyFailedThisCheck' $firstFail.EventTimeET $lastFail.EventTimeET '' $consecCount }
             if ($consecCount -gt 1) { $consec += New-SectionRow $lastFail 'Consecutive Failure' 'ConsecutiveFailure' $firstFail.EventTimeET $lastFail.EventTimeET '' $consecCount }
-            $state += [pscustomobject]@{ ObjectKey=$key; Cluster=$lastFail.Cluster; Environment=$lastFail.Environment; ProtectionGroup=$lastFail.ProtectionGroup; Host=$lastFail.Host; ObjectName=$lastFail.ObjectName; ObjectType=$lastFail.ObjectType; RunType=$lastFail.RunType; CurrentStatus='StillFailing'; FirstFailedET=$firstFail.EventTimeET; LastFailedET=$lastFail.EventTimeET; RecoveredET=''; ConsecutiveFailureCount=$consecCount; LastMessage=$lastFail.Message }
+            $state += [pscustomobject]@{ ObjectKey=$key; Cluster=$lastFail.Cluster; Environment=$lastFail.Environment; ProtectionGroup=$lastFail.ProtectionGroup; Host=$lastFail.Host; ObjectName=$lastFail.ObjectName; ObjectType=$lastFail.ObjectType; RunType=$lastFail.RunType; CurrentStatus=$status; FirstFailedET=$firstFail.EventTimeET; LastFailedET=$lastFail.EventTimeET; RecoveredET=''; ConsecutiveFailureCount=$consecCount; LastMessage=$lastFail.Message }
         }
     }
 
+    $failedEvents = @($Events | Where-Object EventType -eq 'Failed')
+    $failedKeys = @($failedEvents | Select-Object -ExpandProperty ObjectKey -Unique)
     $clusters = @($Events | Where-Object Cluster | Select-Object -ExpandProperty Cluster -Unique)
     $envs = @($Events | Where-Object Environment | Select-Object -ExpandProperty Environment -Unique)
     $pgs = @($Events | Where-Object ProtectionGroup | Select-Object -ExpandProperty ProtectionGroup -Unique)
     $summary = @(
         [pscustomobject]@{Metric='IncidentNumber';Value=$Incident},
+        [pscustomobject]@{Metric='WindowKey';Value=$Window.WindowKey},
+        [pscustomobject]@{Metric='WindowLabel';Value=$Window.WindowLabel},
         [pscustomobject]@{Metric='WindowStartET';Value=Format-ET $Window.StartET},
         [pscustomobject]@{Metric='WindowEndET';Value=Format-ET $Window.EndET},
+        [pscustomobject]@{Metric='SnStartUtc';Value=$Window.SnStartUtc},
+        [pscustomobject]@{Metric='SnEndUtc';Value=$Window.SnEndUtc},
         [pscustomobject]@{Metric='GeneratedAtET';Value=Format-ET (Get-NowET)},
-        [pscustomobject]@{Metric='TotalUniqueObjectsFailedInWindow';Value=$byKey.Keys.Count},
+        [pscustomobject]@{Metric='TotalUniqueObjectsFailedInWindow';Value=$failedKeys.Count},
         [pscustomobject]@{Metric='RecoveredInWindow';Value=$recovered.Count},
         [pscustomobject]@{Metric='StillFailingAtLatestCheck';Value=$current.Count},
         [pscustomobject]@{Metric='NewFailuresSincePreviousRun';Value=$newFail.Count},
         [pscustomobject]@{Metric='NewRecoveriesSincePreviousRun';Value=$newRec.Count},
         [pscustomobject]@{Metric='ConsecutiveRepeatedFailures';Value=$consec.Count},
+        [pscustomobject]@{Metric='ReFailedInWindow';Value=@($current | Where-Object Status -eq 'ReFailed').Count},
         [pscustomobject]@{Metric='RunningRunsSeen';Value=$running.Count},
         [pscustomobject]@{Metric='CancelledRunsSeen';Value=$cancelled.Count},
         [pscustomobject]@{Metric='ImpactedClusters';Value=$clusters.Count},
@@ -500,14 +568,19 @@ function Get-SafeSheetName($Name) {
     if ($s.Length -gt 31) { $s.Substring(0,31) } else { $s }
 }
 
-function Export-Xlsx($Path, [hashtable]$Sheets) {
+function Get-SafeTableName($Name) {
+    $s = ('T_' + (Sanitize-Name $Name)) -replace '[^A-Za-z0-9_]', '_'
+    if ($s.Length -gt 200) { $s.Substring(0,200) } else { $s }
+}
+
+function Export-Xlsx($Path, [System.Collections.IDictionary]$Sheets) {
     if (Test-Path $Path) { Remove-Item $Path -Force }
     $cmd = Get-Command Export-Excel -ErrorAction SilentlyContinue
     if ($cmd) {
         $first = $true
         foreach ($name in $Sheets.Keys) {
             $rows = @($Sheets[$name]); if ($rows.Count -eq 0) { $rows = @([pscustomobject]@{Info='No rows'}) }
-            $params = @{Path=$Path; WorksheetName=(Get-SafeSheetName $name); AutoSize=$true; FreezeTopRow=$true; BoldTopRow=$true; TableName=(Sanitize-Name $name)}
+            $params = @{Path=$Path; WorksheetName=(Get-SafeSheetName $name); AutoSize=$true; FreezeTopRow=$true; BoldTopRow=$true; TableName=(Get-SafeTableName $name)}
             if (-not $first) { $params.Append = $true }
             $rows | Export-Excel @params
             $first = $false
@@ -542,7 +615,8 @@ function New-WorkNotes($Tables,$Window,$Incident,$WorkbookName) {
     @(
         'Backup Failure Window Summary','',
         "Incident: $Incident",
-        "Locked Compute Window: $(Format-ET $Window.StartET) ET to $(Format-ET $Window.EndET) ET",
+        "Locked Compute Window: $($Window.WindowLabel)",
+        "SNOW Compare UTC: $($Window.SnStartUtc) to $($Window.SnEndUtc)",
         "Generated At: $(Format-ET (Get-NowET)) ET",
         'Source: Cohesity Helios API / PowerShell Window Consolidator','',
         'Summary:',
@@ -552,6 +626,7 @@ function New-WorkNotes($Tables,$Window,$Incident,$WorkbookName) {
         "- New failures since previous check: $($h['NewFailuresSincePreviousRun'])",
         "- New recoveries since previous check: $($h['NewRecoveriesSincePreviousRun'])",
         "- Consecutive/repeated failures: $($h['ConsecutiveRepeatedFailures'])",
+        "- Re-failed after recovery in same window: $($h['ReFailedInWindow'])",
         "- Running backup runs seen: $($h['RunningRunsSeen'])",
         "- Cancelled backup runs seen: $($h['CancelledRunsSeen'])",
         "- Impacted clusters: $($h['ImpactedClusters'])",
@@ -569,7 +644,7 @@ function New-WorkNotes($Tables,$Window,$Incident,$WorkbookName) {
 function Show-Output($Tables,$Window,$Incident,$WorkbookPath,$WorkNotesPath,$StatePath) {
     $h=@{}; foreach($r in $Tables.Summary){$h[$r.Metric]=$r.Value}
     Write-Host ''; Write-Host "Incident: $Incident" -ForegroundColor Cyan
-    Write-Host "Window  : $(Format-ET $Window.StartET) ET to $(Format-ET $Window.EndET) ET"; Write-Host ''
+    Write-Host "Window  : $($Window.WindowLabel)"; Write-Host ''
     Write-Host 'Summary:' -ForegroundColor Cyan
     Write-Host "Total Failed In Window       : $($h['TotalUniqueObjectsFailedInWindow'])"
     Write-Host "Recovered In Window          : $($h['RecoveredInWindow'])"
@@ -595,7 +670,7 @@ function Show-Output($Tables,$Window,$Incident,$WorkbookPath,$WorkNotesPath,$Sta
 }
 
 try {
-    $window = Get-ComputeWindow
+    $window = Get-DynatraceComputeWindow
     $mappingInfo = Resolve-WindowMapping $window
     $mapping = $mappingInfo.Mapping
     $incident = $mapping.IncidentNumber
@@ -613,9 +688,13 @@ try {
         [pscustomobject]@{Field='ScriptResult';Value='Success'},
         [pscustomobject]@{Field='GeneratedAtET';Value=Format-ET (Get-NowET)},
         [pscustomobject]@{Field='IncidentNumber';Value=$incident},
+        [pscustomobject]@{Field='WindowKey';Value=$mappingInfo.WindowKey},
+        [pscustomobject]@{Field='WindowLabel';Value=$window.WindowLabel},
         [pscustomobject]@{Field='WindowStartET';Value=Format-ET $window.StartET},
         [pscustomobject]@{Field='WindowEndET';Value=Format-ET $window.EndET},
-        [pscustomobject]@{Field='WindowKey';Value=$mappingInfo.WindowKey},
+        [pscustomobject]@{Field='SnStartUtc';Value=$window.SnStartUtc},
+        [pscustomobject]@{Field='SnEndUtc';Value=$window.SnEndUtc},
+        [pscustomobject]@{Field='WindowSource';Value=$window.Source},
         [pscustomobject]@{Field='WindowLockStatus';Value='Locked'},
         [pscustomobject]@{Field='PreviousRunFound';Value=[bool]$previousState},
         [pscustomobject]@{Field='WarningCount';Value=$collection.Warnings.Count}
@@ -626,8 +705,9 @@ try {
         [pscustomobject]@{Field='OutputRoot';Value=$OutputRoot},
         [pscustomobject]@{Field='RegistryPath';Value=$mappingInfo.RegistryPath},
         [pscustomobject]@{Field='MaxRunsPerProtectionGroup';Value=$MaxRunsPerProtectionGroup},
-        [pscustomobject]@{Field='WindowDurationHours';Value=$WindowDurationHours},
-        [pscustomobject]@{Field='AnchorHourET';Value=$AnchorHourET}
+        [pscustomobject]@{Field='DynatraceWindowStartHourET';Value=$DynatraceWindowStartHourET},
+        [pscustomobject]@{Field='WindowDurationHours';Value=24},
+        [pscustomobject]@{Field='ProductionApiMode';Value='GET-only'}
     )
     $warnTable = @($collection.Warnings | ForEach-Object { [pscustomobject]@{Warning=$_} }); if ($warnTable.Count -eq 0) { $warnTable=@([pscustomobject]@{Warning='No warnings'}) }
 
@@ -640,7 +720,24 @@ try {
     }
     Export-Xlsx $workbookPath $sheets
     New-WorkNotes $tables $window $incident (Split-Path $workbookPath -Leaf) | Set-Content -Path $workNotesPath -Encoding UTF8
-    Write-Json ([pscustomobject]@{IncidentNumber=$incident;WindowKey=$mappingInfo.WindowKey;WindowStartET=Format-ET $window.StartET;WindowEndET=Format-ET $window.EndET;LastRunET=Format-ET (Get-NowET);Objects=$tables.ObjectState;Summary=$tables.Summary;WorkbookPath=$workbookPath;WorkNotesPath=$workNotesPath}) $statePath
+    Write-Json ([pscustomobject]@{
+        IncidentNumber=$incident
+        WindowKey=$mappingInfo.WindowKey
+        WindowLabel=$window.WindowLabel
+        WindowStartET=Format-ET $window.StartET
+        WindowEndET=Format-ET $window.EndET
+        SnStartUtc=$window.SnStartUtc
+        SnEndUtc=$window.SnEndUtc
+        WindowSource=$window.Source
+        WindowLocked=$true
+        SnowSysId=''
+        SnowWorkNotesReadEnabled=$false
+        LastRunET=Format-ET (Get-NowET)
+        Objects=$tables.ObjectState
+        Summary=$tables.Summary
+        WorkbookPath=$workbookPath
+        WorkNotesPath=$workNotesPath
+    }) $statePath
     Show-Output $tables $window $incident $workbookPath $workNotesPath $statePath
 } catch {
     Write-Host ''; Write-Host 'SCRIPT RESULT: FAILED' -ForegroundColor Red; Write-Host $_.Exception.Message -ForegroundColor Red; throw
