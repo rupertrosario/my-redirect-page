@@ -658,6 +658,29 @@ foreach ($c in $selectedClusters) {
 # ==============================
 # 4) Output
 # ==============================
+$csvColumns = @(
+    "WindowKey",
+    "WindowLabel",
+    "Cluster",
+    "ClusterId",
+    "Environment",
+    "ProtectionGroup",
+    "ProtectionGroupId",
+    "RunType",
+    "RunStatus",
+    "FailureType",
+    "StartTimeET",
+    "EndTimeET",
+    "ObjectType",
+    "Host",
+    "ObjectName",
+    "DatabaseName",
+    "FailedMessage",
+    "ObjectKey",
+    "StartTimeUsecs",
+    "EndTimeUsecs"
+)
+
 Write-Host ""
 Write-Host "Summary" -ForegroundColor Cyan
 $summary | Format-Table -AutoSize
@@ -671,23 +694,31 @@ if ($rows.Count -gt 0) {
         Select-Object -First 25 Cluster, Environment, ProtectionGroup, RunType, RunStatus, FailureType, EndTimeET, Host, ObjectName, DatabaseName, FailedMessage
 
     $preview | Format-Table -AutoSize
-
-    if (-not $NoCsv) {
-        if (-not (Test-Path $outputDir)) { New-Item -Path $outputDir -ItemType Directory | Out-Null }
-
-        $safeLabel = (($label -replace '[^a-zA-Z0-9_.-]', '_'))
-        $csv = Join-Path $outputDir ("BackupFailures_{0}_{1}_{2}.csv" -f $safeLabel, $window.Key, (Get-Date -Format "yyyyMMdd_HHmmss"))
-
-        $rows |
-            Sort-Object Cluster, ProtectionGroup, EndTimeUsecs -Descending |
-            Select-Object WindowKey, WindowLabel, Cluster, ClusterId, Environment, ProtectionGroup, ProtectionGroupId, RunType, RunStatus, FailureType, StartTimeET, EndTimeET, ObjectType, Host, ObjectName, DatabaseName, FailedMessage, ObjectKey, StartTimeUsecs, EndTimeUsecs |
-            Export-Csv -Path $csv -NoTypeInformation -Encoding UTF8
-
-        Write-Host "CSV saved: $csv" -ForegroundColor Green
-    }
 }
 else {
     Write-Host "No latest uncleared object-level failure rows found in the current compute window." -ForegroundColor Yellow
+}
+
+if (-not $NoCsv) {
+    if (-not (Test-Path $outputDir)) { New-Item -Path $outputDir -ItemType Directory | Out-Null }
+
+    $safeLabel = (($label -replace '[^a-zA-Z0-9_.-]', '_'))
+    $csv = Join-Path $outputDir ("BackupFailures_{0}_{1}_{2}.csv" -f $safeLabel, $window.Key, (Get-Date -Format "yyyyMMdd_HHmmss"))
+
+    if ($rows.Count -gt 0) {
+        $rows |
+            Sort-Object Cluster, ProtectionGroup, EndTimeUsecs -Descending |
+            Select-Object $csvColumns |
+            Export-Csv -Path $csv -NoTypeInformation -Encoding UTF8
+    }
+    else {
+        ($csvColumns -join ",") | Set-Content -Path $csv -Encoding UTF8
+    }
+
+    Write-Host "CSV saved: $csv" -ForegroundColor Green
+}
+else {
+    Write-Host "CSV skipped because -NoCsv was used." -ForegroundColor Yellow
 }
 
 Write-Host "Done. No registry/state/SNOW updates created." -ForegroundColor Cyan
