@@ -1,16 +1,8 @@
 # Cohesity Helios - Physical PG Inventory
 # STRICTLY READ-ONLY / GET-only
-# PowerShell 5.1 compatible
-#
 # Output only:
 #   X:\PowerShell\Cohesity_API_Scripts\inventory\Physical_PG_Summary_Latest.csv
 #   X:\PowerShell\Cohesity_API_Scripts\inventory\Physical_PG_Object_Detail_Latest.csv
-#
-# Notes:
-#   - This is the standalone Physical-only script used for the current Power BI POC.
-#   - PolicyName is resolved as a readable policy name where possible.
-#   - PolicyId is retained separately.
-#   - PolicyName will not silently fall back to the policy ID.
 
 $ErrorActionPreference = "Stop"
 $FormatEnumerationLimit = -1
@@ -91,7 +83,7 @@ function FirstValue {
 
     foreach ($v in @($Values)) {
         foreach ($vv in @($v)) {
-            if ($null -ne $vv -and "$vv".Trim() -ne "") { return "$vv" }
+            if ($null -ne $vv -and "$vv".Trim() -ne "") { return $vv }
         }
     }
 
@@ -127,9 +119,8 @@ function Test-LooksLikeId {
     $v = $Value.Trim()
 
     if ($v -match '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$') { return $true }
-    if ($v -match '^[0-9]+$') { return $true }
-    if ($v -match '^[0-9]+:[0-9]+:[0-9]+$') { return $true }
     if ($v -match '^[a-fA-F0-9]{24,}$') { return $true }
+    if ($v -match '^[0-9]+:[0-9]+:[0-9]+$') { return $true }
 
     return $false
 }
@@ -166,10 +157,7 @@ function Get-PolicyMap {
     param([hashtable]$Headers)
 
     $map = @{}
-
-    # Best-effort policy lookup. If these endpoints are unavailable, the main inventory still continues.
     $uris = @(
-        "$baseUrl/v2/data-protect/policies?isDeleted=false&maxResultCount=1000",
         "$baseUrl/v2/data-protect/policies?maxResultCount=1000",
         "$baseUrl/v2/data-protect/policies"
     )
@@ -197,17 +185,24 @@ function Get-PolicyMap {
             if ($map.Count -gt 0) { break }
         }
         catch {
-            # Policy resolution is best-effort. Inventory collection should continue.
+            # Policy lookup is best effort. Inventory collection continues.
         }
     }
 
     return $map
 }
 
-function Resolve-PolicyInfo {
+function Resolve-PolicyName {
     param(
         $ProtectionGroup,
         [hashtable]$PolicyMap
+    )
+
+    $policyName = FirstValue @(
+        $ProtectionGroup.policyInfo.name,
+        $ProtectionGroup.policy.name,
+        $ProtectionGroup.policyConfig.name,
+        $ProtectionGroup.policyName
     )
 
     $policyId = FirstValue @(
@@ -216,75 +211,25 @@ function Resolve-PolicyInfo {
         $ProtectionGroup.policy.id
     )
 
-    $directPolicyName = FirstValue @(
-        $ProtectionGroup.policyInfo.name,
-        $ProtectionGroup.policy.name,
-        $ProtectionGroup.policyConfig.name
-    )
+    if (-not [string]::IsNullOrWhiteSpace($policyId) -and $PolicyMap.ContainsKey($policyId)) {
+        return $PolicyMap[$policyId]
+    }
 
-    $policyNameField = FirstValue @($ProtectionGroup.policyName)
+    if (-not [string]::IsNullOrWhiteSpace($policyName)) {
+        if (-not (Test-LooksLikeId -Value $policyName)) {
+            return $policyName
+        }
+
+        if ($PolicyMap.ContainsKey($policyName)) {
+            return $PolicyMap[$policyName]
+        }
+    }
 
     if (-not [string]::IsNullOrWhiteSpace($policyId) -and $PolicyMap.ContainsKey($policyId)) {
-        return [PSCustomObject]@{
-            PolicyName           = $PolicyMap[$policyId]
-            PolicyId             = $policyId
-            PolicyNameResolution = "PolicyMap"
-        }
+        return $PolicyMap[$policyId]
     }
 
-    if (-not [string]::IsNullOrWhiteSpace($directPolicyName)) {
-        return [PSCustomObject]@{
-            PolicyName           = $directPolicyName
-            PolicyId             = $policyId
-            PolicyNameResolution = "ProtectionGroupPolicyName"
-        }
-    }
-
-    if (-not [string]::IsNullOrWhiteSpace($policyNameField)) {
-        if (-not [string]::IsNullOrWhiteSpace($policyId) -and $policyNameField -eq $policyId) {
-            return [PSCustomObject]@{
-                PolicyName           = "UNRESOLVED_POLICY_NAME"
-                PolicyId             = $policyId
-                PolicyNameResolution = "PolicyNameFieldContainedPolicyId"
-            }
-        }
-
-        if ($PolicyMap.ContainsKey($policyNameField)) {
-            return [PSCustomObject]@{
-                PolicyName           = $PolicyMap[$policyNameField]
-                PolicyId             = $policyNameField
-                PolicyNameResolution = "PolicyMapFromPolicyNameField"
-            }
-        }
-
-        if (Test-LooksLikeId -Value $policyNameField) {
-            return [PSCustomObject]@{
-                PolicyName           = "UNRESOLVED_POLICY_NAME"
-                PolicyId             = $policyNameField
-                PolicyNameResolution = "PolicyNameFieldLookedLikeId"
-            }
-        }
-
-        return [PSCustomObject]@{
-            PolicyName           = $policyNameField
-            PolicyId             = $policyId
-            PolicyNameResolution = "PolicyNameField"
-        }
-    }
-
-    if (-not [string]::IsNullOrWhiteSpace($policyId)) {
-        return [PSCustomObject]@{
-            PolicyName           = "UNRESOLVED_POLICY_NAME"
-            PolicyId             = $policyId
-            PolicyNameResolution = "PolicyIdOnly"
-        }
-    }
-
-    return [PSCustomObject]@{
-        PolicyName           = ""
-        PolicyId             = ""
-        PolicyNameResolution = "MissingPolicyFields"
-    }
+    return "UNRESOLVED_POLICY_NAME"
 }
 
 # -------------------------------
@@ -359,7 +304,6 @@ foreach ($c in $selectedClusters) {
     $policyMap = Get-PolicyMap -Headers $headers
 
     Write-Host "Collecting active Physical PGs from $clusterName ..." -ForegroundColor Yellow
-    Write-Host "Policy map entries resolved for $clusterName : $($policyMap.Count)" -ForegroundColor DarkGray
 
     $pgs = Get-PhysicalPGs -Headers $headers
 
@@ -370,7 +314,6 @@ foreach ($c in $selectedClusters) {
         $pgIndex++
         $pgKey = Get-PGKey -Cluster $clusterName -PGName $pg.name
         $protectionType = FirstValue @($physical.protectionType)
-        $policyInfo = Resolve-PolicyInfo -ProtectionGroup $pg -PolicyMap $policyMap
 
         $fileParams = $physical.fileProtectionTypeParams
         $volumeParams = $physical.volumeProtectionTypeParams
@@ -395,9 +338,7 @@ foreach ($c in $selectedClusters) {
             PGIndex               = $pgIndex
             Cluster               = $clusterName
             PGName                = $pg.name
-            PolicyName            = $policyInfo.PolicyName
-            PolicyId              = $policyInfo.PolicyId
-            PolicyNameResolution  = $policyInfo.PolicyNameResolution
+            PolicyName            = Resolve-PolicyName -ProtectionGroup $pg -PolicyMap $policyMap
             ProtectionType        = $protectionType
             PGObjectCount         = @($objects).Count
             GlobalExcludePaths    = $globalExcludePaths
@@ -487,18 +428,9 @@ $detailCsv  = Join-Path $outDir "Physical_PG_Object_Detail_Latest.csv"
 $summaryRows | Export-Csv -Path $summaryCsv -NoTypeInformation -Encoding utf8
 $detailRows  | Export-Csv -Path $detailCsv -NoTypeInformation -Encoding utf8
 
-$unresolvedPolicies = @($summaryRows | Where-Object { $_.PolicyName -eq "UNRESOLVED_POLICY_NAME" })
-
 Write-Host ""
 Write-Host "CSV export complete." -ForegroundColor Green
-Write-Host "Summary rows          : $(@($summaryRows).Count)" -ForegroundColor Green
-Write-Host "Detail rows           : $(@($detailRows).Count)" -ForegroundColor Green
-Write-Host "Unresolved policies   : $($unresolvedPolicies.Count)" -ForegroundColor Yellow
-Write-Host "Summary CSV           : $summaryCsv" -ForegroundColor Green
-Write-Host "Detail CSV            : $detailCsv" -ForegroundColor Green
-
-if ($unresolvedPolicies.Count -gt 0) {
-    Write-Host ""
-    Write-Host "Policy names not resolved. First 10 affected PGs:" -ForegroundColor Yellow
-    $unresolvedPolicies | Select-Object Cluster, PGName, PolicyId, PolicyNameResolution -First 10 | Format-Table -AutoSize
-}
+Write-Host "Summary rows : $(@($summaryRows).Count)" -ForegroundColor Green
+Write-Host "Detail rows  : $(@($detailRows).Count)" -ForegroundColor Green
+Write-Host "Summary CSV  : $summaryCsv" -ForegroundColor Green
+Write-Host "Detail CSV   : $detailCsv" -ForegroundColor Green
