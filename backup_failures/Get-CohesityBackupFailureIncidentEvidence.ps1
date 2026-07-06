@@ -60,28 +60,28 @@ function IsOK($s){ $s -in @("Succeeded","SucceededWithWarning","kSucceeded","kSu
 function Relevant($env,$obj){ $t=[string](P $obj "objectType" ""); switch($env){"kOracle"{$t -in @("kDatabase","kHost")}"kSQL"{$t -in @("kDatabase","kHost")}"kPhysical"{$t -eq "kHost"}"kGenericNas"{$t -eq "kHost"}"kIsilon"{$t -eq "kHost"}"kHyperV"{$t -eq "kVirtualMachine"}"kAcropolis"{$t -eq "kVirtualMachine"}default{$true}} }
 function FailedAttempts($ro){ try{@($ro.localSnapshotInfo.failedAttempts)}catch{@()} }
 function FailMsg($ro){ (($ro|%{FailedAttempts $_}|%{Clean $_.message}|?{$_}) -join " | ") }
-function ObjKey($cid,$c,$env,$pgid,$pg,$oid,$host,$name){ if($oid){"$cid|$env|$pgid|$oid"}else{"$c|$env|$pg|$host|$name"} }
-function Row($inc,$w,$cid,$c,$env,$pgid,$pg,$host,$oid,$name,$type,$rt,$kind,$usecs,$msg){ $k=ObjKey $cid $c $env $pgid $pg $oid $host $name; [pscustomobject]@{IncidentNumber=$inc;WindowKey=$w.Key;Cluster=$c;Environment=(EnvLabel $env);ProtectionGroup=$pg;Host=$host;ObjectName=$name;ObjectType=$type;RunType=$rt;EventKind=$kind;EventTimeET=(Et $usecs);EventTimeUsecs=$usecs;Message=$msg;ObjectKey=$k} }
+function ObjKey($cid,$clusterDisplayName,$env,$pgid,$pgName,$oid,$objectHostName,$objectName){ if($oid){"$cid|$env|$pgid|$oid"}else{"$clusterDisplayName|$env|$pgName|$objectHostName|$objectName"} }
+function Row($inc,$w,$cid,$clusterDisplayName,$env,$pgid,$pgName,$objectHostName,$oid,$objectName,$objectType,$runType,$kind,$usecs,$msg){ $k=ObjKey $cid $clusterDisplayName $env $pgid $pgName $oid $objectHostName $objectName; [pscustomobject]@{IncidentNumber=$inc;WindowKey=$w.Key;Cluster=$clusterDisplayName;Environment=(EnvLabel $env);ProtectionGroup=$pgName;Host=$objectHostName;ObjectName=$objectName;ObjectType=$objectType;RunType=$runType;EventKind=$kind;EventTimeET=(Et $usecs);EventTimeUsecs=$usecs;Message=$msg;ObjectKey=$k} }
 
 function ExpandRun($inc,$w,$cluster,$pg,$run,$info){
   $status=[string](P $info "status" ""); $kind=if(IsFail $status){"Failed"}elseif(IsOK $status){"Success"}else{return @()}
   $start=[int64](P $info "startTimeUsecs" 0); $end=[int64](P $info "endTimeUsecs" 0); $usecs=if($end){$end}else{$start}
   if($usecs -lt $w.StartUsecs -or $usecs -ge $w.EndUsecs){return @()}
-  $cid=[string](P $cluster "clusterId" ""); $c=[string](P $cluster "name" ""); if(!$c){$c=[string](P $cluster "clusterName" "Unknown-$cid")}
-  $pgid=[string](P $pg "id" ""); $pgn=[string](P $pg "name" "Unknown PG"); $env=EnvCode $pg; $rt=[string](P $info "runType" ""); $msg=Clean(P $info "messages" "")
-  $objs=A(P $run "objects" @()); if($objs.Count -eq 0){return @(Row $inc $w $cid $c $env $pgid $pgn "" "" $pgn "ProtectionGroup" $rt $kind $usecs $msg)}
+  $cid=[string](P $cluster "clusterId" ""); $clusterDisplayName=[string](P $cluster "name" ""); if(!$clusterDisplayName){$clusterDisplayName=[string](P $cluster "clusterName" "Unknown-$cid")}
+  $pgid=[string](P $pg "id" ""); $pgName=[string](P $pg "name" "Unknown PG"); $env=EnvCode $pg; $runType=[string](P $info "runType" ""); $msg=Clean(P $info "messages" "")
+  $objs=A(P $run "objects" @()); if($objs.Count -eq 0){return @(Row $inc $w $cid $clusterDisplayName $env $pgid $pgName "" "" $pgName "ProtectionGroup" $runType $kind $usecs $msg)}
   $idName=@{}; foreach($ro in $objs){$o=P $ro "object" $null; $id=[string](P $o "id" ""); $nm=[string](P $o "name" ""); if($id -and $nm){$idName[$id]=$nm}}
   $out=@()
   foreach($ro in $objs){
     $o=P $ro "object" $null; if(!$o -or !(Relevant $env $o)){continue}
     if($kind -eq "Failed" -and (FailedAttempts $ro).Count -eq 0){continue}
-    $type=[string](P $o "objectType" ""); $oid=[string](P $o "id" ""); $name=[string](P $o "name" ""); $host=""
-    if($env -in @("kOracle","kSQL") -and $type -eq "kHost"){$host=$name; if($kind -eq "Failed"){$name="No DBs Found (Host-Level Failure)"}}
-    if($env -in @("kOracle","kSQL") -and $type -eq "kDatabase"){$sid=[string](P $o "sourceId" ""); if($sid -and $idName.ContainsKey($sid)){$host=$idName[$sid]}}
+    $objectType=[string](P $o "objectType" ""); $oid=[string](P $o "id" ""); $objectName=[string](P $o "name" ""); $objectHostName=""
+    if($env -in @("kOracle","kSQL") -and $objectType -eq "kHost"){$objectHostName=$objectName; if($kind -eq "Failed"){$objectName="No DBs Found (Host-Level Failure)"}}
+    if($env -in @("kOracle","kSQL") -and $objectType -eq "kDatabase"){$sid=[string](P $o "sourceId" ""); if($sid -and $idName.ContainsKey($sid)){$objectHostName=$idName[$sid]}}
     $m=$msg; if($kind -eq "Failed"){$fm=FailMsg $ro; if($fm){$m=$fm}}
-    $out += Row $inc $w $cid $c $env $pgid $pgn $host $oid $name $type $rt $kind $usecs $m
+    $out += Row $inc $w $cid $clusterDisplayName $env $pgid $pgName $objectHostName $oid $objectName $objectType $runType $kind $usecs $m
   }
-  if($out.Count -eq 0 -and $kind -eq "Failed"){$out += Row $inc $w $cid $c $env $pgid $pgn "" "" $pgn "ProtectionGroup" $rt $kind $usecs $msg}
+  if($out.Count -eq 0 -and $kind -eq "Failed"){$out += Row $inc $w $cid $clusterDisplayName $env $pgid $pgName "" "" $pgName "ProtectionGroup" $runType $kind $usecs $msg}
   return @($out)
 }
 
