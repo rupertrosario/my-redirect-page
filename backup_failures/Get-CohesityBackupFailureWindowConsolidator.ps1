@@ -4,33 +4,26 @@
 
 .DESCRIPTION
   GET-only Cohesity Helios evidence tool for backup-failure incidents.
-  The script locks one incident to the Dynatrace compute_window:
-  America/New_York, 18:00 ET -> next day 18:00 ET.
+  Uses Dynatrace compute window logic: 18:00 ET -> next day 18:00 ET.
 
-  First run in a new DT window asks once for the incident number.
-  Later runs in the same DT window reuse BackupFailure_WindowRegistry.json.
-
-  Output behavior:
-  - If ImportExcel / Export-Excel is available, create XLSX.
-  - If XLSX export is unavailable, automatically create CSV fallback evidence.
-  - No Microsoft Excel installation is required for CSV fallback.
+  Output is CSV-first and does not require Microsoft Excel or ImportExcel.
 #>
 
 [CmdletBinding()]
 param(
     [string]$HeliosBaseUrl = 'https://helios.cohesity.com',
     [string]$ApiKeyPath = 'X:\PowerShell\Cohesity_API_Scripts\DO_NOT_Delete\apikey.txt',
-    [string]$OutputRoot = 'X:\PowerShell\Data\Cohesity\BackupFailureWindow',
+    [string]$OutputRoot = 'X:\PowerShell\Cohesity_API_Scripts\BackupFailureWindow\Output',
     [string]$IncidentNumber,
     [int]$MaxClusters = 0,
     [int]$MaxProtectionGroupsPerCluster = 0,
     [int]$MaxRunsPerProtectionGroup = 120,
-    [bool]$ShowGridView = $true,
+    [bool]$ShowGridView = $false,
     [switch]$MultipleGridViews,
     [switch]$ForceCsv
 )
 
-Set-StrictMode -Version 2.0
+Set-StrictMode -Off
 $ErrorActionPreference = 'Stop'
 
 function Get-Etz {
@@ -38,22 +31,10 @@ function Get-Etz {
     catch { [TimeZoneInfo]::FindSystemTimeZoneById('America/New_York') }
 }
 
-function Get-NowEt {
-    [TimeZoneInfo]::ConvertTimeFromUtc((Get-Date).ToUniversalTime(), (Get-Etz))
-}
-
-function FmtEt($Value) {
-    if ($null -eq $Value -or [string]::IsNullOrWhiteSpace([string]$Value)) { return '' }
-    ([datetime]$Value).ToString('yyyy-MM-dd HH:mm:ss')
-}
-
-function FmtUtc([datetime]$Value) {
-    $Value.ToUniversalTime().ToString('yyyy-MM-dd HH:mm:ss')
-}
-
-function EtToUtc([datetime]$Value) {
-    [TimeZoneInfo]::ConvertTimeToUtc([datetime]::SpecifyKind($Value, [DateTimeKind]::Unspecified), (Get-Etz))
-}
+function Get-NowEt { [TimeZoneInfo]::ConvertTimeFromUtc((Get-Date).ToUniversalTime(), (Get-Etz)) }
+function FmtEt($Value) { if ($null -eq $Value -or [string]::IsNullOrWhiteSpace([string]$Value)) { '' } else { ([datetime]$Value).ToString('yyyy-MM-dd HH:mm:ss') } }
+function FmtUtc([datetime]$Value) { $Value.ToUniversalTime().ToString('yyyy-MM-dd HH:mm:ss') }
+function EtToUtc([datetime]$Value) { [TimeZoneInfo]::ConvertTimeToUtc([datetime]::SpecifyKind($Value, [DateTimeKind]::Unspecified), (Get-Etz)) }
 
 function UsecToEt($Usecs) {
     if ($null -eq $Usecs -or [string]::IsNullOrWhiteSpace([string]$Usecs)) { return $null }
@@ -63,31 +44,49 @@ function UsecToEt($Usecs) {
     } catch { $null }
 }
 
-function Arr($Value) {
+function AsArray($Value) {
     if ($null -eq $Value) { return @() }
     if ($Value -is [array]) { return @($Value) }
     @($Value)
 }
 
-function Prop($Object, [string[]]$Names) {
+function Get-Prop($Object, [string[]]$Names) {
     if ($null -eq $Object) { return $null }
     foreach ($name in $Names) {
-        if ($Object.PSObject.Properties.Name -contains $name) { return $Object.$name }
+        foreach ($prop in @($Object.PSObject.Properties)) {
+            if ($prop.Name -ieq $name) { return $prop.Value }
+        }
     }
-    $null
+    return $null
 }
 
-function FirstArr($Object, [string[]]$Names) {
-    foreach ($name in $Names) {
-        $value = Prop $Object @($name)
-        if ($null -ne $value) { return @(Arr $value) }
+function Has-Prop($Object, [string]$Name) {
+    if ($null -eq $Object) { return $false }
+    foreach ($prop in @($Object.PSObject.Properties)) {
+        if ($prop.Name -ieq $Name) { return $true }
     }
-    @()
+    return $false
+}
+
+function Get-DynamicProp($Object, [string]$Name) {
+    if ($null -eq $Object) { return $null }
+    foreach ($prop in @($Object.PSObject.Properties)) {
+        if ($prop.Name -ieq $Name) { return $prop.Value }
+    }
+    return $null
+}
+
+function FirstArrayProperty($Object, [string[]]$Names) {
+    foreach ($name in $Names) {
+        $value = Get-Prop $Object @($name)
+        if ($null -ne $value) { return @(AsArray $value) }
+    }
+    return @()
 }
 
 function SafeName([string]$Name) {
     if ([string]::IsNullOrWhiteSpace($Name)) { return 'Unknown' }
-    (($Name.Trim() -replace '[\/:*?"<>|]', '_') -replace '\s+', '_')
+    return (($Name.Trim() -replace '[\/:*?"<>|]', '_') -replace '\s+', '_')
 }
 
 function Get-DtWindow {
@@ -95,7 +94,6 @@ function Get-DtWindow {
     $start = $now.Date.AddHours(18)
     if ($now -lt $start) { $start = $start.AddDays(-1) }
     $end = $start.AddDays(1)
-
     [pscustomobject]@{
         StartET     = $start
         EndET       = $end
@@ -110,9 +108,11 @@ function Get-DtWindow {
 function Read-Json($Path, $Default) {
     if (Test-Path $Path) {
         $raw = Get-Content -Path $Path -Raw
-        if (-not [string]::IsNullOrWhiteSpace($raw)) { return ($raw | ConvertFrom-Json) }
+        if (-not [string]::IsNullOrWhiteSpace($raw)) {
+            try { return ($raw | ConvertFrom-Json) } catch { return $Default }
+        }
     }
-    $Default
+    return $Default
 }
 
 function Write-Json($Object, $Path) {
@@ -123,7 +123,6 @@ function Write-Json($Object, $Path) {
 
 function Resolve-Window($Window) {
     if (-not (Test-Path $OutputRoot)) { New-Item -ItemType Directory -Path $OutputRoot -Force | Out-Null }
-
     $registryPath = Join-Path $OutputRoot 'BackupFailure_WindowRegistry.json'
     $default = [pscustomobject]@{
         TimeZone            = 'America/New_York'
@@ -134,19 +133,25 @@ function Resolve-Window($Window) {
     }
 
     $registry = Read-Json $registryPath $default
-    if (-not ($registry.PSObject.Properties.Name -contains 'Windows')) {
-        $registry | Add-Member -MemberType NoteProperty -Name Windows -Value ([pscustomobject]@{})
+    if (-not (Has-Prop $registry 'Windows')) {
+        $registry | Add-Member -MemberType NoteProperty -Name Windows -Value ([pscustomobject]@{}) -Force
+    }
+    if ($null -eq (Get-Prop $registry @('Windows'))) {
+        $registry.Windows = [pscustomobject]@{}
     }
 
+    $windows = Get-Prop $registry @('Windows')
     $key = $Window.WindowKey
-    if ($registry.Windows.PSObject.Properties.Name -contains $key) {
-        $mapping = $registry.Windows.$key
-        if ($IncidentNumber -and $IncidentNumber.Trim().ToUpper() -ne $mapping.IncidentNumber) {
-            throw "Window $key is locked to $($mapping.IncidentNumber). Do not overwrite the locked incident."
+    $existing = Get-DynamicProp $windows $key
+
+    if ($null -ne $existing) {
+        $lockedIncident = [string](Get-Prop $existing @('IncidentNumber'))
+        if ($IncidentNumber -and $IncidentNumber.Trim().ToUpper() -ne $lockedIncident) {
+            throw "Window $key is locked to $lockedIncident. Do not overwrite the locked incident."
         }
-        $mapping.LastRunET = FmtEt (Get-NowEt)
+        if (Has-Prop $existing 'LastRunET') { $existing.LastRunET = FmtEt (Get-NowEt) }
         Write-Json $registry $registryPath
-        return [pscustomobject]@{ RegistryPath = $registryPath; WindowKey = $key; Mapping = $mapping; IsNew = $false }
+        return [pscustomobject]@{ RegistryPath=$registryPath; WindowKey=$key; Mapping=$existing; IsNew=$false }
     }
 
     $inc = $IncidentNumber
@@ -177,179 +182,172 @@ function Resolve-Window($Window) {
         OutputFolder             = $folder
     }
 
-    $registry.Windows | Add-Member -MemberType NoteProperty -Name $key -Value $mapping
+    $windows | Add-Member -MemberType NoteProperty -Name $key -Value $mapping -Force
     Write-Json $registry $registryPath
-    [pscustomobject]@{ RegistryPath = $registryPath; WindowKey = $key; Mapping = $mapping; IsNew = $true }
+    return [pscustomobject]@{ RegistryPath=$registryPath; WindowKey=$key; Mapping=$mapping; IsNew=$true }
 }
 
 function Get-ApiKeyValue {
     if (-not (Test-Path $ApiKeyPath)) { throw "API key file not found: $ApiKeyPath" }
     $key = (Get-Content -Path $ApiKeyPath -Raw).Trim()
     if ([string]::IsNullOrWhiteSpace($key)) { throw "API key file is empty: $ApiKeyPath" }
-    $key
+    return $key
 }
 
 function Invoke-CohesityGet($Path, $Headers, $Query) {
     $uri = $HeliosBaseUrl.TrimEnd('/') + $Path
     if ($Query -and $Query.Count -gt 0) {
-        $pairs = foreach ($k in $Query.Keys) {
+        $pairs = @()
+        foreach ($k in $Query.Keys) {
             if ($null -ne $Query[$k] -and [string]$Query[$k] -ne '') {
-                '{0}={1}' -f [uri]::EscapeDataString([string]$k), [uri]::EscapeDataString([string]$Query[$k])
+                $pairs += ('{0}={1}' -f [uri]::EscapeDataString([string]$k), [uri]::EscapeDataString([string]$Query[$k]))
             }
         }
-        if ($pairs) { $uri += '?' + ($pairs -join '&') }
+        if ($pairs.Count -gt 0) { $uri += '?' + ($pairs -join '&') }
     }
-
     Invoke-RestMethod -Method GET -Uri $uri -Headers $Headers -TimeoutSec 120
 }
 
-function NormStatus($Status) {
+function Normalize-Status($Status) {
     if (-not $Status) { return 'Unknown' }
     $value = ([string]$Status).Trim() -replace '^k', ''
     switch -Regex ($value) {
-        'SucceededWithWarning|Succeeded|Success|Warning' { 'Succeeded'; break }
-        'Fail|Failed|Failure|Error' { 'Failed'; break }
-        'Cancel|Canceled|Cancelled' { 'Canceled'; break }
-        'Running|Started|InProgress|Progress|Accepted' { 'Running'; break }
-        default { $value }
+        'SucceededWithWarning|Succeeded|Success|Warning' { return 'Succeeded' }
+        'Fail|Failed|Failure|Error' { return 'Failed' }
+        'Cancel|Canceled|Cancelled' { return 'Canceled' }
+        'Running|Started|InProgress|Progress|Accepted' { return 'Running' }
+        default { return $value }
     }
 }
 
-function NormEnv($Env) {
+function Normalize-Env($Env) {
     if (-not $Env) { return 'Unknown' }
     $value = ([string]$Env).Trim() -replace '^k', ''
     switch -Regex ($value) {
-        'Acropolis' { 'Nutanix'; break }
-        'GenericNas' { 'NAS'; break }
-        default { $value }
+        'Acropolis' { return 'Nutanix' }
+        'GenericNas' { return 'NAS' }
+        default { return $value }
     }
 }
 
-function RunStatus($Run) {
-    $status = Prop $Run @('status','backupRunStatus','runStatus')
-    if (-not $status) { $status = Prop (Prop $Run @('localBackupInfo')) @('status') }
-    NormStatus $status
+function Get-RunStatus($Run) {
+    $status = Get-Prop $Run @('status','backupRunStatus','runStatus')
+    if (-not $status) { $status = Get-Prop (Get-Prop $Run @('localBackupInfo')) @('status') }
+    Normalize-Status $status
 }
 
-function RunType($Run) {
-    $type = Prop $Run @('runType','backupRunType')
-    if (-not $type) { $type = Prop (Prop $Run @('localBackupInfo')) @('runType') }
+function Get-RunType($Run) {
+    $type = Get-Prop $Run @('runType','backupRunType')
+    if (-not $type) { $type = Get-Prop (Get-Prop $Run @('localBackupInfo')) @('runType') }
     if (-not $type) { return 'Unknown' }
     ([string]$type -replace '^k', '')
 }
 
-function RunStart($Run) {
-    $usecs = Prop $Run @('startTimeUsecs','runStartTimeUsecs')
-    if (-not $usecs) { $usecs = Prop (Prop $Run @('localBackupInfo')) @('startTimeUsecs') }
+function Get-RunStart($Run) {
+    $usecs = Get-Prop $Run @('startTimeUsecs','runStartTimeUsecs')
+    if (-not $usecs) { $usecs = Get-Prop (Get-Prop $Run @('localBackupInfo')) @('startTimeUsecs') }
     UsecToEt $usecs
 }
 
-function RunEnd($Run) {
-    $usecs = Prop $Run @('endTimeUsecs','endUsecs','runEndTimeUsecs')
-    if (-not $usecs) { $usecs = Prop (Prop $Run @('localBackupInfo')) @('endTimeUsecs') }
-    if (-not $usecs) { $usecs = Prop $Run @('startTimeUsecs','runStartTimeUsecs') }
+function Get-RunEnd($Run) {
+    $usecs = Get-Prop $Run @('endTimeUsecs','endUsecs','runEndTimeUsecs')
+    if (-not $usecs) { $usecs = Get-Prop (Get-Prop $Run @('localBackupInfo')) @('endTimeUsecs') }
+    if (-not $usecs) { $usecs = Get-Prop $Run @('startTimeUsecs','runStartTimeUsecs') }
     UsecToEt $usecs
 }
 
-function Msg($Object) {
+function Get-Message($Object) {
     foreach ($field in @('errorMessage','message','errorMsg','failureMessage','warningMessage','reason')) {
-        $value = Prop $Object @($field)
+        $value = Get-Prop $Object @($field)
         if ($value) { return [string]$value }
     }
-    ''
+    return ''
 }
 
-function ObjName($Object) {
-    $inner = Prop $Object @('object','entity','source')
-    $name = Prop $Object @('name','objectName','displayName')
-    if (-not $name) { $name = Prop $inner @('name','objectName','displayName') }
-    if ($name) { [string]$name } else { 'UnknownObject' }
+function Get-ObjectName($Object) {
+    $inner = Get-Prop $Object @('object','entity','source')
+    $name = Get-Prop $Object @('name','objectName','displayName')
+    if (-not $name) { $name = Get-Prop $inner @('name','objectName','displayName') }
+    if ($name) { return [string]$name }
+    return 'UnknownObject'
 }
 
-function ObjId($Object) {
-    $inner = Prop $Object @('object','entity','source')
-    $id = Prop $Object @('id','objectId','entityId','sourceId','uid')
-    if (-not $id) { $id = Prop $inner @('id','objectId','entityId','sourceId','uid') }
+function Get-ObjectId($Object) {
+    $inner = Get-Prop $Object @('object','entity','source')
+    $id = Get-Prop $Object @('id','objectId','entityId','sourceId','uid')
+    if (-not $id) { $id = Get-Prop $inner @('id','objectId','entityId','sourceId','uid') }
     [string]$id
 }
 
-function ObjType($Object, $Environment) {
-    $inner = Prop $Object @('object','entity','source')
-    $type = Prop $Object @('type','objectType','entityType')
-    if (-not $type) { $type = Prop $inner @('type','objectType','entityType') }
-    if ($type) { ([string]$type -replace '^k', '') } else { $Environment }
+function Get-ObjectType($Object, $Environment) {
+    $inner = Get-Prop $Object @('object','entity','source')
+    $type = Get-Prop $Object @('type','objectType','entityType')
+    if (-not $type) { $type = Get-Prop $inner @('type','objectType','entityType') }
+    if ($type) { return ([string]$type -replace '^k', '') }
+    return $Environment
 }
 
-function HostName($Object) {
-    $host = Prop $Object @('host','hostName','parentName','sourceName','registeredSourceName')
-    if ($host) { return [string]$host }
-    $inner = Prop $Object @('object','entity','source')
-    $host = Prop $inner @('parentName','hostName','sourceName','registeredSourceName')
-    if ($host) { [string]$host } else { '' }
+function Get-HostName($Object) {
+    $hostName = Get-Prop $Object @('host','hostName','parentName','sourceName','registeredSourceName')
+    if ($hostName) { return [string]$hostName }
+    $inner = Get-Prop $Object @('object','entity','source')
+    $hostName = Get-Prop $inner @('parentName','hostName','sourceName','registeredSourceName')
+    if ($hostName) { return [string]$hostName }
+    return ''
 }
 
-function ObjStatus($Object, $RunStatus) {
-    $status = Prop $Object @('status','runStatus','protectionStatus','backupStatus')
+function Get-ObjectStatus($Object, $RunStatus) {
+    $status = Get-Prop $Object @('status','runStatus','protectionStatus','backupStatus')
     if (-not $status) { $status = $RunStatus }
-    NormStatus $status
+    Normalize-Status $status
 }
 
-function ObjKey($ClusterId, $Environment, $PgId, $PgName, $Object) {
-    $id = ObjId $Object
+function Get-ObjectKey($ClusterId, $Environment, $PgId, $PgName, $Object) {
+    $id = Get-ObjectId $Object
     if ($id) { return "$ClusterId|$Environment|$PgId|$id" }
-    "$ClusterId|$Environment|$PgName|$(HostName $Object)|$(ObjName $Object)"
+    return "$ClusterId|$Environment|$PgName|$(Get-HostName $Object)|$(Get-ObjectName $Object)"
 }
 
 function Get-Clusters($Headers) {
     $json = Invoke-CohesityGet '/v2/mcm/cluster-mgmt/info' $Headers @{}
-    $out = foreach ($cluster in (FirstArr $json @('clusters','clusterInfo','clusterInfos','items','data'))) {
-        $id = Prop $cluster @('clusterId','id','uuid')
-        $name = Prop $cluster @('clusterName','name','displayName','hostname')
-        if ($id -or $name) { [pscustomobject]@{ ClusterId = [string]$id; ClusterName = [string]$name } }
+    $clusterList = FirstArrayProperty $json @('clusters','clusterInfo','clusterInfos','items','data')
+    $out = @()
+    foreach ($cluster in $clusterList) {
+        $id = Get-Prop $cluster @('clusterId','id','uuid')
+        $name = Get-Prop $cluster @('clusterName','name','displayName','hostname')
+        if ($id -or $name) { $out += [pscustomobject]@{ ClusterId=[string]$id; ClusterName=[string]$name } }
     }
-    if ($MaxClusters -gt 0) { @($out | Select-Object -First $MaxClusters) } else { @($out) }
+    if ($MaxClusters -gt 0) { return @($out | Select-Object -First $MaxClusters) }
+    return @($out)
 }
 
 function Get-ProtectionGroups($Headers) {
     $json = Invoke-CohesityGet '/v2/data-protect/protection-groups' $Headers @{ isDeleted='false'; isActive='true'; includeLastRunInfo='true' }
-    $pgs = FirstArr $json @('protectionGroups','protectionGroupInfos','items','data')
-    if ($MaxProtectionGroupsPerCluster -gt 0) { @($pgs | Select-Object -First $MaxProtectionGroupsPerCluster) } else { @($pgs) }
+    $pgs = FirstArrayProperty $json @('protectionGroups','protectionGroupInfos','items','data')
+    if ($MaxProtectionGroupsPerCluster -gt 0) { return @($pgs | Select-Object -First $MaxProtectionGroupsPerCluster) }
+    return @($pgs)
 }
 
 function Get-Runs($Headers, $PgId) {
     $encodedPgId = [uri]::EscapeDataString([string]$PgId)
     $json = Invoke-CohesityGet "/v2/data-protect/protection-groups/$encodedPgId/runs" $Headers @{ numRuns=[string]$MaxRunsPerProtectionGroup; includeObjectDetails='true' }
-    FirstArr $json @('runs','protectionRuns','items','data')
+    FirstArrayProperty $json @('runs','protectionRuns','items','data')
 }
 
 function New-EventRow($Incident, $Time, $ClusterId, $Cluster, $Environment, $PgId, $PgName, $Host, $ObjectName, $ObjectType, $ObjectId, $ObjectKey, $RunType, $EventType, $Message, $RunStart, $RunEnd) {
     [pscustomobject]@{
-        IncidentNumber    = $Incident
-        EventTimeET       = FmtEt $Time
-        ClusterId         = $ClusterId
-        Cluster           = $Cluster
-        Environment       = $Environment
-        ProtectionGroupId = $PgId
-        ProtectionGroup   = $PgName
-        Host              = $Host
-        ObjectName        = $ObjectName
-        ObjectType        = $ObjectType
-        ObjectId          = $ObjectId
-        ObjectKey         = $ObjectKey
-        RunType           = $RunType
-        EventType         = $EventType
-        Message           = $Message
-        RunStartET        = FmtEt $RunStart
-        RunEndET          = FmtEt $RunEnd
+        IncidentNumber=$Incident; EventTimeET=FmtEt $Time; ClusterId=$ClusterId; Cluster=$Cluster; Environment=$Environment;
+        ProtectionGroupId=$PgId; ProtectionGroup=$PgName; Host=$Host; ObjectName=$ObjectName; ObjectType=$ObjectType;
+        ObjectId=$ObjectId; ObjectKey=$ObjectKey; RunType=$RunType; EventType=$EventType; Message=$Message; RunStartET=FmtEt $RunStart; RunEndET=FmtEt $RunEnd
     }
 }
 
 function Collect-Events($Headers, $Window, $Incident) {
-    $events = @()
-    $evidence = @()
-    $warnings = @()
+    $events = @(); $evidence = @(); $warnings = @()
+    $clusters = Get-Clusters $Headers
+    if ($clusters.Count -eq 0) { $warnings += 'No clusters returned from Helios cluster API.' }
 
-    foreach ($cluster in (Get-Clusters $Headers)) {
+    foreach ($cluster in $clusters) {
         $clusterId = $cluster.ClusterId
         $clusterName = if ($cluster.ClusterName) { $cluster.ClusterName } else { $clusterId }
         $clusterHeaders = @{}
@@ -360,52 +358,44 @@ function Collect-Events($Headers, $Window, $Incident) {
         catch { $warnings += "Cluster $clusterName PG query failed: $($_.Exception.Message)"; continue }
 
         foreach ($pg in $pgs) {
-            $pgId = [string](Prop $pg @('id','protectionGroupId','uid'))
-            if (-not $pgId) { $pgId = [string](Prop $pg @('name','protectionGroupName')) }
-            $pgName = [string](Prop $pg @('name','protectionGroupName'))
+            $pgId = [string](Get-Prop $pg @('id','protectionGroupId','uid'))
+            if (-not $pgId) { $pgId = [string](Get-Prop $pg @('name','protectionGroupName')) }
+            $pgName = [string](Get-Prop $pg @('name','protectionGroupName'))
             if (-not $pgName) { $pgName = $pgId }
-            $env = NormEnv (Prop $pg @('environment','env','protectionSourceEnvironment'))
+            $env = Normalize-Env (Get-Prop $pg @('environment','env','protectionSourceEnvironment'))
 
             try { $runs = Get-Runs $clusterHeaders $pgId }
             catch { $warnings += "Cluster $clusterName PG $pgName run query failed: $($_.Exception.Message)"; continue }
 
             $oldest = $null
             foreach ($run in $runs) {
-                $runStart = RunStart $run
-                $runEnd = RunEnd $run
+                $runStart = Get-RunStart $run
+                $runEnd = Get-RunEnd $run
                 $eventTime = if ($runEnd) { $runEnd } else { $runStart }
                 if (-not $eventTime) { continue }
                 if (-not $oldest -or $eventTime -lt $oldest) { $oldest = $eventTime }
                 if ($eventTime -lt $Window.StartET -or $eventTime -ge $Window.EndET) { continue }
 
-                $runStatus = RunStatus $run
-                $runType = RunType $run
-                $objects = FirstArr $run @('objects','objectRuns','objectRunList','tasks','taskRuns')
+                $runStatus = Get-RunStatus $run
+                $runType = Get-RunType $run
+                $objects = FirstArrayProperty $run @('objects','objectRuns','objectRunList','tasks','taskRuns')
 
                 $evidence += [pscustomobject]@{
-                    IncidentNumber    = $Incident
-                    Cluster           = $clusterName
-                    Environment       = $env
-                    ProtectionGroup   = $pgName
-                    RunType           = $runType
-                    RunStatus         = $runStatus
-                    RunStartET        = FmtEt $runStart
-                    RunEndET          = FmtEt $runEnd
-                    ObjectDetailCount = $objects.Count
-                    Message           = Msg $run
+                    IncidentNumber=$Incident; Cluster=$clusterName; Environment=$env; ProtectionGroup=$pgName; RunType=$runType; RunStatus=$runStatus;
+                    RunStartET=FmtEt $runStart; RunEndET=FmtEt $runEnd; ObjectDetailCount=$objects.Count; Message=Get-Message $run
                 }
 
                 if ($objects.Count -eq 0) {
                     if ($runStatus -in @('Failed','Canceled','Running')) {
                         $eventType = if ($runStatus -eq 'Failed') { 'Failed' } elseif ($runStatus -eq 'Canceled') { 'CancelledRun' } else { 'RunningRun' }
                         $objectKey = "$clusterId|$env|$pgId|PG_LEVEL|$runType"
-                        $events += New-EventRow $Incident $eventTime $clusterId $clusterName $env $pgId $pgName '' $pgName 'ProtectionGroup' '' $objectKey $runType $eventType (Msg $run) $runStart $runEnd
+                        $events += New-EventRow $Incident $eventTime $clusterId $clusterName $env $pgId $pgName '' $pgName 'ProtectionGroup' '' $objectKey $runType $eventType (Get-Message $run) $runStart $runEnd
                     }
                     continue
                 }
 
                 foreach ($object in $objects) {
-                    $objectStatus = ObjStatus $object $runStatus
+                    $objectStatus = Get-ObjectStatus $object $runStatus
                     $eventType = $null
                     if ($objectStatus -eq 'Running' -or $runStatus -eq 'Running') { $eventType = 'RunningRun' }
                     elseif ($objectStatus -eq 'Canceled' -or $runStatus -eq 'Canceled') { $eventType = 'CancelledRun' }
@@ -413,51 +403,36 @@ function Collect-Events($Headers, $Window, $Incident) {
                     elseif ($objectStatus -eq 'Succeeded' -or $runStatus -eq 'Succeeded') { $eventType = 'Succeeded' }
                     if (-not $eventType) { continue }
 
-                    $objectId = ObjId $object
-                    $objectKey = ObjKey $clusterId $env $pgId $pgName $object
-                    $message = Msg $object
-                    if (-not $message) { $message = Msg $run }
+                    $objectId = Get-ObjectId $object
+                    $objectKey = Get-ObjectKey $clusterId $env $pgId $pgName $object
+                    $message = Get-Message $object
+                    if (-not $message) { $message = Get-Message $run }
 
-                    $events += New-EventRow $Incident $eventTime $clusterId $clusterName $env $pgId $pgName (HostName $object) (ObjName $object) (ObjType $object $env) $objectId $objectKey $runType $eventType $message $runStart $runEnd
+                    $events += New-EventRow $Incident $eventTime $clusterId $clusterName $env $pgId $pgName (Get-HostName $object) (Get-ObjectName $object) (Get-ObjectType $object $env) $objectId $objectKey $runType $eventType $message $runStart $runEnd
                 }
             }
-
-            if ($oldest -and $oldest -gt $Window.StartET) {
-                $warnings += "PG $pgName on $clusterName may be truncated; increase MaxRunsPerProtectionGroup."
-            }
+            if ($oldest -and $oldest -gt $Window.StartET) { $warnings += "PG $pgName on $clusterName may be truncated; increase MaxRunsPerProtectionGroup." }
         }
     }
 
-    [pscustomobject]@{ Events = $events; RunEvidence = $evidence; Warnings = $warnings }
+    [pscustomobject]@{ Events=$events; RunEvidence=$evidence; Warnings=$warnings }
 }
 
 function New-SectionRow($Event, $Section, $Status, $FirstFailedET, $LastFailedET, $RecoveredET, $Count) {
     [pscustomobject]@{
-        Section                 = $Section
-        Status                  = $Status
-        IncidentNumber          = $Event.IncidentNumber
-        Cluster                 = $Event.Cluster
-        Environment             = $Event.Environment
-        ProtectionGroup         = $Event.ProtectionGroup
-        Host                    = $Event.Host
-        ObjectName              = $Event.ObjectName
-        ObjectType              = $Event.ObjectType
-        RunType                 = $Event.RunType
-        FirstFailedET           = $FirstFailedET
-        LastFailedET            = $LastFailedET
-        RecoveredET             = $RecoveredET
-        ConsecutiveFailureCount = $Count
-        Message                 = $Event.Message
-        ObjectKey               = $Event.ObjectKey
+        Section=$Section; Status=$Status; IncidentNumber=$Event.IncidentNumber; Cluster=$Event.Cluster; Environment=$Event.Environment;
+        ProtectionGroup=$Event.ProtectionGroup; Host=$Event.Host; ObjectName=$Event.ObjectName; ObjectType=$Event.ObjectType; RunType=$Event.RunType;
+        FirstFailedET=$FirstFailedET; LastFailedET=$LastFailedET; RecoveredET=$RecoveredET; ConsecutiveFailureCount=$Count; Message=$Event.Message; ObjectKey=$Event.ObjectKey
     }
 }
 
 function Build-Tables($Events, $PreviousState, $Window, $Incident, $RunEvidence, $Warnings) {
     $prevFailing = @{}
-    if ($PreviousState -and ($PreviousState.PSObject.Properties.Name -contains 'Objects')) {
-        foreach ($item in @($PreviousState.Objects)) {
-            if ($item.CurrentStatus -in @('StillFailing','ReFailed')) { $prevFailing[[string]$item.ObjectKey] = $item }
-        }
+    $previousObjects = Get-Prop $PreviousState @('Objects')
+    foreach ($item in @(AsArray $previousObjects)) {
+        $status = Get-Prop $item @('CurrentStatus')
+        $objectKey = [string](Get-Prop $item @('ObjectKey'))
+        if ($objectKey -and $status -in @('StillFailing','ReFailed')) { $prevFailing[$objectKey] = $item }
     }
 
     $byKey = @{}
@@ -466,13 +441,11 @@ function Build-Tables($Events, $PreviousState, $Window, $Incident, $RunEvidence,
         $byKey[$event.ObjectKey] += $event
     }
 
-    $current = @(); $recovered = @(); $newFail = @(); $newRec = @(); $consec = @(); $running = @(); $cancelled = @(); $state = @()
-
+    $current=@(); $recovered=@(); $newFail=@(); $newRec=@(); $consec=@(); $running=@(); $cancelled=@(); $state=@()
     foreach ($key in $byKey.Keys) {
         $evs = @($byKey[$key] | Sort-Object EventTimeET)
         $fails = @($evs | Where-Object EventType -eq 'Failed')
         $successes = @($evs | Where-Object EventType -eq 'Succeeded')
-
         foreach ($run in @($evs | Where-Object EventType -eq 'RunningRun')) { $running += New-SectionRow $run 'Running Run' 'RunningAtLatestCheck' '' '' '' 0 }
         foreach ($cancel in @($evs | Where-Object EventType -eq 'CancelledRun')) { $cancelled += New-SectionRow $cancel 'Cancelled Run' 'CancelledInWindow' '' $cancel.EventTimeET '' 0 }
         if ($fails.Count -eq 0) { continue }
@@ -524,88 +497,36 @@ function Build-Tables($Events, $PreviousState, $Window, $Incident, $RunEvidence,
         [pscustomobject]@{ Metric='WarningCount'; Value=$Warnings.Count }
     )
 
-    [pscustomobject]@{
-        Summary        = $summary
-        CurrentFailing = $current
-        Recovered      = $recovered
-        NewFailures    = $newFail
-        NewRecoveries  = $newRec
-        Consecutive    = $consec
-        CarryForward   = $current
-        EventHistory   = @($Events | Sort-Object EventTimeET)
-        RunEvidence    = $RunEvidence
-        QuickView      = @($current + $recovered + $newFail + $newRec + $consec + $running + $cancelled)
-        ObjectState    = $state
-        Warnings       = $Warnings
-    }
+    [pscustomobject]@{ Summary=$summary; CurrentFailing=$current; Recovered=$recovered; NewFailures=$newFail; NewRecoveries=$newRec; Consecutive=$consec; CarryForward=$current; EventHistory=@($Events | Sort-Object EventTimeET); RunEvidence=$RunEvidence; QuickView=@($current + $recovered + $newFail + $newRec + $consec + $running + $cancelled); ObjectState=$state; Warnings=$Warnings }
 }
 
 function Export-CsvEvidencePackage($CsvFolder, [System.Collections.IDictionary]$Sheets) {
     if (Test-Path $CsvFolder) { Remove-Item -Path $CsvFolder -Recurse -Force }
     New-Item -ItemType Directory -Path $CsvFolder -Force | Out-Null
-
     $created = @()
     foreach ($name in $Sheets.Keys) {
         $rows = @($Sheets[$name])
-        if ($rows.Count -eq 0) { $rows = @([pscustomobject]@{ Info = 'No rows' }) }
+        if ($rows.Count -eq 0) { $rows = @([pscustomobject]@{ Info='No rows' }) }
         $csvPath = Join-Path $CsvFolder ("{0}.csv" -f (SafeName $name))
         $rows | Export-Csv -Path $csvPath -NoTypeInformation -Encoding UTF8
         $created += $csvPath
     }
-
     $manifestPath = Join-Path $CsvFolder '00_Attach_These_CSV_Files.txt'
-    @(
-        'CSV evidence package generated because XLSX export was unavailable or ForceCsv was used.',
-        'Attach these CSV files to the ServiceNow incident, or zip this folder and attach the zip.',
-        '',
-        'Files:',
-        ($created | ForEach-Object { Split-Path $_ -Leaf })
-    ) | Set-Content -Path $manifestPath -Encoding UTF8
-
-    [pscustomobject]@{ Format = 'CSV'; Folder = $CsvFolder; Files = @($created + $manifestPath); EvidenceText = "CSV evidence folder: $(Split-Path $CsvFolder -Leaf)" }
-}
-
-function Export-XlsxUsingImportExcel($WorkbookPath, [System.Collections.IDictionary]$Sheets) {
-    if (Test-Path $WorkbookPath) { Remove-Item -Path $WorkbookPath -Force }
-    $first = $true
-    foreach ($name in $Sheets.Keys) {
-        $rows = @($Sheets[$name])
-        if ($rows.Count -eq 0) { $rows = @([pscustomobject]@{ Info = 'No rows' }) }
-        $sheetName = if ($name.Length -gt 31) { $name.Substring(0,31) } else { $name }
-        $params = @{ Path=$WorkbookPath; WorksheetName=$sheetName; AutoSize=$true; FreezeTopRow=$true; BoldTopRow=$true }
-        if (-not $first) { $params.Append = $true }
-        $rows | Export-Excel @params
-        $first = $false
-    }
-    [pscustomobject]@{ Format = 'XLSX'; WorkbookPath = $WorkbookPath; Files = @($WorkbookPath); EvidenceText = "Attachment: $(Split-Path $WorkbookPath -Leaf)" }
-}
-
-function Export-EvidencePackage($Folder, $Incident, [System.Collections.IDictionary]$Sheets) {
-    $workbookPath = Join-Path $Folder ("{0}_BackupFailure_WindowSummary.xlsx" -f (SafeName $Incident))
-    $csvFolder = Join-Path $Folder ("{0}_BackupFailure_CSV_Evidence" -f (SafeName $Incident))
-
-    if (-not $ForceCsv -and (Get-Command Export-Excel -ErrorAction SilentlyContinue)) {
-        try { return Export-XlsxUsingImportExcel $workbookPath $Sheets }
-        catch {
-            Write-Warning "XLSX export failed. Falling back to CSV. Error: $($_.Exception.Message)"
-            return Export-CsvEvidencePackage $csvFolder $Sheets
-        }
-    }
-
-    Export-CsvEvidencePackage $csvFolder $Sheets
+    @('CSV evidence package generated. Attach this folder or zip it for ServiceNow.','','Files:',($created | ForEach-Object { Split-Path $_ -Leaf })) | Set-Content -Path $manifestPath -Encoding UTF8
+    [pscustomobject]@{ Format='CSV'; Folder=$CsvFolder; Files=@($created + $manifestPath); EvidenceText="CSV evidence folder: $(Split-Path $CsvFolder -Leaf)" }
 }
 
 function New-WorkNotes($Tables, $Window, $Incident, $EvidenceText) {
     $h = @{}
     foreach ($row in $Tables.Summary) { $h[$row.Metric] = $row.Value }
-
     @(
         'Backup Failure Window Summary','',
         "Incident: $Incident",
         "Locked Compute Window: $($Window.WindowLabel)",
         "SNOW Compare UTC: $($Window.SnStartUtc) to $($Window.SnEndUtc)",
         "Generated At: $(FmtEt (Get-NowEt)) ET",
-        'Source: Cohesity Helios API / PowerShell Window Consolidator','',
+        'Source: Cohesity Helios API / PowerShell Window Consolidator',
+        'Cohesity API mode: GET only','',
         'Summary:',
         "- Total unique objects failed in this window: $($h['TotalUniqueObjectsFailedInWindow'])",
         "- Recovered within this window: $($h['RecoveredInWindow'])",
@@ -618,20 +539,29 @@ function New-WorkNotes($Tables, $Window, $Incident, $EvidenceText) {
         "- Impacted clusters: $($h['ImpactedClusters'])",
         "- Impacted environments: $($h['ImpactedEnvironments'])",
         "- Impacted protection groups: $($h['ImpactedProtectionGroups'])",'',
-        'Current Still Failing: See evidence tab/file 02_Current_Still_Failing',
-        'Recovered During Window: See evidence tab/file 03_Recovered_In_Window',
-        'Consecutive / Repeated Failures: See evidence tab/file 06_Consecutive_Failures',
-        'Carry Forward Baseline: See evidence tab/file 07_Carry_Forward_Baseline','',
-        'Note: Running runs are listed separately and are not treated as failed or recovered until they complete.','',
+        'Current Still Failing: See evidence file 02_Current_Still_Failing.csv',
+        'Recovered During Window: See evidence file 03_Recovered_In_Window.csv',
+        'Consecutive / Repeated Failures: See evidence file 06_Consecutive_Failures.csv',
+        'Carry Forward Baseline: See evidence file 07_Carry_Forward_Baseline.csv','',
         $EvidenceText
     ) -join [Environment]::NewLine
 }
 
 try {
+    Write-Host ''
+    Write-Host 'BACKUP FAILURE CONSOLIDATOR' -ForegroundColor Cyan
+    Write-Host "Cohesity API mode : GET only"
+    Write-Host "OutputRoot        : $OutputRoot"
+    Write-Host "ApiKeyPath        : $ApiKeyPath"
+    Write-Host "Evidence format   : CSV"
+    Write-Host ''
+
     $window = Get-DtWindow
     $mappingInfo = Resolve-Window $window
-    $incident = $mappingInfo.Mapping.IncidentNumber
-    $folder = $mappingInfo.Mapping.OutputFolder
+    $incident = [string](Get-Prop $mappingInfo.Mapping @('IncidentNumber'))
+    $folder = [string](Get-Prop $mappingInfo.Mapping @('OutputFolder'))
+    if (-not $folder) { $folder = Join-Path $OutputRoot (SafeName $incident) }
+    if (-not (Test-Path $folder)) { New-Item -ItemType Directory -Path $folder -Force | Out-Null }
 
     $statePath = Join-Path $folder ("{0}_State.json" -f (SafeName $incident))
     $previousState = Read-Json $statePath $null
@@ -657,8 +587,10 @@ try {
         [pscustomobject]@{ Field='OutputRoot'; Value=$OutputRoot },
         [pscustomobject]@{ Field='RegistryPath'; Value=$mappingInfo.RegistryPath },
         [pscustomobject]@{ Field='MaxRunsPerProtectionGroup'; Value=$MaxRunsPerProtectionGroup },
-        [pscustomobject]@{ Field='XlsxAvailable'; Value=[bool](Get-Command Export-Excel -ErrorAction SilentlyContinue) },
-        [pscustomobject]@{ Field='ForceCsv'; Value=[bool]$ForceCsv }
+        [pscustomobject]@{ Field='MaxClusters'; Value=$MaxClusters },
+        [pscustomobject]@{ Field='MaxProtectionGroupsPerCluster'; Value=$MaxProtectionGroupsPerCluster },
+        [pscustomobject]@{ Field='ForceCsv'; Value=$true },
+        [pscustomobject]@{ Field='StrictPropertyNameLookupFixed'; Value=$true }
     )
 
     $warningRows = @($collection.Warnings | ForEach-Object { [pscustomobject]@{ Warning=$_ } })
@@ -679,24 +611,15 @@ try {
         '11_Warnings'               = $warningRows
     }
 
-    $evidence = Export-EvidencePackage $folder $incident $sheets
+    $csvFolder = Join-Path $folder ("{0}_BackupFailure_CSV_Evidence" -f (SafeName $incident))
+    $evidence = Export-CsvEvidencePackage $csvFolder $sheets
     $workNotesPath = Join-Path $folder ("{0}_WorkNotes_Paste.txt" -f (SafeName $incident))
     New-WorkNotes $tables $window $incident $evidence.EvidenceText | Set-Content -Path $workNotesPath -Encoding UTF8
 
     Write-Json ([pscustomobject]@{
-        IncidentNumber = $incident
-        WindowKey      = $window.WindowKey
-        WindowLabel    = $window.WindowLabel
-        SnStartUtc     = $window.SnStartUtc
-        SnEndUtc       = $window.SnEndUtc
-        WindowLocked   = $true
-        WindowSource   = $window.Source
-        LastRunET      = FmtEt (Get-NowEt)
-        ReportFormat   = $evidence.Format
-        EvidencePath   = $(if ($evidence.Format -eq 'XLSX') { $evidence.WorkbookPath } else { $evidence.Folder })
-        WorkNotesPath  = $workNotesPath
-        Objects        = $tables.ObjectState
-        Summary        = $tables.Summary
+        IncidentNumber=$incident; WindowKey=$window.WindowKey; WindowLabel=$window.WindowLabel; SnStartUtc=$window.SnStartUtc; SnEndUtc=$window.SnEndUtc;
+        WindowLocked=$true; WindowSource=$window.Source; LastRunET=FmtEt (Get-NowEt); ReportFormat='CSV'; EvidencePath=$evidence.Folder; WorkNotesPath=$workNotesPath;
+        Objects=$tables.ObjectState; Summary=$tables.Summary
     }) $statePath
 
     $h = @{}
@@ -714,25 +637,14 @@ try {
     Write-Host "Running Runs Seen            : $($h['RunningRunsSeen'])"
     Write-Host "Cancelled Runs Seen          : $($h['CancelledRunsSeen'])`n"
 
-    if ($ShowGridView -and (Get-Command Out-GridView -ErrorAction SilentlyContinue)) {
-        if ($MultipleGridViews) {
-            $tables.CurrentFailing | Out-GridView -Title "$incident - Current Still Failing"
-            $tables.Recovered | Out-GridView -Title "$incident - Recovered In Window"
-            $tables.Consecutive | Out-GridView -Title "$incident - Consecutive Failures"
-        } else {
-            $tables.QuickView | Out-GridView -Title "$incident - Backup Failure Window Quick View"
-        }
-    } else {
-        $tables.QuickView | Select-Object Section,Cluster,Environment,ProtectionGroup,ObjectName,RunType,Status,LastFailedET,RecoveredET,ConsecutiveFailureCount | Format-Table -AutoSize
-    }
+    $tables.QuickView | Select-Object Section,Cluster,Environment,ProtectionGroup,ObjectName,RunType,Status,LastFailedET,RecoveredET,ConsecutiveFailureCount | Format-Table -AutoSize
 
     Write-Host 'Files Created:' -ForegroundColor Cyan
-    if ($evidence.Format -eq 'XLSX') { Write-Host $evidence.WorkbookPath }
-    else { Write-Host $evidence.Folder }
+    Write-Host $evidence.Folder
     Write-Host $workNotesPath
     Write-Host $statePath
     Write-Host ''
-    Write-Host 'Next Step: Attach evidence files to incident and paste WorkNotes_Paste.txt into work_notes.' -ForegroundColor Yellow
+    Write-Host 'Next Step: Attach CSV evidence folder or zip it, then paste WorkNotes_Paste.txt into work_notes.' -ForegroundColor Yellow
 }
 catch {
     Write-Host ''
