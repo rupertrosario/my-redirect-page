@@ -1,5 +1,5 @@
 param(
-    [int]$MaxRunsPerProtectionGroup = 20,
+    [int]$MaxRunsPerProtectionGroup = 30,
     [switch]$NoCsv
 )
 
@@ -316,7 +316,7 @@ function Get-PgFailureResult {
     $runTypeCleared = [System.Collections.Generic.HashSet[string]]::new()
 
     $stats = [ordered]@{
-        RunsSeen               = 0
+        RunsSeen                = 0
         FailedRunsSeen          = 0
         FailedRunsInWindow      = 0
         ObjectsSeen             = 0
@@ -532,6 +532,7 @@ Write-Host "Cohesity Backup Failures - Object-Level Latest Uncleared" -Foregroun
 Write-Host "Mode      : GET only"
 Write-Host "Window    : $($window.Label)"
 Write-Host "WindowKey : $($window.Key)"
+Write-Host "Runs/PG   : $MaxRunsPerProtectionGroup"
 Write-Host ""
 
 $clusterResp = Invoke-GetJson -Uri "$baseUrl/v2/mcm/cluster-mgmt/info" -Headers $commonHeaders
