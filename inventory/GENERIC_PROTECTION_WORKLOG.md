@@ -15,21 +15,18 @@ Current status:
 - Standalone Physical works and is frozen.
 - Generic collector uses AES helper for key loading.
 - Generic collector has safer optional field handling.
-- Hyper-V test returned 9 CollectionErrors.
-- Need exact CollectionErrors from Cohesity_Protection_Run_Metadata.json before changing script.
+- Hyper-V test hit a read-only automatic variable conflict.
+- Generic collector was patched in commit 29fe01325c6820fca3587d37b8967a866a27d596.
+- Runbook was refreshed in commit 2dc4bbe651efab6ab98e0c62c0337330061f7a4b.
 
 Current risk:
 
-The 9 Hyper-V errors could be API collection, Hyper-V params mismatch, or object/run processing. Do not guess until Stage and Error values are reviewed.
+Hyper-V may still have object extraction issues after the variable fix. Retest is required.
 
 Next action:
 
-Capture and review Counts, EnvironmentCounts, and all CollectionErrors from Cohesity_Protection_Run_Metadata.json.
+Pull latest and rerun Hyper-V only.
 
 Next likely fix area:
 
-Depends on CollectionErrors Stage:
-
-- Get-ProtectionGroups: API call or cluster access issue.
-- EnvironmentParams: Hyper-V parameter field name mismatch.
-- ProcessProtectionGroup: object extraction, policy, or run field handling issue.
+If PG rows exist but Object Detail rows are zero, update generic VM object extraction logic.
