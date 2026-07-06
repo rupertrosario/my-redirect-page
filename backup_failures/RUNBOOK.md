@@ -34,6 +34,22 @@ When the cluster menu appears, choose one cluster number.
 
 Do not choose `[0] All clusters` yet. Use `[0] All clusters` only after one-cluster testing is correct.
 
+## Run Lookup Count
+
+The standard lookup is now:
+
+```text
+30 runs per protection group
+```
+
+The script prints this on screen as:
+
+```text
+Runs/PG   : 30
+```
+
+There should be no separate 10-run test command now.
+
 ## What The Script Does
 
 1. Uses `ApiKeyAesHelper.ps1`.
@@ -50,7 +66,7 @@ Do not choose `[0] All clusters` yet. Use `[0] All clusters` only after one-clus
 ```
 
 7. For selected cluster(s), calls active protection groups using GET.
-8. For each protection group, calls recent runs using GET.
+8. For each protection group, calls recent runs using GET with `numRuns=30`.
 9. Walks runs newest-to-oldest.
 10. Tracks object success rows as clear events.
 11. Captures only the latest object failure where a newer object success has not cleared it.
@@ -92,7 +108,7 @@ unless a newer successful run type already cleared it.
 ```text
 GET https://helios.cohesity.com/v2/mcm/cluster-mgmt/info
 GET https://helios.cohesity.com/v2/data-protect/protection-groups
-GET https://helios.cohesity.com/v2/data-protect/protection-groups/{id}/runs
+GET https://helios.cohesity.com/v2/data-protect/protection-groups/{id}/runs?numRuns=30&excludeNonRestorableRuns=false&includeObjectDetails=true
 ```
 
 No Cohesity POST, PUT, PATCH, or DELETE calls are used.
@@ -117,16 +133,17 @@ Just check these items on screen:
 
 ```text
 1. Did the cluster menu appear?
-2. Did your selected cluster start processing?
-3. Did it show ProtectionGroupsChecked in the final Summary table?
-4. What is FailedRunsSeen?
-5. What is FailedRunsInWindow?
-6. What is ObjectsWithFailedAttempt?
-7. What is ObjectRowsCaptured?
-8. What is RunFallbackRowsCaptured?
-9. What is LatestUnclearedRows?
-10. Did it print CSV saved: <path>?
-11. Was there any red error?
+2. Does it show Runs/PG   : 30?
+3. Did your selected cluster start processing?
+4. Did it show ProtectionGroupsChecked in the final Summary table?
+5. What is FailedRunsSeen?
+6. What is FailedRunsInWindow?
+7. What is ObjectsWithFailedAttempt?
+8. What is ObjectRowsCaptured?
+9. What is RunFallbackRowsCaptured?
+10. What is LatestUnclearedRows?
+11. Did it print CSV saved: <path>?
+12. Was there any red error?
 ```
 
 ## What To Tell Back Here
@@ -135,6 +152,7 @@ Type only this manually:
 
 ```text
 Menu: yes/no
+Runs/PG shows 30: yes/no
 Selected cluster processed: yes/no
 PG count shown: yes/no
 FailedRunsSeen: number
