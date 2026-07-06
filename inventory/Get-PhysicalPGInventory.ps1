@@ -90,6 +90,44 @@ function FirstValue {
     return ""
 }
 
+function Get-PropValue {
+    param(
+        $Object,
+        [string[]]$Names
+    )
+
+    if ($null -eq $Object) { return $null }
+    if ($Object -is [string]) { return $null }
+
+    foreach ($name in @($Names)) {
+        foreach ($prop in @($Object.PSObject.Properties)) {
+            if ($prop.Name -ieq $name) {
+                return $prop.Value
+            }
+        }
+    }
+
+    return $null
+}
+
+function Get-NestedPropValue {
+    param(
+        $Object,
+        [string]$Path
+    )
+
+    if ($null -eq $Object -or [string]::IsNullOrWhiteSpace($Path)) { return $null }
+
+    $current = $Object
+    foreach ($part in ($Path -split "\.")) {
+        if ($null -eq $current) { return $null }
+        if ($current -is [string]) { return $null }
+        $current = Get-PropValue -Object $current -Names @($part)
+    }
+
+    return $current
+}
+
 function UsecsToET {
     param($Usecs)
 
@@ -174,8 +212,14 @@ function Get-PolicyMap {
             elseif ($json) { $policies = @($json) }
 
             foreach ($p in @($policies | Where-Object { $_ })) {
-                $id = FirstValue @($p.id, $p.policyId)
-                $name = FirstValue @($p.name, $p.policyName, $p.displayName)
+                if ($p -is [string]) { continue }
+
+                $id = FirstValue @(
+                    (Get-PropValue -Object $p -Names @("id", "policyId"))
+                )
+                $name = FirstValue @(
+                    (Get-PropValue -Object $p -Names @("name", "policyName", "displayName"))
+                )
 
                 if (-not [string]::IsNullOrWhiteSpace($id) -and -not [string]::IsNullOrWhiteSpace($name)) {
                     $map[$id] = $name
@@ -199,16 +243,16 @@ function Resolve-PolicyName {
     )
 
     $policyName = FirstValue @(
-        $ProtectionGroup.policyInfo.name,
-        $ProtectionGroup.policy.name,
-        $ProtectionGroup.policyConfig.name,
-        $ProtectionGroup.policyName
+        (Get-NestedPropValue -Object $ProtectionGroup -Path "policyInfo.name"),
+        (Get-NestedPropValue -Object $ProtectionGroup -Path "policy.name"),
+        (Get-NestedPropValue -Object $ProtectionGroup -Path "policyConfig.name"),
+        (Get-PropValue -Object $ProtectionGroup -Names @("policyName"))
     )
 
     $policyId = FirstValue @(
-        $ProtectionGroup.policyId,
-        $ProtectionGroup.policyInfo.id,
-        $ProtectionGroup.policy.id
+        (Get-PropValue -Object $ProtectionGroup -Names @("policyId")),
+        (Get-NestedPropValue -Object $ProtectionGroup -Path "policyInfo.id"),
+        (Get-NestedPropValue -Object $ProtectionGroup -Path "policy.id")
     )
 
     if (-not [string]::IsNullOrWhiteSpace($policyId) -and $PolicyMap.ContainsKey($policyId)) {
