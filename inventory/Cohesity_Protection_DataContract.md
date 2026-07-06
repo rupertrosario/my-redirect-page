@@ -20,40 +20,36 @@ Hyper-V      -> kHyperV
 Nutanix AHV  -> kAcropolis
 ```
 
-The current Physical-only proof of concept remains available:
+Current scripts:
 
 ```text
-Get-PhysicalPGInventory.ps1
-Physical_PG_Summary_Latest.csv
-Physical_PG_Object_Detail_Latest.csv
-```
+Working Physical POC:
+- Get-PhysicalPGInventory.ps1
+- Physical_PG_Summary_Latest.csv
+- Physical_PG_Object_Detail_Latest.csv
 
-The generic framework collector is:
-
-```text
-Get-CohesityProtectionInventory.ps1
+Generic framework collector:
+- Get-CohesityProtectionInventory.ps1
 ```
 
 ## Architecture
 
 ```text
-PowerShell = data collection
-CSV/JSON   = stable data contract
-Power BI   = dashboard/reporting layer
+PowerShell  = data collection
+CSV/JSON    = stable data contract
+Power BI    = dashboard/reporting layer
 Claude Code = future insight/refactor/enhancement engine
 ```
 
 The dashboard must not be built around one giant raw table. It should use summary tables, exception tables, and controlled drilldown.
 
-## Output files
-
-The generic collector writes these files to:
+## Output location
 
 ```text
 X:\PowerShell\Cohesity_API_Scripts\inventory
 ```
 
-Required files:
+## Output files
 
 ```text
 Cohesity_Protection_PG_Summary_Latest.csv
@@ -71,7 +67,7 @@ Power BI role:
 Primary fact table for executive and operations KPIs.
 ```
 
-Columns:
+Columns exported by the stabilized collector:
 
 ```text
 PGKey
@@ -93,9 +89,15 @@ HasObjectExclusions
 LastSuccessfulBackupET
 LastSuccessfulBackupStatus
 LastSuccessfulBackupAgeHours
+BackupFreshnessBucket
+IsSuccessLast24h
+IsSuccessLast48h
 LastRunStatus
 LastRunType
+LastRunStartET
+LastRunEndET
 IsPaused
+ProtectionType
 StorageDomain
 SourceName
 ```
@@ -107,6 +109,7 @@ PolicyName must be resolved to a readable policy name when the policy API expose
 PolicyId is retained separately for troubleshooting.
 PGKey should prefer ClusterId|ProtectionGroupId.
 Environment should use friendly names, not Cohesity API enum values.
+BackupFreshnessBucket is intended for Power BI grouping: <=24h, 24-48h, >48h, No Success Found.
 ```
 
 ## Object Detail
@@ -199,6 +202,8 @@ Columns:
 
 ```text
 InventoryDateET
+PGKey
+ObjectKey
 Cluster
 Environment
 ProtectionGroup
@@ -253,6 +258,8 @@ SelectedClusters
 SelectedEnvironments
 OutputFiles
 Counts
+EnvironmentCounts
+CollectionErrors
 Notes
 ```
 
@@ -271,15 +278,11 @@ Run_Metadata
 Recommended relationships:
 
 ```text
-PG_Summary[PGKey]          1 -> * Object_Detail[PGKey]
-PG_Summary[PGKey]          1 -> * Path_Detail[PGKey]
-PG_Summary[ProtectionGroup] 1 -> * Exceptions[ProtectionGroup]     -- temporary if PGKey is not available in Exceptions
-```
-
-Future improvement:
-
-```text
-Add PGKey to Exceptions for direct relationship.
+PG_Summary[PGKey]  1 -> * Object_Detail[PGKey]
+PG_Summary[PGKey]  1 -> * Path_Detail[PGKey]
+PG_Summary[PGKey]  1 -> * Exceptions[PGKey]
+Object_Detail[ObjectKey] 1 -> * Path_Detail[ObjectKey]
+Object_Detail[ObjectKey] 1 -> * Exceptions[ObjectKey]     -- optional object-level relationship
 ```
 
 Recommended dimension tables later:
@@ -435,13 +438,18 @@ CALCULATE(
 ```
 
 ```DAX
+Successful Backups in Last 24h =
+CALCULATE(
+    DISTINCTCOUNT(PG_Summary[ProtectionGroupId]),
+    PG_Summary[IsSuccessLast24h] = TRUE()
+)
+```
+
+```DAX
 Backup Success 24h % =
 DIVIDE(
-    CALCULATE(
-        COUNTROWS(PG_Summary),
-        PG_Summary[LastSuccessfulBackupAgeHours] <= 24
-    ),
-    COUNTROWS(PG_Summary)
+    [Successful Backups in Last 24h],
+    [Active PGs]
 )
 ```
 
@@ -467,8 +475,7 @@ Preferred structure:
 ```text
 inventory/Get-CohesityProtectionInventory.ps1
 inventory/Cohesity_Protection_DataContract.md
-inventory/PowerBI_PhysicalPG_Dashboard_Baseline.md
-inventory/PowerBI_PhysicalPG_Dashboard_Measures.dax
+inventory/PowerBI_Cohesity_Protection_Measures.dax
 ```
 
 Claude Code future tasks:
