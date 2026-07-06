@@ -62,7 +62,8 @@ Do not directly read the API key as plain text in new PowerShell scripts.
   - Diagnostic counters for failed runs and captured rows.
   - CSV output.
 - Standardized run lookup to 30 runs per protection group.
-- Updated current runbook for the 30-run standard.
+- Output is now being generated.
+- Current stage moved to output validation.
 
 ## Current Script Behavior
 
@@ -96,7 +97,7 @@ CSV under X:\PowerShell\Data\Cohesity\BackupFailures
 
 ## Current Failure Logic
 
-The script now reports latest uncleared object-level failures.
+The script reports latest uncleared object-level failures.
 
 It does not simply dump every failed attempt.
 
@@ -117,61 +118,35 @@ object.id
 fallback: environment|objectType|name|sourceId
 ```
 
-## Current Test Step
+## Current Validation Step
 
-Run the script without parameters.
+Validate output correctness for one selected cluster before running all clusters.
 
-```powershell
-X:\PowerShell\Cohesity_API_Scripts\Test-CohesityHeliosConnection.ps1
-```
-
-Then choose one cluster number from the menu.
-
-Do not choose `[0] All clusters` yet.
-
-## What User Should Check On Client Network
-
-The user cannot paste full output from the client network. They only need to manually report:
+User should check 3 to 5 output rows against Cohesity UI:
 
 ```text
-Menu: yes/no
-Runs/PG shows 30: yes/no
-Selected cluster processed: yes/no
-PG count shown: yes/no
-FailedRunsSeen: number
-FailedRunsInWindow: number
-ObjectsWithFailedAttempt: number
-ObjectRowsCaptured: number
-RunFallbackRowsCaptured: number
-LatestUnclearedRows: number
-CSV saved: yes/no
+CSV created: yes/no
+Checked rows: number
+PG/object names match UI: yes/no
+EndTimeET window correct: yes/no
+Messages useful: yes/no
+Any false positives: yes/no
+Any missed known failure: yes/no
+Run-level fallback rows acceptable: yes/no/not present
 Error: exact short error if any
 ```
 
 ## Next Fixes / Next Build Steps
 
-After the one-cluster run:
+After output validation:
 
-1. Fix any PowerShell syntax/runtime issue.
-2. Confirm cluster menu works.
-3. Confirm PG count is reasonable.
-4. Confirm failed-run counters and latest-uncleared row count are reasonable.
-5. Confirm CSV path is created.
-6. Review whether failure rows are correct.
-7. Improve classification if needed:
-   - Still failing.
-   - Recovered in window.
-   - New failure.
-   - Re-failed.
-   - Consecutive failure.
-8. Only after one-cluster output is trusted, test `[0] All clusters`.
+1. Fix any false positive or missed failure.
+2. Confirm final column names.
+3. Rename the script from test name to report name.
+4. Run one full all-cluster test using `[0] All clusters`.
+5. Only after all-cluster output is trusted, add final reporting polish.
+6. SNOW/work-note formatting remains later, not now.
 
 ## Current Stop Point
 
-Waiting for user to copy/run:
-
-```powershell
-X:\PowerShell\Cohesity_API_Scripts\Test-CohesityHeliosConnection.ps1
-```
-
-choose one cluster, and manually report the checklist.
+Waiting for user to validate a few CSV rows against Cohesity UI and report the compact checklist.
