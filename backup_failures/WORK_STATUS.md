@@ -33,6 +33,12 @@ It was restored from the older Git file:
 all_fail_do_not_delete
 ```
 
+Current restored line count:
+
+```text
+1125 lines
+```
+
 Header:
 
 ```text
@@ -62,7 +68,7 @@ It was a side-track test script and should not be used to judge backup-failure l
 
 ## Current Completed Work
 
-- Identified the correct 1127/1131-line script:
+- Identified the correct 1125-line script:
   - `all_fail_do_not_delete`
 - Restored it into current branch as:
   - `backup_failures/Get-CohesityBackupFailures.ps1`
