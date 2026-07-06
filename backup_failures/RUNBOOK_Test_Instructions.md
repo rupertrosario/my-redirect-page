@@ -41,17 +41,19 @@ True
 
 If it returns `False`, fix the API key file path before running the script.
 
-## 6. Optional: install XLSX export module
+## 6. XLSX is optional
 
-Run this only if `ImportExcel` is not already installed and internet/module repository access is allowed from the machine.
+You do not need Microsoft Excel.
+You do not need to install `ImportExcel`.
+
+The script now automatically falls back to CSV evidence.
+For testing, force CSV mode explicitly:
 
 ```powershell
-Install-Module ImportExcel -Scope CurrentUser
+-ForceCsv
 ```
 
-If this cannot be installed, the script will try Excel COM automation if Microsoft Excel is installed.
-
-## 7. First limited test run
+## 7. First limited CSV test run
 
 Run this first. Do not start with all clusters.
 
@@ -59,7 +61,8 @@ Run this first. Do not start with all clusters.
 .\Get-CohesityBackupFailureWindowConsolidator.ps1 `
   -MaxClusters 1 `
   -MaxProtectionGroupsPerCluster 3 `
-  -ShowGridView:$false
+  -ShowGridView:$false `
+  -ForceCsv
 ```
 
 What happens immediately:
@@ -71,9 +74,9 @@ What happens immediately:
 5. Enter the incident number, for example `INC1234567`.
 6. Script locks that incident to the DT compute window.
 7. Script collects Helios data using GET only.
-8. Script creates the output files.
+8. Script creates CSV evidence, work_notes TXT, and state JSON.
 
-## 8. Second limited test run
+## 8. Second limited CSV test run
 
 Run the same command again:
 
@@ -81,7 +84,8 @@ Run the same command again:
 .\Get-CohesityBackupFailureWindowConsolidator.ps1 `
   -MaxClusters 1 `
   -MaxProtectionGroupsPerCluster 3 `
-  -ShowGridView:$false
+  -ShowGridView:$false `
+  -ForceCsv
 ```
 
 Expected result:
@@ -100,12 +104,30 @@ The files are created under:
 X:\PowerShell\Data\Cohesity\BackupFailureWindow\INC1234567\
 ```
 
-Expected files:
+Expected CSV fallback output:
 
 ```text
-INC1234567_BackupFailure_WindowSummary.xlsx
+INC1234567_BackupFailure_CSV_Evidence\
 INC1234567_WorkNotes_Paste.txt
 INC1234567_State.json
+```
+
+Inside the CSV evidence folder:
+
+```text
+00_Run_Status.csv
+01_Summary.csv
+02_Current_Still_Failing.csv
+03_Recovered_In_Window.csv
+04_New_Failures_Latest.csv
+05_New_Recoveries_Latest.csv
+06_Consecutive_Failures.csv
+07_Carry_Forward_Baseline.csv
+08_Event_History.csv
+09_Run_Evidence.csv
+10_Metadata.csv
+11_Warnings.csv
+00_Attach_These_CSV_Files.txt
 ```
 
 Registry file:
@@ -133,8 +155,11 @@ Running Runs Seen
 Cancelled Runs Seen
 
 Files Created:
-...
-Next Step: Attach XLSX to incident and paste WorkNotes_Paste.txt into work_notes.
+X:\PowerShell\Data\Cohesity\BackupFailureWindow\INC1234567\INC1234567_BackupFailure_CSV_Evidence
+X:\PowerShell\Data\Cohesity\BackupFailureWindow\INC1234567\INC1234567_WorkNotes_Paste.txt
+X:\PowerShell\Data\Cohesity\BackupFailureWindow\INC1234567\INC1234567_State.json
+
+Next Step: Attach evidence files to incident and paste WorkNotes_Paste.txt into work_notes.
 ```
 
 ## 11. Validate the registry lock
@@ -168,23 +193,17 @@ Confirm it contains:
 Locked Compute Window
 SNOW Compare UTC
 Summary
-Attachment
+CSV evidence folder
 ```
 
 Paste this text into ServiceNow `work_notes`.
 
-## 13. Full run after limited test passes
+## 13. Full CSV run after limited test passes
 
-Only after the limited test passes twice, run full scope:
-
-```powershell
-.\Get-CohesityBackupFailureWindowConsolidator.ps1
-```
-
-Or full scope without GridView:
+Only after the limited test passes twice, run full scope in CSV mode:
 
 ```powershell
-.\Get-CohesityBackupFailureWindowConsolidator.ps1 -ShowGridView:$false
+.\Get-CohesityBackupFailureWindowConsolidator.ps1 -ShowGridView:$false -ForceCsv
 ```
 
 ## 14. If the script fails
