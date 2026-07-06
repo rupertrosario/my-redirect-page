@@ -58,8 +58,7 @@ Do not directly read the API key as plain text in new PowerShell scripts.
   - Object-level failedAttempt extraction.
   - Run-level failed row when object details are missing.
   - CSV output.
-- Updated current runbook:
-  - `RUNBOOK.md`
+- Updated current runbook for simple no-parameter one-cluster testing.
 
 ## Current Script Behavior
 
@@ -87,19 +86,32 @@ CSV under X:\PowerShell\Data\Cohesity\BackupFailures
 
 ## Current Test Step
 
-First test should use a single cluster, not ALL.
-
-Suggested command:
+Run the script without parameters.
 
 ```powershell
-X:\PowerShell\Cohesity_API_Scripts\Test-CohesityHeliosConnection.ps1 -MaxProtectionGroups 5 -MaxRunsPerProtectionGroup 10
+X:\PowerShell\Cohesity_API_Scripts\Test-CohesityHeliosConnection.ps1
 ```
 
-Then choose one cluster from the menu.
+Then choose one cluster number from the menu.
+
+Do not choose `[0] All clusters` yet.
+
+## What User Should Check On Client Network
+
+The user cannot paste full output from the client network. They only need to manually report:
+
+```text
+Menu: yes/no
+Selected cluster processed: yes/no
+PG count shown: yes/no
+Failure rows count: number or not shown
+CSV saved: yes/no
+Error: exact short error if any
+```
 
 ## Next Fixes / Next Build Steps
 
-After the user runs the current script:
+After the one-cluster run:
 
 1. Fix any PowerShell syntax/runtime issue.
 2. Confirm cluster menu works.
@@ -113,13 +125,14 @@ After the user runs the current script:
    - New failure.
    - Re-failed.
    - Consecutive failure.
+8. Only after one-cluster output is trusted, test `[0] All clusters`.
 
 ## Current Stop Point
 
 Waiting for user to copy/run:
 
 ```powershell
-X:\PowerShell\Cohesity_API_Scripts\Test-CohesityHeliosConnection.ps1 -MaxProtectionGroups 5 -MaxRunsPerProtectionGroup 10
+X:\PowerShell\Cohesity_API_Scripts\Test-CohesityHeliosConnection.ps1
 ```
 
-and share the summary or exact error.
+choose one cluster, and manually report the checklist.
