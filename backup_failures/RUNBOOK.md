@@ -12,7 +12,7 @@ It will be overwritten whenever run/test instructions change, so there is only o
 backup_failures/Test-CohesityHeliosConnection.ps1
 ```
 
-This script has now moved beyond connection-only testing. It now does a simple cluster-selected backup-failure run.
+The current test is not a limited PG test. It is a full check for one selected cluster.
 
 ## Local Copy Target
 
@@ -22,19 +22,17 @@ Copy the script to:
 X:\PowerShell\Cohesity_API_Scripts\Test-CohesityHeliosConnection.ps1
 ```
 
-## Standard Run Command
+## Run Command
+
+Run the script without parameters:
 
 ```powershell
 X:\PowerShell\Cohesity_API_Scripts\Test-CohesityHeliosConnection.ps1
 ```
 
-## Safer Test Run Command
+When the cluster menu appears, choose one cluster number.
 
-Use this first if you want to limit load:
-
-```powershell
-X:\PowerShell\Cohesity_API_Scripts\Test-CohesityHeliosConnection.ps1 -MaxProtectionGroups 5 -MaxRunsPerProtectionGroup 10
-```
+Do not choose `[0] All clusters` yet. Use `[0] All clusters` only after one-cluster testing is correct.
 
 ## What The Script Does
 
@@ -80,18 +78,32 @@ CSV name format:
 BackupFailures_<ClusterOrALL>_<WindowKey>_<Timestamp>.csv
 ```
 
-## Output To Share Back
+## What To Check On Client Network
 
-Share:
+You do not need to paste a full summary.
+
+Just check these items on screen:
 
 ```text
-Selected cluster
-WindowKey
-Summary table
-Failure rows in window count
-CSV saved path, if created
-Any red error text
-Line/char details, if PowerShell reports them
+1. Did the cluster menu appear?
+2. Did your selected cluster start processing?
+3. Did it show ProtectionGroupsChecked in the final Summary table?
+4. Did it show Failure rows in window: <number>?
+5. Did it print CSV saved: <path>?
+6. Was there any red error?
+```
+
+## What To Tell Back Here
+
+Type only this manually:
+
+```text
+Menu: yes/no
+Selected cluster processed: yes/no
+PG count shown: yes/no
+Failure rows count: number or not shown
+CSV saved: yes/no
+Error: exact short error if any
 ```
 
 Do not share API key contents.
