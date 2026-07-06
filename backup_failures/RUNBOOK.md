@@ -8,13 +8,19 @@ It will be overwritten whenever run/test instructions change, so there is only o
 
 ## Current Script Under Test
 
-Use the restored real backup-failure script:
+Use the AES runner for the restored real backup-failure script:
+
+```text
+backup_failures/Get-CohesityBackupFailures_AES.ps1
+```
+
+The real backup-failure logic remains in:
 
 ```text
 backup_failures/Get-CohesityBackupFailures.ps1
 ```
 
-This was restored from the older Git file:
+The real script was restored from the older Git file:
 
 ```text
 all_fail_do_not_delete
@@ -28,19 +34,35 @@ backup_failures/Test-CohesityHeliosConnection.ps1
 
 ## Local Copy Target
 
-Copy the restored script to your local script folder:
+Copy both files to your local script folder:
 
 ```text
 X:\PowerShell\Cohesity_API_Scripts\Get-CohesityBackupFailures.ps1
+X:\PowerShell\Cohesity_API_Scripts\Get-CohesityBackupFailures_AES.ps1
 ```
+
+Both files must be in the same folder because the AES runner loads the real script from its own folder.
 
 ## Run Command
 
-Run:
+Run the AES runner:
 
 ```powershell
-X:\PowerShell\Cohesity_API_Scripts\Get-CohesityBackupFailures.ps1
+X:\PowerShell\Cohesity_API_Scripts\Get-CohesityBackupFailures_AES.ps1
 ```
+
+## What The AES Runner Does
+
+The runner does not change the backup-failure logic.
+
+It loads `Get-CohesityBackupFailures.ps1`, replaces only the old plain/API-key block in memory, and runs the script with:
+
+```text
+X:\PowerShell\Cohesity_API_Scripts\Common\ApiKeyAesHelper.ps1
+X:\PowerShell\Cohesity_API_Scripts\Common\Secure\cohesity_apikey.enc
+```
+
+It does not write the API key to disk.
 
 ## Expected Menu
 
@@ -75,7 +97,7 @@ Do not compare this with `Test-CohesityHeliosConnection.ps1`. That script is scr
 
 ## Current Scope
 
-Only validate that the restored real script runs and reports the known failure.
+Only validate that the restored real script runs with AES key handling and reports the known failure.
 
 Do not change failure logic yet.
 
@@ -90,6 +112,7 @@ No full output paste is needed.
 Type only this manually:
 
 ```text
+AES runner started: yes/no
 Real script menu shown: yes/no
 Option tested: number
 Known failure reported: yes/no
@@ -101,4 +124,4 @@ Error: exact short error if any
 
 The restored script is GET-only per header.
 
-The restored script currently still has its original API-key section. AES-helper conversion is the next controlled change after the real script is confirmed working.
+The AES runner is a controlled test step so the failure logic remains untouched while API-key handling uses the `.enc` reference.
