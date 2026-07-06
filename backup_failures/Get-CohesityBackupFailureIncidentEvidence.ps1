@@ -1,29 +1,37 @@
 <#
-Standalone incident evidence script for Cohesity backup failures.
-Baseline source is the latest CSV created by backup_failures/Cohesity_Backup_Failures:
-X:\PowerShell\Data\Cohesity\BackupFailures\BackupFailures_AllEnvironments_*.csv
+.SYNOPSIS
+One script for Cohesity backup failure incident evidence.
 
-This script does not create the baseline by scanning every PG.
-It reads the baseline CSV, then checks only those baseline cluster/PG rows for recovery.
-GET-only. No Excel. No ServiceNow update.
+.DESCRIPTION
+This replaces the operational need to run Cohesity_Backup_Failures first.
+First run in the 18:00 ET compute window runs a full all-environment failure scan and writes the baseline into state.json.
+Later runs in the same window check only that baseline for recovery.
+
+GET-only against Cohesity. No Excel. No ServiceNow update.
+Outputs only:
+- current_failures.csv
+- recovered.csv
+- new_failures.csv
+- new_recoveries.csv
+- worknotes.txt
+- state.json
 #>
 [CmdletBinding()]
 param(
     [string]$BaseUrl = "https://helios.cohesity.com",
-    [string]$BaselineDirectory = "X:\PowerShell\Data\Cohesity\BackupFailures",
     [string]$OutputRoot = "X:\PowerShell\Data\Cohesity\BackupFailureWindow",
     [string]$HelperPath = "X:\PowerShell\Cohesity_API_Scripts\Common\ApiKeyAesHelper.ps1",
     [string]$EncryptedFile = "X:\PowerShell\Cohesity_API_Scripts\Common\Secure\cohesity_apikey.enc",
     [int]$NumRuns = 30,
     [string]$IncidentNumber = "",
-    [string]$BaselineCsv = ""
+    [switch]$ResetBaseline
 )
 
 $ErrorActionPreference = "Stop"
 
 function Get-EtZone {
-    try { [TimeZoneInfo]::FindSystemTimeZoneById("Eastern Standard Time") }
-    catch { [TimeZoneInfo]::FindSystemTimeZoneById("America/New_York") }
+    try { return [TimeZoneInfo]::FindSystemTimeZoneById("Eastern Standard Time") }
+    catch { return [TimeZoneInfo]::FindSystemTimeZoneById("America/New_York") }
 }
 $script:EtZone = Get-EtZone
 
@@ -35,9 +43,9 @@ function Get-Value($Object, [string]$Name, $Default = $null) {
 }
 
 function As-List($Value) {
-    if ($null -eq $Value) { @() }
-    elseif ($Value -is [array]) { @($Value) }
-    else { @($Value) }
+    if ($null -eq $Value) { return @() }
+    if ($Value -is [array]) { return @($Value) }
+    return @($Value)
 }
 
 function Clean-Value($Value) {
@@ -47,23 +55,24 @@ function Clean-Value($Value) {
 }
 
 function Usecs-ToEt($Usecs) {
-    if (-not $Usecs) { return "" }
+    if ($null -eq $Usecs -or [int64]$Usecs -le 0) { return "" }
     $Milliseconds = [int64]([double]$Usecs / 1000)
     $Utc = [DateTimeOffset]::FromUnixTimeMilliseconds($Milliseconds).UtcDateTime
-    ([TimeZoneInfo]::ConvertTimeFromUtc($Utc, $script:EtZone)).ToString("yyyy-MM-dd HH:mm:ss")
+    return ([TimeZoneInfo]::ConvertTimeFromUtc($Utc, $script:EtZone)).ToString("yyyy-MM-dd HH:mm:ss")
 }
 
-function Et-ToUsecs([datetime]$EtTime) {
-    $Utc = [TimeZoneInfo]::ConvertTimeToUtc([datetime]::SpecifyKind($EtTime, [DateTimeKind]::Unspecified), $script:EtZone)
-    [int64](([DateTimeOffset]::new($Utc, [TimeSpan]::Zero)).ToUnixTimeMilliseconds() * 1000)
+function Et-ToUsecs([string]$EtText) {
+    if ([string]::IsNullOrWhiteSpace($EtText)) { return 0 }
+    $EtDate = [datetime]$EtText
+    $Utc = [TimeZoneInfo]::ConvertTimeToUtc([datetime]::SpecifyKind($EtDate, [DateTimeKind]::Unspecified), $script:EtZone)
+    return [int64](([DateTimeOffset]::new($Utc, [TimeSpan]::Zero)).ToUnixTimeMilliseconds() * 1000)
 }
 
 function Read-JsonFile([string]$Path) {
-    if (Test-Path $Path) {
-        $Raw = Get-Content $Path -Raw
-        if ($Raw) { return $Raw | ConvertFrom-Json }
-    }
-    return $null
+    if (!(Test-Path $Path)) { return $null }
+    $Raw = Get-Content $Path -Raw
+    if ([string]::IsNullOrWhiteSpace($Raw)) { return $null }
+    return $Raw | ConvertFrom-Json
 }
 
 function Write-JsonFile($Object, [string]$Path) {
@@ -84,7 +93,7 @@ function Write-CsvFile($Rows, [string]$Path, [string[]]$Columns) {
 }
 
 function Query-String([hashtable]$Items) {
-    (($Items.GetEnumerator() | ForEach-Object {
+    return (($Items.GetEnumerator() | ForEach-Object {
         [uri]::EscapeDataString([string]$_.Key) + "=" + [uri]::EscapeDataString([string]$_.Value)
     }) -join "&")
 }
@@ -92,7 +101,7 @@ function Query-String([hashtable]$Items) {
 function Invoke-GetJson([string]$Uri, [hashtable]$Headers) {
     $Response = Invoke-WebRequest -Uri $Uri -Headers $Headers -Method Get -UseBasicParsing
     if (!$Response.Content) { return $null }
-    $Response.Content | ConvertFrom-Json
+    return $Response.Content | ConvertFrom-Json
 }
 
 function Get-WindowNow {
@@ -104,8 +113,8 @@ function Get-WindowNow {
     [pscustomobject]@{
         Key = "${StartDate}_1800ET"
         Label = "$StartDate 18:00 ET -> $EndDate 18:00 ET"
-        StartUsecs = Et-ToUsecs $Start
-        EndUsecs = Et-ToUsecs $End
+        StartUsecs = Et-ToUsecs ($Start.ToString("yyyy-MM-dd HH:mm:ss"))
+        EndUsecs = Et-ToUsecs ($End.ToString("yyyy-MM-dd HH:mm:ss"))
         GeneratedET = ([TimeZoneInfo]::ConvertTimeFromUtc((Get-Date).ToUniversalTime(), $script:EtZone)).ToString("yyyy-MM-dd HH:mm:ss")
     }
 }
@@ -117,10 +126,12 @@ function Resolve-Incident($Window) {
     if (!$Registry) { $Registry = [pscustomobject]@{ WindowSource = "backup_failures/compute_window.js"; Windows = [pscustomobject]@{} } }
     $Existing = $Registry.Windows.PSObject.Properties[$Window.Key]
     if ($Existing) { return $Existing.Value }
+
     $Incident = $IncidentNumber
     if (!$Incident) { $Incident = Read-Host "Enter incident number for this backup-failure window" }
     $Incident = $Incident.Trim().ToUpper()
     if ($Incident -notmatch '^INC[0-9A-Z]+$') { throw "Invalid incident number: $Incident" }
+
     $Entry = [pscustomobject]@{
         IncidentNumber = $Incident
         WindowKey = $Window.Key
@@ -134,118 +145,308 @@ function Resolve-Incident($Window) {
     return $Entry
 }
 
-function Find-BaselineCsv {
-    if ($BaselineCsv -and (Test-Path $BaselineCsv)) { return (Resolve-Path $BaselineCsv).Path }
-    if (!(Test-Path $BaselineDirectory)) { throw "Baseline directory not found: $BaselineDirectory" }
-    $Latest = Get-ChildItem -Path $BaselineDirectory -Filter "BackupFailures_AllEnvironments_*.csv" -File |
-        Sort-Object LastWriteTime -Descending |
-        Select-Object -First 1
-    if (!$Latest) {
-        throw "No baseline CSV found. Run backup_failures\Cohesity_Backup_Failures first using All environments or Consolidated silent. Expected: $BaselineDirectory\BackupFailures_AllEnvironments_*.csv"
-    }
-    return $Latest.FullName
+function Get-EnvironmentMap {
+    @(
+        [pscustomobject]@{ Label = "Oracle";        Filter = "kOracle";        TargetType = "kDatabase";       ParentHostNeeded = $true  },
+        [pscustomobject]@{ Label = "SQL";           Filter = "kSQL";           TargetType = "kDatabase";       ParentHostNeeded = $true  },
+        [pscustomobject]@{ Label = "Physical";      Filter = "kPhysical";      TargetType = "kHost";           ParentHostNeeded = $false },
+        [pscustomobject]@{ Label = "GenericNas";    Filter = "kGenericNas";    TargetType = "kHost";           ParentHostNeeded = $false },
+        [pscustomobject]@{ Label = "Isilon";        Filter = "kIsilon";        TargetType = "kHost";           ParentHostNeeded = $false },
+        [pscustomobject]@{ Label = "HyperV";        Filter = "kHyperV";        TargetType = "kVirtualMachine"; ParentHostNeeded = $false },
+        [pscustomobject]@{ Label = "Acropolis";     Filter = "kAcropolis";     TargetType = "kVirtualMachine"; ParentHostNeeded = $false },
+        [pscustomobject]@{ Label = "RemoteAdapter"; Filter = "kRemoteAdapter"; TargetType = "kRemoteAdapter";  ParentHostNeeded = $false }
+    )
 }
 
-function New-BaselineKey($Row) {
-    $HostValue = Clean-Value (Get-Value $Row "Host" "")
-    $ObjectName = Clean-Value (Get-Value $Row "ObjectName" "")
-    "$((Clean-Value $Row.Environment))|$((Clean-Value $Row.Cluster))|$((Clean-Value $Row.ProtectionGroup))|$HostValue|$ObjectName|$((Clean-Value $Row.RunType))"
+function Is-SuccessStatus([string]$Status) { return ($Status -in @("Succeeded", "SucceededWithWarning", "kSucceeded", "kSucceededWithWarning")) }
+function Is-FailedStatus([string]$Status) { return ($Status -in @("Failed", "kFailed")) }
+
+function Get-ClusterDisplayName($Cluster) {
+    $Name = Clean-Value (Get-Value $Cluster "name" "")
+    if (!$Name) { $Name = Clean-Value (Get-Value $Cluster "clusterName" "") }
+    if (!$Name) { $Name = Clean-Value (Get-Value $Cluster "displayName" "") }
+    if (!$Name) { $Name = "Unknown-$(Get-Value $Cluster 'clusterId' '')" }
+    return $Name
 }
 
-function Import-Baseline($CsvPath, $Window, $Incident) {
-    $Rows = @(Import-Csv -Path $CsvPath)
-    if ($Rows.Count -eq 0) { throw "Baseline CSV has no rows: $CsvPath" }
-    foreach ($Row in $Rows) {
-        $HostValue = Clean-Value (Get-Value $Row "Host" "")
-        $ObjectName = Clean-Value (Get-Value $Row "ObjectName" "")
-        [pscustomobject]@{
-            IncidentNumber = $Incident
-            WindowKey = $Window.Key
-            Status = "BaselineFailure"
-            Cluster = Clean-Value $Row.Cluster
-            Environment = Clean-Value $Row.Environment
-            ProtectionGroup = Clean-Value $Row.ProtectionGroup
-            SourceHostName = $HostValue
-            ObjectName = $ObjectName
-            ObjectType = ""
-            RunType = Clean-Value $Row.RunType
-            FirstFailedET = Clean-Value $Row.EndTime
-            LastFailedET = Clean-Value $Row.EndTime
-            RecoveredET = ""
-            ConsecutiveFailureCount = 1
-            Message = Clean-Value $Row.FailedMessage
-            BaselineKey = (New-BaselineKey $Row)
-        }
-    }
-}
-
-function Environment-ToFilter($Environment) {
-    switch ($Environment) {
-        "Oracle" { "kOracle" }
-        "SQL" { "kSQL" }
-        "Physical" { "kPhysical" }
-        "GenericNas" { "kGenericNas" }
-        "NAS" { "kGenericNas" }
-        "Isilon" { "kIsilon" }
-        "HyperV" { "kHyperV" }
-        "Acropolis" { "kAcropolis" }
-        "RemoteAdapter" { "kRemoteAdapter" }
-        default { "" }
-    }
-}
-
-function Is-Ok([string]$Status) { $Status -in @("Succeeded", "SucceededWithWarning", "kSucceeded", "kSucceededWithWarning") }
-
-function Get-RunObjectName($RunObject, $Environment, $IdToName) {
+function Get-ObjectKeyFromRunObject($RunObject, [string]$ClusterId, [string]$Environment, [string]$ProtectionGroupId, [string]$ClusterName, [string]$ProtectionGroupName, [string]$SourceHostName, [string]$ObjectName) {
     $Object = Get-Value $RunObject "object" $null
-    if (!$Object) { return [pscustomobject]@{ SourceHostName = ""; ObjectName = "" } }
-    $Name = Clean-Value (Get-Value $Object "name" "")
-    $Type = [string](Get-Value $Object "objectType" "")
+    $ObjectId = [string](Get-Value $Object "id" "")
+    if ($ObjectId) { return "$ClusterId|$Environment|$ProtectionGroupId|$ObjectId" }
+    return "$ClusterName|$Environment|$ProtectionGroupName|$SourceHostName|$ObjectName"
+}
+
+function Get-FailedAttempts($RunObject) {
+    try { return @(Get-Value $RunObject.localSnapshotInfo "failedAttempts" @()) } catch { return @() }
+}
+
+function Get-FailureMessage($RunObject, $Info) {
+    $Attempts = Get-FailedAttempts $RunObject
+    $Message = (($Attempts | ForEach-Object { Clean-Value (Get-Value $_ "message" "") } | Where-Object { $_ }) -join " | ")
+    if (!$Message) { $Message = Clean-Value (Get-Value $Info "messages" "") }
+    if (!$Message) { $Message = "Run marked Failed" }
+    return $Message
+}
+
+function Resolve-ObjectNames($RunObject, [string]$Environment, [hashtable]$IdToName) {
+    $Object = Get-Value $RunObject "object" $null
+    $ObjectType = [string](Get-Value $Object "objectType" "")
+    $ObjectName = Clean-Value (Get-Value $Object "name" "")
     $SourceHostName = ""
-    $ObjectName = $Name
-    if ($Environment -in @("Oracle", "SQL") -and $Type -eq "kHost") {
-        $SourceHostName = $Name
+
+    if ($Environment -in @("Oracle", "SQL") -and $ObjectType -eq "kHost") {
+        $SourceHostName = $ObjectName
         $ObjectName = "No DBs Found (Host-Level Failure)"
     }
-    if ($Environment -in @("Oracle", "SQL") -and $Type -eq "kDatabase") {
+    elseif ($Environment -in @("Oracle", "SQL") -and $ObjectType -eq "kDatabase") {
         $SourceId = [string](Get-Value $Object "sourceId" "")
         if ($SourceId -and $IdToName.ContainsKey($SourceId)) { $SourceHostName = $IdToName[$SourceId] }
     }
-    [pscustomobject]@{ SourceHostName = $SourceHostName; ObjectName = $ObjectName }
+
+    [pscustomobject]@{ SourceHostName = $SourceHostName; ObjectName = $ObjectName; ObjectType = $ObjectType }
 }
 
-function Test-BaselineRecovered($BaselineRow, $Cluster, $ProtectionGroup, $Runs) {
-    $BaselineUsecs = 0
-    if ($BaselineRow.LastFailedET) { try { $BaselineUsecs = Et-ToUsecs ([datetime]$BaselineRow.LastFailedET) } catch {} }
-    $IdToName = @{}
+function New-FailureRow($Incident, $Window, $Cluster, $EnvironmentInfo, $ProtectionGroup, $RunObject, $Info, [hashtable]$IdToName) {
+    $ClusterId = [string](Get-Value $Cluster "clusterId" "")
+    $ClusterName = Get-ClusterDisplayName $Cluster
+    $ProtectionGroupId = [string](Get-Value $ProtectionGroup "id" "")
+    $ProtectionGroupName = Clean-Value (Get-Value $ProtectionGroup "name" "")
+    $Resolved = Resolve-ObjectNames $RunObject $EnvironmentInfo.Label $IdToName
+    $RunType = Clean-Value (Get-Value $Info "runType" "")
+    $EndUsecs = [int64](Get-Value $Info "endTimeUsecs" 0)
+    if ($EndUsecs -le 0) { $EndUsecs = [int64](Get-Value $Info "startTimeUsecs" 0) }
+    $Key = Get-ObjectKeyFromRunObject $RunObject $ClusterId $EnvironmentInfo.Label $ProtectionGroupId $ClusterName $ProtectionGroupName $Resolved.SourceHostName $Resolved.ObjectName
+
+    [pscustomobject]@{
+        IncidentNumber = $Incident
+        WindowKey = $Window.Key
+        Status = "StillFailing"
+        Cluster = $ClusterName
+        Environment = $EnvironmentInfo.Label
+        ProtectionGroup = $ProtectionGroupName
+        SourceHostName = $Resolved.SourceHostName
+        ObjectName = $Resolved.ObjectName
+        ObjectType = $Resolved.ObjectType
+        RunType = $RunType
+        FirstFailedET = Usecs-ToEt $EndUsecs
+        LastFailedET = Usecs-ToEt $EndUsecs
+        LastFailedUsecs = $EndUsecs
+        RecoveredET = ""
+        ConsecutiveFailureCount = 1
+        Message = Get-FailureMessage $RunObject $Info
+        ObjectKey = $Key
+        ClusterId = $ClusterId
+        ProtectionGroupId = $ProtectionGroupId
+        EnvironmentFilter = $EnvironmentInfo.Filter
+    }
+}
+
+function New-RunLevelFailureRow($Incident, $Window, $Cluster, $EnvironmentInfo, $ProtectionGroup, $Info) {
+    $ClusterId = [string](Get-Value $Cluster "clusterId" "")
+    $ClusterName = Get-ClusterDisplayName $Cluster
+    $ProtectionGroupId = [string](Get-Value $ProtectionGroup "id" "")
+    $ProtectionGroupName = Clean-Value (Get-Value $ProtectionGroup "name" "")
+    $RunType = Clean-Value (Get-Value $Info "runType" "")
+    $EndUsecs = [int64](Get-Value $Info "endTimeUsecs" 0)
+    if ($EndUsecs -le 0) { $EndUsecs = [int64](Get-Value $Info "startTimeUsecs" 0) }
+    $Key = "$ClusterName|$($EnvironmentInfo.Label)|$ProtectionGroupName||$ProtectionGroupName|$RunType"
+
+    [pscustomobject]@{
+        IncidentNumber = $Incident
+        WindowKey = $Window.Key
+        Status = "StillFailing"
+        Cluster = $ClusterName
+        Environment = $EnvironmentInfo.Label
+        ProtectionGroup = $ProtectionGroupName
+        SourceHostName = ""
+        ObjectName = $ProtectionGroupName
+        ObjectType = "ProtectionGroup"
+        RunType = $RunType
+        FirstFailedET = Usecs-ToEt $EndUsecs
+        LastFailedET = Usecs-ToEt $EndUsecs
+        LastFailedUsecs = $EndUsecs
+        RecoveredET = ""
+        ConsecutiveFailureCount = 1
+        Message = Clean-Value (Get-Value $Info "messages" "Run marked Failed")
+        ObjectKey = $Key
+        ClusterId = $ClusterId
+        ProtectionGroupId = $ProtectionGroupId
+        EnvironmentFilter = $EnvironmentInfo.Filter
+    }
+}
+
+function Build-IdToName($Runs) {
+    $Map = @{}
     foreach ($Run in $Runs) {
         foreach ($RunObject in (As-List (Get-Value $Run "objects" @()))) {
             $Object = Get-Value $RunObject "object" $null
             $ObjectId = [string](Get-Value $Object "id" "")
             $ObjectName = Clean-Value (Get-Value $Object "name" "")
-            if ($ObjectId -and $ObjectName) { $IdToName[$ObjectId] = $ObjectName }
+            if ($ObjectId -and $ObjectName -and !$Map.ContainsKey($ObjectId)) { $Map[$ObjectId] = $ObjectName }
         }
     }
-    foreach ($Run in $Runs) {
-        foreach ($Info in (As-List (Get-Value $Run "localBackupInfo" @()))) {
-            if (!(Is-Ok ([string](Get-Value $Info "status" "")))) { continue }
-            $EndUsecs = [int64](Get-Value $Info "endTimeUsecs" 0)
-            if ($EndUsecs -le $BaselineUsecs) { continue }
-            if ((Clean-Value (Get-Value $Info "runType" "")) -ne $BaselineRow.RunType) { continue }
-            $Objects = As-List (Get-Value $Run "objects" @())
-            if ($Objects.Count -eq 0) {
-                return Usecs-ToEt $EndUsecs
+    return $Map
+}
+
+function Collect-FullBaseline($Incident, $Window, $Clusters, $ApiKey) {
+    $Rows = @()
+    foreach ($EnvironmentInfo in (Get-EnvironmentMap)) {
+        foreach ($Cluster in $Clusters) {
+            $ClusterId = [string](Get-Value $Cluster "clusterId" "")
+            $Headers = @{ apiKey = $ApiKey; accept = "application/json"; accessClusterId = $ClusterId }
+            try {
+                $PgUri = "$BaseUrl/v2/data-protect/protection-groups?$(Query-String @{ environments=$EnvironmentInfo.Filter; isDeleted='false'; isPaused='false'; isActive='true' })"
+                $ProtectionGroups = @((Invoke-GetJson $PgUri $Headers).protectionGroups)
+            } catch { continue }
+
+            foreach ($ProtectionGroup in $ProtectionGroups) {
+                $ProtectionGroupId = [string](Get-Value $ProtectionGroup "id" "")
+                try {
+                    $RunUri = "$BaseUrl/v2/data-protect/protection-groups/$([uri]::EscapeDataString($ProtectionGroupId))/runs?$(Query-String @{ numRuns=$NumRuns; excludeNonRestorableRuns='false'; includeObjectDetails='true' })"
+                    $Runs = @((Invoke-GetJson $RunUri $Headers).runs)
+                } catch { continue }
+                if ($Runs.Count -eq 0) { continue }
+
+                $IdToName = Build-IdToName $Runs
+                $RunTypes = @($Runs | ForEach-Object { foreach ($Info in (As-List (Get-Value $_ "localBackupInfo" @()))) { Clean-Value (Get-Value $Info "runType" "") } } | Where-Object { $_ } | Select-Object -Unique)
+
+                foreach ($RunType in $RunTypes) {
+                    $Cleared = New-Object 'System.Collections.Generic.HashSet[string]'
+                    $LatestFailByKey = @{}
+                    $RunsForType = @($Runs | Where-Object { (As-List (Get-Value $_ "localBackupInfo" @()) | Where-Object { (Clean-Value (Get-Value $_ "runType" "")) -eq $RunType }).Count -gt 0 })
+                    $RunsForType = @($RunsForType | Sort-Object { $Info = (As-List (Get-Value $_ "localBackupInfo" @()) | Select-Object -First 1); [int64](Get-Value $Info "endTimeUsecs" 0) } -Descending)
+
+                    foreach ($Run in $RunsForType) {
+                        $Info = As-List (Get-Value $Run "localBackupInfo" @()) | Where-Object { (Clean-Value (Get-Value $_ "runType" "")) -eq $RunType } | Select-Object -First 1
+                        if (!$Info) { continue }
+                        $Status = [string](Get-Value $Info "status" "")
+                        $RunObjects = As-List (Get-Value $Run "objects" @())
+
+                        if (Is-SuccessStatus $Status) {
+                            if ($RunObjects.Count -eq 0) {
+                                $ProtectionGroupName = Clean-Value (Get-Value $ProtectionGroup "name" "")
+                                [void]$Cleared.Add("$(Get-ClusterDisplayName $Cluster)|$($EnvironmentInfo.Label)|$ProtectionGroupName||$ProtectionGroupName|$RunType")
+                            }
+                            foreach ($RunObject in $RunObjects) {
+                                $Resolved = Resolve-ObjectNames $RunObject $EnvironmentInfo.Label $IdToName
+                                $Key = Get-ObjectKeyFromRunObject $RunObject $ClusterId $EnvironmentInfo.Label $ProtectionGroupId (Get-ClusterDisplayName $Cluster) (Clean-Value (Get-Value $ProtectionGroup "name" "")) $Resolved.SourceHostName $Resolved.ObjectName
+                                if ($Key) { [void]$Cleared.Add($Key) }
+                            }
+                            continue
+                        }
+
+                        if (!(Is-FailedStatus $Status)) { continue }
+
+                        if ($RunObjects.Count -eq 0) {
+                            $Row = New-RunLevelFailureRow $Incident $Window $Cluster $EnvironmentInfo $ProtectionGroup $Info
+                            if (!$Cleared.Contains($Row.ObjectKey) -and !$LatestFailByKey.ContainsKey($Row.ObjectKey)) { $LatestFailByKey[$Row.ObjectKey] = $Row }
+                            continue
+                        }
+
+                        foreach ($RunObject in $RunObjects) {
+                            $Object = Get-Value $RunObject "object" $null
+                            if (!$Object) { continue }
+                            $ObjectType = [string](Get-Value $Object "objectType" "")
+                            $Attempts = Get-FailedAttempts $RunObject
+                            if ($Attempts.Count -eq 0 -and $EnvironmentInfo.Label -ne "Physical") { continue }
+
+                            $Relevant = $true
+                            if ($EnvironmentInfo.Label -in @("Oracle", "SQL")) { $Relevant = ($ObjectType -in @("kDatabase", "kHost")) }
+                            elseif ($EnvironmentInfo.Label -in @("HyperV", "Acropolis")) { $Relevant = ($ObjectType -eq "kVirtualMachine") }
+                            elseif ($EnvironmentInfo.Label -in @("Physical", "GenericNas", "Isilon")) { $Relevant = ($ObjectType -eq "kHost" -or $Attempts.Count -gt 0) }
+                            if (!$Relevant) { continue }
+
+                            $Row = New-FailureRow $Incident $Window $Cluster $EnvironmentInfo $ProtectionGroup $RunObject $Info $IdToName
+                            if (!$Cleared.Contains($Row.ObjectKey) -and !$LatestFailByKey.ContainsKey($Row.ObjectKey)) { $LatestFailByKey[$Row.ObjectKey] = $Row }
+                        }
+                    }
+                    foreach ($Key in $LatestFailByKey.Keys) { $Rows += $LatestFailByKey[$Key] }
+                }
             }
-            foreach ($RunObject in $Objects) {
-                $Resolved = Get-RunObjectName $RunObject $BaselineRow.Environment $IdToName
-                $CandidateKey = "$($BaselineRow.Environment)|$($BaselineRow.Cluster)|$($BaselineRow.ProtectionGroup)|$($Resolved.SourceHostName)|$($Resolved.ObjectName)|$($BaselineRow.RunType)"
-                if ($CandidateKey -eq $BaselineRow.BaselineKey) { return Usecs-ToEt $EndUsecs }
+        }
+    }
+
+    return @($Rows | Group-Object ObjectKey | ForEach-Object { $_.Group | Sort-Object LastFailedUsecs -Descending | Select-Object -First 1 } | Sort-Object Cluster, ProtectionGroup, Environment, LastFailedUsecs -Descending)
+}
+
+function Test-BaselineRecovered($BaselineRow, $Runs) {
+    $IdToName = Build-IdToName $Runs
+    foreach ($Run in ($Runs | Sort-Object { $Info = (As-List (Get-Value $_ "localBackupInfo" @()) | Select-Object -First 1); [int64](Get-Value $Info "endTimeUsecs" 0) } -Descending)) {
+        foreach ($Info in (As-List (Get-Value $Run "localBackupInfo" @()))) {
+            if (!(Is-SuccessStatus ([string](Get-Value $Info "status" "")))) { continue }
+            if ((Clean-Value (Get-Value $Info "runType" "")) -ne $BaselineRow.RunType) { continue }
+            $EndUsecs = [int64](Get-Value $Info "endTimeUsecs" 0)
+            if ($EndUsecs -le [int64]$BaselineRow.LastFailedUsecs) { continue }
+
+            $RunObjects = As-List (Get-Value $Run "objects" @())
+            if ($RunObjects.Count -eq 0 -and $BaselineRow.ObjectType -eq "ProtectionGroup") { return (Usecs-ToEt $EndUsecs) }
+            foreach ($RunObject in $RunObjects) {
+                $Resolved = Resolve-ObjectNames $RunObject $BaselineRow.Environment $IdToName
+                $Key = Get-ObjectKeyFromRunObject $RunObject $BaselineRow.ClusterId $BaselineRow.Environment $BaselineRow.ProtectionGroupId $BaselineRow.Cluster $BaselineRow.ProtectionGroup $Resolved.SourceHostName $Resolved.ObjectName
+                if ($Key -eq $BaselineRow.ObjectKey) { return (Usecs-ToEt $EndUsecs) }
             }
         }
     }
     return ""
 }
 
+function Collect-TargetedFollowUp($BaselineRows, $Clusters, $ApiKey) {
+    $Current = @()
+    $Recovered = @()
+    $Warnings = @()
+    $ClusterById = @{}
+    foreach ($Cluster in $Clusters) { $ClusterById[[string](Get-Value $Cluster "clusterId" "")] = $Cluster }
+
+    foreach ($Group in (@($BaselineRows) | Group-Object ClusterId, ProtectionGroupId)) {
+        $Sample = $Group.Group[0]
+        $Cluster = $ClusterById[[string]$Sample.ClusterId]
+        if (!$Cluster) { $Warnings += "Cluster not found: $($Sample.Cluster)"; $Current += $Group.Group; continue }
+        $Headers = @{ apiKey = $ApiKey; accept = "application/json"; accessClusterId = [string]$Sample.ClusterId }
+        try {
+            $RunUri = "$BaseUrl/v2/data-protect/protection-groups/$([uri]::EscapeDataString([string]$Sample.ProtectionGroupId))/runs?$(Query-String @{ numRuns=$NumRuns; excludeNonRestorableRuns='false'; includeObjectDetails='true' })"
+            $Runs = @((Invoke-GetJson $RunUri $Headers).runs)
+        } catch {
+            $Warnings += "Runs lookup failed for $($Sample.Cluster)/$($Sample.ProtectionGroup): $($_.Exception.Message)"
+            $Current += $Group.Group
+            continue
+        }
+        foreach ($BaselineRow in $Group.Group) {
+            $RecoveredET = Test-BaselineRecovered $BaselineRow $Runs
+            if ($RecoveredET) {
+                $Recovered += [pscustomobject]@{
+                    IncidentNumber = $BaselineRow.IncidentNumber
+                    WindowKey = $BaselineRow.WindowKey
+                    Status = "Recovered"
+                    Cluster = $BaselineRow.Cluster
+                    Environment = $BaselineRow.Environment
+                    ProtectionGroup = $BaselineRow.ProtectionGroup
+                    SourceHostName = $BaselineRow.SourceHostName
+                    ObjectName = $BaselineRow.ObjectName
+                    ObjectType = $BaselineRow.ObjectType
+                    RunType = $BaselineRow.RunType
+                    FirstFailedET = $BaselineRow.FirstFailedET
+                    LastFailedET = $BaselineRow.LastFailedET
+                    LastFailedUsecs = $BaselineRow.LastFailedUsecs
+                    RecoveredET = $RecoveredET
+                    ConsecutiveFailureCount = 0
+                    Message = $BaselineRow.Message
+                    ObjectKey = $BaselineRow.ObjectKey
+                    ClusterId = $BaselineRow.ClusterId
+                    ProtectionGroupId = $BaselineRow.ProtectionGroupId
+                    EnvironmentFilter = $BaselineRow.EnvironmentFilter
+                }
+            } else {
+                $Current += $BaselineRow
+            }
+        }
+    }
+
+    return [pscustomobject]@{ Current = @($Current); Recovered = @($Recovered); Warnings = @($Warnings) }
+}
+
+# -----------------------------
+# Main
+# -----------------------------
 if (!(Test-Path $HelperPath)) { throw "Missing API key helper: $HelperPath" }
 if (!(Test-Path $EncryptedFile)) { throw "Missing encrypted key file: $EncryptedFile" }
 . $HelperPath
@@ -257,116 +458,63 @@ $IncidentLock = Resolve-Incident $Window
 $Incident = $IncidentLock.IncidentNumber
 $OutputFolder = $IncidentLock.OutputFolder
 if (!(Test-Path $OutputFolder)) { New-Item $OutputFolder -ItemType Directory -Force | Out-Null }
-
 $StatePath = Join-Path $OutputFolder "state.json"
 $PreviousState = Read-JsonFile $StatePath
-$SelectedBaselineCsv = if ($PreviousState -and (Get-Value $PreviousState "BaselineCsv" "")) { Get-Value $PreviousState "BaselineCsv" "" } else { Find-BaselineCsv }
-$BaselineRows = @(Import-Baseline $SelectedBaselineCsv $Window $Incident)
 
-$PreviouslyRecovered = @{}
-if ($PreviousState) {
-    foreach ($RecoveredItem in (As-List (Get-Value $PreviousState "Recovered" @()))) {
-        $Key = [string](Get-Value $RecoveredItem "BaselineKey" "")
+$Headers = @{ apiKey = $ApiKey; accept = "application/json" }
+$Clusters = @((Invoke-GetJson "$BaseUrl/v2/mcm/cluster-mgmt/info" $Headers).cohesityClusters)
+
+if ($ResetBaseline -or !$PreviousState -or !(Get-Value $PreviousState "BaselineFailures" $null) -or (As-List (Get-Value $PreviousState "BaselineFailures" @())).Count -eq 0) {
+    $Mode = "FullBaseline"
+    $BaselineFailures = @(Collect-FullBaseline $Incident $Window $Clusters $ApiKey)
+    $CurrentFailures = @($BaselineFailures)
+    $Recovered = @()
+    $NewFailures = @($BaselineFailures)
+    $NewRecoveries = @()
+    $Warnings = @()
+} else {
+    $Mode = "TargetedFollowUp"
+    $BaselineFailures = @(As-List (Get-Value $PreviousState "BaselineFailures" @()))
+    $PreviouslyRecovered = @{}
+    foreach ($Item in (As-List (Get-Value $PreviousState "Recovered" @()))) {
+        $Key = [string](Get-Value $Item "ObjectKey" "")
         if ($Key) { $PreviouslyRecovered[$Key] = $true }
     }
+    $FollowUp = Collect-TargetedFollowUp $BaselineFailures $Clusters $ApiKey
+    $CurrentFailures = @($FollowUp.Current)
+    $Recovered = @($FollowUp.Recovered)
+    $Warnings = @($FollowUp.Warnings)
+    $NewFailures = @()
+    $NewRecoveries = @($Recovered | Where-Object { !$PreviouslyRecovered.ContainsKey($_.ObjectKey) })
 }
 
-$CommonHeaders = @{ apiKey = $ApiKey; accept = "application/json" }
-$Clusters = @((Invoke-GetJson "$BaseUrl/v2/mcm/cluster-mgmt/info" $CommonHeaders).cohesityClusters)
-$ClusterByName = @{}
-foreach ($Cluster in $Clusters) {
-    $ClusterDisplayName = Clean-Value (@(Get-Value $Cluster "name" "", Get-Value $Cluster "clusterName" "", Get-Value $Cluster "displayName" "") | Where-Object { $_ } | Select-Object -First 1)
-    if ($ClusterDisplayName) { $ClusterByName[$ClusterDisplayName] = $Cluster }
-}
-
-$Current = @()
-$Recovered = @()
-$Warnings = @()
-$TargetGroups = @($BaselineRows | Group-Object Cluster, Environment, ProtectionGroup)
-
-foreach ($Group in $TargetGroups) {
-    $Sample = $Group.Group[0]
-    $Cluster = $ClusterByName[$Sample.Cluster]
-    if (!$Cluster) { $Warnings += "Cluster not found from baseline: $($Sample.Cluster)"; foreach ($r in $Group.Group) { $Current += $r }; continue }
-    $ClusterId = [string](Get-Value $Cluster "clusterId" "")
-    $Headers = @{ apiKey = $ApiKey; accept = "application/json"; accessClusterId = $ClusterId }
-    $Filter = Environment-ToFilter $Sample.Environment
-    if (!$Filter) { $Warnings += "Unknown environment filter for: $($Sample.Environment)"; foreach ($r in $Group.Group) { $Current += $r }; continue }
-    try {
-        $PgJson = Invoke-GetJson "$BaseUrl/v2/data-protect/protection-groups?$(Query-String @{ environments=$Filter; isDeleted='false'; isPaused='false'; isActive='true' })" $Headers
-        $ProtectionGroup = @($PgJson.protectionGroups | Where-Object { (Clean-Value (Get-Value $_ "name" "")) -eq $Sample.ProtectionGroup } | Select-Object -First 1)
-    } catch {
-        $Warnings += "PG lookup failed for $($Sample.Cluster)/$($Sample.ProtectionGroup): $($_.Exception.Message)"
-        foreach ($r in $Group.Group) { $Current += $r }
-        continue
-    }
-    if (!$ProtectionGroup) { $Warnings += "Protection group not found from baseline: $($Sample.Cluster)/$($Sample.ProtectionGroup)"; foreach ($r in $Group.Group) { $Current += $r }; continue }
-    $ProtectionGroupId = [string](Get-Value $ProtectionGroup "id" "")
-    try {
-        $RunQuery = Query-String @{ numRuns=$NumRuns; excludeNonRestorableRuns='false'; includeObjectDetails='true' }
-        $Runs = @((Invoke-GetJson "$BaseUrl/v2/data-protect/protection-groups/$([uri]::EscapeDataString($ProtectionGroupId))/runs?$RunQuery" $Headers).runs)
-    } catch {
-        $Warnings += "Runs lookup failed for $($Sample.Cluster)/$($Sample.ProtectionGroup): $($_.Exception.Message)"
-        foreach ($r in $Group.Group) { $Current += $r }
-        continue
-    }
-    foreach ($BaselineRow in $Group.Group) {
-        $RecoveredET = Test-BaselineRecovered $BaselineRow $Cluster $ProtectionGroup $Runs
-        if ($RecoveredET) {
-            $Recovered += [pscustomobject]@{
-                IncidentNumber = $Incident
-                WindowKey = $Window.Key
-                Status = "Recovered"
-                Cluster = $BaselineRow.Cluster
-                Environment = $BaselineRow.Environment
-                ProtectionGroup = $BaselineRow.ProtectionGroup
-                SourceHostName = $BaselineRow.SourceHostName
-                ObjectName = $BaselineRow.ObjectName
-                ObjectType = $BaselineRow.ObjectType
-                RunType = $BaselineRow.RunType
-                FirstFailedET = $BaselineRow.FirstFailedET
-                LastFailedET = $BaselineRow.LastFailedET
-                RecoveredET = $RecoveredET
-                ConsecutiveFailureCount = 0
-                Message = $BaselineRow.Message
-                BaselineKey = $BaselineRow.BaselineKey
-            }
-        } else {
-            $Current += $BaselineRow
-        }
-    }
-}
-
-$NewFailures = @()
-$NewRecoveries = @($Recovered | Where-Object { !$PreviouslyRecovered.ContainsKey($_.BaselineKey) })
-$Columns = "IncidentNumber", "WindowKey", "Status", "Cluster", "Environment", "ProtectionGroup", "SourceHostName", "ObjectName", "ObjectType", "RunType", "FirstFailedET", "LastFailedET", "RecoveredET", "ConsecutiveFailureCount", "Message", "BaselineKey"
-Write-CsvFile $Current (Join-Path $OutputFolder "current_failures.csv") $Columns
-Write-CsvFile $Recovered (Join-Path $OutputFolder "recovered.csv") $Columns
-Write-CsvFile $NewFailures (Join-Path $OutputFolder "new_failures.csv") $Columns
-Write-CsvFile $NewRecoveries (Join-Path $OutputFolder "new_recoveries.csv") $Columns
+$CsvColumns = "IncidentNumber", "WindowKey", "Status", "Cluster", "Environment", "ProtectionGroup", "SourceHostName", "ObjectName", "ObjectType", "RunType", "FirstFailedET", "LastFailedET", "RecoveredET", "ConsecutiveFailureCount", "Message", "ObjectKey"
+Write-CsvFile $CurrentFailures (Join-Path $OutputFolder "current_failures.csv") $CsvColumns
+Write-CsvFile $Recovered (Join-Path $OutputFolder "recovered.csv") $CsvColumns
+Write-CsvFile $NewFailures (Join-Path $OutputFolder "new_failures.csv") $CsvColumns
+Write-CsvFile $NewRecoveries (Join-Path $OutputFolder "new_recoveries.csv") $CsvColumns
 
 $Worknotes = @"
 Backup Failure Evidence
 
 Incident: $Incident
 Window: $($Window.Label)
-Mode: BaselineCsvTargetedFollowUp
-Baseline CSV: $SelectedBaselineCsv
+Mode: $Mode
 Generated At: $($Window.GeneratedET) ET
 
 Summary:
-- Baseline failures still failing: $(@($Current).Count)
-- Baseline failures recovered: $(@($Recovered).Count)
-- New failures: 0
+- Baseline failures: $(@($BaselineFailures).Count)
+- Current failures still failing: $(@($CurrentFailures).Count)
+- Recovered baseline failures: $(@($Recovered).Count)
+- New failures: $(@($NewFailures).Count)
 - New recoveries since last run: $(@($NewRecoveries).Count)
 
-Important:
-- Baseline is the latest BackupFailures_AllEnvironments_*.csv generated by Cohesity_Backup_Failures.
-- This script checks only baseline cluster/protection-group/object rows for recovery.
-- It does not scan every PG again.
-- new_failures.csv is intentionally header-only because new failures require a new full baseline run.
+Behavior:
+- FullBaseline mode runs the full all-environment failure scan and creates state.json.
+- TargetedFollowUp mode checks only the baseline failures stored in state.json.
 - Cohesity calls are GET-only.
 - No Excel output is generated.
+- No ServiceNow update is performed.
 "@
 if ($Warnings.Count -gt 0) { $Worknotes += "`nWarnings:`n" + (($Warnings | ForEach-Object { "- $_" }) -join "`n") }
 $Worknotes | Set-Content (Join-Path $OutputFolder "worknotes.txt") -Encoding UTF8
@@ -375,13 +523,12 @@ $State = [pscustomobject]@{
     IncidentNumber = $Incident
     WindowKey = $Window.Key
     WindowLabel = $Window.Label
-    Mode = "BaselineCsvTargetedFollowUp"
-    BaselineCsv = $SelectedBaselineCsv
+    Mode = $Mode
     LastRunET = $Window.GeneratedET
-    BaselineFailures = @($BaselineRows)
-    CurrentFailures = @($Current)
+    BaselineFailures = @($BaselineFailures)
+    CurrentFailures = @($CurrentFailures)
     Recovered = @($Recovered)
 }
 Write-JsonFile $State $StatePath
 
-Write-Host "`nIncident: $Incident`nWindow  : $($Window.Label)`nMode    : BaselineCsvTargetedFollowUp`nBaseline: $SelectedBaselineCsv`nOutput  : $OutputFolder`nCreated : current_failures.csv, recovered.csv, new_failures.csv, new_recoveries.csv, worknotes.txt, state.json"
+Write-Host "`nIncident: $Incident`nWindow  : $($Window.Label)`nMode    : $Mode`nOutput  : $OutputFolder`nCreated : current_failures.csv, recovered.csv, new_failures.csv, new_recoveries.csv, worknotes.txt, state.json"
