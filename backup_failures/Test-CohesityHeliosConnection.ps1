@@ -5,6 +5,9 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+# ==============================
+# 0) API key
+# ==============================
 $root = "X:\PowerShell\Cohesity_API_Scripts"
 $keyCheckPath = Join-Path $root "DO_NOT_Delete\apikey.txt"
 $helperPath = Join-Path $root "Common\ApiKeyAesHelper.ps1"
@@ -24,8 +27,31 @@ $commonHeaders = @{
     "accept" = "application/json"
 }
 
+# -----------------------------
+# CSV helper
+# -----------------------------
+function To-CsvList {
+    param([object]$v)
+
+    if ($null -eq $v) { return "" }
+    if ($v -isnot [System.Array]) { return "$v" }
+
+    $arr = @($v | ForEach-Object { "$_" } | Where-Object { $_ -ne "" })
+
+    if ($arr.Count -eq 0) { return "" }
+    if ($arr.Count -eq 1) { return $arr[0] }
+
+    return ($arr -join " ; ")
+}
+
+# ==============================
+# 1) Helpers
+# ==============================
 function Invoke-GetJson {
-    param([string]$Uri, [hashtable]$Headers)
+    param(
+        [Parameter(Mandatory)] [string]$Uri,
+        [Parameter(Mandatory)] [hashtable]$Headers
+    )
 
     if ($PSVersionTable.PSVersion.Major -lt 6) {
         $r = Invoke-WebRequest -Method GET -Uri $Uri -Headers $Headers -UseBasicParsing
@@ -39,7 +65,7 @@ function Invoke-GetJson {
 }
 
 function Convert-UsecsToUtc {
-    param($Usecs)
+    param([object]$Usecs)
 
     if ($null -eq $Usecs -or $Usecs -eq 0) { return $null }
 
@@ -60,7 +86,7 @@ function Convert-UtcToEtText {
     return ([System.TimeZoneInfo]::ConvertTimeFromUtc($Utc, $tz)).ToString("yyyy-MM-dd HH:mm:ss")
 }
 
-function Get-Window {
+function Get-CurrentWindow {
     $tz = [System.TimeZoneInfo]::FindSystemTimeZoneById("Eastern Standard Time")
     $nowEt = [System.TimeZoneInfo]::ConvertTimeFromUtc([datetime]::UtcNow, $tz)
 
@@ -82,19 +108,19 @@ function Get-Window {
 }
 
 function CleanText {
-    param($Value)
+    param([object]$Value)
 
     if ($null -eq $Value) { return "" }
 
     if ($Value -is [System.Array]) {
-        $Value = ($Value | ForEach-Object { "$_" }) -join " | "
+        $Value = To-CsvList $Value
     }
 
     return (([string]$Value -replace "[`r`n]+", " ") -replace "\s+", " ").Trim()
 }
 
 function Get-FirstInfo {
-    param($Run)
+    param([object]$Run)
 
     if ($null -eq $Run -or $null -eq $Run.localBackupInfo) { return $null }
 
@@ -105,7 +131,7 @@ function Get-FirstInfo {
 }
 
 function Get-ClusterName {
-    param($Cluster)
+    param([object]$Cluster)
 
     if ($Cluster.clusterName) { return [string]$Cluster.clusterName }
     if ($Cluster.name) { return [string]$Cluster.name }
@@ -114,9 +140,10 @@ function Get-ClusterName {
 }
 
 function Get-PgEnvironment {
-    param($Pg)
+    param([object]$Pg)
 
     if ($Pg.environment) { return [string]$Pg.environment }
+
     if ($Pg.environmentTypes) {
         $envs = @($Pg.environmentTypes)
         if ($envs.Count -gt 0) { return [string]$envs[0] }
@@ -126,7 +153,7 @@ function Get-PgEnvironment {
 }
 
 function Get-ObjectKey {
-    param($ObjectWrapper)
+    param([object]$ObjectWrapper)
 
     if ($null -eq $ObjectWrapper -or $null -eq $ObjectWrapper.object) { return "" }
 
@@ -143,7 +170,10 @@ function Get-ObjectKey {
 }
 
 function Get-TargetRole {
-    param($Environment, $Object)
+    param(
+        [string]$Environment,
+        [object]$Object
+    )
 
     if ($null -eq $Object) { return "" }
 
@@ -163,16 +193,19 @@ function Get-TargetRole {
             if ($type -eq "kHost") { return "Object" }
         }
         "kGenericNas" {
-            if ($type -eq "kHost") { return "Object" }
+            if ($type -eq "kHost" -or $type -eq "kGenericNas" -or $objEnv -eq "kGenericNas") { return "Object" }
         }
         "kIsilon" {
-            if ($type -eq "kHost") { return "Object" }
+            if ($type -eq "kHost" -or $type -eq "kIsilon" -or $objEnv -eq "kIsilon") { return "Object" }
         }
         "kHyperV" {
             if ($type -eq "kVirtualMachine") { return "Object" }
         }
         "kAcropolis" {
             if ($type -eq "kVirtualMachine") { return "Object" }
+        }
+        "kRemoteAdapter" {
+            return "RemoteAdapter"
         }
         default {
             if (-not [string]::IsNullOrWhiteSpace($type)) { return "Object" }
@@ -183,7 +216,10 @@ function Get-TargetRole {
 }
 
 function Find-HostNameInObjects {
-    param($Objects, $SourceId)
+    param(
+        [object[]]$Objects,
+        [object]$SourceId
+    )
 
     if ($null -eq $SourceId) { return "" }
 
@@ -202,7 +238,7 @@ function Find-HostNameInObjects {
 }
 
 function Get-FailedMessage {
-    param($Attempts)
+    param([object[]]$Attempts)
 
     $messages = @()
 
@@ -219,23 +255,24 @@ function Get-FailedMessage {
 
 function New-OutputRow {
     param(
-        $Window,
+        [object]$Window,
         [string]$ClusterName,
         [string]$ClusterId,
         [string]$Environment,
-        $ProtectionGroup,
+        [object]$ProtectionGroup,
         [string]$RunType,
         [string]$RunStatus,
         [string]$FailureType,
-        $StartUtc,
-        $EndUtc,
+        [object]$StartUtc,
+        [object]$EndUtc,
         [string]$ObjectType,
         [string]$HostName,
         [string]$ObjectName,
         [string]$DatabaseName,
         [string]$FailedMessage,
-        $StartUsecs,
-        $EndUsecs
+        [object]$StartUsecs,
+        [object]$EndUsecs,
+        [string]$ObjectKey
     )
 
     return [pscustomobject]@{
@@ -256,19 +293,20 @@ function New-OutputRow {
         ObjectName        = $ObjectName
         DatabaseName      = $DatabaseName
         FailedMessage     = $FailedMessage
+        ObjectKey         = $ObjectKey
         StartTimeUsecs    = $StartUsecs
         EndTimeUsecs      = $EndUsecs
         EndUtc            = $EndUtc
     }
 }
 
-function Get-LatestUnclearedFailuresForPg {
+function Get-PgFailureResult {
     param(
-        $Window,
+        [object]$Window,
         [string]$ClusterName,
         [string]$ClusterId,
-        $ProtectionGroup,
-        $Runs
+        [object]$ProtectionGroup,
+        [object[]]$Runs
     )
 
     $environment = Get-PgEnvironment $ProtectionGroup
@@ -276,6 +314,17 @@ function Get-LatestUnclearedFailuresForPg {
     $cleared = [System.Collections.Generic.HashSet[string]]::new()
     $runLevelByType = @{}
     $runTypeCleared = [System.Collections.Generic.HashSet[string]]::new()
+
+    $stats = [ordered]@{
+        RunsSeen               = 0
+        FailedRunsSeen          = 0
+        FailedRunsInWindow      = 0
+        ObjectsSeen             = 0
+        ObjectsWithFailedAttempt = 0
+        ClearedObjectCount      = 0
+        ObjectRowsCaptured      = 0
+        RunFallbackRowsCaptured = 0
+    }
 
     $runsWithInfo = @()
 
@@ -296,6 +345,8 @@ function Get-LatestUnclearedFailuresForPg {
     $runsWithInfo = @($runsWithInfo | Sort-Object EndUsecs -Descending)
 
     foreach ($item in $runsWithInfo) {
+        $stats.RunsSeen++
+
         $run = $item.Run
         $info = $item.Info
 
@@ -307,43 +358,26 @@ function Get-LatestUnclearedFailuresForPg {
         $endUtc = Convert-UsecsToUtc $info.endTimeUsecs
         $objects = @($run.objects)
 
+        $isInWindow = $false
+        if ($null -ne $endUtc -and $endUtc -ge $Window.StartUtc -and $endUtc -lt $Window.EndUtc) {
+            $isInWindow = $true
+        }
+
+        if ($runStatus -eq "Failed") {
+            $stats.FailedRunsSeen++
+            if ($isInWindow) { $stats.FailedRunsInWindow++ }
+        }
+
         if ($runStatus -eq "Succeeded" -or $runStatus -eq "SucceededWithWarning") {
             [void]$runTypeCleared.Add($runType)
         }
 
-        if ($objects.Count -eq 0) {
-            if ($runStatus -eq "Failed" -and -not $runTypeCleared.Contains($runType) -and -not $runLevelByType.ContainsKey($runType)) {
-                $msg = CleanText $info.messages
-                if ([string]::IsNullOrWhiteSpace($msg)) {
-                    $msg = "Run marked Failed but no object details were returned."
-                }
-
-                $runLevelByType[$runType] = New-OutputRow `
-                    -Window $Window `
-                    -ClusterName $ClusterName `
-                    -ClusterId $ClusterId `
-                    -Environment $environment `
-                    -ProtectionGroup $ProtectionGroup `
-                    -RunType $runType `
-                    -RunStatus $runStatus `
-                    -FailureType "RunLevelFailedNoObjectDetails" `
-                    -StartUtc $startUtc `
-                    -EndUtc $endUtc `
-                    -ObjectType "" `
-                    -HostName "" `
-                    -ObjectName "" `
-                    -DatabaseName "" `
-                    -FailedMessage $msg `
-                    -StartUsecs $info.startTimeUsecs `
-                    -EndUsecs $info.endTimeUsecs
-            }
-
-            continue
-        }
+        $objectFailureCapturedThisRun = $false
 
         # Pass 1: newer object successes clear older object failures.
         foreach ($ob in $objects) {
             if ($null -eq $ob.object) { continue }
+            $stats.ObjectsSeen++
 
             $role = Get-TargetRole -Environment $environment -Object $ob.object
             if ([string]::IsNullOrWhiteSpace($role)) { continue }
@@ -356,7 +390,13 @@ function Get-LatestUnclearedFailuresForPg {
                 $attempts = @($ob.localSnapshotInfo.failedAttempts)
             }
 
-            if ($ob.localSnapshotInfo -and $attempts.Count -eq 0 -and -not $latestByKey.ContainsKey($key)) {
+            if ($attempts.Count -gt 0) {
+                $stats.ObjectsWithFailedAttempt++
+                continue
+            }
+
+            if ($ob.localSnapshotInfo -and -not $latestByKey.ContainsKey($key)) {
+                if (-not $cleared.Contains($key)) { $stats.ClearedObjectCount++ }
                 [void]$cleared.Add($key)
             }
         }
@@ -378,14 +418,7 @@ function Get-LatestUnclearedFailuresForPg {
                 $attempts = @($ob.localSnapshotInfo.failedAttempts)
             }
 
-            if (-not $attempts -or $attempts.Count -eq 0) {
-                if ($environment -eq "kPhysical" -and $runStatus -eq "Failed") {
-                    $attempts = @([pscustomobject]@{ message = "No failedAttempts[] details found - run marked Failed" })
-                }
-                else {
-                    continue
-                }
-            }
+            if (-not $attempts -or $attempts.Count -eq 0) { continue }
 
             $objectType = [string]$ob.object.objectType
             $objectName = [string]$ob.object.name
@@ -425,7 +458,47 @@ function Get-LatestUnclearedFailuresForPg {
                 -DatabaseName $databaseName `
                 -FailedMessage $msg `
                 -StartUsecs $info.startTimeUsecs `
-                -EndUsecs $info.endTimeUsecs
+                -EndUsecs $info.endTimeUsecs `
+                -ObjectKey $key
+
+            $objectFailureCapturedThisRun = $true
+            $stats.ObjectRowsCaptured++
+        }
+
+        # Fallback: Cohesity sometimes returns a failed run with objects but no failedAttempts[].
+        # Keep one run-level row per run type unless a newer success has already cleared that run type.
+        if ($runStatus -eq "Failed" -and -not $objectFailureCapturedThisRun -and -not $runTypeCleared.Contains($runType) -and -not $runLevelByType.ContainsKey($runType)) {
+            $msg = CleanText $info.messages
+            if ([string]::IsNullOrWhiteSpace($msg)) {
+                if ($objects.Count -gt 0) {
+                    $msg = "Run marked Failed but no object-level failedAttempts[] were returned."
+                }
+                else {
+                    $msg = "Run marked Failed but no object details were returned."
+                }
+            }
+
+            $runLevelByType[$runType] = New-OutputRow `
+                -Window $Window `
+                -ClusterName $ClusterName `
+                -ClusterId $ClusterId `
+                -Environment $environment `
+                -ProtectionGroup $ProtectionGroup `
+                -RunType $runType `
+                -RunStatus $runStatus `
+                -FailureType "RunLevelFailedNoObjectFailureCaptured" `
+                -StartUtc $startUtc `
+                -EndUtc $endUtc `
+                -ObjectType "" `
+                -HostName "" `
+                -ObjectName "" `
+                -DatabaseName "" `
+                -FailedMessage $msg `
+                -StartUsecs $info.startTimeUsecs `
+                -EndUsecs $info.endTimeUsecs `
+                -ObjectKey "RUNLEVEL|$runType"
+
+            $stats.RunFallbackRowsCaptured++
         }
     }
 
@@ -443,10 +516,16 @@ function Get-LatestUnclearedFailuresForPg {
         }
     }
 
-    return $out
+    return [pscustomobject]@{
+        Rows  = @($out)
+        Stats = [pscustomobject]$stats
+    }
 }
 
-$window = Get-Window
+# ==============================
+# 2) Cluster selection
+# ==============================
+$window = Get-CurrentWindow
 
 Write-Host ""
 Write-Host "Cohesity Backup Failures - Object-Level Latest Uncleared" -ForegroundColor Cyan
@@ -495,6 +574,9 @@ else {
     $label = $selectedClusters[0].ClusterName
 }
 
+# ==============================
+# 3) Collect failures
+# ==============================
 $rows = @()
 $summary = @()
 
@@ -516,6 +598,17 @@ foreach ($c in $selectedClusters) {
         continue
     }
 
+    $clusterStats = [ordered]@{
+        RunsSeen                = 0
+        FailedRunsSeen          = 0
+        FailedRunsInWindow      = 0
+        ObjectsSeen             = 0
+        ObjectsWithFailedAttempt = 0
+        ClearedObjectCount      = 0
+        ObjectRowsCaptured      = 0
+        RunFallbackRowsCaptured = 0
+    }
+
     $clusterRowCount = 0
     $i = 0
 
@@ -535,7 +628,13 @@ foreach ($c in $selectedClusters) {
 
         if (-not $runs -or $runs.Count -eq 0) { continue }
 
-        $pgRows = @(Get-LatestUnclearedFailuresForPg -Window $window -ClusterName $c.ClusterName -ClusterId $c.ClusterId -ProtectionGroup $pg -Runs $runs)
+        $result = Get-PgFailureResult -Window $window -ClusterName $c.ClusterName -ClusterId $c.ClusterId -ProtectionGroup $pg -Runs $runs
+        $pgRows = @($result.Rows)
+        $pgStats = $result.Stats
+
+        foreach ($k in @($clusterStats.Keys)) {
+            $clusterStats[$k] += [int]$pgStats.$k
+        }
 
         if ($pgRows.Count -gt 0) {
             $rows += $pgRows
@@ -544,12 +643,20 @@ foreach ($c in $selectedClusters) {
     }
 
     $summary += [pscustomobject]@{
-        Cluster                 = $c.ClusterName
-        ProtectionGroupsChecked = $pgs.Count
-        LatestUnclearedRows     = $clusterRowCount
+        Cluster                  = $c.ClusterName
+        ProtectionGroupsChecked  = $pgs.Count
+        FailedRunsSeen           = $clusterStats.FailedRunsSeen
+        FailedRunsInWindow       = $clusterStats.FailedRunsInWindow
+        ObjectsWithFailedAttempt = $clusterStats.ObjectsWithFailedAttempt
+        ObjectRowsCaptured       = $clusterStats.ObjectRowsCaptured
+        RunFallbackRowsCaptured  = $clusterStats.RunFallbackRowsCaptured
+        LatestUnclearedRows      = $clusterRowCount
     }
 }
 
+# ==============================
+# 4) Output
+# ==============================
 Write-Host ""
 Write-Host "Summary" -ForegroundColor Cyan
 $summary | Format-Table -AutoSize
@@ -572,7 +679,7 @@ if ($rows.Count -gt 0) {
 
         $rows |
             Sort-Object Cluster, ProtectionGroup, EndTimeUsecs -Descending |
-            Select-Object WindowKey, WindowLabel, Cluster, ClusterId, Environment, ProtectionGroup, ProtectionGroupId, RunType, RunStatus, FailureType, StartTimeET, EndTimeET, ObjectType, Host, ObjectName, DatabaseName, FailedMessage, StartTimeUsecs, EndTimeUsecs |
+            Select-Object WindowKey, WindowLabel, Cluster, ClusterId, Environment, ProtectionGroup, ProtectionGroupId, RunType, RunStatus, FailureType, StartTimeET, EndTimeET, ObjectType, Host, ObjectName, DatabaseName, FailedMessage, ObjectKey, StartTimeUsecs, EndTimeUsecs |
             Export-Csv -Path $csv -NoTypeInformation -Encoding UTF8
 
         Write-Host "CSV saved: $csv" -ForegroundColor Green
