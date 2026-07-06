@@ -26,9 +26,9 @@ Do not bulk-edit older Cohesity scripts outside this folder.
 2. `RUNBOOK.md` is the one current run/test instruction file and may be overwritten each time instructions change.
 3. `WORK_STATUS.md` tracks status, decisions, current scope, and next fixes.
 4. Existing scripts outside `backup_failures/` are not changed unless explicitly requested.
-5. Use one-step-at-a-time development.
+5. Use controlled development.
 6. Cohesity production calls must be GET-only unless explicitly changed.
-7. No registry, state, incident locking, CSV, Excel, or SNOW logic until the basic steps work.
+7. No registry, state files, incident locking, Excel, or SNOW update logic at this stage.
 
 ## API Key Standard For PowerShell Scripts
 
@@ -47,47 +47,79 @@ Do not directly read the API key as plain text in new PowerShell scripts.
 - Kept the two Dynatrace JavaScript references:
   - `cohesity_backup_failures.js`
   - `compute_window.js`
-- Added first PowerShell connection test:
+- Added PowerShell script:
   - `Test-CohesityHeliosConnection.ps1`
-- Added current runbook:
+- Phase 1 connection test completed by user.
+- Updated the PowerShell script to include:
+  - 18:00 ET compute window.
+  - Cluster selection menu.
+  - Protection group discovery for selected cluster(s).
+  - Recent run lookup per protection group.
+  - Object-level failedAttempt extraction.
+  - Run-level failed row when object details are missing.
+  - CSV output.
+- Updated current runbook:
   - `RUNBOOK.md`
-- Added actual work status file:
-  - `WORK_STATUS.md`
 
-## Current Plan
+## Current Script Behavior
 
-Phase 1 is to prove the local PowerShell foundation before adding backup-failure logic.
+Current script:
 
-Current sequence:
+```text
+backup_failures/Test-CohesityHeliosConnection.ps1
+```
 
-1. Run the Helios connection test.
-2. Confirm AES API-key helper works locally.
-3. Confirm the Helios cluster-list GET endpoint works.
-4. Confirm cluster names and IDs print correctly.
-5. Only after this succeeds, add compute-window printing in PowerShell.
-6. Then add protection-group listing for one selected cluster.
-7. Then add run listing for one selected protection group.
-8. Then add failure-classification logic.
-9. Then add CSV output.
-10. Then add incident/work-note formatting.
+Menu behavior:
+
+```text
+[0] All clusters
+[1..N] One selected cluster
+[X] Exit
+```
+
+Output:
+
+```text
+Console summary
+Failure preview
+CSV under X:\PowerShell\Data\Cohesity\BackupFailures
+```
 
 ## Current Test Step
 
-Run only the connection test.
+First test should use a single cluster, not ALL.
 
-Expected result:
+Suggested command:
 
-```text
-Cluster count: <number>
-ClusterName / ClusterId table
+```powershell
+X:\PowerShell\Cohesity_API_Scripts\Test-CohesityHeliosConnection.ps1 -MaxProtectionGroups 5 -MaxRunsPerProtectionGroup 10
 ```
+
+Then choose one cluster from the menu.
+
+## Next Fixes / Next Build Steps
+
+After the user runs the current script:
+
+1. Fix any PowerShell syntax/runtime issue.
+2. Confirm cluster menu works.
+3. Confirm PG count is reasonable.
+4. Confirm runs are retrieved.
+5. Confirm CSV path is created.
+6. Review whether failure rows are correct.
+7. Then improve classification if needed:
+   - Still failing.
+   - Recovered in window.
+   - New failure.
+   - Re-failed.
+   - Consecutive failure.
 
 ## Current Stop Point
 
-Waiting for user to run:
+Waiting for user to copy/run:
 
 ```powershell
-X:\PowerShell\Cohesity_API_Scripts\Test-CohesityHeliosConnection.ps1
+X:\PowerShell\Cohesity_API_Scripts\Test-CohesityHeliosConnection.ps1 -MaxProtectionGroups 5 -MaxRunsPerProtectionGroup 10
 ```
 
-and share the result or exact error.
+and share the summary or exact error.
