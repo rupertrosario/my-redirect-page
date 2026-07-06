@@ -7,7 +7,9 @@ Use this only to validate baseline runtime and output.
 param(
     [Parameter(Mandatory)] [string]$ClusterName,
     [switch]$ResetBaseline,
-    [string]$IncidentNumber = ""
+    [string]$IncidentNumber = "",
+    [string]$HelperPath = "",
+    [string]$EncryptedFile = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -40,6 +42,8 @@ $TempScript = Join-Path $env:TEMP "Get-CohesityBackupFailureIncidentEvidence_One
 Set-Content -Path $TempScript -Value $Text -Encoding UTF8
 
 $InvokeArgs = @("-ClusterName", $ClusterName)
+if ($HelperPath) { $InvokeArgs += @("-HelperPath", $HelperPath) }
+if ($EncryptedFile) { $InvokeArgs += @("-EncryptedFile", $EncryptedFile) }
 if ($ResetBaseline) { $InvokeArgs += "-ResetBaseline" }
 if ($IncidentNumber) { $InvokeArgs += @("-IncidentNumber", $IncidentNumber) }
 
