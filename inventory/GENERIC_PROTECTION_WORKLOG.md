@@ -12,15 +12,24 @@ Current decision: final Power BI model should use generic Cohesity_Protection ou
 
 Current status:
 
-- Standalone Physical works.
-- Generic collector now uses AES helper for key loading.
+- Standalone Physical works and is frozen.
+- Generic collector uses AES helper for key loading.
 - Generic collector has safer optional field handling.
-- Next validation is Hyper-V first, then Nutanix AHV.
+- Hyper-V test returned 9 CollectionErrors.
+- Need exact CollectionErrors from Cohesity_Protection_Run_Metadata.json before changing script.
 
 Current risk:
 
-Hyper-V or Nutanix may show PG rows but zero object rows. If that happens, fix only generic VM object extraction logic.
+The 9 Hyper-V errors could be API collection, Hyper-V params mismatch, or object/run processing. Do not guess until Stage and Error values are reviewed.
+
+Next action:
+
+Capture and review Counts, EnvironmentCounts, and all CollectionErrors from Cohesity_Protection_Run_Metadata.json.
 
 Next likely fix area:
 
-Get-ObjectsFromParams in inventory/Get-CohesityProtectionInventory.ps1.
+Depends on CollectionErrors Stage:
+
+- Get-ProtectionGroups: API call or cluster access issue.
+- EnvironmentParams: Hyper-V parameter field name mismatch.
+- ProcessProtectionGroup: object extraction, policy, or run field handling issue.
