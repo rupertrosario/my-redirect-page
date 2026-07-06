@@ -1,17 +1,18 @@
 # Generic Cohesity Protection Inventory Runbook
 
-Current focus: Hyper-V retest.
+Current focus: Nutanix AHV test.
 
 Current script: inventory/Get-CohesityProtectionInventory.ps1
 
-The generic collector was updated in commit 29fe01325c6820fca3587d37b8967a866a27d596.
+Hyper-V CSV validation completed after the generic collector fix.
 
 Next steps:
 
-1. Pull the latest Cohesity_Automations branch.
+1. Pull latest branch.
 2. Run the generic collector again.
-3. Select the same Hyper-V cluster.
-4. Select environment option 2.
-5. Review the metadata JSON for Counts, EnvironmentCounts, and CollectionErrors.
+3. Select one known AHV cluster.
+4. Select environment option 3.
+5. Run the CSV validation script.
+6. Review Counts, EnvironmentCounts, and CollectionErrors.
 
-Stop after Hyper-V. Do not test Nutanix yet.
+Stop after AHV. Do not move to Power BI yet.
