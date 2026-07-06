@@ -25,21 +25,37 @@ $EnvironmentMap = @(
 )
 
 function NowET { try { $tz=[TimeZoneInfo]::FindSystemTimeZoneById("Eastern Standard Time"); return ([TimeZoneInfo]::ConvertTimeFromUtc((Get-Date).ToUniversalTime(),$tz)).ToString("yyyy-MM-dd HH:mm:ss") } catch { return (Get-Date).ToString("yyyy-MM-dd HH:mm:ss") } }
-$InventoryDateET = NowET
 function Headers { param([string]$ClusterId) $h=@{accept="application/json"}; $h.Add(("api"+"Key"),$cohesityKey); if($ClusterId){$h["accessClusterId"]=$ClusterId}; return $h }
 function JsonGet { param([string]$Uri,[hashtable]$Headers) if($PSVersionTable.PSVersion.Major -lt 6){$r=Invoke-WebRequest -Uri $Uri -Headers $Headers -Method Get -UseBasicParsing}else{$r=Invoke-WebRequest -Uri $Uri -Headers $Headers -Method Get}; if(!$r -or [string]::IsNullOrWhiteSpace($r.Content)){return $null}; return ($r.Content|ConvertFrom-Json) }
 function Arr { param($v) if($null -eq $v){return @()}; return @($v) }
 function Prop { param($o,[string[]]$names) if($null -eq $o -or $o -is [string]){return $null}; foreach($n in $names){foreach($p in @($o.PSObject.Properties)){if($p.Name -ieq $n){return $p.Value}}}; return $null }
 function Nest { param($o,[string]$path) $c=$o; foreach($part in ($path -split "\.")){if($null -eq $c -or $c -is [string]){return $null}; $c=Prop $c @($part)}; return $c }
 function First { param($vals) foreach($v in @($vals)){foreach($x in @($v)){if($null -ne $x -and "$x".Trim() -ne ""){return "$x"}}}; return "" }
-function Flat { param($v) $a=@(); foreach($x in @(Arr $v)){foreach($y in @(Arr $x)){if($null -ne $y -and "$y".Trim() -ne ""){$a+="$y"}}}; if($a.Count -eq 0){return ""}; return (($a|Select-Object -Unique)-join ";") }
-function Cnt { param($v) $f=Flat $v; if([string]::IsNullOrWhiteSpace($f)){return 0}; return @($f -split ";"|Where-Object{$_}).Count }
+function Pack { param($v) if($null -eq $v){return ""}; try { return ($v | ConvertTo-Json -Depth 8 -Compress) } catch { return "$v" } }
 function Et { param($u) if($null -eq $u -or "$u" -eq "0" -or "$u".Trim() -eq ""){return ""}; try{$e=[DateTime]::SpecifyKind([datetime]"1970-01-01",[DateTimeKind]::Utc);$d=$e.AddSeconds(([double]$u/1000000));$tz=[TimeZoneInfo]::FindSystemTimeZoneById("Eastern Standard Time");return ([TimeZoneInfo]::ConvertTimeFromUtc($d,$tz)).ToString("yyyy-MM-dd HH:mm:ss")}catch{return ""} }
 function Good { param($s) if(!$s){return $false}; return (@("ksuccess","success","succeeded") -contains $s.Trim().ToLower()) }
-function LooksId { param($v) if(!$v){return $false}; return ($v -match '^[a-fA-F0-9]{24,}$' -or $v -match '^[0-9]+:[0-9]+:[0-9]+$') }
 function ObjName { param($o) return First @((Prop $o @("name","objectName","sourceName","vmName","hostName","displayName","id"))) }
 function ObjId { param($o) return First @((Prop $o @("id","objectId","sourceId","vmId","entityId"))) }
-function PolicyMap { param([hashtable]$Headers) $m=@{}; foreach($u in @("$baseUrl/v2/data-protect/policies?maxResultCount=1000","$baseUrl/v2/data-protect/policies")){try{$j=JsonGet $u $Headers;$list=Prop $j @("policies","policyList","items");if(!$list){$list=$j};foreach($p in @(Arr $list|Where-Object{$_ -and $_ -isnot [string]})){ $policyObjId=First @((Prop $p @("id","policyId")));$policyObjName=First @((Prop $p @("name","policyName","displayName")));if($policyObjId -and $policyObjName){$m[$policyObjId]=$policyObjName}};if($m.Count -gt 0){break}}catch{}};return $m }
+function LooksId { param($v) if(!$v){return $false}; return ($v -match '^[a-fA-F0-9]{24,}$' -or $v -match '^[0-9]+:[0-9]+:[0-9]+$') }
+
+function PolicyMap {
+    param([hashtable]$Headers)
+    $map=@{}
+    foreach($u in @("$baseUrl/v2/data-protect/policies?maxResultCount=1000","$baseUrl/v2/data-protect/policies")){
+        try{
+            $j=JsonGet $u $Headers
+            $list=Prop $j @("policies","policyList","items")
+            if(!$list){$list=$j}
+            foreach($p in @(Arr $list|Where-Object{$_ -and $_ -isnot [string]})){
+                $policyObjId=First @((Prop $p @("id","policyId")))
+                $policyObjName=First @((Prop $p @("name","policyName","displayName")))
+                if($policyObjId -and $policyObjName){$map[$policyObjId]=$policyObjName}
+            }
+            if($map.Count -gt 0){break}
+        }catch{}
+    }
+    return $map
+}
 function PolicyId { param($pg) return First @((Prop $pg @("policyId")),(Nest $pg "policyInfo.id"),(Nest $pg "policy.id")) }
 function PolicyName { param($pg,[hashtable]$map) $resolvedPolicyId=PolicyId $pg; if($resolvedPolicyId -and $map.ContainsKey($resolvedPolicyId)){return $map[$resolvedPolicyId]}; $n=First @((Nest $pg "policyInfo.name"),(Nest $pg "policy.name"),(Nest $pg "policyConfig.name"),(Prop $pg @("policyName"))); if($n -and !(LooksId $n)){return $n}; if($n -and $map.ContainsKey($n)){return $map[$n]}; return "UNRESOLVED_POLICY_NAME" }
 function PGs { param([string]$EnvApi,[hashtable]$Headers) $all=@();$cookie="";do{$u="$baseUrl/v2/data-protect/protection-groups?environments=$EnvApi&isDeleted=false&isActive=true&includeLastRunInfo=true&maxResultCount=1000";if($cookie){$u="$u&paginationCookie=$([uri]::EscapeDataString($cookie))"};$j=JsonGet $u $Headers;$g=Prop $j @("protectionGroups");if($g){$all+=@(Arr $g|Where-Object{$_})};$cookie=First @((Prop $j @("paginationCookie")));$trunc=Prop $j @("isResponseTruncated");if($trunc -ne $true -and [string]::IsNullOrWhiteSpace($cookie)){break}}while($cookie);return @($all) }
@@ -48,17 +64,60 @@ function FindObjs { param($node,[int]$depth) $out=@();if($null -eq $node -or $no
 function Dedupe { param($objs) $seen=@{};$out=@();foreach($o in @(Arr $objs|Where-Object{$_ -and $_ -isnot [string]})){ $k=First @((ObjId $o),(ObjName $o));if($k -and !$seen.ContainsKey($k)){$seen[$k]=$true;$out+=$o}};return @($out) }
 function ObjectsFromParams { param($params,[string]$envApi) if($envApi -eq "kPhysical"){$pt=First @((Prop $params @("protectionType")));if($pt -eq "kVolume"){return @(Arr (Nest $params "volumeProtectionTypeParams.objects")|Where-Object{$_})};return @(Arr (Nest $params "fileProtectionTypeParams.objects")|Where-Object{$_})};foreach($n in @("objects","sourceObjects","virtualMachines","vms","vmObjects","protectedObjects","selectedObjects","entities")){ $items=@(Arr (Prop $params @($n))|Where-Object{$_});if($items.Count -gt 0){return @(Dedupe $items)}};return @(Dedupe (FindObjs $params 0)) }
 function RunInfo { param($pg) $lr=Prop $pg @("lastRun");$li=Prop $lr @("localBackupInfo","localSnapshotInfo");$s=First @((Prop $li @("status")),(Prop $lr @("status")));$rt=First @((Prop $li @("runType")),(Prop $lr @("runType")));$st=Et (First @((Prop $li @("startTimeUsecs")),(Prop $lr @("startTimeUsecs"))));$en=Et (First @((Prop $li @("endTimeUsecs")),(Prop $lr @("endTimeUsecs"))));$ok="";$okS="";if(Good $s){$ok=$en;$okS=$s};return [pscustomobject]@{LastRunStatus=$s;LastRunType=$rt;LastRunStartET=$st;LastRunEndET=$en;LastSuccessfulBackupET=$ok;LastSuccessfulBackupStatus=$okS;LastSuccessfulBackupAgeHours="";BackupFreshnessBucket="";IsSuccessLast24h=$false;IsSuccessLast48h=$false} }
-$clusterJson=JsonGet "$baseUrl/v2/mcm/cluster-mgmt/info" (Headers);$clusterRows=@(Arr (Prop $clusterJson @("cohesityClusters")));if($clusterRows.Count -eq 0){throw "No clusters returned from Helios."}
+
+$InventoryDateET = NowET
+$clusterJson=JsonGet "$baseUrl/v2/mcm/cluster-mgmt/info" (Headers)
+$clusterRows=@(Arr (Prop $clusterJson @("cohesityClusters")))
+if($clusterRows.Count -eq 0){throw "No clusters returned from Helios."}
 $clusters=$clusterRows|ForEach-Object{[pscustomobject]@{ClusterName=First @((Prop $_ @("clusterName")),(Prop $_ @("displayName")),(Prop $_ @("name")));ClusterId=First @((Prop $_ @("clusterId")),(Prop $_ @("id")))}}|Sort-Object ClusterName
 $clusterMenu=for($i=0;$i -lt $clusters.Count;$i++){[pscustomobject]@{Index=$i+1;ClusterName=$clusters[$i].ClusterName;ClusterId=$clusters[$i].ClusterId}}
-Write-Host "`nAvailable Helios Clusters:" -ForegroundColor Cyan;$clusterMenu|Format-Table -AutoSize;Write-Host "[0] All clusters`n[X] Exit" -ForegroundColor Yellow
+Write-Host "`nAvailable Helios Clusters:" -ForegroundColor Cyan
+$clusterMenu|Format-Table -AutoSize
+Write-Host "[0] All clusters`n[X] Exit" -ForegroundColor Yellow
 while($true){$sel=Read-Host "Select cluster";if($sel -match '^(x|X|q|Q)$'){return};$num=0;if([int]::TryParse($sel,[ref]$num) -and $num -ge 0 -and $num -le $clusterMenu.Count){if($num -eq 0){$selectedClusters=@($clusterMenu)}else{$selectedClusters=@($clusterMenu|Where-Object{$_.Index -eq $num})};break};Write-Host "Invalid selection." -ForegroundColor Red}
 Write-Host "`n[0] Physical + Hyper-V + Nutanix AHV`n[1] Physical only`n[2] Hyper-V only`n[3] Nutanix AHV only`n[X] Exit" -ForegroundColor Yellow
 while($true){$es=Read-Host "Select environment";if($es -match '^(x|X|q|Q)$'){return};if($es -eq "0"){$selectedEnvironments=@($EnvironmentMap);break};if($es -eq "1"){$selectedEnvironments=@($EnvironmentMap|Where-Object{$_.ApiName -eq "kPhysical"});break};if($es -eq "2"){$selectedEnvironments=@($EnvironmentMap|Where-Object{$_.ApiName -eq "kHyperV"});break};if($es -eq "3"){$selectedEnvironments=@($EnvironmentMap|Where-Object{$_.ApiName -eq "kAcropolis"});break};Write-Host "Invalid selection." -ForegroundColor Red}
+
 $pgRows=@();$objRows=@();$pathRows=@();$exRows=@();$errors=@()
-foreach($c in $selectedClusters){$h=Headers $c.ClusterId;$pm=PolicyMap $h;foreach($e in $selectedEnvironments){Write-Host "Collecting $($e.DisplayName) PGs from $($c.ClusterName) ..." -ForegroundColor Yellow;try{$pgList=@(PGs $e.ApiName $h)}catch{$errors+=[pscustomobject]@{Cluster=$c.ClusterName;Environment=$e.DisplayName;Stage="Get-ProtectionGroups";Error=$_.Exception.Message};continue};foreach($pg in $pgList){try{$p=Params $pg $e.ParamNames;if($null -eq $p){$errors+=[pscustomobject]@{Cluster=$c.ClusterName;Environment=$e.DisplayName;Stage="EnvironmentParams";Error="No matching params"};continue};$pgId=First @((Prop $pg @("id")),(Prop $pg @("protectionGroupId")));$pgName=First @((Prop $pg @("name")),(Prop $pg @("protectionGroupName")),$pgId);$pgKey=if($c.ClusterId -and $pgId){"$($c.ClusterId)|$pgId"}else{"$($c.ClusterName)|$pgName"};$policyId=PolicyId $pg;$policyName=PolicyName $pg $pm;$r=RunInfo $pg;$objs=@(ObjectsFromParams $p $e.ApiName);$ptype=if($e.ApiName -eq "kPhysical"){First @((Prop $p @("protectionType")))}else{"VirtualMachine"};$globalEx="";$globalExCount=0;if($e.ApiName -eq "kPhysical" -and $ptype -ne "kVolume"){$globalEx=Flat (Nest $p "fileProtectionTypeParams.globalExcludePaths");$globalExCount=Cnt $globalEx};$pgRows+=[pscustomobject]@{PGKey=$pgKey;InventoryDateET=$InventoryDateET;Cluster=$c.ClusterName;ClusterId=$c.ClusterId;Environment=$e.DisplayName;ProtectionGroup=$pgName;ProtectionGroupId=$pgId;PolicyName=$policyName;PolicyId=$policyId;IsActive=Prop $pg @("isActive");IsDeleted=Prop $pg @("isDeleted");ObjectCount=@($objs).Count;GlobalExcludePathCount=$globalExCount;ObjectExcludePathCount=0;HasGlobalExclusions=($globalExCount -gt 0);HasObjectExclusions=$false;LastSuccessfulBackupET=$r.LastSuccessfulBackupET;LastSuccessfulBackupStatus=$r.LastSuccessfulBackupStatus;LastSuccessfulBackupAgeHours=$r.LastSuccessfulBackupAgeHours;BackupFreshnessBucket=$r.BackupFreshnessBucket;IsSuccessLast24h=$r.IsSuccessLast24h;IsSuccessLast48h=$r.IsSuccessLast48h;LastRunStatus=$r.LastRunStatus;LastRunType=$r.LastRunType;LastRunStartET=$r.LastRunStartET;LastRunEndET=$r.LastRunEndET;IsPaused=Prop $pg @("isPaused");ProtectionType=$ptype;StorageDomain=First @((Prop $pg @("storageDomainName")),(Nest $pg "storageDomain.name"));SourceName=First @((Prop $pg @("sourceName")),(Nest $pg "source.name"))};foreach($o in $objs){$on=ObjName $o;$oid=ObjId $o;$okey="$pgKey|$(First @($oid,$on))";$objectHostName=First @((Prop $o @("hostName")),(Prop $o @("sourceName")),$on);$otype=First @((Prop $o @("objectType","type","entityType")));if(!$otype){$otype=if($e.ApiName -eq "kPhysical"){"PhysicalObject"}else{"VirtualMachine"}};$objRows+=[pscustomobject]@{ObjectKey=$okey;PGKey=$pgKey;InventoryDateET=$InventoryDateET;Cluster=$c.ClusterName;ClusterId=$c.ClusterId;Environment=$e.DisplayName;ProtectionGroup=$pgName;ProtectionGroupId=$pgId;PolicyName=$policyName;HostName=$objectHostName;ObjectName=$on;ObjectType=$otype;ObjectId=$oid;ParentSource=First @((Prop $o @("parentSourceName")),(Prop $o @("sourceName")),(Prop $o @("sourceId")));IncludedPathCount=0;ObjectExcludePathCount=0;HasGlobalExclusions=($globalExCount -gt 0);HasObjectExclusions=$false;LastSuccessfulBackupET=$r.LastSuccessfulBackupET;LastSuccessfulBackupStatus=$r.LastSuccessfulBackupStatus}}}catch{$errors+=[pscustomobject]@{Cluster=$c.ClusterName;Environment=$e.DisplayName;Stage="ProcessProtectionGroup";Error=$_.Exception.Message};continue}}}}
+foreach($c in $selectedClusters){
+    $h=Headers $c.ClusterId
+    $pm=PolicyMap $h
+    foreach($e in $selectedEnvironments){
+        Write-Host "Collecting $($e.DisplayName) PGs from $($c.ClusterName) ..." -ForegroundColor Yellow
+        try{$pgList=@(PGs $e.ApiName $h)}catch{$errors+=[pscustomobject]@{Cluster=$c.ClusterName;Environment=$e.DisplayName;Stage="Get-ProtectionGroups";Error=$_.Exception.Message};continue}
+        foreach($pg in $pgList){
+            try{
+                $p=Params $pg $e.ParamNames
+                if($null -eq $p){$errors+=[pscustomobject]@{Cluster=$c.ClusterName;Environment=$e.DisplayName;Stage="EnvironmentParams";Error="No matching params"};continue}
+                $pgId=First @((Prop $pg @("id")),(Prop $pg @("protectionGroupId")))
+                $pgName=First @((Prop $pg @("name")),(Prop $pg @("protectionGroupName")),$pgId)
+                $pgKey=if($c.ClusterId -and $pgId){"$($c.ClusterId)|$pgId"}else{"$($c.ClusterName)|$pgName"}
+                $policyId=PolicyId $pg
+                $policyName=PolicyName $pg $pm
+                $r=RunInfo $pg
+                $objs=@(ObjectsFromParams $p $e.ApiName)
+                $ptype=First @((Prop $p @("protectionType")))
+                if(!$ptype -and $e.ApiName -ne "kPhysical"){$ptype="VirtualMachine"}
+                $indexPolicy=Prop $p @("indexingPolicy")
+                $srcId=First @((Prop $p @("sourceId")),(Prop $pg @("sourceId")))
+                $srcName=First @((Prop $p @("sourceName")),(Prop $pg @("sourceName")),(Nest $pg "source.name"))
+                $globalEx="";$globalExCount=0
+                if($e.ApiName -eq "kPhysical" -and $ptype -ne "kVolume"){$globalEx=Pack (Nest $p "fileProtectionTypeParams.globalExcludePaths");$globalExCount=Cnt (Nest $p "fileProtectionTypeParams.globalExcludePaths")}
+                $pgRows+=[pscustomobject]@{PGKey=$pgKey;InventoryDateET=$InventoryDateET;Cluster=$c.ClusterName;ClusterId=$c.ClusterId;Environment=$e.DisplayName;ProtectionGroup=$pgName;ProtectionGroupId=$pgId;PolicyName=$policyName;PolicyId=$policyId;IsActive=Prop $pg @("isActive");IsDeleted=Prop $pg @("isDeleted");ObjectCount=@($objs).Count;GlobalExcludePathCount=$globalExCount;ObjectExcludePathCount=0;HasGlobalExclusions=($globalExCount -gt 0);HasObjectExclusions=$false;LastSuccessfulBackupET=$r.LastSuccessfulBackupET;LastSuccessfulBackupStatus=$r.LastSuccessfulBackupStatus;LastSuccessfulBackupAgeHours=$r.LastSuccessfulBackupAgeHours;BackupFreshnessBucket=$r.BackupFreshnessBucket;IsSuccessLast24h=$r.IsSuccessLast24h;IsSuccessLast48h=$r.IsSuccessLast48h;LastRunStatus=$r.LastRunStatus;LastRunType=$r.LastRunType;LastRunStartET=$r.LastRunStartET;LastRunEndET=$r.LastRunEndET;IsPaused=Prop $pg @("isPaused");ProtectionType=$ptype;StorageDomain=First @((Prop $pg @("storageDomainName")),(Nest $pg "storageDomain.name"));SourceId=$srcId;SourceName=$srcName;CloudMigration=Prop $p @("cloudMigration");AppConsistentSnapshot=Prop $p @("appConsistentSnapshot");FallbackToCrashConsistentSnapshot=Prop $p @("fallbackToCrashConsistentSnapshot");ContinueOnQuiesceFailure=Prop $p @("continueOnQuiesceFailure");BackupDirectlyAttachedVolumeGroups=Prop $p @("backupDirectlyAttachedVolumeGroups");GlobalIncludeDisks=Pack (Prop $p @("globalIncludeDisks"));GlobalExcludeDisks=Pack (Prop $p @("globalExcludeDisks"));ExcludeObjectIds=Pack (Prop $p @("excludeObjectIds"));VmTagIds=Pack (Prop $p @("vmTagIds"));ExcludeVmTagIds=Pack (Prop $p @("excludeVmTagIds"));IndexingEnabled=Prop $indexPolicy @("enableIndexing");IndexingIncludePaths=Pack (Prop $indexPolicy @("includePaths"));IndexingExcludePaths=Pack (Prop $indexPolicy @("excludePaths"))}
+                foreach($o in $objs){
+                    $on=ObjName $o;$oid=ObjId $o;$okey="$pgKey|$(First @($oid,$on))"
+                    $objectHostName=First @((Prop $o @("hostName")),(Prop $o @("sourceName")),$on)
+                    $otype=First @((Prop $o @("objectType","type","entityType")))
+                    if(!$otype){$otype=if($e.ApiName -eq "kPhysical"){"PhysicalObject"}else{"VirtualMachine"}}
+                    $objRows+=[pscustomobject]@{ObjectKey=$okey;PGKey=$pgKey;InventoryDateET=$InventoryDateET;Cluster=$c.ClusterName;ClusterId=$c.ClusterId;Environment=$e.DisplayName;ProtectionGroup=$pgName;ProtectionGroupId=$pgId;PolicyName=$policyName;HostName=$objectHostName;ObjectName=$on;ObjectType=$otype;ObjectId=$oid;ParentSource=First @((Prop $o @("parentSourceName")),(Prop $o @("sourceName")),(Prop $o @("sourceId")));IncludedPathCount=0;ObjectExcludePathCount=0;HasGlobalExclusions=($globalExCount -gt 0);HasObjectExclusions=$false;LastSuccessfulBackupET=$r.LastSuccessfulBackupET;LastSuccessfulBackupStatus=$r.LastSuccessfulBackupStatus;ObjectIncludeDisks=Pack (Prop $o @("includeDisks"));ObjectExcludeDisks=Pack (Prop $o @("excludeDisks"))}
+                }
+            }catch{$errors+=[pscustomobject]@{Cluster=$c.ClusterName;Environment=$e.DisplayName;Stage="ProcessProtectionGroup";Error=$_.Exception.Message};continue}
+        }
+    }
+}
+
 $pgCsv=Join-Path $outDir "Cohesity_Protection_PG_Summary_Latest.csv";$objCsv=Join-Path $outDir "Cohesity_Protection_Object_Detail_Latest.csv";$pathCsv=Join-Path $outDir "Cohesity_Protection_Path_Detail_Latest.csv";$exCsv=Join-Path $outDir "Cohesity_Protection_Exceptions_Latest.csv";$metaJson=Join-Path $outDir "Cohesity_Protection_Run_Metadata.json"
 $pgRows|Export-Csv $pgCsv -NoTypeInformation -Encoding utf8;$objRows|Export-Csv $objCsv -NoTypeInformation -Encoding utf8;$pathRows|Export-Csv $pathCsv -NoTypeInformation -Encoding utf8;$exRows|Export-Csv $exCsv -NoTypeInformation -Encoding utf8
-$meta=[pscustomobject]@{InventoryDateET=$InventoryDateET;ScriptName="Get-CohesityProtectionInventory.ps1";HeliosBaseUrl=$baseUrl;SelectedClusters=@($selectedClusters|Select-Object ClusterName,ClusterId);SelectedEnvironments=@($selectedEnvironments|Select-Object ApiName,DisplayName);Counts=[pscustomobject]@{PGSummaryRows=@($pgRows).Count;ObjectDetailRows=@($objRows).Count;PathDetailRows=@($pathRows).Count;ExceptionRows=@($exRows).Count;CollectionErrors=@($errors).Count};EnvironmentCounts=@($pgRows|Group-Object Environment|Select-Object Name,Count);CollectionErrors=@($errors);Notes=@("GET-only collector","Reserved automatic variable names are avoided")}
+$meta=[pscustomobject]@{InventoryDateET=$InventoryDateET;ScriptName="Get-CohesityProtectionInventory.ps1";HeliosBaseUrl=$baseUrl;SelectedClusters=@($selectedClusters|Select-Object ClusterName,ClusterId);SelectedEnvironments=@($selectedEnvironments|Select-Object ApiName,DisplayName);Counts=[pscustomobject]@{PGSummaryRows=@($pgRows).Count;ObjectDetailRows=@($objRows).Count;PathDetailRows=@($pathRows).Count;ExceptionRows=@($exRows).Count;CollectionErrors=@($errors).Count};EnvironmentCounts=@($pgRows|Group-Object Environment|Select-Object Name,Count);CollectionErrors=@($errors);Notes=@("GET-only collector","VM protection parameter details captured")}
 $meta|ConvertTo-Json -Depth 10|Out-File $metaJson -Encoding utf8
 Write-Host "`nCohesity Protection Inventory export complete." -ForegroundColor Green;Write-Host "PG Summary rows    : $(@($pgRows).Count)" -ForegroundColor Green;Write-Host "Object Detail rows : $(@($objRows).Count)" -ForegroundColor Green;Write-Host "Path Detail rows   : $(@($pathRows).Count)" -ForegroundColor Green;Write-Host "Exception rows     : $(@($exRows).Count)" -ForegroundColor Green;Write-Host "Collection errors  : $(@($errors).Count)" -ForegroundColor Green;Write-Host "Metadata JSON      : $metaJson" -ForegroundColor Green
