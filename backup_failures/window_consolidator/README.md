@@ -27,10 +27,17 @@ The team should only need to:
 4. Paste the generated TXT into work_notes.
 5. Troubleshoot the actual failures.
 
-## File
+## Files
 
 ```powershell
 backup_failures/window_consolidator/Get-CohesityBackupFailureWindowConsolidator.ps1
+backup_failures/window_consolidator/RUNBOOK_Test_Instructions.md
+```
+
+For the exact copy/paste run steps, open:
+
+```text
+backup_failures/window_consolidator/RUNBOOK_Test_Instructions.md
 ```
 
 ## Default behavior
