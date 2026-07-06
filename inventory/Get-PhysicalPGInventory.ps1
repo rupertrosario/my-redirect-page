@@ -1,5 +1,6 @@
 # Cohesity Helios - Physical PG Inventory
 # STRICTLY READ-ONLY / GET-only
+# PowerShell 5.1 compatible
 # Output only:
 #   X:\PowerShell\Cohesity_API_Scripts\inventory\Physical_PG_Summary_Latest.csv
 #   X:\PowerShell\Cohesity_API_Scripts\inventory\Physical_PG_Object_Detail_Latest.csv
@@ -9,27 +10,37 @@ $FormatEnumerationLimit = -1
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
 $outDir     = "X:\PowerShell\Cohesity_API_Scripts\inventory"
-$apikeypath = "X:\PowerShell\Cohesity_API_Scripts\DO_NOT_Delete\apikey.txt"
 $baseUrl    = "https://helios.cohesity.com"
+$helperPath = "X:\PowerShell\Cohesity_API_Scripts\Common\ApiKeyAesHelper.ps1"
+$encryptedApiKeyPath = "X:\PowerShell\Cohesity_API_Scripts\Common\Secure\cohesity_apikey.enc"
 
 if (-not (Test-Path -Path $outDir -PathType Container)) {
     New-Item -Path $outDir -ItemType Directory -Force | Out-Null
 }
 
-if (-not (Test-Path $apikeypath)) {
-    throw "API key file not found at $apikeypath"
+if (-not (Test-Path $helperPath)) {
+    throw "API key helper not found at $helperPath"
 }
 
-$apiKey = (Get-Content -Path $apikeypath -Raw).Trim()
+if (-not (Test-Path $encryptedApiKeyPath)) {
+    throw "Encrypted API key file not found at $encryptedApiKeyPath"
+}
+
+. $helperPath
+
+$apiKey = Get-CohesityApiKeyFromAes -EncryptedFile $encryptedApiKeyPath
+
+if ([string]::IsNullOrWhiteSpace($apiKey)) {
+    throw "AES API key helper returned an empty API key."
+}
 
 function New-Headers {
     param([string]$ClusterId)
 
     $h = @{
         accept = "application/json"
+        apiKey = $apiKey
     }
-
-    $h["apiKey"] = $apiKey
 
     if (-not [string]::IsNullOrWhiteSpace($ClusterId)) {
         $h["accessClusterId"] = $ClusterId
@@ -83,7 +94,7 @@ function FirstValue {
 
     foreach ($v in @($Values)) {
         foreach ($vv in @($v)) {
-            if ($null -ne $vv -and "$vv".Trim() -ne "") { return $vv }
+            if ($null -ne $vv -and "$vv".Trim() -ne "") { return "$vv" }
         }
     }
 
@@ -101,9 +112,7 @@ function Get-PropValue {
 
     foreach ($name in @($Names)) {
         foreach ($prop in @($Object.PSObject.Properties)) {
-            if ($prop.Name -ieq $name) {
-                return $prop.Value
-            }
+            if ($prop.Name -ieq $name) { return $prop.Value }
         }
     }
 
@@ -155,7 +164,6 @@ function Test-LooksLikeId {
     if ([string]::IsNullOrWhiteSpace($Value)) { return $false }
 
     $v = $Value.Trim()
-
     if ($v -match '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$') { return $true }
     if ($v -match '^[a-fA-F0-9]{24,}$') { return $true }
     if ($v -match '^[0-9]+:[0-9]+:[0-9]+$') { return $true }
@@ -176,9 +184,10 @@ function Get-PhysicalPGs {
         }
 
         $json = Get-Json -Uri $uri -Headers $Headers
+        $groups = Get-PropValue -Object $json -Names @("protectionGroups")
 
-        if ($json.protectionGroups) {
-            $all += @($json.protectionGroups | Where-Object { $_ })
+        if ($groups) {
+            $all += @(As-Array $groups | Where-Object { $_ })
         }
 
         $cookie = FirstValue @((Get-PropValue -Object $json -Names @("paginationCookie")))
@@ -205,22 +214,17 @@ function Get-PolicyMap {
         try {
             $json = Get-Json -Uri $uri -Headers $Headers
             $policies = @()
+            $policyArray = Get-PropValue -Object $json -Names @("policies", "policyList", "items")
 
-            if ($json.policies) { $policies = @($json.policies) }
-            elseif ($json.policyList) { $policies = @($json.policyList) }
-            elseif ($json.items) { $policies = @($json.items) }
+            if ($policyArray) { $policies = @(As-Array $policyArray) }
             elseif ($json -is [array]) { $policies = @($json) }
             elseif ($json) { $policies = @($json) }
 
             foreach ($p in @($policies | Where-Object { $_ })) {
                 if ($p -is [string]) { continue }
 
-                $id = FirstValue @(
-                    (Get-PropValue -Object $p -Names @("id", "policyId"))
-                )
-                $name = FirstValue @(
-                    (Get-PropValue -Object $p -Names @("name", "policyName", "displayName"))
-                )
+                $id = FirstValue @((Get-PropValue -Object $p -Names @("id", "policyId")))
+                $name = FirstValue @((Get-PropValue -Object $p -Names @("name", "policyName", "displayName")))
 
                 if (-not [string]::IsNullOrWhiteSpace($id) -and -not [string]::IsNullOrWhiteSpace($name)) {
                     $map[$id] = $name
@@ -261,13 +265,8 @@ function Resolve-PolicyName {
     }
 
     if (-not [string]::IsNullOrWhiteSpace($policyName)) {
-        if (-not (Test-LooksLikeId -Value $policyName)) {
-            return $policyName
-        }
-
-        if ($PolicyMap.ContainsKey($policyName)) {
-            return $PolicyMap[$policyName]
-        }
+        if (-not (Test-LooksLikeId -Value $policyName)) { return $policyName }
+        if ($PolicyMap.ContainsKey($policyName)) { return $PolicyMap[$policyName] }
     }
 
     return "UNRESOLVED_POLICY_NAME"
@@ -277,7 +276,7 @@ function Resolve-PolicyName {
 # Cluster menu
 # -------------------------------
 $cluJson = Get-Json -Uri "$baseUrl/v2/mcm/cluster-mgmt/info" -Headers (New-Headers)
-$json_clu = @($cluJson.cohesityClusters)
+$json_clu = @(As-Array (Get-PropValue -Object $cluJson -Names @("cohesityClusters")))
 
 if (-not $json_clu -or $json_clu.Count -eq 0) {
     throw "No clusters returned from Helios."
@@ -356,62 +355,69 @@ foreach ($c in $selectedClusters) {
     $pgs = Get-PhysicalPGs -Headers $headers
 
     foreach ($pg in @($pgs | Where-Object { $_ })) {
-        $physical = $pg.physicalParams
+        $physical = Get-PropValue -Object $pg -Names @("physicalParams")
         if ($null -eq $physical) { continue }
 
+        $pgName = FirstValue @((Get-PropValue -Object $pg -Names @("name", "protectionGroupName")))
         $pgIndex++
-        $pgKey = Get-PGKey -Cluster $clusterName -PGName $pg.name
-        $protectionType = FirstValue @($physical.protectionType)
+        $pgKey = Get-PGKey -Cluster $clusterName -PGName $pgName
+        $protectionType = FirstValue @((Get-PropValue -Object $physical -Names @("protectionType")))
 
-        $fileParams = $physical.fileProtectionTypeParams
-        $volumeParams = $physical.volumeProtectionTypeParams
+        $fileParams = Get-PropValue -Object $physical -Names @("fileProtectionTypeParams")
+        $volumeParams = Get-PropValue -Object $physical -Names @("volumeProtectionTypeParams")
 
         if ($protectionType -eq "kVolume") {
-            $objects = @(As-Array $volumeParams.objects | Where-Object { $_ })
+            $objects = @(As-Array (Get-PropValue -Object $volumeParams -Names @("objects")) | Where-Object { $_ })
             $globalExcludePaths = ""
-            $jobExcludedVssWriters = Flat $volumeParams.excludedVssWriters
+            $jobExcludedVssWriters = Flat (Get-PropValue -Object $volumeParams -Names @("excludedVssWriters"))
         }
         else {
-            $objects = @(As-Array $fileParams.objects | Where-Object { $_ })
-            $globalExcludePaths = Flat $fileParams.globalExcludePaths
-            $jobExcludedVssWriters = Flat $fileParams.excludedVssWriters
+            $objects = @(As-Array (Get-PropValue -Object $fileParams -Names @("objects")) | Where-Object { $_ })
+            $globalExcludePaths = Flat (Get-PropValue -Object $fileParams -Names @("globalExcludePaths"))
+            $jobExcludedVssWriters = Flat (Get-PropValue -Object $fileParams -Names @("excludedVssWriters"))
         }
 
-        $lastRun = $pg.lastRun
-        $localInfo = $lastRun.localBackupInfo
-        if ($null -eq $localInfo) { $localInfo = $lastRun.localSnapshotInfo }
+        $lastRun = Get-PropValue -Object $pg -Names @("lastRun")
+        $localInfo = Get-PropValue -Object $lastRun -Names @("localBackupInfo", "localSnapshotInfo")
 
         $summaryRows += [PSCustomObject]@{
             PGKey                 = $pgKey
             PGIndex               = $pgIndex
             Cluster               = $clusterName
-            PGName                = $pg.name
+            PGName                = $pgName
             PolicyName            = Resolve-PolicyName -ProtectionGroup $pg -PolicyMap $policyMap
             ProtectionType        = $protectionType
             PGObjectCount         = @($objects).Count
             GlobalExcludePaths    = $globalExcludePaths
             JobExcludedVssWriters = $jobExcludedVssWriters
-            IsActive              = $pg.isActive
-            IsPaused              = $pg.isPaused
-            LastRunStatus         = FirstValue @($localInfo.status, $lastRun.status)
-            LastRunStartET        = UsecsToET (FirstValue @($localInfo.startTimeUsecs, $lastRun.startTimeUsecs))
-            LastRunEndET          = UsecsToET (FirstValue @($localInfo.endTimeUsecs, $lastRun.endTimeUsecs))
+            IsActive              = Get-PropValue -Object $pg -Names @("isActive")
+            IsPaused              = Get-PropValue -Object $pg -Names @("isPaused")
+            LastRunStatus         = FirstValue @((Get-PropValue -Object $localInfo -Names @("status")), (Get-PropValue -Object $lastRun -Names @("status")))
+            LastRunStartET        = UsecsToET (FirstValue @((Get-PropValue -Object $localInfo -Names @("startTimeUsecs")), (Get-PropValue -Object $lastRun -Names @("startTimeUsecs"))))
+            LastRunEndET          = UsecsToET (FirstValue @((Get-PropValue -Object $localInfo -Names @("endTimeUsecs")), (Get-PropValue -Object $lastRun -Names @("endTimeUsecs"))))
         }
 
         foreach ($obj in $objects) {
-            $objectName = FirstValue @($obj.name, $obj.sourceName, $obj.hostName, $obj.displayName, $obj.id)
-            $objectExcludedVssWriters = Flat $obj.excludedVssWriters
-            $filePaths = @(As-Array $obj.filePaths | Where-Object { $_ })
+            $objectName = FirstValue @(
+                (Get-PropValue -Object $obj -Names @("name")),
+                (Get-PropValue -Object $obj -Names @("sourceName")),
+                (Get-PropValue -Object $obj -Names @("hostName")),
+                (Get-PropValue -Object $obj -Names @("displayName")),
+                (Get-PropValue -Object $obj -Names @("id"))
+            )
+            $objectExcludedVssWriters = Flat (Get-PropValue -Object $obj -Names @("excludedVssWriters"))
+            $filePaths = @(As-Array (Get-PropValue -Object $obj -Names @("filePaths")) | Where-Object { $_ })
 
             if ($protectionType -eq "kVolume") {
+                $volumeGuids = Flat (Get-PropValue -Object $obj -Names @("volumeGuids"))
                 $detailRows += [PSCustomObject]@{
                     PGKey                          = $pgKey
                     Cluster                        = $clusterName
-                    PGName                         = $pg.name
+                    PGName                         = $pgName
                     ObjectName                     = $objectName
-                    ObjectIncludedPaths            = Flat $obj.volumeGuids
+                    ObjectIncludedPaths            = $volumeGuids
                     ObjectExcludedPathsAll         = ""
-                    IncludedPath                   = Flat $obj.volumeGuids
+                    IncludedPath                   = $volumeGuids
                     ExcludedPathsUnderIncludedPath = ""
                     SkipNestedVolumes              = ""
                     GlobalExcludePaths             = $globalExcludePaths
@@ -421,16 +427,16 @@ foreach ($c in $selectedClusters) {
                 continue
             }
 
-            $objectIncludedPaths = Flat @($filePaths | ForEach-Object { $_.includedPath })
+            $objectIncludedPaths = Flat @($filePaths | ForEach-Object { Get-PropValue -Object $_ -Names @("includedPath") })
             $allExcludedPaths = @()
-            foreach ($fp in $filePaths) { $allExcludedPaths += @(As-Array $fp.excludedPaths) }
+            foreach ($fp in $filePaths) { $allExcludedPaths += @(As-Array (Get-PropValue -Object $fp -Names @("excludedPaths"))) }
             $objectExcludedPathsAll = Flat $allExcludedPaths
 
             if ($filePaths.Count -eq 0) {
                 $detailRows += [PSCustomObject]@{
                     PGKey                          = $pgKey
                     Cluster                        = $clusterName
-                    PGName                         = $pg.name
+                    PGName                         = $pgName
                     ObjectName                     = $objectName
                     ObjectIncludedPaths            = ""
                     ObjectExcludedPathsAll         = ""
@@ -447,13 +453,13 @@ foreach ($c in $selectedClusters) {
                     $detailRows += [PSCustomObject]@{
                         PGKey                          = $pgKey
                         Cluster                        = $clusterName
-                        PGName                         = $pg.name
+                        PGName                         = $pgName
                         ObjectName                     = $objectName
                         ObjectIncludedPaths            = $objectIncludedPaths
                         ObjectExcludedPathsAll         = $objectExcludedPathsAll
-                        IncludedPath                   = $fp.includedPath
-                        ExcludedPathsUnderIncludedPath = Flat $fp.excludedPaths
-                        SkipNestedVolumes              = $fp.skipNestedVolumes
+                        IncludedPath                   = Get-PropValue -Object $fp -Names @("includedPath")
+                        ExcludedPathsUnderIncludedPath = Flat (Get-PropValue -Object $fp -Names @("excludedPaths"))
+                        SkipNestedVolumes              = Get-PropValue -Object $fp -Names @("skipNestedVolumes")
                         GlobalExcludePaths             = $globalExcludePaths
                         ObjectExcludedVssWriters       = $objectExcludedVssWriters
                         JobExcludedVssWriters          = $jobExcludedVssWriters
