@@ -48,6 +48,32 @@ The script prints this on screen as:
 Runs/PG   : 30
 ```
 
+## CSV Output Behavior
+
+The script now always creates a CSV unless `-NoCsv` is used.
+
+If failure rows exist, the CSV contains the failure rows.
+
+If zero failure rows are found, the script still creates a header-only CSV. This gives evidence that the report ran and found no current rows.
+
+CSV output location:
+
+```text
+X:\PowerShell\Data\Cohesity\BackupFailures
+```
+
+CSV name format:
+
+```text
+BackupFailures_<ClusterOrALL>_<WindowKey>_<Timestamp>.csv
+```
+
+The screen must show:
+
+```text
+CSV saved: <path>
+```
+
 ## Current Validation Step
 
 Because output is now being generated, the next step is to validate row correctness against Cohesity UI for one known failing cluster.
@@ -127,18 +153,6 @@ GET https://helios.cohesity.com/v2/data-protect/protection-groups/{id}/runs?numR
 
 No Cohesity POST, PUT, PATCH, or DELETE calls are used.
 
-## CSV Output Location
-
-```text
-X:\PowerShell\Data\Cohesity\BackupFailures
-```
-
-CSV name format:
-
-```text
-BackupFailures_<ClusterOrALL>_<WindowKey>_<Timestamp>.csv
-```
-
 ## What To Tell Back Here
 
 No full output paste is needed.
@@ -146,7 +160,8 @@ No full output paste is needed.
 Type only this manually after validating a few rows:
 
 ```text
-CSV created: yes/no
+CSV saved line shown: yes/no
+CSV file present in folder: yes/no
 Checked rows: number
 PG/object names match UI: yes/no
 EndTimeET window correct: yes/no
