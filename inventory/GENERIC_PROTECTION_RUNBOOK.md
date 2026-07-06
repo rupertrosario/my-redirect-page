@@ -1,13 +1,25 @@
 # Generic Cohesity Protection Inventory Runbook
 
-Current focus: output structure.
+Current focus: Power BI slicer-ready output.
 
 Current script: inventory/Get-CohesityProtectionInventory.ps1
 
-Main report table uses shared fields only.
+Main report table uses shared PG fields only.
 
-Required fields: cluster, environment, protection group, policy, status, object count, and latest backup time.
+Power BI slicers needed:
 
-Platform settings stay in separate output files.
+- Cluster
+- Environment
+- Policy
+- Active or paused state
+
+Main fields needed:
+
+- Protection group
+- Object count
+- Backup status
+- Latest backup time
+
+Platform-specific settings stay in separate output files.
 
 Wait for output structure review before next report work.
