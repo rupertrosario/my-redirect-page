@@ -1,42 +1,38 @@
 # One Cluster Validation
 
-## Important spelling
+## Local folder rule
 
-Use exactly:
+The runner and main script must be in the same local folder.
+
+Create/use this local folder:
 
 ```text
--ResetBaseline
+X:\PowerShell\Cohesity_API_Scripts\backup_failures
 ```
 
-Do not type:
+Put these two files there:
 
 ```text
--ResetBasline
+Get-CohesityBackupFailureIncidentEvidence.ps1
+Run-IncidentEvidence-OneCluster.ps1
 ```
 
 ## Run one cluster
 
 ```powershell
-cd .\backup_failures
+cd X:\PowerShell\Cohesity_API_Scripts\backup_failures
 .\Run-IncidentEvidence-OneCluster.ps1 -ClusterName "YOUR_CLUSTER_NAME" -ResetBaseline
 ```
 
 ## Run one cluster with incident number
 
 ```powershell
-cd .\backup_failures
+cd X:\PowerShell\Cohesity_API_Scripts\backup_failures
 .\Run-IncidentEvidence-OneCluster.ps1 -ClusterName "YOUR_CLUSTER_NAME" -IncidentNumber "INC1234567" -ResetBaseline
 ```
 
-## If you see Missing API key helper
+## ResetBaseline spelling
 
-That means the helper file path is not being found, or the command was typed incorrectly.
+Correct: `-ResetBaseline`
 
-First run the simple command above without HelperPath.
-
-Only use HelperPath when you have the full helper file path.
-
-```powershell
-cd .\backup_failures
-.\Run-IncidentEvidence-OneCluster.ps1 -ClusterName "YOUR_CLUSTER_NAME" -IncidentNumber "INC1234567" -HelperPath "FULL_HELPER_FILE_PATH" -EncryptedFile "FULL_KEY_FILE_PATH" -ResetBaseline
-```
+Wrong: `-ResetBasline`
