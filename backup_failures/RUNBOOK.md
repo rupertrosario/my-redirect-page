@@ -12,7 +12,7 @@ It will be overwritten whenever run/test instructions change, so there is only o
 backup_failures/Test-CohesityHeliosConnection.ps1
 ```
 
-The current test is a full object-level latest-uncleared failure check for one selected cluster.
+The current test is a full object-level latest-uncleared failure check for one selected cluster, with fallback rows and counters for missed failed-run cases.
 
 ## Local Copy Target
 
@@ -55,9 +55,9 @@ Do not choose `[0] All clusters` yet. Use `[0] All clusters` only after one-clus
 10. Tracks object success rows as clear events.
 11. Captures only the latest object failure where a newer object success has not cleared it.
 12. Handles SQL/Oracle database object failures and host-level discovery failures separately.
-13. Adds run-level failure rows only when no object details are returned.
+13. Adds run-level fallback rows when a run is Failed but no object failure could be captured.
 14. Filters final rows to the current 18:00 ET compute window.
-15. Prints a summary and preview.
+15. Prints a summary, counters, and preview.
 16. Saves one CSV unless `-NoCsv` is used.
 
 ## Logic Definition
@@ -77,6 +77,14 @@ Object key priority:
 ```text
 object.id
 fallback: environment|objectType|name|sourceId
+```
+
+Fallback rule:
+
+```text
+If the run is Failed but object failedAttempts[] are not present/captured,
+write one RunLevelFailedNoObjectFailureCaptured row for that run type,
+unless a newer successful run type already cleared it.
 ```
 
 ## GET Endpoints Used
@@ -111,10 +119,14 @@ Just check these items on screen:
 1. Did the cluster menu appear?
 2. Did your selected cluster start processing?
 3. Did it show ProtectionGroupsChecked in the final Summary table?
-4. Did it show LatestUnclearedRows in the final Summary table?
-5. Did it show Latest uncleared failure rows in window: <number>?
-6. Did it print CSV saved: <path>?
-7. Was there any red error?
+4. What is FailedRunsSeen?
+5. What is FailedRunsInWindow?
+6. What is ObjectsWithFailedAttempt?
+7. What is ObjectRowsCaptured?
+8. What is RunFallbackRowsCaptured?
+9. What is LatestUnclearedRows?
+10. Did it print CSV saved: <path>?
+11. Was there any red error?
 ```
 
 ## What To Tell Back Here
@@ -125,8 +137,12 @@ Type only this manually:
 Menu: yes/no
 Selected cluster processed: yes/no
 PG count shown: yes/no
-LatestUnclearedRows shown: yes/no
-Failure rows count: number or not shown
+FailedRunsSeen: number
+FailedRunsInWindow: number
+ObjectsWithFailedAttempt: number
+ObjectRowsCaptured: number
+RunFallbackRowsCaptured: number
+LatestUnclearedRows: number
 CSV saved: yes/no
 Error: exact short error if any
 ```
