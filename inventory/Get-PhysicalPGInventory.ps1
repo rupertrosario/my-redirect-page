@@ -139,6 +139,68 @@ function Get-PhysicalPGs {
     return @($all)
 }
 
+function Get-PolicyMap {
+    param([hashtable]$Headers)
+
+    $map = @{}
+    $uris = @(
+        "$baseUrl/v2/data-protect/policies?isDeleted=false&maxResultCount=1000",
+        "$baseUrl/v2/data-protect/policies?maxResultCount=1000",
+        "$baseUrl/v2/data-protect/policies"
+    )
+
+    foreach ($uri in $uris) {
+        try {
+            $json = Get-Json -Uri $uri -Headers $Headers
+            $policies = @()
+            if ($json.policies) { $policies = @($json.policies) }
+            elseif ($json -is [array]) { $policies = @($json) }
+            elseif ($json) { $policies = @($json) }
+
+            foreach ($p in @($policies | Where-Object { $_ })) {
+                $id = FirstValue @($p.id, $p.policyId)
+                $name = FirstValue @($p.name, $p.policyName)
+                if (-not [string]::IsNullOrWhiteSpace($id) -and -not [string]::IsNullOrWhiteSpace($name)) {
+                    $map[$id] = $name
+                }
+            }
+
+            if ($map.Count -gt 0) { break }
+        }
+        catch {
+            # Policy resolution is best-effort. Inventory collection should continue.
+        }
+    }
+
+    return $map
+}
+
+function Resolve-PolicyName {
+    param(
+        $ProtectionGroup,
+        [hashtable]$PolicyMap
+    )
+
+    $policyId = FirstValue @(
+        $ProtectionGroup.policyId,
+        $ProtectionGroup.policyInfo.id,
+        $ProtectionGroup.policy.id,
+        $ProtectionGroup.policyName
+    )
+
+    if (-not [string]::IsNullOrWhiteSpace($policyId) -and $PolicyMap.ContainsKey($policyId)) {
+        return $PolicyMap[$policyId]
+    }
+
+    return FirstValue @(
+        $ProtectionGroup.policyInfo.name,
+        $ProtectionGroup.policy.name,
+        $ProtectionGroup.policyConfig.name,
+        $ProtectionGroup.policyName,
+        $ProtectionGroup.policyId
+    )
+}
+
 # -------------------------------
 # Cluster menu
 # -------------------------------
@@ -208,6 +270,7 @@ $pgIndex = 0
 foreach ($c in $selectedClusters) {
     $clusterName = $c.ClusterName
     $headers = New-Headers -ClusterId $c.ClusterId
+    $policyMap = Get-PolicyMap -Headers $headers
 
     Write-Host "Collecting active Physical PGs from $clusterName ..." -ForegroundColor Yellow
 
@@ -220,6 +283,8 @@ foreach ($c in $selectedClusters) {
         $pgIndex++
         $pgKey = Get-PGKey -Cluster $clusterName -PGName $pg.name
         $protectionType = FirstValue @($physical.protectionType)
+        $policyId = FirstValue @($pg.policyId, $pg.policyInfo.id, $pg.policy.id, $pg.policyName)
+        $policyName = Resolve-PolicyName -ProtectionGroup $pg -PolicyMap $policyMap
 
         $fileParams = $physical.fileProtectionTypeParams
         $volumeParams = $physical.volumeProtectionTypeParams
@@ -244,7 +309,8 @@ foreach ($c in $selectedClusters) {
             PGIndex               = $pgIndex
             Cluster               = $clusterName
             PGName                = $pg.name
-            PolicyName            = FirstValue @($pg.policyName, $pg.policyId)
+            PolicyName            = $policyName
+            PolicyId              = $policyId
             ProtectionType        = $protectionType
             PGObjectCount         = @($objects).Count
             GlobalExcludePaths    = $globalExcludePaths
