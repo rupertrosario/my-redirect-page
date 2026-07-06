@@ -37,7 +37,7 @@ backup_failures/window_consolidator/RUNBOOK_Test_Instructions.md
 For the exact copy/paste run steps, open:
 
 ```text
-backup_failures/window_consolidator/RUNBOOK_Test_Instructions.md
+https://github.com/rupertrosario/my-redirect-page/blob/Cohesity_Automations/backup_failures/window_consolidator/RUNBOOK_Test_Instructions.md
 ```
 
 ## Default behavior
