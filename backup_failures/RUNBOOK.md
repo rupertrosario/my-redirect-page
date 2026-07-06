@@ -12,7 +12,7 @@ It will be overwritten whenever run/test instructions change, so there is only o
 backup_failures/Test-CohesityHeliosConnection.ps1
 ```
 
-The current test is a full object-level latest-uncleared failure check for one selected cluster, with fallback rows and counters for missed failed-run cases.
+The current test is now an output validation test for one selected cluster.
 
 ## Local Copy Target
 
@@ -32,11 +32,11 @@ X:\PowerShell\Cohesity_API_Scripts\Test-CohesityHeliosConnection.ps1
 
 When the cluster menu appears, choose one cluster number.
 
-Do not choose `[0] All clusters` yet. Use `[0] All clusters` only after one-cluster testing is correct.
+Do not choose `[0] All clusters` yet. Use `[0] All clusters` only after one-cluster output validation is correct.
 
 ## Run Lookup Count
 
-The standard lookup is now:
+The standard lookup is:
 
 ```text
 30 runs per protection group
@@ -48,7 +48,21 @@ The script prints this on screen as:
 Runs/PG   : 30
 ```
 
-There should be no separate 10-run test command now.
+## Current Validation Step
+
+Because output is now being generated, the next step is to validate row correctness against Cohesity UI for one known failing cluster.
+
+Check 3 to 5 rows from the CSV/output against Cohesity UI:
+
+```text
+1. Cluster name matches.
+2. Protection group name matches.
+3. Object/database/VM/host name matches the failed object in Cohesity.
+4. EndTimeET is within the current 18:00 ET compute window.
+5. FailedMessage is useful and not blank.
+6. A newer success for the same object is not being reported as a failure.
+7. RunLevelFailedNoObjectFailureCaptured rows are acceptable only when Cohesity does not expose object failedAttempts[].
+```
 
 ## What The Script Does
 
@@ -125,43 +139,21 @@ CSV name format:
 BackupFailures_<ClusterOrALL>_<WindowKey>_<Timestamp>.csv
 ```
 
-## What To Check On Client Network
-
-You do not need to paste a full summary.
-
-Just check these items on screen:
-
-```text
-1. Did the cluster menu appear?
-2. Does it show Runs/PG   : 30?
-3. Did your selected cluster start processing?
-4. Did it show ProtectionGroupsChecked in the final Summary table?
-5. What is FailedRunsSeen?
-6. What is FailedRunsInWindow?
-7. What is ObjectsWithFailedAttempt?
-8. What is ObjectRowsCaptured?
-9. What is RunFallbackRowsCaptured?
-10. What is LatestUnclearedRows?
-11. Did it print CSV saved: <path>?
-12. Was there any red error?
-```
-
 ## What To Tell Back Here
 
-Type only this manually:
+No full output paste is needed.
+
+Type only this manually after validating a few rows:
 
 ```text
-Menu: yes/no
-Runs/PG shows 30: yes/no
-Selected cluster processed: yes/no
-PG count shown: yes/no
-FailedRunsSeen: number
-FailedRunsInWindow: number
-ObjectsWithFailedAttempt: number
-ObjectRowsCaptured: number
-RunFallbackRowsCaptured: number
-LatestUnclearedRows: number
-CSV saved: yes/no
+CSV created: yes/no
+Checked rows: number
+PG/object names match UI: yes/no
+EndTimeET window correct: yes/no
+Messages useful: yes/no
+Any false positives: yes/no
+Any missed known failure: yes/no
+Run-level fallback rows acceptable: yes/no/not present
 Error: exact short error if any
 ```
 
