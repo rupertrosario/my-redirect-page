@@ -269,10 +269,6 @@ function Resolve-PolicyName {
         }
     }
 
-    if (-not [string]::IsNullOrWhiteSpace($policyId) -and $PolicyMap.ContainsKey($policyId)) {
-        return $PolicyMap[$policyId]
-    }
-
     return "UNRESOLVED_POLICY_NAME"
 }
 
@@ -287,8 +283,15 @@ if (-not $json_clu -or $json_clu.Count -eq 0) {
 }
 
 $clusters = $json_clu | ForEach-Object {
-    $name = FirstValue @($_.name, $_.clusterName, $_.displayName)
-    $cid  = FirstValue @($_.clusterId, $_.id)
+    $name = FirstValue @(
+        (Get-PropValue -Object $_ -Names @("clusterName")),
+        (Get-PropValue -Object $_ -Names @("displayName")),
+        (Get-PropValue -Object $_ -Names @("name"))
+    )
+    $cid  = FirstValue @(
+        (Get-PropValue -Object $_ -Names @("clusterId")),
+        (Get-PropValue -Object $_ -Names @("id"))
+    )
 
     if ([string]::IsNullOrWhiteSpace($name)) { $name = "Unknown-$cid" }
 
