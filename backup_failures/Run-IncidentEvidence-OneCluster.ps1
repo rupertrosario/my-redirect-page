@@ -1,7 +1,6 @@
 <#
 Temporary one-cluster validation runner for Get-CohesityBackupFailureIncidentEvidence.ps1.
-This does not change the source script. It creates a temporary filtered copy and runs only the requested cluster.
-Use this only to validate baseline runtime and output.
+This creates a temporary filtered copy and runs only the requested cluster.
 #>
 [CmdletBinding()]
 param(
@@ -9,7 +8,8 @@ param(
     [switch]$ResetBaseline,
     [string]$IncidentNumber = "",
     [string]$HelperPath = "",
-    [string]$EncryptedFile = ""
+    [string]$EncryptedFile = "",
+    [string]$ApiKeyFile = "X:\PowerShell\Cohesity_API_Scripts\DO_NOT_Delete\apikey.txt"
 )
 
 $ErrorActionPreference = "Stop"
@@ -21,6 +21,30 @@ $Text = Get-Content $SourceScript -Raw
 
 if ($Text -notmatch '\[string\]\$ClusterName') {
     $Text = $Text -replace '\[string\]\$IncidentNumber = "",\s*\r?\n\s*\[switch\]\$ResetBaseline', "[string]`$IncidentNumber = `"`",`r`n    [string]`$ClusterName = `"`",`r`n    [switch]`$ResetBaseline"
+}
+
+$AuthOld = @'
+if (!(Test-Path $HelperPath)) { throw "Missing API key helper: $HelperPath" }
+if (!(Test-Path $EncryptedFile)) { throw "Missing encrypted key file: $EncryptedFile" }
+. $HelperPath
+$ApiKey = Get-CohesityApiKeyFromAes -EncryptedFile $EncryptedFile
+if (!$ApiKey) { throw "API key is blank" }
+'@
+
+$AuthNew = @'
+$ApiKey = $null
+if ($HelperPath -and $EncryptedFile -and (Test-Path $HelperPath) -and (Test-Path $EncryptedFile)) {
+    . $HelperPath
+    $ApiKey = Get-CohesityApiKeyFromAes -EncryptedFile $EncryptedFile
+}
+if (!$ApiKey -and (Test-Path "X:\PowerShell\Cohesity_API_Scripts\DO_NOT_Delete\apikey.txt")) {
+    $ApiKey = (Get-Content "X:\PowerShell\Cohesity_API_Scripts\DO_NOT_Delete\apikey.txt" -Raw).Trim()
+}
+if (!$ApiKey) { throw "API key not found. Checked AES helper/encrypted file and X:\PowerShell\Cohesity_API_Scripts\DO_NOT_Delete\apikey.txt" }
+'@
+
+if ($Text -like "*$AuthOld*") {
+    $Text = $Text.Replace($AuthOld, $AuthNew)
 }
 
 $Needle = '$Clusters = @($ClusterJson.cohesityClusters)'
