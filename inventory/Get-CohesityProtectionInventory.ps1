@@ -1,6 +1,8 @@
 # Cohesity Helios - Protection Inventory Framework
 # STRICTLY READ-ONLY / GET-only
 # Baseline environments: Physical, Hyper-V, Nutanix AHV
+# PowerShell 5.1 compatible
+#
 # Output:
 #   X:\PowerShell\Cohesity_API_Scripts\inventory\Cohesity_Protection_PG_Summary_Latest.csv
 #   X:\PowerShell\Cohesity_API_Scripts\inventory\Cohesity_Protection_Object_Detail_Latest.csv
@@ -16,19 +18,22 @@ $outDir     = "X:\PowerShell\Cohesity_API_Scripts\inventory"
 $apikeypath = "X:\PowerShell\Cohesity_API_Scripts\DO_NOT_Delete\apikey.txt"
 $baseUrl    = "https://helios.cohesity.com"
 
-$InventoryDateET = $null
-try {
-    $tz = [TimeZoneInfo]::FindSystemTimeZoneById("Eastern Standard Time")
-    $InventoryDateET = ([TimeZoneInfo]::ConvertTimeFromUtc((Get-Date).ToUniversalTime(), $tz)).ToString("yyyy-MM-dd HH:mm:ss")
-}
-catch {
-    $InventoryDateET = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
-}
-
 $EnvironmentMap = @(
-    [PSCustomObject]@{ ApiName = "kPhysical";  DisplayName = "Physical";    ParamName = "physicalParams"  },
-    [PSCustomObject]@{ ApiName = "kHyperV";    DisplayName = "Hyper-V";     ParamName = "hypervParams"    },
-    [PSCustomObject]@{ ApiName = "kAcropolis"; DisplayName = "Nutanix AHV"; ParamName = "acropolisParams" }
+    [PSCustomObject]@{
+        ApiName     = "kPhysical"
+        DisplayName = "Physical"
+        ParamNames  = @("physicalParams")
+    },
+    [PSCustomObject]@{
+        ApiName     = "kHyperV"
+        DisplayName = "Hyper-V"
+        ParamNames  = @("hypervParams", "hyperVParams")
+    },
+    [PSCustomObject]@{
+        ApiName     = "kAcropolis"
+        DisplayName = "Nutanix AHV"
+        ParamNames  = @("acropolisParams", "nutanixParams", "ahvParams")
+    }
 )
 
 if (-not (Test-Path -Path $outDir -PathType Container)) {
@@ -40,6 +45,18 @@ if (-not (Test-Path $apikeypath)) {
 }
 
 $apiKey = (Get-Content -Path $apikeypath -Raw).Trim()
+
+function Get-InventoryDateET {
+    try {
+        $tz = [TimeZoneInfo]::FindSystemTimeZoneById("Eastern Standard Time")
+        return ([TimeZoneInfo]::ConvertTimeFromUtc((Get-Date).ToUniversalTime(), $tz)).ToString("yyyy-MM-dd HH:mm:ss")
+    }
+    catch {
+        return (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
+    }
+}
+
+$InventoryDateET = Get-InventoryDateET
 
 function New-Headers {
     param([string]$ClusterId)
@@ -67,14 +84,54 @@ function Get-Json {
         $resp = Invoke-WebRequest -Uri $Uri -Headers $Headers -Method Get
     }
 
-    if (-not $resp -or [string]::IsNullOrWhiteSpace($resp.Content)) { return $null }
+    if (-not $resp -or [string]::IsNullOrWhiteSpace($resp.Content)) {
+        return $null
+    }
+
     return ($resp.Content | ConvertFrom-Json)
 }
 
 function As-Array {
     param($Value)
+
     if ($null -eq $Value) { return @() }
     return @($Value)
+}
+
+function Get-PropValue {
+    param(
+        $Object,
+        [string[]]$Names
+    )
+
+    if ($null -eq $Object) { return $null }
+
+    foreach ($name in $Names) {
+        foreach ($prop in @($Object.PSObject.Properties)) {
+            if ($prop.Name -ieq $name) {
+                return $prop.Value
+            }
+        }
+    }
+
+    return $null
+}
+
+function Get-NestedPropValue {
+    param(
+        $Object,
+        [string]$Path
+    )
+
+    if ($null -eq $Object -or [string]::IsNullOrWhiteSpace($Path)) { return $null }
+
+    $current = $Object
+    foreach ($part in ($Path -split "\.")) {
+        if ($null -eq $current) { return $null }
+        $current = Get-PropValue -Object $current -Names @($part)
+    }
+
+    return $current
 }
 
 function FirstValue {
@@ -82,7 +139,9 @@ function FirstValue {
 
     foreach ($v in @($Values)) {
         foreach ($vv in @($v)) {
-            if ($null -ne $vv -and "$vv".Trim() -ne "") { return $vv }
+            if ($null -ne $vv -and "$vv".Trim() -ne "") {
+                return "$vv"
+            }
         }
     }
 
@@ -97,7 +156,9 @@ function Flat {
     $items = @()
     foreach ($v in @($Value)) {
         foreach ($vv in @($v)) {
-            if ($null -ne $vv -and "$vv".Trim() -ne "") { $items += "$vv" }
+            if ($null -ne $vv -and "$vv".Trim() -ne "") {
+                $items += "$vv"
+            }
         }
     }
 
@@ -110,6 +171,7 @@ function Count-FlatItems {
 
     $flatValue = Flat $Value
     if ([string]::IsNullOrWhiteSpace($flatValue)) { return 0 }
+
     return @($flatValue -split ";" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }).Count
 }
 
@@ -124,7 +186,9 @@ function UsecsToET {
         $tz = [TimeZoneInfo]::FindSystemTimeZoneById("Eastern Standard Time")
         return ([TimeZoneInfo]::ConvertTimeFromUtc($dtUtc, $tz)).ToString("yyyy-MM-dd HH:mm:ss")
     }
-    catch { return "" }
+    catch {
+        return ""
+    }
 }
 
 function Get-AgeHoursFromET {
@@ -137,7 +201,9 @@ function Get-AgeHoursFromET {
         $now = [datetime]::ParseExact($InventoryDateET, "yyyy-MM-dd HH:mm:ss", $null)
         return [math]::Round(($now - $dt).TotalHours, 2)
     }
-    catch { return "" }
+    catch {
+        return ""
+    }
 }
 
 function Is-SuccessStatus {
@@ -145,7 +211,23 @@ function Is-SuccessStatus {
 
     if ([string]::IsNullOrWhiteSpace($Status)) { return $false }
     $s = $Status.Trim().ToLower()
-    return @("ksuccess", "success", "succeeded") -contains $s
+    return (@("ksuccess", "success", "succeeded") -contains $s)
+}
+
+function Get-FreshnessBucket {
+    param($AgeHours)
+
+    if ($AgeHours -eq "" -or $null -eq $AgeHours) { return "No Success Found" }
+
+    try {
+        $age = [double]$AgeHours
+        if ($age -le 24) { return "<=24h" }
+        if ($age -le 48) { return "24-48h" }
+        return ">48h"
+    }
+    catch {
+        return "Unknown"
+    }
 }
 
 function Get-PGKey {
@@ -163,6 +245,102 @@ function Get-PGKey {
     return (("{0}|{1}" -f $ClusterName, $ProtectionGroupName).Trim())
 }
 
+function Get-ObjectKey {
+    param(
+        [string]$PGKey,
+        [string]$ObjectId,
+        [string]$ObjectName
+    )
+
+    if (-not [string]::IsNullOrWhiteSpace($ObjectId)) {
+        return "$PGKey|$ObjectId"
+    }
+
+    return "$PGKey|$ObjectName"
+}
+
+function Test-LooksLikeInventoryObject {
+    param($Object)
+
+    if ($null -eq $Object) { return $false }
+    if ($Object -is [string]) { return $false }
+
+    $props = @($Object.PSObject.Properties.Name)
+    $interesting = @("id", "objectId", "sourceId", "vmId", "entityId", "name", "objectName", "sourceName", "vmName", "hostName", "displayName")
+
+    foreach ($p in $props) {
+        foreach ($i in $interesting) {
+            if ($p -ieq $i) { return $true }
+        }
+    }
+
+    return $false
+}
+
+function Find-InventoryObjectsRecursive {
+    param(
+        $Node,
+        [int]$Depth
+    )
+
+    $results = @()
+    if ($null -eq $Node) { return @() }
+    if ($Depth -gt 4) { return @() }
+    if ($Node -is [string]) { return @() }
+
+    foreach ($item in @($Node)) {
+        if ($null -eq $item -or $item -is [string]) { continue }
+
+        if (Test-LooksLikeInventoryObject -Object $item) {
+            $results += $item
+        }
+
+        foreach ($prop in @($item.PSObject.Properties)) {
+            $val = $prop.Value
+            if ($null -eq $val -or $val -is [string]) { continue }
+
+            $arrayVal = @(As-Array $val | Where-Object { $_ -and ($_ -isnot [string]) })
+            if ($arrayVal.Count -gt 0) {
+                $looksUseful = $false
+                foreach ($av in $arrayVal) {
+                    if (Test-LooksLikeInventoryObject -Object $av) { $looksUseful = $true; break }
+                }
+
+                if ($looksUseful) {
+                    $results += $arrayVal
+                }
+                elseif ($Depth -lt 4) {
+                    $results += @(Find-InventoryObjectsRecursive -Node $arrayVal -Depth ($Depth + 1))
+                }
+            }
+        }
+    }
+
+    return @($results)
+}
+
+function Get-DedupedObjects {
+    param($Objects)
+
+    $seen = @{}
+    $deduped = @()
+
+    foreach ($obj in @(As-Array $Objects | Where-Object { $_ })) {
+        $id = Get-ObjectId -Object $obj
+        $name = Get-ObjectName -Object $obj
+        $key = FirstValue @($id, $name)
+
+        if ([string]::IsNullOrWhiteSpace($key)) { continue }
+
+        if (-not $seen.ContainsKey($key)) {
+            $seen[$key] = $true
+            $deduped += $obj
+        }
+    }
+
+    return @($deduped)
+}
+
 function Get-PolicyMap {
     param([hashtable]$Headers)
 
@@ -177,13 +355,20 @@ function Get-PolicyMap {
         try {
             $json = Get-Json -Uri $uri -Headers $Headers
             $policies = @()
+
             if ($json.policies) { $policies = @($json.policies) }
+            elseif ($json.policyList) { $policies = @($json.policyList) }
             elseif ($json -is [array]) { $policies = @($json) }
             elseif ($json) { $policies = @($json) }
 
             foreach ($p in @($policies | Where-Object { $_ })) {
-                $id = FirstValue @($p.id, $p.policyId)
-                $name = FirstValue @($p.name, $p.policyName)
+                $id = FirstValue @(
+                    (Get-PropValue -Object $p -Names @("id", "policyId"))
+                )
+                $name = FirstValue @(
+                    (Get-PropValue -Object $p -Names @("name", "policyName"))
+                )
+
                 if (-not [string]::IsNullOrWhiteSpace($id) -and -not [string]::IsNullOrWhiteSpace($name)) {
                     $map[$id] = $name
                 }
@@ -206,10 +391,9 @@ function Resolve-PolicyName {
     )
 
     $policyId = FirstValue @(
-        $ProtectionGroup.policyId,
-        $ProtectionGroup.policyInfo.id,
-        $ProtectionGroup.policy.id,
-        $ProtectionGroup.policyName
+        (Get-NestedPropValue -Object $ProtectionGroup -Path "policyId"),
+        (Get-NestedPropValue -Object $ProtectionGroup -Path "policyInfo.id"),
+        (Get-NestedPropValue -Object $ProtectionGroup -Path "policy.id")
     )
 
     if (-not [string]::IsNullOrWhiteSpace($policyId) -and $PolicyMap.ContainsKey($policyId)) {
@@ -217,11 +401,21 @@ function Resolve-PolicyName {
     }
 
     return FirstValue @(
-        $ProtectionGroup.policyInfo.name,
-        $ProtectionGroup.policy.name,
-        $ProtectionGroup.policyConfig.name,
-        $ProtectionGroup.policyName,
-        $ProtectionGroup.policyId
+        (Get-NestedPropValue -Object $ProtectionGroup -Path "policyInfo.name"),
+        (Get-NestedPropValue -Object $ProtectionGroup -Path "policy.name"),
+        (Get-NestedPropValue -Object $ProtectionGroup -Path "policyConfig.name"),
+        (Get-NestedPropValue -Object $ProtectionGroup -Path "policyName"),
+        $policyId
+    )
+}
+
+function Resolve-PolicyId {
+    param($ProtectionGroup)
+
+    return FirstValue @(
+        (Get-NestedPropValue -Object $ProtectionGroup -Path "policyId"),
+        (Get-NestedPropValue -Object $ProtectionGroup -Path "policyInfo.id"),
+        (Get-NestedPropValue -Object $ProtectionGroup -Path "policy.id")
     )
 }
 
@@ -247,7 +441,10 @@ function Get-ProtectionGroups {
         }
 
         $cookie = FirstValue @($json.paginationCookie)
-        if ($json.isResponseTruncated -ne $true -and [string]::IsNullOrWhiteSpace($cookie)) { break }
+
+        if ($json.isResponseTruncated -ne $true -and [string]::IsNullOrWhiteSpace($cookie)) {
+            break
+        }
     } while (-not [string]::IsNullOrWhiteSpace($cookie))
 
     return @($all)
@@ -256,11 +453,15 @@ function Get-ProtectionGroups {
 function Get-EnvironmentParams {
     param(
         $ProtectionGroup,
-        [string]$ParamName
+        [string[]]$ParamNames
     )
 
-    if ($null -eq $ProtectionGroup) { return $null }
-    return $ProtectionGroup.$ParamName
+    foreach ($name in @($ParamNames)) {
+        $value = Get-PropValue -Object $ProtectionGroup -Names @($name)
+        if ($null -ne $value) { return $value }
+    }
+
+    return $null
 }
 
 function Get-ObjectsFromParams {
@@ -272,41 +473,47 @@ function Get-ObjectsFromParams {
     if ($null -eq $Params) { return @() }
 
     if ($EnvironmentApiName -eq "kPhysical") {
-        $protectionType = FirstValue @($Params.protectionType)
+        $protectionType = FirstValue @((Get-PropValue -Object $Params -Names @("protectionType")))
         if ($protectionType -eq "kVolume") {
-            return @(As-Array $Params.volumeProtectionTypeParams.objects | Where-Object { $_ })
+            return @(As-Array (Get-NestedPropValue -Object $Params -Path "volumeProtectionTypeParams.objects") | Where-Object { $_ })
         }
-        return @(As-Array $Params.fileProtectionTypeParams.objects | Where-Object { $_ })
+
+        return @(As-Array (Get-NestedPropValue -Object $Params -Path "fileProtectionTypeParams.objects") | Where-Object { $_ })
     }
 
-    $candidateLists = @(
-        $Params.objects,
-        $Params.sourceObjects,
-        $Params.virtualMachines,
-        $Params.vms,
-        $Params.protectedObjects,
-        $Params.vmObjects
+    $directCandidates = @(
+        (Get-PropValue -Object $Params -Names @("objects")),
+        (Get-PropValue -Object $Params -Names @("sourceObjects")),
+        (Get-PropValue -Object $Params -Names @("virtualMachines")),
+        (Get-PropValue -Object $Params -Names @("vms")),
+        (Get-PropValue -Object $Params -Names @("vmObjects")),
+        (Get-PropValue -Object $Params -Names @("protectedObjects")),
+        (Get-PropValue -Object $Params -Names @("selectedObjects")),
+        (Get-PropValue -Object $Params -Names @("entities"))
     )
 
-    foreach ($candidate in $candidateLists) {
+    foreach ($candidate in $directCandidates) {
         $items = @(As-Array $candidate | Where-Object { $_ })
-        if ($items.Count -gt 0) { return $items }
+        if ($items.Count -gt 0) {
+            return @(Get-DedupedObjects -Objects $items)
+        }
     }
 
-    return @()
+    $recursive = @(Find-InventoryObjectsRecursive -Node $Params -Depth 0)
+    return @(Get-DedupedObjects -Objects $recursive)
 }
 
 function Get-ObjectName {
     param($Object)
 
     return FirstValue @(
-        $Object.name,
-        $Object.objectName,
-        $Object.sourceName,
-        $Object.vmName,
-        $Object.hostName,
-        $Object.displayName,
-        $Object.id
+        (Get-PropValue -Object $Object -Names @("name")),
+        (Get-PropValue -Object $Object -Names @("objectName")),
+        (Get-PropValue -Object $Object -Names @("sourceName")),
+        (Get-PropValue -Object $Object -Names @("vmName")),
+        (Get-PropValue -Object $Object -Names @("hostName")),
+        (Get-PropValue -Object $Object -Names @("displayName")),
+        (Get-PropValue -Object $Object -Names @("id"))
     )
 }
 
@@ -314,15 +521,71 @@ function Get-ObjectId {
     param($Object)
 
     return FirstValue @(
-        $Object.id,
-        $Object.objectId,
-        $Object.sourceId,
-        $Object.vmId
+        (Get-PropValue -Object $Object -Names @("id")),
+        (Get-PropValue -Object $Object -Names @("objectId")),
+        (Get-PropValue -Object $Object -Names @("sourceId")),
+        (Get-PropValue -Object $Object -Names @("vmId")),
+        (Get-PropValue -Object $Object -Names @("entityId"))
     )
+}
+
+function Get-RunInfo {
+    param($ProtectionGroup)
+
+    $lastRun = Get-PropValue -Object $ProtectionGroup -Names @("lastRun")
+    $localInfo = Get-PropValue -Object $lastRun -Names @("localBackupInfo", "localSnapshotInfo")
+
+    $status = FirstValue @(
+        (Get-PropValue -Object $localInfo -Names @("status")),
+        (Get-PropValue -Object $lastRun -Names @("status"))
+    )
+
+    $runType = FirstValue @(
+        (Get-PropValue -Object $localInfo -Names @("runType")),
+        (Get-PropValue -Object $lastRun -Names @("runType"))
+    )
+
+    $startUsecs = FirstValue @(
+        (Get-PropValue -Object $localInfo -Names @("startTimeUsecs")),
+        (Get-PropValue -Object $lastRun -Names @("startTimeUsecs"))
+    )
+
+    $endUsecs = FirstValue @(
+        (Get-PropValue -Object $localInfo -Names @("endTimeUsecs")),
+        (Get-PropValue -Object $lastRun -Names @("endTimeUsecs"))
+    )
+
+    $startET = UsecsToET $startUsecs
+    $endET = UsecsToET $endUsecs
+
+    $lastSuccessET = ""
+    $lastSuccessStatus = ""
+
+    if (Is-SuccessStatus $status) {
+        $lastSuccessET = $endET
+        $lastSuccessStatus = $status
+    }
+
+    $ageHours = Get-AgeHoursFromET $lastSuccessET
+
+    return [PSCustomObject]@{
+        LastRunStatus                = $status
+        LastRunType                  = $runType
+        LastRunStartET               = $startET
+        LastRunEndET                 = $endET
+        LastSuccessfulBackupET       = $lastSuccessET
+        LastSuccessfulBackupStatus   = $lastSuccessStatus
+        LastSuccessfulBackupAgeHours = $ageHours
+        BackupFreshnessBucket        = Get-FreshnessBucket $ageHours
+        IsSuccessLast24h             = (($ageHours -ne "") -and ([double]$ageHours -le 24))
+        IsSuccessLast48h             = (($ageHours -ne "") -and ([double]$ageHours -le 48))
+    }
 }
 
 function New-ExceptionRow {
     param(
+        [string]$PGKey,
+        [string]$ObjectKey,
         [string]$Cluster,
         [string]$Environment,
         [string]$ProtectionGroup,
@@ -336,6 +599,8 @@ function New-ExceptionRow {
 
     return [PSCustomObject]@{
         InventoryDateET   = $InventoryDateET
+        PGKey             = $PGKey
+        ObjectKey         = $ObjectKey
         Cluster           = $Cluster
         Environment       = $Environment
         ProtectionGroup   = $ProtectionGroup
@@ -354,18 +619,35 @@ function New-ExceptionRow {
 $cluJson = Get-Json -Uri "$baseUrl/v2/mcm/cluster-mgmt/info" -Headers (New-Headers)
 $json_clu = @($cluJson.cohesityClusters)
 
-if (-not $json_clu -or $json_clu.Count -eq 0) { throw "No clusters returned from Helios." }
+if (-not $json_clu -or $json_clu.Count -eq 0) {
+    throw "No clusters returned from Helios."
+}
 
 $clusters = $json_clu | ForEach-Object {
-    $name = FirstValue @($_.name, $_.clusterName, $_.displayName)
-    $cid  = FirstValue @($_.clusterId, $_.id)
+    $name = FirstValue @(
+        (Get-PropValue -Object $_ -Names @("name")),
+        (Get-PropValue -Object $_ -Names @("clusterName")),
+        (Get-PropValue -Object $_ -Names @("displayName"))
+    )
+    $cid = FirstValue @(
+        (Get-PropValue -Object $_ -Names @("clusterId")),
+        (Get-PropValue -Object $_ -Names @("id"))
+    )
+
     if ([string]::IsNullOrWhiteSpace($name)) { $name = "Unknown-$cid" }
 
-    [PSCustomObject]@{ ClusterName = $name; ClusterId = $cid }
+    [PSCustomObject]@{
+        ClusterName = $name
+        ClusterId   = $cid
+    }
 } | Sort-Object ClusterName
 
 $clusterMenu = for ($i = 0; $i -lt $clusters.Count; $i++) {
-    [PSCustomObject]@{ Index = $i + 1; ClusterName = $clusters[$i].ClusterName; ClusterId = $clusters[$i].ClusterId }
+    [PSCustomObject]@{
+        Index       = $i + 1
+        ClusterName = $clusters[$i].ClusterName
+        ClusterId   = $clusters[$i].ClusterId
+    }
 }
 
 Write-Host ""
@@ -377,14 +659,23 @@ Write-Host "[X] Exit" -ForegroundColor Yellow
 
 while ($true) {
     $selection = Read-Host "Select cluster: 0 for ALL, 1-$($clusterMenu.Count) for single, or X"
+
     if ($selection -match '^(x|X|q|Q)$') { return }
 
     $n = 0
-    if (-not [int]::TryParse($selection, [ref]$n)) { Write-Host "Invalid selection." -ForegroundColor Red; continue }
-    if ($n -lt 0 -or $n -gt $clusterMenu.Count) { Write-Host "Invalid selection." -ForegroundColor Red; continue }
+    if (-not [int]::TryParse($selection, [ref]$n)) {
+        Write-Host "Enter 0, 1-$($clusterMenu.Count), or X." -ForegroundColor Red
+        continue
+    }
+
+    if ($n -lt 0 -or $n -gt $clusterMenu.Count) {
+        Write-Host "Enter 0, 1-$($clusterMenu.Count), or X." -ForegroundColor Red
+        continue
+    }
 
     if ($n -eq 0) { $selectedClusters = @($clusterMenu) }
     else { $selectedClusters = @($clusterMenu | Where-Object { $_.Index -eq $n }) }
+
     break
 }
 
@@ -394,14 +685,18 @@ Write-Host "[0] Baseline: Physical + Hyper-V + Nutanix AHV" -ForegroundColor Yel
 Write-Host "[1] Physical only" -ForegroundColor Yellow
 Write-Host "[2] Hyper-V only" -ForegroundColor Yellow
 Write-Host "[3] Nutanix AHV only" -ForegroundColor Yellow
+Write-Host "[X] Exit" -ForegroundColor Yellow
 
 while ($true) {
     $envSelection = Read-Host "Select environment scope"
+
+    if ($envSelection -match '^(x|X|q|Q)$') { return }
     if ($envSelection -eq "0") { $selectedEnvironments = @($EnvironmentMap); break }
     if ($envSelection -eq "1") { $selectedEnvironments = @($EnvironmentMap | Where-Object { $_.ApiName -eq "kPhysical" }); break }
     if ($envSelection -eq "2") { $selectedEnvironments = @($EnvironmentMap | Where-Object { $_.ApiName -eq "kHyperV" }); break }
     if ($envSelection -eq "3") { $selectedEnvironments = @($EnvironmentMap | Where-Object { $_.ApiName -eq "kAcropolis" }); break }
-    Write-Host "Enter 0, 1, 2, or 3." -ForegroundColor Red
+
+    Write-Host "Enter 0, 1, 2, 3, or X." -ForegroundColor Red
 }
 
 # -------------------------------
@@ -411,6 +706,7 @@ $pgSummaryRows = @()
 $objectDetailRows = @()
 $pathDetailRows = @()
 $exceptionRows = @()
+$collectionErrors = @()
 
 foreach ($c in $selectedClusters) {
     $clusterName = $c.ClusterName
@@ -421,147 +717,78 @@ foreach ($c in $selectedClusters) {
     foreach ($env in $selectedEnvironments) {
         Write-Host "Collecting $($env.DisplayName) PGs from $clusterName ..." -ForegroundColor Yellow
 
-        $pgs = Get-ProtectionGroups -EnvironmentApiName $env.ApiName -Headers $headers
+        try {
+            $pgs = @(Get-ProtectionGroups -EnvironmentApiName $env.ApiName -Headers $headers)
+        }
+        catch {
+            $collectionErrors += [PSCustomObject]@{
+                Cluster     = $clusterName
+                Environment = $env.DisplayName
+                Stage       = "Get-ProtectionGroups"
+                Error       = $_.Exception.Message
+            }
+            Write-Host "Failed to collect $($env.DisplayName) from $clusterName : $($_.Exception.Message)" -ForegroundColor Red
+            continue
+        }
 
         foreach ($pg in @($pgs | Where-Object { $_ })) {
-            $params = Get-EnvironmentParams -ProtectionGroup $pg -ParamName $env.ParamName
-            if ($null -eq $params) { continue }
-
-            $pgId = FirstValue @($pg.id, $pg.protectionGroupId)
-            $pgName = FirstValue @($pg.name, $pg.protectionGroupName)
-            $pgKey = Get-PGKey -ClusterId $clusterId -ProtectionGroupId $pgId -ClusterName $clusterName -ProtectionGroupName $pgName
-            $policyId = FirstValue @($pg.policyId, $pg.policyInfo.id, $pg.policy.id, $pg.policyName)
-            $policyName = Resolve-PolicyName -ProtectionGroup $pg -PolicyMap $policyMap
-            $objects = @(Get-ObjectsFromParams -Params $params -EnvironmentApiName $env.ApiName)
-
-            $lastRun = $pg.lastRun
-            $localInfo = $lastRun.localBackupInfo
-            if ($null -eq $localInfo) { $localInfo = $lastRun.localSnapshotInfo }
-            $lastRunStatus = FirstValue @($localInfo.status, $lastRun.status)
-            $lastRunEndET = UsecsToET (FirstValue @($localInfo.endTimeUsecs, $lastRun.endTimeUsecs))
-            $lastRunType = FirstValue @($localInfo.runType, $lastRun.runType)
-
-            $lastSuccessET = ""
-            $lastSuccessStatus = ""
-            if (Is-SuccessStatus $lastRunStatus) {
-                $lastSuccessET = $lastRunEndET
-                $lastSuccessStatus = $lastRunStatus
-            }
-            $lastSuccessAgeHours = Get-AgeHoursFromET $lastSuccessET
-
-            $globalExcludePaths = ""
-            $globalExcludeCount = 0
-            $objectExcludePathCount = 0
-            $hasGlobalExclusions = $false
-            $hasObjectExclusions = $false
-
-            if ($env.ApiName -eq "kPhysical") {
-                $protectionType = FirstValue @($params.protectionType)
-                if ($protectionType -ne "kVolume") {
-                    $globalExcludePaths = Flat $params.fileProtectionTypeParams.globalExcludePaths
-                    $globalExcludeCount = Count-FlatItems $params.fileProtectionTypeParams.globalExcludePaths
-                    if ($globalExcludeCount -gt 0) { $hasGlobalExclusions = $true }
-
-                    foreach ($obj in $objects) {
-                        foreach ($fp in @(As-Array $obj.filePaths | Where-Object { $_ })) {
-                            $objectExcludePathCount += Count-FlatItems $fp.excludedPaths
-                        }
+            try {
+                $params = Get-EnvironmentParams -ProtectionGroup $pg -ParamNames @($env.ParamNames)
+                if ($null -eq $params) {
+                    $collectionErrors += [PSCustomObject]@{
+                        Cluster     = $clusterName
+                        Environment = $env.DisplayName
+                        Stage       = "EnvironmentParams"
+                        Error       = "No matching environment params found on protection group."
                     }
-                    if ($objectExcludePathCount -gt 0) { $hasObjectExclusions = $true }
-                }
-            }
-
-            $pgSummaryRows += [PSCustomObject]@{
-                PGKey                         = $pgKey
-                InventoryDateET               = $InventoryDateET
-                Cluster                       = $clusterName
-                ClusterId                     = $clusterId
-                Environment                   = $env.DisplayName
-                ProtectionGroup               = $pgName
-                ProtectionGroupId             = $pgId
-                PolicyName                    = $policyName
-                PolicyId                      = $policyId
-                IsActive                      = $pg.isActive
-                IsDeleted                     = $pg.isDeleted
-                ObjectCount                   = @($objects).Count
-                GlobalExcludePathCount        = $globalExcludeCount
-                ObjectExcludePathCount        = $objectExcludePathCount
-                HasGlobalExclusions           = $hasGlobalExclusions
-                HasObjectExclusions           = $hasObjectExclusions
-                LastSuccessfulBackupET        = $lastSuccessET
-                LastSuccessfulBackupStatus    = $lastSuccessStatus
-                LastSuccessfulBackupAgeHours  = $lastSuccessAgeHours
-                LastRunStatus                 = $lastRunStatus
-                LastRunType                   = $lastRunType
-                IsPaused                      = $pg.isPaused
-                StorageDomain                 = FirstValue @($pg.storageDomainName, $pg.storageDomain.name, $pg.storageDomain.id)
-                SourceName                    = FirstValue @($pg.sourceName, $pg.source.name, $params.sourceName, $params.source.name)
-            }
-
-            if (@($objects).Count -eq 0) {
-                $exceptionRows += New-ExceptionRow -Cluster $clusterName -Environment $env.DisplayName -ProtectionGroup $pgName -HostName "" -ObjectName "" -ExceptionType "PG_ZERO_OBJECTS" -Severity "High" -ExceptionReason "Protection group has zero objects." -RecommendedAction "Confirm whether the protection group is intentionally empty or needs object membership fixed."
-            }
-
-            if ([string]::IsNullOrWhiteSpace($policyName)) {
-                $exceptionRows += New-ExceptionRow -Cluster $clusterName -Environment $env.DisplayName -ProtectionGroup $pgName -HostName "" -ObjectName "" -ExceptionType "MISSING_POLICY" -Severity "Critical" -ExceptionReason "Protection group policy name could not be resolved." -RecommendedAction "Check policy assignment in Cohesity and policy API visibility."
-            }
-
-            if ([string]::IsNullOrWhiteSpace($lastSuccessET)) {
-                $exceptionRows += New-ExceptionRow -Cluster $clusterName -Environment $env.DisplayName -ProtectionGroup $pgName -HostName "" -ObjectName "" -ExceptionType "MISSING_LAST_SUCCESS" -Severity "Critical" -ExceptionReason "No successful backup timestamp was found from the latest run information." -RecommendedAction "Check recent runs and job failures in Cohesity."
-            }
-            elseif ($lastSuccessAgeHours -ne "") {
-                if ([double]$lastSuccessAgeHours -gt 48) {
-                    $exceptionRows += New-ExceptionRow -Cluster $clusterName -Environment $env.DisplayName -ProtectionGroup $pgName -HostName "" -ObjectName "" -ExceptionType "LAST_SUCCESS_GT_48H" -Severity "Critical" -ExceptionReason "Last successful backup is older than 48 hours." -RecommendedAction "Investigate job schedule, failures, pause state, and object availability."
-                }
-                elseif ([double]$lastSuccessAgeHours -gt 24) {
-                    $exceptionRows += New-ExceptionRow -Cluster $clusterName -Environment $env.DisplayName -ProtectionGroup $pgName -HostName "" -ObjectName "" -ExceptionType "LAST_SUCCESS_GT_24H" -Severity "High" -ExceptionReason "Last successful backup is older than 24 hours." -RecommendedAction "Review backup freshness and recent run status."
-                }
-            }
-
-            if ($hasGlobalExclusions) {
-                $exceptionRows += New-ExceptionRow -Cluster $clusterName -Environment $env.DisplayName -ProtectionGroup $pgName -HostName "" -ObjectName "" -ExceptionType "PG_GLOBAL_EXCLUSIONS" -Severity "Medium" -ExceptionReason "Protection group has global exclude paths." -RecommendedAction "Review whether global exclusions are approved and documented."
-            }
-
-            if ($objectExcludePathCount -gt 20) {
-                $exceptionRows += New-ExceptionRow -Cluster $clusterName -Environment $env.DisplayName -ProtectionGroup $pgName -HostName "" -ObjectName "" -ExceptionType "HIGH_EXCLUSION_COUNT" -Severity "Medium" -ExceptionReason "Protection group has a high number of object-level exclusions." -RecommendedAction "Review exclusions for audit and operational correctness."
-            }
-
-            if (@($objects).Count -gt 250) {
-                $exceptionRows += New-ExceptionRow -Cluster $clusterName -Environment $env.DisplayName -ProtectionGroup $pgName -HostName "" -ObjectName "" -ExceptionType "VERY_LARGE_PG" -Severity "Medium" -ExceptionReason "Protection group has more than 250 objects." -RecommendedAction "Review whether the PG should be split for operations, run duration, and blast-radius control."
-            }
-
-            foreach ($obj in $objects) {
-                $objectName = Get-ObjectName $obj
-                $objectId = Get-ObjectId $obj
-                $hostName = FirstValue @($obj.hostName, $obj.sourceName, $obj.parentSourceName, $objectName)
-                $objectType = FirstValue @($obj.objectType, $obj.type, $obj.entityType)
-                if ([string]::IsNullOrWhiteSpace($objectType)) {
-                    if ($env.ApiName -eq "kPhysical") { $objectType = "PhysicalObject" }
-                    else { $objectType = "VirtualMachine" }
+                    continue
                 }
 
-                $includedPathCount = 0
-                $objExcludeCount = 0
-                $objHasExclusions = $false
-                $objHasIncludedPath = $true
+                $pgId = FirstValue @(
+                    (Get-PropValue -Object $pg -Names @("id")),
+                    (Get-PropValue -Object $pg -Names @("protectionGroupId"))
+                )
+                $pgName = FirstValue @(
+                    (Get-PropValue -Object $pg -Names @("name")),
+                    (Get-PropValue -Object $pg -Names @("protectionGroupName")),
+                    $pgId
+                )
+
+                $pgKey = Get-PGKey -ClusterId $clusterId -ProtectionGroupId $pgId -ClusterName $clusterName -ProtectionGroupName $pgName
+                $policyId = Resolve-PolicyId -ProtectionGroup $pg
+                $policyName = Resolve-PolicyName -ProtectionGroup $pg -PolicyMap $policyMap
+                $runInfo = Get-RunInfo -ProtectionGroup $pg
+                $objects = @(Get-ObjectsFromParams -Params $params -EnvironmentApiName $env.ApiName)
+
+                $globalExcludePaths = ""
+                $globalExcludeCount = 0
+                $objectExcludePathCount = 0
+                $hasGlobalExclusions = $false
+                $hasObjectExclusions = $false
+                $protectionType = ""
 
                 if ($env.ApiName -eq "kPhysical") {
-                    $protectionType = FirstValue @($params.protectionType)
-                    if ($protectionType -eq "kVolume") {
-                        $includedPathCount = Count-FlatItems $obj.volumeGuids
-                    }
-                    else {
-                        $filePaths = @(As-Array $obj.filePaths | Where-Object { $_ })
-                        $includedPathCount = @($filePaths | Where-Object { -not [string]::IsNullOrWhiteSpace($_.includedPath) }).Count
-                        foreach ($fp in $filePaths) { $objExcludeCount += Count-FlatItems $fp.excludedPaths }
-                    }
+                    $protectionType = FirstValue @((Get-PropValue -Object $params -Names @("protectionType")))
 
-                    if ($includedPathCount -eq 0) { $objHasIncludedPath = $false }
-                    if ($objExcludeCount -gt 0) { $objHasExclusions = $true }
+                    if ($protectionType -ne "kVolume") {
+                        $globalExcludePaths = Flat (Get-NestedPropValue -Object $params -Path "fileProtectionTypeParams.globalExcludePaths")
+                        $globalExcludeCount = Count-FlatItems (Get-NestedPropValue -Object $params -Path "fileProtectionTypeParams.globalExcludePaths")
+                        if ($globalExcludeCount -gt 0) { $hasGlobalExclusions = $true }
+
+                        foreach ($obj in $objects) {
+                            foreach ($fp in @(As-Array (Get-PropValue -Object $obj -Names @("filePaths")) | Where-Object { $_ })) {
+                                $objectExcludePathCount += Count-FlatItems (Get-PropValue -Object $fp -Names @("excludedPaths"))
+                            }
+                        }
+
+                        if ($objectExcludePathCount -gt 0) { $hasObjectExclusions = $true }
+                    }
+                }
+                else {
+                    $protectionType = "VirtualMachine"
                 }
 
-                $objectDetailRows += [PSCustomObject]@{
-                    ObjectKey                    = "$pgKey|$objectId|$objectName"
+                $pgSummaryRows += [PSCustomObject]@{
                     PGKey                        = $pgKey
                     InventoryDateET              = $InventoryDateET
                     Cluster                      = $clusterName
@@ -570,96 +797,231 @@ foreach ($c in $selectedClusters) {
                     ProtectionGroup              = $pgName
                     ProtectionGroupId            = $pgId
                     PolicyName                   = $policyName
-                    HostName                     = $hostName
-                    ObjectName                   = $objectName
-                    ObjectType                   = $objectType
-                    ObjectId                     = $objectId
-                    ParentSource                 = FirstValue @($obj.parentSourceName, $obj.sourceName, $obj.parentSource.id, $obj.sourceId)
-                    IncludedPathCount            = $includedPathCount
-                    ObjectExcludePathCount       = $objExcludeCount
+                    PolicyId                     = $policyId
+                    IsActive                     = Get-PropValue -Object $pg -Names @("isActive")
+                    IsDeleted                    = Get-PropValue -Object $pg -Names @("isDeleted")
+                    ObjectCount                  = @($objects).Count
+                    GlobalExcludePathCount       = $globalExcludeCount
+                    ObjectExcludePathCount       = $objectExcludePathCount
                     HasGlobalExclusions          = $hasGlobalExclusions
-                    HasObjectExclusions          = $objHasExclusions
-                    LastSuccessfulBackupET       = $lastSuccessET
-                    LastSuccessfulBackupStatus   = $lastSuccessStatus
+                    HasObjectExclusions          = $hasObjectExclusions
+                    LastSuccessfulBackupET       = $runInfo.LastSuccessfulBackupET
+                    LastSuccessfulBackupStatus   = $runInfo.LastSuccessfulBackupStatus
+                    LastSuccessfulBackupAgeHours = $runInfo.LastSuccessfulBackupAgeHours
+                    BackupFreshnessBucket        = $runInfo.BackupFreshnessBucket
+                    IsSuccessLast24h             = $runInfo.IsSuccessLast24h
+                    IsSuccessLast48h             = $runInfo.IsSuccessLast48h
+                    LastRunStatus                = $runInfo.LastRunStatus
+                    LastRunType                  = $runInfo.LastRunType
+                    LastRunStartET               = $runInfo.LastRunStartET
+                    LastRunEndET                 = $runInfo.LastRunEndET
+                    IsPaused                     = Get-PropValue -Object $pg -Names @("isPaused")
+                    ProtectionType               = $protectionType
+                    StorageDomain                = FirstValue @(
+                        (Get-NestedPropValue -Object $pg -Path "storageDomainName"),
+                        (Get-NestedPropValue -Object $pg -Path "storageDomain.name"),
+                        (Get-NestedPropValue -Object $pg -Path "storageDomain.id")
+                    )
+                    SourceName                   = FirstValue @(
+                        (Get-PropValue -Object $pg -Names @("sourceName")),
+                        (Get-NestedPropValue -Object $pg -Path "source.name"),
+                        (Get-PropValue -Object $params -Names @("sourceName")),
+                        (Get-NestedPropValue -Object $params -Path "source.name")
+                    )
                 }
 
-                if ($env.ApiName -eq "kPhysical") {
-                    $protectionType = FirstValue @($params.protectionType)
-                    if ($protectionType -eq "kVolume") {
-                        $pathDetailRows += [PSCustomObject]@{
-                            PathKey            = "$pgKey|$objectId|volume"
-                            PGKey              = $pgKey
-                            ObjectKey          = "$pgKey|$objectId|$objectName"
-                            InventoryDateET    = $InventoryDateET
-                            Cluster            = $clusterName
-                            Environment        = $env.DisplayName
-                            ProtectionGroup    = $pgName
-                            HostName           = $hostName
-                            ObjectName         = $objectName
-                            IncludedPath       = Flat $obj.volumeGuids
-                            ExcludedPath       = ""
-                            ExclusionLevel     = "None"
-                            SkipNestedVolumes  = ""
-                            GlobalExcludePaths = $globalExcludePaths
-                        }
+                if (@($objects).Count -eq 0) {
+                    $exceptionRows += New-ExceptionRow -PGKey $pgKey -ObjectKey "" -Cluster $clusterName -Environment $env.DisplayName -ProtectionGroup $pgName -HostName "" -ObjectName "" -ExceptionType "PG_ZERO_OBJECTS" -Severity "High" -ExceptionReason "Protection group has zero objects." -RecommendedAction "Confirm whether the protection group is intentionally empty or object discovery failed."
+                }
+
+                if ([string]::IsNullOrWhiteSpace($policyName)) {
+                    $exceptionRows += New-ExceptionRow -PGKey $pgKey -ObjectKey "" -Cluster $clusterName -Environment $env.DisplayName -ProtectionGroup $pgName -HostName "" -ObjectName "" -ExceptionType "MISSING_POLICY" -Severity "Critical" -ExceptionReason "Protection group policy name could not be resolved." -RecommendedAction "Check policy assignment and policy API visibility."
+                }
+
+                if ([string]::IsNullOrWhiteSpace($runInfo.LastSuccessfulBackupET)) {
+                    $exceptionRows += New-ExceptionRow -PGKey $pgKey -ObjectKey "" -Cluster $clusterName -Environment $env.DisplayName -ProtectionGroup $pgName -HostName "" -ObjectName "" -ExceptionType "MISSING_LAST_SUCCESS" -Severity "Critical" -ExceptionReason "No successful backup timestamp was found from latest run information." -RecommendedAction "Check recent runs. Future enhancement should scan prior runs for latest success."
+                }
+                elseif ($runInfo.LastSuccessfulBackupAgeHours -ne "") {
+                    if ([double]$runInfo.LastSuccessfulBackupAgeHours -gt 48) {
+                        $exceptionRows += New-ExceptionRow -PGKey $pgKey -ObjectKey "" -Cluster $clusterName -Environment $env.DisplayName -ProtectionGroup $pgName -HostName "" -ObjectName "" -ExceptionType "LAST_SUCCESS_GT_48H" -Severity "Critical" -ExceptionReason "Last successful backup is older than 48 hours." -RecommendedAction "Investigate job schedule, failures, pause state, and object availability."
                     }
-                    else {
-                        $filePaths = @(As-Array $obj.filePaths | Where-Object { $_ })
-                        foreach ($fp in $filePaths) {
-                            $excluded = @(As-Array $fp.excludedPaths | Where-Object { $_ })
-                            if ($excluded.Count -eq 0) {
-                                $pathDetailRows += [PSCustomObject]@{
-                                    PathKey            = "$pgKey|$objectId|$($fp.includedPath)|none"
-                                    PGKey              = $pgKey
-                                    ObjectKey          = "$pgKey|$objectId|$objectName"
-                                    InventoryDateET    = $InventoryDateET
-                                    Cluster            = $clusterName
-                                    Environment        = $env.DisplayName
-                                    ProtectionGroup    = $pgName
-                                    HostName           = $hostName
-                                    ObjectName         = $objectName
-                                    IncludedPath       = $fp.includedPath
-                                    ExcludedPath       = ""
-                                    ExclusionLevel     = "None"
-                                    SkipNestedVolumes  = $fp.skipNestedVolumes
-                                    GlobalExcludePaths = $globalExcludePaths
-                                }
+                    elseif ([double]$runInfo.LastSuccessfulBackupAgeHours -gt 24) {
+                        $exceptionRows += New-ExceptionRow -PGKey $pgKey -ObjectKey "" -Cluster $clusterName -Environment $env.DisplayName -ProtectionGroup $pgName -HostName "" -ObjectName "" -ExceptionType "LAST_SUCCESS_GT_24H" -Severity "High" -ExceptionReason "Last successful backup is older than 24 hours." -RecommendedAction "Review backup freshness and recent run status."
+                    }
+                }
+
+                if ($hasGlobalExclusions) {
+                    $exceptionRows += New-ExceptionRow -PGKey $pgKey -ObjectKey "" -Cluster $clusterName -Environment $env.DisplayName -ProtectionGroup $pgName -HostName "" -ObjectName "" -ExceptionType "PG_GLOBAL_EXCLUSIONS" -Severity "Medium" -ExceptionReason "Protection group has global exclude paths." -RecommendedAction "Review whether global exclusions are approved and documented."
+                }
+
+                if ($objectExcludePathCount -gt 20) {
+                    $exceptionRows += New-ExceptionRow -PGKey $pgKey -ObjectKey "" -Cluster $clusterName -Environment $env.DisplayName -ProtectionGroup $pgName -HostName "" -ObjectName "" -ExceptionType "HIGH_EXCLUSION_COUNT" -Severity "Medium" -ExceptionReason "Protection group has a high number of object-level exclusions." -RecommendedAction "Review exclusions for audit and operational correctness."
+                }
+
+                if (@($objects).Count -gt 250) {
+                    $exceptionRows += New-ExceptionRow -PGKey $pgKey -ObjectKey "" -Cluster $clusterName -Environment $env.DisplayName -ProtectionGroup $pgName -HostName "" -ObjectName "" -ExceptionType "VERY_LARGE_PG" -Severity "Medium" -ExceptionReason "Protection group has more than 250 objects." -RecommendedAction "Review whether the PG should be split for operations, run duration, and blast-radius control."
+                }
+
+                foreach ($obj in $objects) {
+                    $objectName = Get-ObjectName -Object $obj
+                    $objectId = Get-ObjectId -Object $obj
+                    $objectKey = Get-ObjectKey -PGKey $pgKey -ObjectId $objectId -ObjectName $objectName
+                    $hostName = FirstValue @(
+                        (Get-PropValue -Object $obj -Names @("hostName")),
+                        (Get-PropValue -Object $obj -Names @("sourceName")),
+                        (Get-PropValue -Object $obj -Names @("parentSourceName")),
+                        $objectName
+                    )
+                    $objectType = FirstValue @(
+                        (Get-PropValue -Object $obj -Names @("objectType")),
+                        (Get-PropValue -Object $obj -Names @("type")),
+                        (Get-PropValue -Object $obj -Names @("entityType"))
+                    )
+                    if ([string]::IsNullOrWhiteSpace($objectType)) {
+                        if ($env.ApiName -eq "kPhysical") { $objectType = "PhysicalObject" }
+                        else { $objectType = "VirtualMachine" }
+                    }
+
+                    $includedPathCount = 0
+                    $objExcludeCount = 0
+                    $objHasExclusions = $false
+                    $objHasIncludedPath = $true
+
+                    if ($env.ApiName -eq "kPhysical") {
+                        if ($protectionType -eq "kVolume") {
+                            $includedPathCount = Count-FlatItems (Get-PropValue -Object $obj -Names @("volumeGuids"))
+                        }
+                        else {
+                            $filePaths = @(As-Array (Get-PropValue -Object $obj -Names @("filePaths")) | Where-Object { $_ })
+                            $includedPathCount = @($filePaths | Where-Object { -not [string]::IsNullOrWhiteSpace((Get-PropValue -Object $_ -Names @("includedPath"))) }).Count
+                            foreach ($fp in $filePaths) {
+                                $objExcludeCount += Count-FlatItems (Get-PropValue -Object $fp -Names @("excludedPaths"))
                             }
-                            else {
-                                foreach ($excludedPath in $excluded) {
+                        }
+
+                        if ($includedPathCount -eq 0) { $objHasIncludedPath = $false }
+                        if ($objExcludeCount -gt 0) { $objHasExclusions = $true }
+                    }
+
+                    $objectDetailRows += [PSCustomObject]@{
+                        ObjectKey                  = $objectKey
+                        PGKey                      = $pgKey
+                        InventoryDateET            = $InventoryDateET
+                        Cluster                    = $clusterName
+                        ClusterId                  = $clusterId
+                        Environment                = $env.DisplayName
+                        ProtectionGroup            = $pgName
+                        ProtectionGroupId          = $pgId
+                        PolicyName                 = $policyName
+                        HostName                   = $hostName
+                        ObjectName                 = $objectName
+                        ObjectType                 = $objectType
+                        ObjectId                   = $objectId
+                        ParentSource               = FirstValue @(
+                            (Get-PropValue -Object $obj -Names @("parentSourceName")),
+                            (Get-PropValue -Object $obj -Names @("sourceName")),
+                            (Get-NestedPropValue -Object $obj -Path "parentSource.id"),
+                            (Get-PropValue -Object $obj -Names @("sourceId"))
+                        )
+                        IncludedPathCount          = $includedPathCount
+                        ObjectExcludePathCount     = $objExcludeCount
+                        HasGlobalExclusions        = $hasGlobalExclusions
+                        HasObjectExclusions        = $objHasExclusions
+                        LastSuccessfulBackupET     = $runInfo.LastSuccessfulBackupET
+                        LastSuccessfulBackupStatus = $runInfo.LastSuccessfulBackupStatus
+                    }
+
+                    if ($env.ApiName -eq "kPhysical") {
+                        if ($protectionType -eq "kVolume") {
+                            $volumePaths = Flat (Get-PropValue -Object $obj -Names @("volumeGuids"))
+                            $pathDetailRows += [PSCustomObject]@{
+                                PathKey            = "$objectKey|volume"
+                                PGKey              = $pgKey
+                                ObjectKey          = $objectKey
+                                InventoryDateET    = $InventoryDateET
+                                Cluster            = $clusterName
+                                Environment        = $env.DisplayName
+                                ProtectionGroup    = $pgName
+                                HostName           = $hostName
+                                ObjectName         = $objectName
+                                IncludedPath       = $volumePaths
+                                ExcludedPath       = ""
+                                ExclusionLevel     = "None"
+                                SkipNestedVolumes  = ""
+                                GlobalExcludePaths = $globalExcludePaths
+                            }
+                        }
+                        else {
+                            $filePaths = @(As-Array (Get-PropValue -Object $obj -Names @("filePaths")) | Where-Object { $_ })
+                            foreach ($fp in $filePaths) {
+                                $includedPath = FirstValue @((Get-PropValue -Object $fp -Names @("includedPath")))
+                                $skipNested = Get-PropValue -Object $fp -Names @("skipNestedVolumes")
+                                $excludedPaths = @(As-Array (Get-PropValue -Object $fp -Names @("excludedPaths")) | Where-Object { $_ })
+
+                                if ($excludedPaths.Count -eq 0) {
                                     $pathDetailRows += [PSCustomObject]@{
-                                        PathKey            = "$pgKey|$objectId|$($fp.includedPath)|$excludedPath"
+                                        PathKey            = "$objectKey|$includedPath|none"
                                         PGKey              = $pgKey
-                                        ObjectKey          = "$pgKey|$objectId|$objectName"
+                                        ObjectKey          = $objectKey
                                         InventoryDateET    = $InventoryDateET
                                         Cluster            = $clusterName
                                         Environment        = $env.DisplayName
                                         ProtectionGroup    = $pgName
                                         HostName           = $hostName
                                         ObjectName         = $objectName
-                                        IncludedPath       = $fp.includedPath
-                                        ExcludedPath       = $excludedPath
-                                        ExclusionLevel     = "Object"
-                                        SkipNestedVolumes  = $fp.skipNestedVolumes
+                                        IncludedPath       = $includedPath
+                                        ExcludedPath       = ""
+                                        ExclusionLevel     = "None"
+                                        SkipNestedVolumes  = $skipNested
                                         GlobalExcludePaths = $globalExcludePaths
                                     }
                                 }
-                            }
+                                else {
+                                    foreach ($excludedPath in $excludedPaths) {
+                                        $pathDetailRows += [PSCustomObject]@{
+                                            PathKey            = "$objectKey|$includedPath|$excludedPath"
+                                            PGKey              = $pgKey
+                                            ObjectKey          = $objectKey
+                                            InventoryDateET    = $InventoryDateET
+                                            Cluster            = $clusterName
+                                            Environment        = $env.DisplayName
+                                            ProtectionGroup    = $pgName
+                                            HostName           = $hostName
+                                            ObjectName         = $objectName
+                                            IncludedPath       = $includedPath
+                                            ExcludedPath       = $excludedPath
+                                            ExclusionLevel     = "Object"
+                                            SkipNestedVolumes  = $skipNested
+                                            GlobalExcludePaths = $globalExcludePaths
+                                        }
+                                    }
+                                }
 
-                            if ($fp.skipNestedVolumes -eq $true) {
-                                $exceptionRows += New-ExceptionRow -Cluster $clusterName -Environment $env.DisplayName -ProtectionGroup $pgName -HostName $hostName -ObjectName $objectName -ExceptionType "SKIP_NESTED_VOLUMES" -Severity "Medium" -ExceptionReason "SkipNestedVolumes is enabled for an included path." -RecommendedAction "Validate whether nested volume exclusion is expected and approved."
+                                if ($skipNested -eq $true) {
+                                    $exceptionRows += New-ExceptionRow -PGKey $pgKey -ObjectKey $objectKey -Cluster $clusterName -Environment $env.DisplayName -ProtectionGroup $pgName -HostName $hostName -ObjectName $objectName -ExceptionType "SKIP_NESTED_VOLUMES" -Severity "Medium" -ExceptionReason "SkipNestedVolumes is enabled for an included path." -RecommendedAction "Validate whether nested volume exclusion is expected and approved."
+                                }
                             }
                         }
-                    }
 
-                    if (-not $objHasIncludedPath) {
-                        $exceptionRows += New-ExceptionRow -Cluster $clusterName -Environment $env.DisplayName -ProtectionGroup $pgName -HostName $hostName -ObjectName $objectName -ExceptionType "OBJECT_NO_INCLUDED_PATH" -Severity "High" -ExceptionReason "Physical object has no included path." -RecommendedAction "Review object include path configuration."
-                    }
+                        if (-not $objHasIncludedPath) {
+                            $exceptionRows += New-ExceptionRow -PGKey $pgKey -ObjectKey $objectKey -Cluster $clusterName -Environment $env.DisplayName -ProtectionGroup $pgName -HostName $hostName -ObjectName $objectName -ExceptionType "OBJECT_NO_INCLUDED_PATH" -Severity "High" -ExceptionReason "Physical object has no included path." -RecommendedAction "Review object include path configuration."
+                        }
 
-                    if ($objHasExclusions) {
-                        $exceptionRows += New-ExceptionRow -Cluster $clusterName -Environment $env.DisplayName -ProtectionGroup $pgName -HostName $hostName -ObjectName $objectName -ExceptionType "OBJECT_LEVEL_EXCLUSIONS" -Severity "Medium" -ExceptionReason "Object has object-level exclude paths." -RecommendedAction "Review object-level exclusions for audit and operational correctness."
+                        if ($objHasExclusions) {
+                            $exceptionRows += New-ExceptionRow -PGKey $pgKey -ObjectKey $objectKey -Cluster $clusterName -Environment $env.DisplayName -ProtectionGroup $pgName -HostName $hostName -ObjectName $objectName -ExceptionType "OBJECT_LEVEL_EXCLUSIONS" -Severity "Medium" -ExceptionReason "Object has object-level exclude paths." -RecommendedAction "Review object-level exclusions for audit and operational correctness."
+                        }
                     }
                 }
+            }
+            catch {
+                $collectionErrors += [PSCustomObject]@{
+                    Cluster     = $clusterName
+                    Environment = $env.DisplayName
+                    Stage       = "ProcessProtectionGroup"
+                    Error       = $_.Exception.Message
+                }
+                Write-Host "Failed processing a $($env.DisplayName) PG on $clusterName : $($_.Exception.Message)" -ForegroundColor Red
+                continue
             }
         }
     }
@@ -685,32 +1047,36 @@ $pathDetailRows   | Export-Csv -Path $pathDetailCsv -NoTypeInformation -Encoding
 $exceptionRows    | Export-Csv -Path $exceptionsCsv -NoTypeInformation -Encoding utf8
 
 $metadata = [PSCustomObject]@{
-    InventoryDateET     = $InventoryDateET
-    ScriptName          = "Get-CohesityProtectionInventory.ps1"
-    HeliosBaseUrl       = $baseUrl
-    SelectedClusters    = @($selectedClusters | Select-Object ClusterName, ClusterId)
+    InventoryDateET      = $InventoryDateET
+    ScriptName           = "Get-CohesityProtectionInventory.ps1"
+    HeliosBaseUrl        = $baseUrl
+    SelectedClusters     = @($selectedClusters | Select-Object ClusterName, ClusterId)
     SelectedEnvironments = @($selectedEnvironments | Select-Object ApiName, DisplayName)
-    OutputFiles         = [PSCustomObject]@{
-        PGSummary     = $pgSummaryCsv
-        ObjectDetail  = $objectDetailCsv
-        PathDetail    = $pathDetailCsv
-        Exceptions    = $exceptionsCsv
+    OutputFiles          = [PSCustomObject]@{
+        PGSummary    = $pgSummaryCsv
+        ObjectDetail = $objectDetailCsv
+        PathDetail   = $pathDetailCsv
+        Exceptions   = $exceptionsCsv
     }
-    Counts              = [PSCustomObject]@{
-        PGSummaryRows     = @($pgSummaryRows).Count
-        ObjectDetailRows  = @($objectDetailRows).Count
-        PathDetailRows    = @($pathDetailRows).Count
-        ExceptionRows     = @($exceptionRows).Count
+    Counts               = [PSCustomObject]@{
+        PGSummaryRows    = @($pgSummaryRows).Count
+        ObjectDetailRows = @($objectDetailRows).Count
+        PathDetailRows   = @($pathDetailRows).Count
+        ExceptionRows    = @($exceptionRows).Count
+        CollectionErrors = @($collectionErrors).Count
     }
-    Notes               = @(
+    EnvironmentCounts    = @($pgSummaryRows | Group-Object Environment | Select-Object Name, Count)
+    CollectionErrors     = @($collectionErrors)
+    Notes                = @(
         "GET-only baseline collector.",
         "Physical path detail is populated.",
         "Hyper-V and Nutanix AHV use object-level VM inventory; path detail is not forced.",
-        "LastSuccessfulBackupET currently uses latest run information when latest run status is success. Older-success run scan is a future enhancement."
+        "PolicyName is resolved from policy API where available; PolicyId is retained separately.",
+        "LastSuccessfulBackupET currently uses latest run information when the latest run status is success. Recent-run success scanning is a future enhancement."
     )
 }
 
-$metadata | ConvertTo-Json -Depth 8 | Out-File -FilePath $metadataJson -Encoding utf8
+$metadata | ConvertTo-Json -Depth 10 | Out-File -FilePath $metadataJson -Encoding utf8
 
 Write-Host ""
 Write-Host "Cohesity Protection Inventory export complete." -ForegroundColor Green
@@ -718,6 +1084,7 @@ Write-Host "PG Summary rows    : $(@($pgSummaryRows).Count)" -ForegroundColor Gr
 Write-Host "Object Detail rows : $(@($objectDetailRows).Count)" -ForegroundColor Green
 Write-Host "Path Detail rows   : $(@($pathDetailRows).Count)" -ForegroundColor Green
 Write-Host "Exception rows     : $(@($exceptionRows).Count)" -ForegroundColor Green
+Write-Host "Collection errors  : $(@($collectionErrors).Count)" -ForegroundColor Green
 Write-Host "PG Summary CSV     : $pgSummaryCsv" -ForegroundColor Green
 Write-Host "Object Detail CSV  : $objectDetailCsv" -ForegroundColor Green
 Write-Host "Path Detail CSV    : $pathDetailCsv" -ForegroundColor Green
