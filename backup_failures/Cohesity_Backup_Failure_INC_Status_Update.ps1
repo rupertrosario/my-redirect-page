@@ -5,7 +5,7 @@ Entry point for Cohesity Backup Failure INC status updates.
 .DESCRIPTION
 This is the operational entry point for the backup failure incident update workflow.
 It delegates to the main implementation script, then rewrites the human-readable text outputs
-so there is one detailed source of truth with no truncated row sections.
+so worknotes and summary are complete, audit-ready, and non-truncated.
 
 Run one cluster:
   .\Cohesity_Backup_Failure_INC_Status_Update.ps1 -ClusterName "CLUSTER_NAME"
@@ -116,7 +116,7 @@ function Format-StatusTotals($Rows) {
     return ($lines -join [Environment]::NewLine)
 }
 
-function Write-ConsistentIncidentText([string]$Folder, [int]$RunLimit) {
+function Write-AuditReadyIncidentText([string]$Folder, [int]$RunLimit) {
     if ([string]::IsNullOrWhiteSpace($Folder) -or !(Test-Path $Folder)) { return }
 
     $state = Read-JsonFile (Join-Path $Folder "state.json")
@@ -144,53 +144,12 @@ function Write-ConsistentIncidentText([string]$Folder, [int]$RunLimit) {
         $completeness = "Incomplete. One or more cluster/protection-group queries failed or timed out. Do not treat missing rows from warned PGs/clusters as cleared unless listed in cleared_by_success.csv."
     }
 
-    $worknotes = @"
-Backup Failure Window Update
+    $detailedUpdate = @"
+Backup Failure Incident Update
 
 Incident: $incident
 Compute Window: $windowLabel
 Generated At: $generated ET
-Evidence Folder: $Folder
-
-Summary:
-- Current active/unresolved failures: $($current.Count)
-- New failures since previous check: $($newFailures.Count)
-- Older/current still failing: $($older.Count)
-- Carried forward still failing: $($carried.Count)
-- Re-failed after earlier clear: $($refailed.Count)
-- Cleared by later successful backup: $($cleared.Count)
-- Running / awaiting completion: $($running.Count)
-- Cancelled after failure: $($cancelled.Count)
-- Unknown / needs review: $($unknown.Count)
-- Consecutive/repeated active failures: $($consecutive.Count)
-- Warnings / incomplete collection: $($warnings.Count)
-- Scope: latest $RunLimit runs per protection group/run type.
-
-Report completeness:
-$completeness
-
-Warnings / Incomplete Collection:
-$(Format-Warnings $warnings)
-
-Detailed incident update:
-See summary.txt
-
-Closure / handoff summary:
-See closing_summary.txt
-
-CSV evidence:
-- current_failures.csv
-- cleared_by_success.csv
-- incident_lifecycle.csv
-"@
-    $worknotes | Set-Content -Path (Join-Path $Folder "worknotes.txt") -Encoding UTF8
-
-    $summary = @"
-Backup Failure Incident Summary
-
-Incident: $incident
-Compute Window: $windowLabel
-Last Updated: $generated ET
 Evidence Folder: $Folder
 
 Report completeness:
@@ -208,6 +167,8 @@ Current State:
 - Unknown / needs review: $($unknown.Count)
 - Consecutive/repeated active failures: $($consecutive.Count)
 - Total lifecycle rows tracked: $($lifecycle.Count)
+- Warnings / incomplete collection: $($warnings.Count)
+- Scope: latest $RunLimit runs per protection group/run type.
 
 Lifecycle Status Totals:
 $(Format-StatusTotals $lifecycle)
@@ -240,16 +201,22 @@ Scope / Limitations:
 - Missing from the current scan is not treated as cleared unless a later successful backup is verified.
 - This is incident lifecycle tracking for observed/latest uncleared failures, not an audit-grade history of every failure event.
 
-Evidence Files:
+CSV Evidence Files:
 - current_failures.csv
 - cleared_by_success.csv
 - incident_lifecycle.csv
+
+Text Evidence Files:
 - worknotes.txt
 - summary.txt
 - closing_summary.txt
 - state.json
 "@
-    $summary | Set-Content -Path (Join-Path $Folder "summary.txt") -Encoding UTF8
+
+    # For audit clarity, worknotes.txt and summary.txt intentionally contain the same full detail.
+    # This avoids partial incident notes that require a CSV attachment to understand the update.
+    $detailedUpdate | Set-Content -Path (Join-Path $Folder "worknotes.txt") -Encoding UTF8
+    $detailedUpdate | Set-Content -Path (Join-Path $Folder "summary.txt") -Encoding UTF8
 
     $closing = @"
 Backup Failure Incident Closure Summary
@@ -270,6 +237,8 @@ Closure State:
 - Unknown / needs review: $($unknown.Count)
 - Consecutive/repeated active failures: $($consecutive.Count)
 - Total lifecycle rows tracked: $($lifecycle.Count)
+- Warnings / incomplete collection: $($warnings.Count)
+- Scope: latest $RunLimit runs per protection group/run type.
 
 Carry Forward / Handoff:
 $(if ($current.Count -eq 0) { "No active backup failures remain based on the latest saved state." } else { "$($current.Count) active/unresolved objects remain and should be carried forward or separately tracked." })
@@ -313,9 +282,9 @@ $mainExitCode = $LASTEXITCODE
 try {
     $folder = Get-ReportFolder -Root $OutputRoot -Inc $IncidentNumber
     if ($folder) {
-        Write-ConsistentIncidentText -Folder $folder -RunLimit $NumRuns
+        Write-AuditReadyIncidentText -Folder $folder -RunLimit $NumRuns
         Write-Host ""
-        Write-Host "Text outputs normalized with no row truncation:"
+        Write-Host "Text outputs normalized with full audit-ready details and no row truncation:"
         Write-Host (Join-Path $folder "worknotes.txt")
         Write-Host (Join-Path $folder "summary.txt")
         Write-Host (Join-Path $folder "closing_summary.txt")
