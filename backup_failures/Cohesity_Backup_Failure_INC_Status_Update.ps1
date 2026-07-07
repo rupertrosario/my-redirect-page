@@ -49,6 +49,17 @@ $script:LifecycleCsvColumns = @(
     "Message"
 )
 
+$script:SuccessWorknotesColumns = @(
+    "Cluster",
+    "ProtectionGroup",
+    "Environment",
+    "Host",
+    "ObjectName",
+    "ObjectType",
+    "RunType",
+    "LatestSuccessET"
+)
+
 function Clean-Text($Value) {
     if ($null -eq $Value) { return "" }
     if ($Value -is [array]) { $Value = $Value -join " | " }
@@ -300,19 +311,29 @@ function Get-DisplayObjectName($Row) {
 
     if (!$objectName) { return "" }
     if ($objectType -eq "ProtectionGroup") { return "" }
-    if (($objectName -eq $pg) -and !$objectType) { return "" }
+    if (($objectName -eq $pg) -and (!$objectType -or $objectType -eq "ProtectionGroup")) { return "" }
     return $objectName
+}
+
+function Get-DisplayObjectType($Row, [string]$DisplayObjectName) {
+    $objectType = Clean-Text $Row.ObjectType
+    if (!$DisplayObjectName) { return "" }
+    if ($objectType -eq "ProtectionGroup") { return "" }
+    return $objectType
 }
 
 function Convert-ToLifecycleExportRows($Rows) {
     foreach ($r in @($Rows)) {
+        $displayObjectName = Get-DisplayObjectName $r
+        $displayObjectType = Get-DisplayObjectType -Row $r -DisplayObjectName $displayObjectName
+
         [pscustomobject]@{
             Cluster = Clean-Text $r.Cluster
             ProtectionGroup = Clean-Text $r.ProtectionGroup
             Environment = Clean-Text $r.Environment
             Host = Clean-Text $r.Host
-            ObjectName = Get-DisplayObjectName $r
-            ObjectType = Clean-Text $r.ObjectType
+            ObjectName = $displayObjectName
+            ObjectType = $displayObjectType
             RunType = Clean-Text $r.RunType
             Status = Clean-Text $r.Status
             OldestFailedET = Clean-Text $r.FirstFailedET
@@ -322,6 +343,24 @@ function Convert-ToLifecycleExportRows($Rows) {
             Message = Clean-Text $r.Message
         }
     }
+}
+
+function Format-PipeRows($Rows, [string[]]$Columns) {
+    $lines = New-Object System.Collections.Generic.List[string]
+    $lines.Add(($Columns -join " | "))
+
+    $list = @($Rows)
+    if ($list.Count -eq 0) {
+        $lines.Add("- None")
+        return ($lines -join [Environment]::NewLine)
+    }
+
+    foreach ($r in $list) {
+        $values = foreach ($c in $Columns) { Clean-Text $r.$c }
+        $lines.Add(($values -join " | "))
+    }
+
+    return ($lines -join [Environment]::NewLine)
 }
 
 function Format-Warnings($Warnings) {
@@ -411,7 +450,8 @@ function Write-FinalMonitorSummary {
     param(
         [string]$ApiStatus,
         [int]$ActiveCount,
-        [int]$ClearedCount,
+        [int]$NewlyClearedCount,
+        [int]$PreviouslyClearedCount,
         [int]$LifecycleCount,
         [int]$NewCount,
         [int]$OlderCount,
@@ -429,7 +469,7 @@ function Write-FinalMonitorSummary {
     Write-Host ""
     Write-Host "Final Normalized Summary (matches worknotes_summary.txt):"
     Write-Host "Cohesity API Collection Status : $ApiStatus"
-    Write-Host "Active / Unresolved Failures  : $ActiveCount"
+    Write-Host "Active / Unresolved Failures   : $ActiveCount"
     Write-Host "  Newly failed this check      : $NewCount"
     Write-Host "  Older/current still failing  : $OlderCount"
     Write-Host "  Carried forward still failing: $CarriedCount"
@@ -437,7 +477,8 @@ function Write-FinalMonitorSummary {
     Write-Host "  Running / awaiting completion: $RunningCount"
     Write-Host "  Cancelled after failure      : $CancelledCount"
     Write-Host "  Needs review / not verified  : $UnknownCount"
-    Write-Host "Cleared By Later Success       : $ClearedCount"
+    Write-Host "Newly Cleared This Check       : $NewlyClearedCount"
+    Write-Host "Previously Cleared Retained    : $PreviouslyClearedCount"
     Write-Host "Total Lifecycle Rows           : $LifecycleCount"
     Write-Host "Incomplete Collection Warnings : $WarningCount"
     Write-Host "Tally Check:"
@@ -484,10 +525,17 @@ function Write-SingleWorknotesSummary([string]$Folder, [int]$RunLimit) {
     $unknown = @($current | Where-Object { $_.Status -eq "UnknownNeedsReview" })
 
     $activeCount = $current.Count
-    $clearedCount = $cleared.Count
-    $lifecycleCount = $lifecycle.Count
+    $newlyClearedRows = @($lifecycleExport | Where-Object { $_.Status -eq "NewlyClearedThisCheck" } | Sort-Object @{ Expression = { Get-DateSortText $_.LatestSuccessET }; Descending = $true })
+    $previouslyClearedRows = @($lifecycleExport | Where-Object { $_.Status -eq "ClearedByLaterSuccess" })
+    $newlyClearedCount = $newlyClearedRows.Count
+    $previouslyClearedCount = $previouslyClearedRows.Count
+    $lifecycleCount = @($lifecycleExport).Count
+
+    $failureRowsForNotes = @(Convert-ToLifecycleExportRows $current | Sort-Object @{ Expression = { Get-DateSortText $_.NewestFailedET }; Descending = $true })
+    $successRowsForNotes = @($newlyClearedRows | Select-Object $script:SuccessWorknotesColumns)
+
     $activeBreakdownTotal = $newFailures.Count + $older.Count + $carried.Count + $refailed.Count + $running.Count + $cancelled.Count + $unknown.Count
-    $expectedLifecycleTotal = $activeCount + $clearedCount
+    $expectedLifecycleTotal = $activeCount + $newlyClearedCount + $previouslyClearedCount
 
     $activeTally = if ($activeBreakdownTotal -eq $activeCount) {
         "Active breakdown tally: $activeBreakdownTotal = $activeCount active/unresolved lifecycle rows."
@@ -496,13 +544,13 @@ function Write-SingleWorknotesSummary([string]$Folder, [int]$RunLimit) {
     }
 
     $lifecycleTally = if ($expectedLifecycleTotal -eq $lifecycleCount) {
-        "Lifecycle tally: $activeCount active/unresolved + $clearedCount cleared = $lifecycleCount total lifecycle rows."
+        "Lifecycle tally: $activeCount active/unresolved + $newlyClearedCount newly cleared this check + $previouslyClearedCount previously cleared retained = $lifecycleCount total lifecycle rows."
     } else {
-        "Lifecycle tally requires review: $activeCount active/unresolved + $clearedCount cleared = $expectedLifecycleTotal, but incident_lifecycle.csv has $lifecycleCount rows. Review incident_lifecycle.csv for row-level detail."
+        "Lifecycle tally requires review: $activeCount active/unresolved + $newlyClearedCount newly cleared this check + $previouslyClearedCount previously cleared retained = $expectedLifecycleTotal, but incident_lifecycle.csv has $lifecycleCount rows. Review incident_lifecycle.csv for row-level detail."
     }
 
     $latestSuccessReconcileLine = if ($movedToCleared.Count -gt 0) {
-        "Latest-success reconciliation: $($movedToCleared.Count) row(s) were moved from active/unresolved to cleared because LatestRunStatus was Succeeded/SucceededWithWarning after NewestFailedET."
+        "Latest-success reconciliation: $($movedToCleared.Count) active row(s) moved to NewlyClearedThisCheck because a later successful backup was found."
     } else {
         "Latest-success reconciliation: no active rows had a later successful backup."
     }
@@ -527,6 +575,8 @@ After the rerun completes, use the refreshed worknotes_summary.txt and incident_
     }
 
     $localCleanupIssues = Format-LocalCleanupIssues $retention
+    $failureSectionText = Format-PipeRows -Rows $failureRowsForNotes -Columns $script:LifecycleCsvColumns
+    $successSectionText = Format-PipeRows -Rows $successRowsForNotes -Columns $script:SuccessWorknotesColumns
 
     $worknotesSummary = @"
 Cohesity Backup Failure Incident Update
@@ -534,7 +584,6 @@ Cohesity Backup Failure Incident Update
 Incident: $incident
 Compute Window: $windowLabel
 Generated At: $generated ET
-Evidence Folder: $Folder
 Cohesity API Collection Status: $apiStatus
 Scope: latest $RunLimit runs per protection group/run type.
 
@@ -544,15 +593,8 @@ Do Not Edit Generated Files:
 
 Summary Counts:
 - Active / unresolved failures: $activeCount
-  - Newly failed this check: $($newFailures.Count)
-  - Older/current still failing: $($older.Count)
-  - Carried forward still failing: $($carried.Count)
-  - Re-failed after earlier clear: $($refailed.Count)
-  - Running / awaiting completion: $($running.Count)
-  - Cancelled after failure: $($cancelled.Count)
-  - Needs review / not verified: $($unknown.Count)
-
-- Cleared by later successful backup: $clearedCount
+- Newly cleared this check: $newlyClearedCount
+- Previously cleared rows retained in lifecycle CSV: $previouslyClearedCount
 - Total lifecycle rows tracked: $lifecycleCount
 
 Tally Check:
@@ -560,11 +602,15 @@ Tally Check:
 - $lifecycleTally
 - $latestSuccessReconcileLine
 
-Action Summary:
-- Use incident_lifecycle.csv as the only row-level evidence file.
-- Work rows whose Status is active/unresolved: NewlyFailedThisCheck, OlderStillFailing, CarriedForwardStillFailing, ReFailedAfterClear, RunningAtLatestCheck, CancelledAfterFailure, or UnknownNeedsReview.
-- Rows with ClearedByLaterSuccess or NewlyClearedThisCheck are already verified as cleared by a later successful backup.
-- Rows counted as Needs review / not verified remain unresolved until a later successful backup is verified.
+Team Focus:
+- Focus on OlderStillFailing and UnknownNeedsReview rows in the Failure section.
+- Success section only lists rows newly cleared in this check.
+
+Failure Section:
+$failureSectionText
+
+Success Section:
+$successSectionText
 
 Incomplete Collection:
 $(Format-Warnings $warnings)
@@ -589,7 +635,6 @@ Backup Failure Incident Closure Summary
 Incident: $incident
 Compute Window: $windowLabel
 Generated At: $generated ET
-Evidence Folder: $Folder
 Cohesity API Collection Status: $apiStatus
 Scope: latest $RunLimit runs per protection group/run type.
 
@@ -599,16 +644,20 @@ Do Not Edit Generated Files:
 
 Closure Counts:
 - Active / unresolved failures: $activeCount
-  - Running / awaiting completion: $($running.Count)
-  - Cancelled after failure: $($cancelled.Count)
-  - Needs review / not verified: $($unknown.Count)
-- Cleared by later successful backup: $clearedCount
+- Newly cleared this check: $newlyClearedCount
+- Previously cleared rows retained in lifecycle CSV: $previouslyClearedCount
 - Total lifecycle rows tracked: $lifecycleCount
 
 Tally Check:
 - $activeTally
 - $lifecycleTally
 - $latestSuccessReconcileLine
+
+Failure Section:
+$failureSectionText
+
+Success Section:
+$successSectionText
 
 Carry Forward / Handoff:
 $(if ($activeCount -eq 0) { "No active backup failures remain based on the latest saved state." } else { "$activeCount active/unresolved rows remain in incident_lifecycle.csv and should be carried forward or separately tracked." })
@@ -632,7 +681,8 @@ $localCleanupIssues
     Write-FinalMonitorSummary `
         -ApiStatus $apiStatus `
         -ActiveCount $activeCount `
-        -ClearedCount $clearedCount `
+        -NewlyClearedCount $newlyClearedCount `
+        -PreviouslyClearedCount $previouslyClearedCount `
         -LifecycleCount $lifecycleCount `
         -NewCount $newFailures.Count `
         -OlderCount $older.Count `
