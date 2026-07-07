@@ -89,6 +89,40 @@ Retry Failed Collection Scope:
 
 Use the command printed in `worknotes_summary.txt`. After the rerun completes, use the refreshed `worknotes_summary.txt` and `incident_lifecycle.csv` for the incident update.
 
+## Latest-success reconciliation
+
+The entry script performs a final reconciliation after the main collection completes.
+
+A row is not allowed to remain in `current_failures.csv` when all of these are true:
+
+```text
+Status is active/unresolved
+LatestRunStatus is Succeeded or SucceededWithWarning
+LastSeenET is later than LastFailedET
+```
+
+When this condition is found, the entry script:
+
+```text
+1. Removes the row from current_failures.csv.
+2. Sets Status to NewlyClearedThisCheck.
+3. Sets ClearedET to LastSeenET.
+4. Adds or updates the row in cleared_by_success.csv.
+5. Updates incident_lifecycle.csv.
+6. Updates state.json so the next run does not carry the row as active.
+```
+
+This prevents rows such as the following from appearing as active failures:
+
+```text
+Status = OlderStillFailing
+LatestRunStatus = Succeeded
+LastSeenET > LastFailedET
+ClearedET = blank
+```
+
+That combination is treated as cleared by a later successful backup.
+
 ## Locked design summary
 
 - One incident is locked to one compute window.
@@ -124,16 +158,26 @@ closing_summary.txt
 state.json
 ```
 
+### CSV headers
+
+All three CSV files use the same standard header order:
+
+```text
+IncidentNumber,WindowKey,Status,Cluster,Environment,ProtectionGroup,Host,ObjectName,ObjectType,RunType,FirstFailedET,LastFailedET,ClearedET,LastSeenET,LatestRunStatus,ConsecutiveFailureCount,Message,ObjectKey
+```
+
+If a CSV has no rows, the entry script still preserves the header line.
+
 ### File purpose
 
 | File | Purpose |
 |---|---|
-| `current_failures.csv` | Main action list. Active/unresolved failures for the team to work. |
+| `current_failures.csv` | Main action list. Active/unresolved failures for the team to work. Rows with a later successful `LatestRunStatus` are removed by reconciliation. |
 | `cleared_by_success.csv` | Failures verified as cleared by a later successful backup. |
 | `incident_lifecycle.csv` | Consolidated incident view with all tracked objects and current status. This is the best sortable operational detail file and the only file opened by `-ShowGrid`. |
-| `worknotes_summary.txt` | Main incident update. Contains count source, clear tally checks, incomplete collection details, and retry command when needed. |
+| `worknotes_summary.txt` | Main incident update. Contains count source, clear tally checks, latest-success reconciliation count, incomplete collection details, and retry command when needed. |
 | `closing_summary.txt` | Closure/handoff summary with the same count/tally model. |
-| `state.json` | Script memory. Keeps failure state, failed run keys, cleared items, and warnings. |
+| `state.json` | Script memory. Keeps failure state, failed run keys, cleared items, latest-success reconciliation count, and warnings. |
 
 ## Sort order
 
@@ -168,10 +212,12 @@ This keeps each cluster together and keeps the most actionable statuses ahead of
 It contains:
 
 - Cohesity API Collection Status: Complete or Incomplete with reason/count.
+- CSV header line.
 - Count source explanation.
 - Summary counts.
 - Parent/child active failure breakdown.
 - Tally checks.
+- Latest-success reconciliation count.
 - Incomplete collection details.
 - Retry Failed Collection Scope command when needed.
 - File attachment/update list.
@@ -187,7 +233,7 @@ It does not contain:
 
 ## Count model
 
-The worknotes counts are based on CSV row counts.
+The worknotes counts are based on CSV row counts after latest-success reconciliation.
 
 ```text
 Active / unresolved failures = row count in current_failures.csv
