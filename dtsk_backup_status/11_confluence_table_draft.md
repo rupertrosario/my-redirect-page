@@ -13,24 +13,24 @@
 | Tools Used | Dynatrace Workflow, ServiceNow DTSK table, Cohesity Helios API, email notification. |
 | Estimated Effort to Complete Automation | Initial report-only workflow completed; future ServiceNow writeback/closure depends on approved access, field confirmation, and testing. |
 | Work Performed By | Backup automation / backup operations team. |
-| Expected Savings and Benefits | Effort per DTSK: 3-5 minutes manual validation/update. Annual DTSK volume: ~2,390. Monthly task volume: ~199 DTSKs/month. Monthly effort saved: ~597-995 minutes/month, equal to ~10-17 hours/month. Annual effort saved: ~7,170-11,950 minutes/year, equal to ~120-200 hours/year. Benefits: removes repeated cluster-by-cluster lookup across 23 Cohesity clusters, runs every 5 hours daily to reduce missed DTSKs, provides consistent recurring backup-status reporting, separates confirmed backup/missing backup/DB-only/validation-error cases, keeps the first phase safe with read-only reporting, and creates a path for future ServiceNow writeback and eligible auto-closure. |
+| Expected Savings and Benefits | Removes repeated cluster-by-cluster lookup across 23 Cohesity clusters; runs every 5 hours daily to reduce missed DTSKs; provides consistent recurring backup-status reporting; separates confirmed backup, missing backup, DB-only backup, and validation-error cases; keeps the first phase safe with read-only reporting; creates a path for future ServiceNow writeback and eligible auto-closure. Estimated potential avoidance at same 5-hour cadence: ~154-264 hours/month. Broader DTSK volume estimate: ~120-200 hours/year. |
 | Current Status | Report-only automation is in place. No ServiceNow writeback, no work_notes update, no state change, and no auto-closure in current phase. |
 | Comments / Future Enhancement | ServiceNow idea/request raised for controlled update access: work_notes update, duplicate-note check, eligible CR Required = No, state change, and auto-close for approved cases, especially VM DTSKs. Physical server unregister/removal remains pending for later enhancement. |
 
 ---
 
-## Savings Calculation
+## Manual vs Automation Time Saving
 
-| Metric | Value |
-|---|---:|
-| Manual effort per DTSK | 3-5 minutes |
-| Annual DTSK volume | ~2,390 DTSKs/year |
-| Monthly DTSK volume | ~199 DTSKs/month |
-| Monthly effort saved | ~597-995 minutes/month |
-| Monthly effort saved | ~10-17 hours/month |
-| Annual effort saved | ~7,170-11,950 minutes/year |
-| Annual effort saved | ~120-200 hours/year |
-| Automation run frequency | Every 5 hours daily |
+| Criteria | Manual Process | Automated Process | Estimated Saving |
+|---|---:|---:|---:|
+| Item scope | 1 DTSK / CI | 1 DTSK / CI | Same scope |
+| Cluster coverage | 23 clusters checked manually | 23 clusters checked by workflow | Removes manual cluster lookup |
+| Time per cluster | 3-5 minutes per cluster | API-driven | Manual per-cluster effort avoided |
+| Frequency | Manual/on-demand or monthly review | Scheduled every 5 hours daily | Reduces missed DTSKs |
+| Time per run | 23 clusters x 3-5 minutes = 69-115 minutes | ~5 minutes review | ~64-110 minutes/run |
+| Estimated runs per month | Not practical manually at 5-hour cadence | ~144 scheduled runs/month | Continuous coverage without manual effort |
+| Monthly effort if done manually at same cadence | ~166-276 hours/month | ~12 hours/month review | ~154-264 hours/month potential avoidance |
+| Broader DTSK volume estimate | 2,390 DTSKs/year x 3-5 minutes | Automated validation/update path | ~120-200 hours/year potential |
 
 ---
 
@@ -50,4 +50,4 @@
 
 ## Short Version for Confluence Page
 
-The current automation validates decommission DTSK backup status using a read-only Dynatrace workflow. It checks active DTSKs, validates CI/server protection from Cohesity Helios, and sends a clean email report every 5 hours daily. Based on ~2,390 DTSKs/year and 3-5 minutes of manual effort per DTSK, estimated effort avoided is ~120-200 hours/year. Benefits include reduced manual validation, recurring 5-hour DTSK coverage, consistent status reporting, exception-focused review, and a controlled path for future ServiceNow work_notes/state updates and eligible auto-closure.
+The current automation validates decommission DTSK backup status using a read-only Dynatrace workflow. It checks active DTSKs, validates CI/server protection from Cohesity Helios, and sends a clean email report every 5 hours daily. Manual checking across 23 clusters would take ~69-115 minutes per run, while automated review is estimated at ~5 minutes per run. At the same 5-hour cadence, estimated potential manual effort avoided is ~154-264 hours/month. Broader annual DTSK volume estimate remains ~120-200 hours/year based on 2,390 DTSKs/year and 3-5 minutes per DTSK.
