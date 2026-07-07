@@ -5,7 +5,7 @@ Entry point for Cohesity Backup Failure INC status updates.
 .DESCRIPTION
 This is the operational entry point for the backup failure incident update workflow.
 It delegates to the main implementation script, then rewrites the human-readable text outputs
-so worknotes and summary are complete, audit-ready, and non-truncated.
+so there is one complete worknotes_summary.txt file with all incident details and no row truncation.
 
 Run one cluster:
   .\Cohesity_Backup_Failure_INC_Status_Update.ps1 -ClusterName "CLUSTER_NAME"
@@ -116,7 +116,7 @@ function Format-StatusTotals($Rows) {
     return ($lines -join [Environment]::NewLine)
 }
 
-function Write-AuditReadyIncidentText([string]$Folder, [int]$RunLimit) {
+function Write-SingleWorknotesSummary([string]$Folder, [int]$RunLimit) {
     if ([string]::IsNullOrWhiteSpace($Folder) -or !(Test-Path $Folder)) { return }
 
     $state = Read-JsonFile (Join-Path $Folder "state.json")
@@ -144,8 +144,8 @@ function Write-AuditReadyIncidentText([string]$Folder, [int]$RunLimit) {
         $completeness = "Incomplete. One or more cluster/protection-group queries failed or timed out. Do not treat missing rows from warned PGs/clusters as cleared unless listed in cleared_by_success.csv."
     }
 
-    $detailedUpdate = @"
-Backup Failure Incident Update
+    $worknotesSummary = @"
+Backup Failure Incident Worknotes Summary
 
 Incident: $incident
 Compute Window: $windowLabel
@@ -207,16 +207,12 @@ CSV Evidence Files:
 - incident_lifecycle.csv
 
 Text Evidence Files:
-- worknotes.txt
-- summary.txt
+- worknotes_summary.txt
 - closing_summary.txt
 - state.json
 "@
 
-    # For audit clarity, worknotes.txt and summary.txt intentionally contain the same full detail.
-    # This avoids partial incident notes that require a CSV attachment to understand the update.
-    $detailedUpdate | Set-Content -Path (Join-Path $Folder "worknotes.txt") -Encoding UTF8
-    $detailedUpdate | Set-Content -Path (Join-Path $Folder "summary.txt") -Encoding UTF8
+    $worknotesSummary | Set-Content -Path (Join-Path $Folder "worknotes_summary.txt") -Encoding UTF8
 
     $closing = @"
 Backup Failure Incident Closure Summary
@@ -263,12 +259,18 @@ Evidence Files:
 - current_failures.csv
 - cleared_by_success.csv
 - incident_lifecycle.csv
-- worknotes.txt
-- summary.txt
+- worknotes_summary.txt
 - closing_summary.txt
 - state.json
 "@
     $closing | Set-Content -Path (Join-Path $Folder "closing_summary.txt") -Encoding UTF8
+
+    foreach ($obsolete in @("worknotes.txt", "summary.txt")) {
+        $obsoletePath = Join-Path $Folder $obsolete
+        if (Test-Path $obsoletePath) {
+            Remove-Item -Path $obsoletePath -Force -ErrorAction SilentlyContinue
+        }
+    }
 }
 
 $target = Join-Path $PSScriptRoot "Get-CohesityBackupFailureWindowConsolidator.ps1"
@@ -282,11 +284,10 @@ $mainExitCode = $LASTEXITCODE
 try {
     $folder = Get-ReportFolder -Root $OutputRoot -Inc $IncidentNumber
     if ($folder) {
-        Write-AuditReadyIncidentText -Folder $folder -RunLimit $NumRuns
+        Write-SingleWorknotesSummary -Folder $folder -RunLimit $NumRuns
         Write-Host ""
-        Write-Host "Text outputs normalized with full audit-ready details and no row truncation:"
-        Write-Host (Join-Path $folder "worknotes.txt")
-        Write-Host (Join-Path $folder "summary.txt")
+        Write-Host "Text outputs normalized with single worknotes summary and no row truncation:"
+        Write-Host (Join-Path $folder "worknotes_summary.txt")
         Write-Host (Join-Path $folder "closing_summary.txt")
     } else {
         Write-Warning "Unable to locate incident output folder for text normalization."
