@@ -97,10 +97,20 @@ state.json
 | `current_failures.csv` | Main action list. Active/unresolved failures for the team to work. |
 | `cleared_by_success.csv` | Failures verified as cleared by a later successful backup. |
 | `incident_lifecycle.csv` | Consolidated incident view with all tracked objects and current status. |
-| `worknotes.txt` | Short paste-ready ServiceNow update. |
-| `summary.txt` | Detailed current-state summary. |
-| `closing_summary.txt` | Closure/handoff summary. Also refreshed for the previous incident when a new window starts. |
+| `worknotes.txt` | Short index/status note only. It does not contain partial row details. |
+| `summary.txt` | Detailed incident source of truth. Attach/paste this when full detail is needed. No row truncation. |
+| `closing_summary.txt` | Closure/handoff summary. Includes active/unresolved failures and successful backup clearances. No row truncation. |
 | `state.json` | Script memory. Keeps failure state, failed run keys, cleared items, and warnings. |
+
+## Human-readable reporting rule
+
+To avoid conflicting or partial reporting:
+
+- `summary.txt` is the detailed incident update and contains all row details.
+- `closing_summary.txt` is the detailed closure/handoff note and contains all row details, including successful backup clearances.
+- `worknotes.txt` is only a short status/index note pointing to `summary.txt`, `closing_summary.txt`, and the CSV evidence.
+- The operational entry script rewrites the text outputs after the main run so there are no `... more rows in CSV` truncation lines.
+- Warning and timeout details are shown directly in `summary.txt`, `closing_summary.txt`, and summarized in `worknotes.txt`.
 
 ## Status values
 
