@@ -84,8 +84,7 @@ X:\PowerShell\Data\Cohesity\BackupFailureWindow\<INC_NUMBER>\
 current_failures.csv
 cleared_by_success.csv
 incident_lifecycle.csv
-worknotes.txt
-summary.txt
+worknotes_summary.txt
 closing_summary.txt
 state.json
 ```
@@ -96,9 +95,8 @@ state.json
 |---|---|
 | `current_failures.csv` | Main action list. Active/unresolved failures for the team to work. |
 | `cleared_by_success.csv` | Failures verified as cleared by a later successful backup. |
-| `incident_lifecycle.csv` | Consolidated incident view with all tracked objects and current status. |
-| `worknotes.txt` | Full audit-ready incident update. Same detailed content as `summary.txt`. No partial updates. |
-| `summary.txt` | Full audit-ready incident update. Same detailed content as `worknotes.txt`. No row truncation. |
+| `incident_lifecycle.csv` | Consolidated incident view with all tracked objects and current status. This is the best sortable operational detail file. |
+| `worknotes_summary.txt` | Full audit-ready incident update. Upload/paste this into the incident. No row truncation. |
 | `closing_summary.txt` | Closure/handoff summary. Includes active/unresolved failures and successful backup clearances. No row truncation. |
 | `state.json` | Script memory. Keeps failure state, failed run keys, cleared items, and warnings. |
 
@@ -106,12 +104,12 @@ state.json
 
 To avoid conflicting, partial, or audit-confusing reporting:
 
-- `worknotes.txt` and `summary.txt` intentionally contain the same full detailed incident update.
-- Neither file is a short pointer/index note.
-- Both files include all row details with no `... more rows in CSV` truncation lines.
-- Both files include current failures, carried-forward failures, running/cancelled/unknown items, successful backup clearances, lifecycle rows, and warning/timeout details.
-- `closing_summary.txt` is the detailed closure/handoff note and also includes successful backup clearances.
-- CSV files remain sortable evidence, but the text note is complete enough to understand the incident update without opening the CSVs.
+- There is one main human-readable incident update: `worknotes_summary.txt`.
+- `worknotes.txt` and `summary.txt` are not retained by the entry script.
+- `worknotes_summary.txt` includes all row details with no `... more rows in CSV` truncation lines.
+- `worknotes_summary.txt` includes current failures, carried-forward failures, running/cancelled/unknown items, successful backup clearances, lifecycle rows, and warning/timeout details.
+- `closing_summary.txt` is the separate closure/handoff note and also includes successful backup clearances.
+- CSV files remain sortable evidence, but `worknotes_summary.txt` is complete enough to understand the incident update without opening the CSVs.
 
 ## Status values
 
@@ -157,7 +155,7 @@ Safety rules:
 
 - Active incident folder is never zipped or deleted.
 - Folder is deleted only after zip exists.
-- Retention actions and warnings are written into `summary.txt` and `worknotes.txt`.
+- Retention actions and warnings are written into `worknotes_summary.txt`.
 
 ## Authentication
 
@@ -174,4 +172,4 @@ X:\PowerShell\Cohesity_API_Scripts\Common\Secure\cohesity_apikey.enc
 - No ServiceNow writes.
 - Cohesity API calls are GET-only.
 - No `Recovered` / `Recovery` wording is used for backup clearances.
-- Scope line is written to worknotes and summary: latest 30 runs per protection group/run type.
+- Scope line is written to `worknotes_summary.txt`: latest 30 runs per protection group/run type.
