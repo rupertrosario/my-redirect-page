@@ -18,41 +18,55 @@ backup_failures/Get-CohesityBackupFailureWindowConsolidator.ps1
 
 Incident lifecycle tracker for Cohesity backup failures.
 
-It is not an audit-grade collector for every backup event. It tracks current/latest uncleared failures observed during the incident window, detects new/old/carry-forward failures, and marks a failure cleared only when a later successful backup is verified.
+It tracks current/latest uncleared failures observed during the incident window, detects new/old/carry-forward failures, and marks a failure cleared only when a later successful backup is verified.
 
-## Run one cluster
+This is an incident operations workflow. It is not an audit-grade collector for every historical backup event.
 
-```powershell
-cd X:\PowerShell\Cohesity_API_Scripts\backup_failures
-.\Cohesity_Backup_Failure_INC_Status_Update.ps1 -ClusterName "YOUR_CLUSTER_NAME"
-```
+## Important operator rule
+
+Use only the new incident lifecycle script.
+
+Do not use the legacy backup-failure script as a fallback for this incident workflow.
+Do not import legacy backup-failure CSV files into this workflow.
+Do not manually merge legacy output into the incident lifecycle files.
 
 ## Run all clusters
+
+This is the standard run mode.
 
 ```powershell
 cd X:\PowerShell\Cohesity_API_Scripts\backup_failures
 .\Cohesity_Backup_Failure_INC_Status_Update.ps1
 ```
 
-## Optional first baseline from existing failure CSV
+## Run one cluster
 
-Use this only when you already ran the existing failure-only script and want the first incident baseline from its latest combined CSV:
-
-```powershell
-.\Cohesity_Backup_Failure_INC_Status_Update.ps1 -UseLatestFailureCsv
-```
-
-Default legacy CSV location:
-
-```text
-X:\PowerShell\Data\Cohesity\BackupFailures\BackupFailures_AllEnvironments_*.csv
-```
-
-You can also provide an exact CSV:
+Use one-cluster mode only for standalone testing unless targeted partial-update mode has been explicitly added and confirmed.
 
 ```powershell
-.\Cohesity_Backup_Failure_INC_Status_Update.ps1 -UseLatestFailureCsv -LegacyFailureCsvPath "X:\PowerShell\Data\Cohesity\BackupFailures\BackupFailures_AllEnvironments_YYYYMMDD_HHMMSS.csv"
+cd X:\PowerShell\Cohesity_API_Scripts\backup_failures
+.\Cohesity_Backup_Failure_INC_Status_Update.ps1 -ClusterName "YOUR_CLUSTER_NAME"
 ```
+
+Do not run a one-cluster scan against an existing all-cluster incident and assume the output is complete for the full estate.
+
+## Timeout / incomplete collection handling
+
+If `worknotes_summary.txt` says the report is incomplete, or if warnings show PG/cluster lookup timeout:
+
+1. Do not close the incident based only on that run.
+2. Do not treat missing objects from the warned cluster/protection group as cleared.
+3. Review the `Warnings / Incomplete Collection` section in `worknotes_summary.txt`.
+4. Re-run the new incident lifecycle script after the timeout condition is expected to clear.
+5. Use only the refreshed files from the new incident lifecycle script.
+
+Planned safe retry model:
+
+```powershell
+.\Cohesity_Backup_Failure_INC_Status_Update.ps1 -IncidentNumber "INCxxxxxxx" -ClusterName "FAILED_CLUSTER" -Environment "kOracle" -PartialUpdate
+```
+
+This targeted partial-update mode must preserve all existing incident rows outside the failed retry scope. Until that mode is implemented and confirmed, do not use one-cluster output as a full incident update for an existing all-cluster incident.
 
 ## Locked design summary
 
@@ -68,7 +82,7 @@ You can also provide an exact CSV:
 - Only `Succeeded` or `SucceededWithWarning` clears a failure.
 - `Running` does not clear.
 - `Cancelled` / `Canceled` does not clear.
-- Unknown or incomplete API data does not clear.
+- Unknown, timeout, or incomplete API data does not clear.
 - Consecutive count is based on unique failed backup runs, not script executions.
 - Evaluation is limited to the latest 30 runs per protection group/run type.
 
@@ -125,6 +139,23 @@ CancelledAfterFailure
 UnknownNeedsReview
 ```
 
+## Required incident attachments / updates
+
+For each clean run:
+
+1. Upload or paste `worknotes_summary.txt`.
+2. Attach `incident_lifecycle.csv`.
+3. Attach `current_failures.csv` if active failures remain.
+4. Attach `cleared_by_success.csv` if rows exist.
+5. Use `closing_summary.txt` only during closure or handoff.
+
+For incomplete runs:
+
+1. Upload/paste `worknotes_summary.txt` only if the incomplete warning is clearly visible.
+2. Do not close the incident.
+3. Do not claim all failures are cleared.
+4. Re-run the new incident lifecycle script and attach the refreshed output.
+
 ## Previous incident closure summary
 
 When a new compute window starts and the script needs a new incident number, it first refreshes the previous incident's:
@@ -171,5 +202,6 @@ X:\PowerShell\Cohesity_API_Scripts\Common\Secure\cohesity_apikey.enc
 - No Excel output.
 - No ServiceNow writes.
 - Cohesity API calls are GET-only.
+- No legacy backup-failure CSV fallback in the operator process.
 - No `Recovered` / `Recovery` wording is used for backup clearances.
 - Scope line is written to `worknotes_summary.txt`: latest 30 runs per protection group/run type.
