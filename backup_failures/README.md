@@ -41,32 +41,34 @@ cd X:\PowerShell\Cohesity_API_Scripts\backup_failures
 
 ## Run one cluster
 
-Use one-cluster mode only for standalone testing unless targeted partial-update mode has been explicitly added and confirmed.
+Use one-cluster mode only for standalone testing or when the incident workflow output specifically provides the retry command.
 
 ```powershell
 cd X:\PowerShell\Cohesity_API_Scripts\backup_failures
 .\Cohesity_Backup_Failure_INC_Status_Update.ps1 -ClusterName "YOUR_CLUSTER_NAME"
 ```
 
-Do not run a one-cluster scan against an existing all-cluster incident and assume the output is complete for the full estate.
+## Incomplete collection handling
 
-## Timeout / incomplete collection handling
+If a cluster, environment, protection-group, or runs lookup times out, the run is marked incomplete in `worknotes_summary.txt`.
 
-If `worknotes_summary.txt` says the report is incomplete, or if warnings show PG/cluster lookup timeout:
+The note will show:
 
-1. Do not close the incident based only on that run.
-2. Do not treat missing objects from the warned cluster/protection group as cleared.
-3. Review the `Warnings / Incomplete Collection` section in `worknotes_summary.txt`.
-4. Re-run the new incident lifecycle script after the timeout condition is expected to clear.
-5. Use only the refreshed files from the new incident lifecycle script.
-
-Planned safe retry model:
-
-```powershell
-.\Cohesity_Backup_Failure_INC_Status_Update.ps1 -IncidentNumber "INCxxxxxxx" -ClusterName "FAILED_CLUSTER" -Environment "kOracle" -PartialUpdate
+```text
+Cohesity API Collection Status: Incomplete - <reason/count>
 ```
 
-This targeted partial-update mode must preserve all existing incident rows outside the failed retry scope. Until that mode is implemented and confirmed, do not use one-cluster output as a full incident update for an existing all-cluster incident.
+It will also show:
+
+```text
+Incomplete Collection:
+- <warning detail>
+
+Retry Failed Collection Scope:
+<exact command to run>
+```
+
+Use the command printed in `worknotes_summary.txt`. After the rerun completes, use the refreshed `worknotes_summary.txt` and `incident_lifecycle.csv` for the incident update.
 
 ## Locked design summary
 
@@ -110,20 +112,32 @@ state.json
 | `current_failures.csv` | Main action list. Active/unresolved failures for the team to work. |
 | `cleared_by_success.csv` | Failures verified as cleared by a later successful backup. |
 | `incident_lifecycle.csv` | Consolidated incident view with all tracked objects and current status. This is the best sortable operational detail file. |
-| `worknotes_summary.txt` | Full audit-ready incident update. Upload/paste this into the incident. No row truncation. |
-| `closing_summary.txt` | Closure/handoff summary. Includes active/unresolved failures and successful backup clearances. No row truncation. |
+| `worknotes_summary.txt` | Main incident update. Contains active failure details, short clearance evidence, incomplete collection details, and the exact retry command when needed. |
+| `closing_summary.txt` | Closure/handoff summary. Includes active/unresolved failures and successful backup clearances. |
 | `state.json` | Script memory. Keeps failure state, failed run keys, cleared items, and warnings. |
 
-## Human-readable reporting rule
+## Worknotes summary format
 
-To avoid conflicting, partial, or audit-confusing reporting:
+`worknotes_summary.txt` is intentionally concise.
 
-- There is one main human-readable incident update: `worknotes_summary.txt`.
-- `worknotes.txt` and `summary.txt` are not retained by the entry script.
-- `worknotes_summary.txt` includes all row details with no `... more rows in CSV` truncation lines.
-- `worknotes_summary.txt` includes current failures, carried-forward failures, running/cancelled/unknown items, successful backup clearances, lifecycle rows, and warning/timeout details.
-- `closing_summary.txt` is the separate closure/handoff note and also includes successful backup clearances.
-- CSV files remain sortable evidence, but `worknotes_summary.txt` is complete enough to understand the incident update without opening the CSVs.
+It contains:
+
+- Cohesity API Collection Status: Complete or Incomplete with reason/count.
+- Operator guidance.
+- Counts.
+- Full details for active/unresolved failures only.
+- Short evidence for items cleared by later successful backup.
+- Incomplete collection details.
+- Retry Failed Collection Scope command when needed.
+- Pointer to `incident_lifecycle.csv` for the full lifecycle view.
+
+It does not contain:
+
+- Full lifecycle dump.
+- Separate consecutive/repeated failure section.
+- Failure error message on cleared-success rows.
+- Local retention/output cleanup actions unless a cleanup issue is detected.
+- `... more rows in CSV` truncation lines.
 
 ## Status values
 
@@ -151,10 +165,8 @@ For each clean run:
 
 For incomplete runs:
 
-1. Upload/paste `worknotes_summary.txt` only if the incomplete warning is clearly visible.
-2. Do not close the incident.
-3. Do not claim all failures are cleared.
-4. Re-run the new incident lifecycle script and attach the refreshed output.
+1. Follow the `Retry Failed Collection Scope` command shown in `worknotes_summary.txt`.
+2. After the rerun, update the incident using the refreshed `worknotes_summary.txt` and `incident_lifecycle.csv`.
 
 ## Previous incident closure summary
 
@@ -186,7 +198,7 @@ Safety rules:
 
 - Active incident folder is never zipped or deleted.
 - Folder is deleted only after zip exists.
-- Retention actions and warnings are written into `worknotes_summary.txt`.
+- Retention/output cleanup messages are not shown in `worknotes_summary.txt` unless a local cleanup issue is detected.
 
 ## Authentication
 
