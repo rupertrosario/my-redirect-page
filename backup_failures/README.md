@@ -50,20 +50,20 @@ cd X:\PowerShell\Cohesity_API_Scripts\backup_failures
 
 ## Optional grid view
 
-For local review, the entry script can open the generated CSV files in PowerShell Grid View:
+For local review, the entry script can open only the full lifecycle CSV in PowerShell Grid View:
 
 ```powershell
 cd X:\PowerShell\Cohesity_API_Scripts\backup_failures
 .\Cohesity_Backup_Failure_INC_Status_Update.ps1 -ShowGrid
 ```
 
-This opens filterable grid windows for:
+This opens:
 
 ```text
-current_failures.csv
 incident_lifecycle.csv
-cleared_by_success.csv
 ```
+
+Reason: `incident_lifecycle.csv` already contains the complete tracked lifecycle view, including active/unresolved rows, cleared rows, running/cancelled/needs-review rows, and carry-forward status. Keeping the grid to one file avoids multiple windows and operator confusion.
 
 `-ShowGrid` is optional and requires a PowerShell session where `Out-GridView` is available.
 
@@ -130,7 +130,7 @@ state.json
 |---|---|
 | `current_failures.csv` | Main action list. Active/unresolved failures for the team to work. |
 | `cleared_by_success.csv` | Failures verified as cleared by a later successful backup. |
-| `incident_lifecycle.csv` | Consolidated incident view with all tracked objects and current status. This is the best sortable operational detail file. |
+| `incident_lifecycle.csv` | Consolidated incident view with all tracked objects and current status. This is the best sortable operational detail file and the only file opened by `-ShowGrid`. |
 | `worknotes_summary.txt` | Main incident update. Contains count source, clear tally checks, incomplete collection details, and retry command when needed. |
 | `closing_summary.txt` | Closure/handoff summary with the same count/tally model. |
 | `state.json` | Script memory. Keeps failure state, failed run keys, cleared items, and warnings. |
