@@ -97,20 +97,21 @@ state.json
 | `current_failures.csv` | Main action list. Active/unresolved failures for the team to work. |
 | `cleared_by_success.csv` | Failures verified as cleared by a later successful backup. |
 | `incident_lifecycle.csv` | Consolidated incident view with all tracked objects and current status. |
-| `worknotes.txt` | Short index/status note only. It does not contain partial row details. |
-| `summary.txt` | Detailed incident source of truth. Attach/paste this when full detail is needed. No row truncation. |
+| `worknotes.txt` | Full audit-ready incident update. Same detailed content as `summary.txt`. No partial updates. |
+| `summary.txt` | Full audit-ready incident update. Same detailed content as `worknotes.txt`. No row truncation. |
 | `closing_summary.txt` | Closure/handoff summary. Includes active/unresolved failures and successful backup clearances. No row truncation. |
 | `state.json` | Script memory. Keeps failure state, failed run keys, cleared items, and warnings. |
 
 ## Human-readable reporting rule
 
-To avoid conflicting or partial reporting:
+To avoid conflicting, partial, or audit-confusing reporting:
 
-- `summary.txt` is the detailed incident update and contains all row details.
-- `closing_summary.txt` is the detailed closure/handoff note and contains all row details, including successful backup clearances.
-- `worknotes.txt` is only a short status/index note pointing to `summary.txt`, `closing_summary.txt`, and the CSV evidence.
-- The operational entry script rewrites the text outputs after the main run so there are no `... more rows in CSV` truncation lines.
-- Warning and timeout details are shown directly in `summary.txt`, `closing_summary.txt`, and summarized in `worknotes.txt`.
+- `worknotes.txt` and `summary.txt` intentionally contain the same full detailed incident update.
+- Neither file is a short pointer/index note.
+- Both files include all row details with no `... more rows in CSV` truncation lines.
+- Both files include current failures, carried-forward failures, running/cancelled/unknown items, successful backup clearances, lifecycle rows, and warning/timeout details.
+- `closing_summary.txt` is the detailed closure/handoff note and also includes successful backup clearances.
+- CSV files remain sortable evidence, but the text note is complete enough to understand the incident update without opening the CSVs.
 
 ## Status values
 
@@ -156,7 +157,7 @@ Safety rules:
 
 - Active incident folder is never zipped or deleted.
 - Folder is deleted only after zip exists.
-- Retention actions and warnings are written into `summary.txt`.
+- Retention actions and warnings are written into `summary.txt` and `worknotes.txt`.
 
 ## Authentication
 
