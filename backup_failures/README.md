@@ -116,6 +116,20 @@ state.json
 | `closing_summary.txt` | Closure/handoff summary. Includes active/unresolved failures and successful backup clearances. |
 | `state.json` | Script memory. Keeps failure state, failed run keys, cleared items, and warnings. |
 
+## Sort order
+
+The entry script normalizes the final text and CSV outputs into an operator-friendly order.
+
+| Output | Sort order |
+|---|---|
+| `current_failures.csv` | Cluster ascending, then `LastFailedET` descending, then Environment, ProtectionGroup, ObjectName. |
+| `cleared_by_success.csv` | Cluster ascending, then `ClearedET` descending, then Environment, ProtectionGroup, ObjectName. |
+| `incident_lifecycle.csv` | Cluster ascending, then latest activity descending. Latest activity uses `ClearedET` when present, otherwise `LastSeenET`, otherwise `LastFailedET`. |
+| `worknotes_summary.txt` | Uses the same clusterwise sort order as the CSV sections. |
+| `closing_summary.txt` | Uses the same clusterwise sort order as the CSV sections. |
+
+This keeps each cluster together while showing the latest failure or clearance first inside that cluster.
+
 ## Worknotes summary format
 
 `worknotes_summary.txt` is intentionally concise.
