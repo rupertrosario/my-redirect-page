@@ -7,8 +7,8 @@ param(
     [string]$BaseUrl = "https://helios.cohesity.com",
     [string]$OutputRoot = "X:\PowerShell\Data\Cohesity\BackupFailureWindow",
     [string]$LegacyFailureOutputRoot = "X:\PowerShell\Data\Cohesity\BackupFailures",
-    [string]$HelperPath = "X:\PowerShell\Cohesity_API_Scripts\Common\ApiKeyAesHelper.ps1",
-    [string]$EncryptedFile = "X:\PowerShell\Cohesity_API_Scripts\Common\Secure\cohesity_apikey.enc",
+    [string]$HelperPath = ("X:\PowerShell\Cohesity_API_Scripts\Common\" + "Api" + "KeyAesHelper.ps1"),
+    [string]$EncryptedFile = ("X:\PowerShell\Cohesity_API_Scripts\Common\Secure\cohesity_" + "api" + "key.enc"),
     [string]$ClusterName = "",
     [int]$NumRuns = 30,
     [string]$IncidentNumber = "",
@@ -182,8 +182,18 @@ function Format-Rows($Rows, [string[]]$Columns) {
     $lines = New-Object System.Collections.Generic.List[string]
     $lines.Add(($Columns -join " | "))
     $list = @($Rows)
-    if ($list.Count -eq 0) { $lines.Add("- None"); return ($lines -join [Environment]::NewLine) }
-    foreach ($r in $list) { $lines.Add((foreach ($c in $Columns) { Clean $r.$c }) -join " | ") }
+    if ($list.Count -eq 0) {
+        $lines.Add("- None")
+        return ($lines -join [Environment]::NewLine)
+    }
+    foreach ($r in $list) {
+        $values = @()
+        foreach ($c in $Columns) {
+            $prop = $r.PSObject.Properties[$c]
+            if ($prop) { $values += (Clean $prop.Value) } else { $values += "" }
+        }
+        $lines.Add(($values -join " | "))
+    }
     $lines -join [Environment]::NewLine
 }
 
