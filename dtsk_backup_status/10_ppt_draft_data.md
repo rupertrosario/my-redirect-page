@@ -48,9 +48,9 @@
 |---|---:|---:|---:|
 | Item scope | 1 DTSK / CI | 1 DTSK / CI | Same scope |
 | Cluster coverage | 23 clusters checked manually | 23 clusters checked by workflow | Removes manual cluster lookup |
-| Time per cluster/check | 3-5 minutes | API-driven | Manual effort avoided |
+| Time per cluster | 3-5 minutes per cluster | API-driven | Manual per-cluster effort avoided |
 | Frequency | Monthly | Monthly | Same cadence |
-| Time per monthly run | 69-115 minutes | ~5 minutes review | ~64-110 minutes/month |
+| Time per monthly run | 23 clusters x 3-5 minutes = 69-115 minutes | ~5 minutes review | ~64-110 minutes/month |
 | Annual saving for monthly run | ~13-22 hours/year | Review only | ~13-22 hours/year |
 | Broader DTSK volume estimate | 2,390 DTSKs/year x 3-5 minutes | Automated validation/update path | ~120-200 hours/year potential |
 
