@@ -184,18 +184,19 @@ function Open-OutputGrid([string]$Folder) {
         return
     }
 
-    $gridFiles = @(
-        @{ Path = (Join-Path $Folder "current_failures.csv"); Title = "Cohesity - Current Active / Unresolved Failures" },
-        @{ Path = (Join-Path $Folder "incident_lifecycle.csv"); Title = "Cohesity - Incident Lifecycle" },
-        @{ Path = (Join-Path $Folder "cleared_by_success.csv"); Title = "Cohesity - Cleared By Later Successful Backup" }
-    )
-
-    foreach ($g in $gridFiles) {
-        if (Test-Path $g.Path) {
-            $rows = Import-ReportCsv $g.Path
-            if ($rows.Count -gt 0) { $rows | Out-GridView -Title $g.Title }
-        }
+    $lifecyclePath = Join-Path $Folder "incident_lifecycle.csv"
+    if (!(Test-Path $lifecyclePath)) {
+        Write-Warning "incident_lifecycle.csv was not found. Grid view was not opened."
+        return
     }
+
+    $rows = Import-ReportCsv $lifecyclePath
+    if ($rows.Count -eq 0) {
+        Write-Warning "incident_lifecycle.csv has no rows. Grid view was not opened."
+        return
+    }
+
+    $rows | Out-GridView -Title "Cohesity - Incident Lifecycle"
 }
 
 function Write-SingleWorknotesSummary([string]$Folder, [int]$RunLimit) {
