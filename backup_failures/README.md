@@ -8,31 +8,25 @@ Operational entry point:
 backup_failures/Cohesity_Backup_Failure_INC_Status_Update.ps1
 ```
 
-Main implementation file retained in the same folder:
+Main collector retained in the same folder:
 
 ```text
 backup_failures/Get-CohesityBackupFailureWindowConsolidator.ps1
 ```
 
+Operators should run only the entry script.
+
 ## Purpose
 
 Incident lifecycle tracker for Cohesity backup failures.
 
-It tracks current/latest uncleared failures observed during the incident window, detects new/old/carry-forward failures, and marks a failure cleared only when a later successful backup is verified.
+It tracks current/latest uncleared failures observed during the incident lifecycle, detects new/old/carry-forward failures, and marks a failure cleared only when a later successful backup is verified.
 
 This is an incident operations workflow. It is not an audit-grade collector for every historical backup event.
 
-## Important operator rule
-
-Use only the new incident lifecycle script.
-
-Do not use the legacy backup-failure script as a fallback for this incident workflow.
-Do not import legacy backup-failure CSV files into this workflow.
-Do not manually merge legacy output into the incident lifecycle files.
-
 ## Run all clusters
 
-This is the standard run mode.
+Standard run mode:
 
 ```powershell
 cd X:\PowerShell\Cohesity_API_Scripts\backup_failures
@@ -48,24 +42,203 @@ cd X:\PowerShell\Cohesity_API_Scripts\backup_failures
 .\Cohesity_Backup_Failure_INC_Status_Update.ps1 -ClusterName "YOUR_CLUSTER_NAME"
 ```
 
-## Optional grid view
-
-For local review, the entry script can open only the full lifecycle CSV in PowerShell Grid View:
+## Optional lifecycle grid view
 
 ```powershell
 cd X:\PowerShell\Cohesity_API_Scripts\backup_failures
 .\Cohesity_Backup_Failure_INC_Status_Update.ps1 -ShowGrid
 ```
 
-This opens:
+This opens only:
 
 ```text
 incident_lifecycle.csv
 ```
 
-Reason: `incident_lifecycle.csv` already contains the complete tracked lifecycle view, including active/unresolved rows, cleared rows, running/cancelled/needs-review rows, and carry-forward status. Keeping the grid to one file avoids multiple windows and operator confusion.
+Reason: `incident_lifecycle.csv` is the complete row-level evidence file. It contains active/unresolved rows, cleared rows, running/cancelled/needs-review rows, and carry-forward status.
 
 `-ShowGrid` is optional and requires a PowerShell session where `Out-GridView` is available.
+
+## Final operator-facing files
+
+The entry script leaves only these operator-facing files for incident use:
+
+```text
+worknotes_summary.txt
+incident_lifecycle.csv
+closing_summary.txt
+```
+
+The script also keeps:
+
+```text
+state.json
+```
+
+`state.json` is script memory. Do not manually edit it and do not attach it to the incident.
+
+Temporary collector files such as `current_failures.csv`, `cleared_by_success.csv`, `worknotes.txt`, and `summary.txt` are removed by the entry script after final normalization.
+
+## Do not edit generated files
+
+Do not manually edit:
+
+```text
+incident_lifecycle.csv
+worknotes_summary.txt
+closing_summary.txt
+state.json
+```
+
+If the output looks incorrect, stale, or incomplete, rerun the script and use the refreshed files.
+
+## incident_lifecycle.csv columns
+
+The final lifecycle CSV uses this simplified header order:
+
+```text
+Cluster,ProtectionGroup,Environment,Host,ObjectName,ObjectType,RunType,Status,OldestFailedET,NewestFailedET,LatestSuccessET,FailureRuns,Message
+```
+
+Column meaning:
+
+| Column | Meaning |
+|---|---|
+| `Cluster` | Cohesity cluster name. |
+| `ProtectionGroup` | Protection group name. |
+| `Environment` | Cohesity environment category such as Oracle, SQL, Physical, HyperV, Acropolis, NAS, Isilon, RemoteAdapter. |
+| `Host` | Host/source name when available. Blank when Cohesity did not return a specific host. |
+| `ObjectName` | Protected object name when Cohesity returned one. Blank for run-level/protection-group-level failures where no object was returned. |
+| `ObjectType` | Object type returned by Cohesity, for example `kDatabase`, `kHost`, `kVirtualMachine`, or `ProtectionGroup`. |
+| `RunType` | Backup run type, for example `kRegular` or `kLog`. |
+| `Status` | Lifecycle status for the row. |
+| `OldestFailedET` | Oldest tracked failure timestamp for this lifecycle row. |
+| `NewestFailedET` | Newest tracked failure timestamp for this lifecycle row. |
+| `LatestSuccessET` | Later successful backup timestamp that cleared the row. Blank when the row is still active/unresolved. |
+| `FailureRuns` | Count of unique failed backup run keys tracked for the row. |
+| `Message` | Failure/detail message from Cohesity or script-generated explanation. |
+
+## Object name handling
+
+The script no longer copies the protection group name into `ObjectName` for run-level/protection-group-level failures.
+
+If Cohesity did not return an object, `ObjectName` is left blank. The row can still be identified by `ProtectionGroup`, `ObjectType`, `RunType`, and `Message`.
+
+## Latest-success reconciliation
+
+After the main collection completes, the entry script performs final reconciliation.
+
+A row is not allowed to remain active/unresolved when all of these are true:
+
+```text
+Status is active/unresolved
+LatestRunStatus is Succeeded or SucceededWithWarning
+LastSeenET is later than LastFailedET
+```
+
+When this condition is found, the entry script:
+
+```text
+1. Removes the row from active/unresolved tracking.
+2. Sets Status to NewlyClearedThisCheck.
+3. Sets LatestSuccessET to the successful backup time in incident_lifecycle.csv.
+4. Updates state.json so the next run does not carry the row as active.
+```
+
+This prevents rows such as the following from appearing as active failures:
+
+```text
+Status = OlderStillFailing
+LatestRunStatus = Succeeded
+LastSeenET > LastFailedET
+ClearedET = blank
+```
+
+That combination is treated as cleared by a later successful backup.
+
+## Worknotes summary format
+
+`worknotes_summary.txt` is summary-only and count-focused.
+
+It contains:
+
+- Incident/window metadata.
+- Cohesity API Collection Status.
+- Do-not-edit instruction.
+- Summary counts.
+- Active parent/child count breakdown.
+- Tally checks.
+- Latest-success reconciliation result.
+- Incomplete collection details.
+- Retry command when needed.
+- Final file list.
+
+It does not contain:
+
+- CSV headers.
+- Sort order details.
+- Full row dumps.
+- Current/cleared CSV references.
+- Failure messages for every row.
+
+All row-level detail is in:
+
+```text
+incident_lifecycle.csv
+```
+
+## Count model
+
+Counts are based on the final normalized lifecycle data.
+
+```text
+Active / unresolved failures = lifecycle rows with active/unresolved Status
+Cleared by later successful backup = lifecycle rows with cleared Status
+Total lifecycle rows tracked = all rows in incident_lifecycle.csv
+```
+
+The active/unresolved child statuses must add up to the active/unresolved parent total:
+
+```text
+Newly failed this check
++ Older/current still failing
++ Carried forward still failing
++ Re-failed after earlier clear
++ Running / awaiting completion
++ Cancelled after failure
++ Needs review / not verified
+= Active / unresolved failures
+```
+
+The lifecycle tally should normally be:
+
+```text
+Active / unresolved failures + Cleared by later successful backup = Total lifecycle rows tracked
+```
+
+If this does not match, `worknotes_summary.txt` prints a `requires review` line and the team should review `incident_lifecycle.csv`.
+
+## Status values
+
+```text
+NewlyFailedThisCheck
+OlderStillFailing
+CarriedForwardStillFailing
+ClearedByLaterSuccess
+NewlyClearedThisCheck
+ReFailedAfterClear
+RunningAtLatestCheck
+CancelledAfterFailure
+UnknownNeedsReview
+```
+
+Worknotes wording for `UnknownNeedsReview` is:
+
+```text
+Needs review / not verified
+```
+
+Meaning: the script could not verify whether the item cleared. Treat it as unresolved until a later successful backup is verified.
 
 ## Incomplete collection handling
 
@@ -89,39 +262,26 @@ Retry Failed Collection Scope:
 
 Use the command printed in `worknotes_summary.txt`. After the rerun completes, use the refreshed `worknotes_summary.txt` and `incident_lifecycle.csv` for the incident update.
 
-## Latest-success reconciliation
+## Required incident attachments / updates
 
-The entry script performs a final reconciliation after the main collection completes.
-
-A row is not allowed to remain in `current_failures.csv` when all of these are true:
+For each clean run:
 
 ```text
-Status is active/unresolved
-LatestRunStatus is Succeeded or SucceededWithWarning
-LastSeenET is later than LastFailedET
+worknotes_summary.txt
+incident_lifecycle.csv
 ```
 
-When this condition is found, the entry script:
+For closure or handoff, also use:
 
 ```text
-1. Removes the row from current_failures.csv.
-2. Sets Status to NewlyClearedThisCheck.
-3. Sets ClearedET to LastSeenET.
-4. Adds or updates the row in cleared_by_success.csv.
-5. Updates incident_lifecycle.csv.
-6. Updates state.json so the next run does not carry the row as active.
+closing_summary.txt
 ```
 
-This prevents rows such as the following from appearing as active failures:
+Do not attach or manually edit:
 
 ```text
-Status = OlderStillFailing
-LatestRunStatus = Succeeded
-LastSeenET > LastFailedET
-ClearedET = blank
+state.json
 ```
-
-That combination is treated as cleared by a later successful backup.
 
 ## Locked design summary
 
@@ -140,186 +300,6 @@ That combination is treated as cleared by a later successful backup.
 - Unknown, timeout, or incomplete API data does not clear.
 - Consecutive count is based on unique failed backup runs, not script executions.
 - Evaluation is limited to the latest 30 runs per protection group/run type.
-
-## Output folder
-
-```text
-X:\PowerShell\Data\Cohesity\BackupFailureWindow\<INC_NUMBER>\
-```
-
-## Output files
-
-```text
-current_failures.csv
-cleared_by_success.csv
-incident_lifecycle.csv
-worknotes_summary.txt
-closing_summary.txt
-state.json
-```
-
-### CSV headers
-
-All three CSV files use the same standard header order:
-
-```text
-IncidentNumber,WindowKey,Status,Cluster,Environment,ProtectionGroup,Host,ObjectName,ObjectType,RunType,FirstFailedET,LastFailedET,ClearedET,LastSeenET,LatestRunStatus,ConsecutiveFailureCount,Message,ObjectKey
-```
-
-If a CSV has no rows, the entry script still preserves the header line.
-
-### File purpose
-
-| File | Purpose |
-|---|---|
-| `current_failures.csv` | Main action list. Active/unresolved failures for the team to work. Rows with a later successful `LatestRunStatus` are removed by reconciliation. |
-| `cleared_by_success.csv` | Failures verified as cleared by a later successful backup. |
-| `incident_lifecycle.csv` | Consolidated incident view with all tracked objects and current status. This is the best sortable operational detail file and the only file opened by `-ShowGrid`. |
-| `worknotes_summary.txt` | Main incident update. Contains count source, clear tally checks, latest-success reconciliation count, incomplete collection details, and retry command when needed. |
-| `closing_summary.txt` | Closure/handoff summary with the same count/tally model. |
-| `state.json` | Script memory. Keeps failure state, failed run keys, cleared items, latest-success reconciliation count, and warnings. |
-
-## Sort order
-
-The entry script normalizes the final text and CSV outputs into an operator-friendly order.
-
-| Output | Sort order |
-|---|---|
-| `current_failures.csv` | Cluster ascending, then status priority, then `LastFailedET` descending, then Environment, ProtectionGroup, ObjectName. |
-| `cleared_by_success.csv` | Cluster ascending, then `ClearedET` descending, then Environment, ProtectionGroup, ObjectName. |
-| `incident_lifecycle.csv` | Cluster ascending, then status priority, then latest activity descending. Latest activity uses `ClearedET` when present, otherwise `LastSeenET`, otherwise `LastFailedET`. |
-| `worknotes_summary.txt` | Summary-only. It points to the sorted CSV files for row-level detail. |
-| `closing_summary.txt` | Summary-only. It points to the sorted CSV files for row-level detail. |
-
-Status priority for active rows:
-
-```text
-NewlyFailedThisCheck
-ReFailedAfterClear
-OlderStillFailing / CurrentStillFailing
-CarriedForwardStillFailing
-RunningAtLatestCheck
-CancelledAfterFailure
-UnknownNeedsReview
-```
-
-This keeps each cluster together and keeps the most actionable statuses ahead of lower-confidence/unverified statuses.
-
-## Worknotes summary format
-
-`worknotes_summary.txt` is intentionally concise and count-focused.
-
-It contains:
-
-- Cohesity API Collection Status: Complete or Incomplete with reason/count.
-- CSV header line.
-- Count source explanation.
-- Summary counts.
-- Parent/child active failure breakdown.
-- Tally checks.
-- Latest-success reconciliation count.
-- Incomplete collection details.
-- Retry Failed Collection Scope command when needed.
-- File attachment/update list.
-
-It does not contain:
-
-- Full lifecycle dump.
-- Active failure row dump.
-- Separate consecutive/repeated failure section.
-- Failure error message on cleared-success rows.
-- Local retention/output cleanup actions unless a cleanup issue is detected.
-- `... more rows in CSV` truncation lines.
-
-## Count model
-
-The worknotes counts are based on CSV row counts after latest-success reconciliation.
-
-```text
-Active / unresolved failures = row count in current_failures.csv
-Cleared by later successful backup = row count in cleared_by_success.csv
-Total lifecycle rows tracked = row count in incident_lifecycle.csv
-```
-
-The active/unresolved child statuses must add up to the active/unresolved parent total:
-
-```text
-Newly failed this check
-+ Older/current still failing
-+ Carried forward still failing
-+ Re-failed after earlier clear
-+ Running / awaiting completion
-+ Cancelled after failure
-+ Needs review / not verified
-= Active / unresolved failures
-```
-
-The lifecycle tally should normally be:
-
-```text
-Active / unresolved failures + Cleared by later successful backup = Total lifecycle rows tracked
-```
-
-If this does not match, the worknotes summary prints a `requires review` tally line and the team should use `incident_lifecycle.csv` for row-level validation.
-
-## Operator wording for UnknownNeedsReview
-
-Internal CSV status:
-
-```text
-UnknownNeedsReview
-```
-
-Worknotes wording:
-
-```text
-Needs review / not verified
-```
-
-Meaning:
-
-```text
-The script could not verify whether the item cleared. Treat it as unresolved until a later successful backup is verified.
-```
-
-## Status values
-
-```text
-NewlyFailedThisCheck
-OlderStillFailing
-CarriedForwardStillFailing
-ClearedByLaterSuccess
-NewlyClearedThisCheck
-ReFailedAfterClear
-RunningAtLatestCheck
-CancelledAfterFailure
-UnknownNeedsReview
-```
-
-## Required incident attachments / updates
-
-For each clean run:
-
-1. Upload or paste `worknotes_summary.txt`.
-2. Attach `incident_lifecycle.csv`.
-3. Attach `current_failures.csv` if active failures remain.
-4. Attach `cleared_by_success.csv` if rows exist.
-5. Use `closing_summary.txt` only during closure or handoff.
-
-For incomplete runs:
-
-1. Follow the `Retry Failed Collection Scope` command shown in `worknotes_summary.txt`.
-2. After the rerun, update the incident using the refreshed `worknotes_summary.txt` and `incident_lifecycle.csv`.
-
-## Previous incident closure summary
-
-When a new compute window starts and the script needs a new incident number, it first refreshes the previous incident's:
-
-```text
-closing_summary.txt
-```
-
-This uses the previous incident state/files only. It does not perform a new Cohesity scan for the previous incident.
 
 ## Retention
 
@@ -359,4 +339,3 @@ X:\PowerShell\Cohesity_API_Scripts\Common\Secure\cohesity_apikey.enc
 - Cohesity API calls are GET-only.
 - No legacy backup-failure CSV fallback in the operator process.
 - No `Recovered` / `Recovery` wording is used for backup clearances.
-- Scope line is written to `worknotes_summary.txt`: latest 30 runs per protection group/run type.
