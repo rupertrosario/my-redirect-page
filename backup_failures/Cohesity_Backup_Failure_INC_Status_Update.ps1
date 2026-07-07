@@ -47,6 +47,12 @@ function Import-ReportCsv([string]$Path) {
     try { return @(Import-Csv -Path $Path) } catch { return @() }
 }
 
+function Save-SortedCsv([string]$Path, $Rows) {
+    $list = @($Rows)
+    if ($list.Count -eq 0) { return }
+    $list | Export-Csv -Path $Path -NoTypeInformation -Encoding UTF8
+}
+
 function Get-ReportFolder([string]$Root, [string]$Inc) {
     if ($Inc) {
         $candidate = Join-Path $Root $Inc.Trim().ToUpper()
@@ -58,6 +64,60 @@ function Get-ReportFolder([string]$Root, [string]$Inc) {
         Select-Object -First 1
     if ($latest) { return $latest.FullName }
     return ""
+}
+
+function Get-DateSortText($Value) {
+    $t = Clean-Text $Value
+    if (!$t) { return "0000-00-00 00:00:00" }
+    return $t
+}
+
+function Get-ActiveSortText($Row) {
+    $lastFailed = Get-DateSortText $Row.LastFailedET
+    if ($lastFailed -ne "0000-00-00 00:00:00") { return $lastFailed }
+    return (Get-DateSortText $Row.LastSeenET)
+}
+
+function Get-ClearedSortText($Row) {
+    $cleared = Get-DateSortText $Row.ClearedET
+    if ($cleared -ne "0000-00-00 00:00:00") { return $cleared }
+    return (Get-DateSortText $Row.LastFailedET)
+}
+
+function Get-LifecycleSortText($Row) {
+    $cleared = Get-DateSortText $Row.ClearedET
+    if ($cleared -ne "0000-00-00 00:00:00") { return $cleared }
+    $lastSeen = Get-DateSortText $Row.LastSeenET
+    if ($lastSeen -ne "0000-00-00 00:00:00") { return $lastSeen }
+    return (Get-DateSortText $Row.LastFailedET)
+}
+
+function Sort-ActiveRows($Rows) {
+    @($Rows) | Sort-Object `
+        @{ Expression = { Clean-Text $_.Cluster }; Ascending = $true }, `
+        @{ Expression = { Get-ActiveSortText $_ }; Descending = $true }, `
+        @{ Expression = { Clean-Text $_.Environment }; Ascending = $true }, `
+        @{ Expression = { Clean-Text $_.ProtectionGroup }; Ascending = $true }, `
+        @{ Expression = { Clean-Text $_.ObjectName }; Ascending = $true }
+}
+
+function Sort-ClearedRows($Rows) {
+    @($Rows) | Sort-Object `
+        @{ Expression = { Clean-Text $_.Cluster }; Ascending = $true }, `
+        @{ Expression = { Get-ClearedSortText $_ }; Descending = $true }, `
+        @{ Expression = { Clean-Text $_.Environment }; Ascending = $true }, `
+        @{ Expression = { Clean-Text $_.ProtectionGroup }; Ascending = $true }, `
+        @{ Expression = { Clean-Text $_.ObjectName }; Ascending = $true }
+}
+
+function Sort-LifecycleRows($Rows) {
+    @($Rows) | Sort-Object `
+        @{ Expression = { Clean-Text $_.Cluster }; Ascending = $true }, `
+        @{ Expression = { Get-LifecycleSortText $_ }; Descending = $true }, `
+        @{ Expression = { Clean-Text $_.Status }; Ascending = $true }, `
+        @{ Expression = { Clean-Text $_.Environment }; Ascending = $true }, `
+        @{ Expression = { Clean-Text $_.ProtectionGroup }; Ascending = $true }, `
+        @{ Expression = { Clean-Text $_.ObjectName }; Ascending = $true }
 }
 
 function Format-ActiveRows([string]$Title, $Rows) {
@@ -167,9 +227,17 @@ function Write-SingleWorknotesSummary([string]$Folder, [int]$RunLimit) {
     if ([string]::IsNullOrWhiteSpace($Folder) -or !(Test-Path $Folder)) { return }
 
     $state = Read-JsonFile (Join-Path $Folder "state.json")
-    $current = Import-ReportCsv (Join-Path $Folder "current_failures.csv")
-    $cleared = Import-ReportCsv (Join-Path $Folder "cleared_by_success.csv")
-    $lifecycle = Import-ReportCsv (Join-Path $Folder "incident_lifecycle.csv")
+    $currentPath = Join-Path $Folder "current_failures.csv"
+    $clearedPath = Join-Path $Folder "cleared_by_success.csv"
+    $lifecyclePath = Join-Path $Folder "incident_lifecycle.csv"
+
+    $current = Sort-ActiveRows (Import-ReportCsv $currentPath)
+    $cleared = Sort-ClearedRows (Import-ReportCsv $clearedPath)
+    $lifecycle = Sort-LifecycleRows (Import-ReportCsv $lifecyclePath)
+
+    Save-SortedCsv -Path $currentPath -Rows $current
+    Save-SortedCsv -Path $clearedPath -Rows $cleared
+    Save-SortedCsv -Path $lifecyclePath -Rows $lifecycle
 
     $incident = if ($state -and $state.IncidentNumber) { Clean-Text $state.IncidentNumber } else { Split-Path $Folder -Leaf }
     $windowLabel = if ($state -and $state.WindowLabel) { Clean-Text $state.WindowLabel } else { "" }
@@ -215,6 +283,7 @@ Generated At: $generated ET
 Evidence Folder: $Folder
 Cohesity API Collection Status: $apiStatus
 Scope: latest $RunLimit runs per protection group/run type.
+Sort Order: Cluster ascending; active failures by LastFailedET descending; cleared rows by ClearedET descending; lifecycle rows by latest activity descending.
 
 Operator Guidance:
 - If Cohesity API Collection Status is Complete, review and action the Active / Unresolved Failures section.
@@ -267,6 +336,7 @@ Generated At: $generated ET
 Evidence Folder: $Folder
 Cohesity API Collection Status: $apiStatus
 Scope: latest $RunLimit runs per protection group/run type.
+Sort Order: Cluster ascending; active failures by LastFailedET descending; cleared rows by ClearedET descending; lifecycle rows by latest activity descending.
 
 Closure State:
 - Active / unresolved failures: $($current.Count)
@@ -321,7 +391,7 @@ try {
     if ($folder) {
         Write-SingleWorknotesSummary -Folder $folder -RunLimit $NumRuns
         Write-Host ""
-        Write-Host "Text outputs normalized with simplified worknotes summary and no row truncation:"
+        Write-Host "Text outputs normalized with simplified worknotes summary, clusterwise sorting, and no row truncation:"
         Write-Host (Join-Path $folder "worknotes_summary.txt")
         Write-Host (Join-Path $folder "closing_summary.txt")
     } else {
