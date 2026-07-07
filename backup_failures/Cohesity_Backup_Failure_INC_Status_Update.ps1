@@ -33,6 +33,27 @@ param(
     [switch]$ShowGrid
 )
 
+$script:CsvColumns = @(
+    "IncidentNumber",
+    "WindowKey",
+    "Status",
+    "Cluster",
+    "Environment",
+    "ProtectionGroup",
+    "Host",
+    "ObjectName",
+    "ObjectType",
+    "RunType",
+    "FirstFailedET",
+    "LastFailedET",
+    "ClearedET",
+    "LastSeenET",
+    "LatestRunStatus",
+    "ConsecutiveFailureCount",
+    "Message",
+    "ObjectKey"
+)
+
 function Clean-Text($Value) {
     if ($null -eq $Value) { return "" }
     if ($Value -is [array]) { $Value = $Value -join " | " }
@@ -46,15 +67,28 @@ function Read-JsonFile([string]$Path) {
     try { return ($raw | ConvertFrom-Json) } catch { return $null }
 }
 
+function Write-JsonFile($Object, [string]$Path) {
+    $dir = Split-Path $Path -Parent
+    if (!(Test-Path $dir)) { New-Item -Path $dir -ItemType Directory -Force | Out-Null }
+    $Object | ConvertTo-Json -Depth 100 | Set-Content -Path $Path -Encoding UTF8
+}
+
 function Import-ReportCsv([string]$Path) {
     if (!(Test-Path $Path)) { return @() }
     try { return @(Import-Csv -Path $Path) } catch { return @() }
 }
 
 function Save-SortedCsv([string]$Path, $Rows) {
+    $dir = Split-Path $Path -Parent
+    if (!(Test-Path $dir)) { New-Item -Path $dir -ItemType Directory -Force | Out-Null }
+
     $list = @($Rows)
-    if ($list.Count -eq 0) { return }
-    $list | Export-Csv -Path $Path -NoTypeInformation -Encoding UTF8
+    if ($list.Count -eq 0) {
+        ($script:CsvColumns -join ",") | Set-Content -Path $Path -Encoding UTF8
+        return
+    }
+
+    $list | Select-Object $script:CsvColumns | Export-Csv -Path $Path -NoTypeInformation -Encoding UTF8
 }
 
 function Get-ReportFolder([string]$Root, [string]$Inc) {
@@ -70,9 +104,49 @@ function Get-ReportFolder([string]$Root, [string]$Inc) {
     return ""
 }
 
+function Set-RowProp($Object, [string]$Name, $Value) {
+    if ($null -eq $Object) { return }
+    $p = $Object.PSObject.Properties[$Name]
+    if ($p) { $Object.$Name = $Value }
+    else { $Object | Add-Member -MemberType NoteProperty -Name $Name -Value $Value -Force }
+}
+
+function Clone-Row($Row) {
+    if ($null -eq $Row) { return $null }
+    $Row | Select-Object *
+}
+
+function Parse-ReportDate([string]$Text) {
+    $t = Clean-Text $Text
+    if (!$t) { return $null }
+
+    $formats = @(
+        "yyyy-MM-dd HH:mm:ss",
+        "yyyy-MM-dd H:mm:ss",
+        "yyyy-MM-dd HH:mm",
+        "yyyy-MM-dd H:mm",
+        "M/d/yyyy H:mm:ss",
+        "M/d/yyyy HH:mm:ss",
+        "M/d/yyyy H:mm",
+        "M/d/yyyy HH:mm",
+        "M/d/yyyy h:mm:ss tt",
+        "M/d/yyyy hh:mm:ss tt",
+        "M/d/yyyy h:mm tt",
+        "M/d/yyyy hh:mm tt"
+    )
+
+    foreach ($fmt in $formats) {
+        try { return [datetime]::ParseExact($t, $fmt, [Globalization.CultureInfo]::InvariantCulture) } catch {}
+    }
+
+    try { return [datetime]::Parse($t, [Globalization.CultureInfo]::InvariantCulture) } catch { return $null }
+}
+
 function Get-DateSortText($Value) {
     $t = Clean-Text $Value
     if (!$t) { return "0000-00-00 00:00:00" }
+    $dt = Parse-ReportDate $t
+    if ($dt) { return $dt.ToString("yyyy-MM-dd HH:mm:ss") }
     return $t
 }
 
@@ -96,19 +170,98 @@ function Get-LifecycleSortText($Row) {
     return (Get-DateSortText $Row.LastFailedET)
 }
 
+function Is-SuccessStatusText([string]$Status) {
+    (Clean-Text $Status) -in @("Succeeded", "SucceededWithWarning", "kSucceeded", "kSucceededWithWarning")
+}
+
+function Is-ClearedStatusText([string]$Status) {
+    (Clean-Text $Status) -in @("ClearedByLaterSuccess", "NewlyClearedThisCheck")
+}
+
+function Test-LatestSuccessClearsActiveRow($Row) {
+    if ($null -eq $Row) { return $false }
+    if (Is-ClearedStatusText $Row.Status) { return $false }
+    if (!(Is-SuccessStatusText $Row.LatestRunStatus)) { return $false }
+
+    $lastSeen = Parse-ReportDate (Clean-Text $Row.LastSeenET)
+    $lastFailed = Parse-ReportDate (Clean-Text $Row.LastFailedET)
+    if ($null -eq $lastSeen -or $null -eq $lastFailed) { return $false }
+
+    return ($lastSeen -gt $lastFailed)
+}
+
+function Get-RowKey($Row) {
+    $key = Clean-Text $Row.ObjectKey
+    if ($key) { return $key }
+    $parts = @(
+        (Clean-Text $Row.Cluster),
+        (Clean-Text $Row.Environment),
+        (Clean-Text $Row.ProtectionGroup),
+        (Clean-Text $Row.Host),
+        (Clean-Text $Row.ObjectName),
+        (Clean-Text $Row.RunType)
+    )
+    return ($parts -join "|")
+}
+
+function Merge-RowsByKeyPreferLatestActivity($Rows) {
+    $map = @{}
+    foreach ($r in @($Rows)) {
+        if ($null -eq $r) { continue }
+        $key = Get-RowKey $r
+        if (!$key) { continue }
+
+        if (!$map.ContainsKey($key)) {
+            $map[$key] = $r
+            continue
+        }
+
+        $existingSort = Get-LifecycleSortText $map[$key]
+        $newSort = Get-LifecycleSortText $r
+        if ($newSort -ge $existingSort) { $map[$key] = $r }
+    }
+    @($map.Values)
+}
+
+function Reconcile-LatestSuccessfulBackupRows($Current, $Cleared) {
+    $remainingCurrent = @()
+    $movedToCleared = @()
+
+    foreach ($r in @($Current)) {
+        if (Test-LatestSuccessClearsActiveRow $r) {
+            $c = Clone-Row $r
+            Set-RowProp $c "Status" "NewlyClearedThisCheck"
+            Set-RowProp $c "ClearedET" (Clean-Text $c.LastSeenET)
+            $movedToCleared += $c
+        } else {
+            $remainingCurrent += $r
+        }
+    }
+
+    $finalCleared = Merge-RowsByKeyPreferLatestActivity @($Cleared + $movedToCleared)
+    $finalLifecycle = Merge-RowsByKeyPreferLatestActivity @($remainingCurrent + $finalCleared)
+
+    [pscustomobject]@{
+        Current = @($remainingCurrent)
+        Cleared = @($finalCleared)
+        Lifecycle = @($finalLifecycle)
+        MovedToCleared = @($movedToCleared)
+    }
+}
+
 function Get-StatusPriority($Status) {
     switch (Clean-Text $Status) {
-        "NewlyFailedThisCheck"      { return 10 }
-        "ReFailedAfterClear"        { return 20 }
-        "OlderStillFailing"         { return 30 }
-        "CurrentStillFailing"       { return 30 }
-        "CarriedForwardStillFailing"{ return 40 }
-        "RunningAtLatestCheck"      { return 50 }
-        "CancelledAfterFailure"     { return 60 }
-        "UnknownNeedsReview"        { return 70 }
-        "NewlyClearedThisCheck"     { return 80 }
-        "ClearedByLaterSuccess"     { return 90 }
-        default                      { return 99 }
+        "NewlyFailedThisCheck"       { return 10 }
+        "ReFailedAfterClear"         { return 20 }
+        "OlderStillFailing"          { return 30 }
+        "CurrentStillFailing"        { return 30 }
+        "CarriedForwardStillFailing" { return 40 }
+        "RunningAtLatestCheck"       { return 50 }
+        "CancelledAfterFailure"      { return 60 }
+        "UnknownNeedsReview"         { return 70 }
+        "NewlyClearedThisCheck"      { return 80 }
+        "ClearedByLaterSuccess"      { return 90 }
+        default                       { return 99 }
     }
 }
 
@@ -199,21 +352,46 @@ function Open-OutputGrid([string]$Folder) {
     $rows | Out-GridView -Title "Cohesity - Incident Lifecycle"
 }
 
+function Update-StateWithReconciledRows($State, [string]$StatePath, $Current, $Cleared, $Lifecycle, $MovedToCleared) {
+    if ($null -eq $State -or [string]::IsNullOrWhiteSpace($StatePath)) { return }
+
+    Set-RowProp $State "CurrentOpenFailures" @($Current)
+    Set-RowProp $State "ClearedBySuccess" @($Cleared)
+    Set-RowProp $State "LifecycleRows" @($Lifecycle)
+    Set-RowProp $State "LatestSuccessReconciledClearCount" @($MovedToCleared).Count
+
+    $lastRunCleared = @()
+    if ($State.PSObject.Properties["LastRunClearedBySuccess"]) { $lastRunCleared += @($State.LastRunClearedBySuccess) }
+    $lastRunCleared += @($MovedToCleared)
+    $lastRunCleared = Merge-RowsByKeyPreferLatestActivity $lastRunCleared
+    Set-RowProp $State "LastRunClearedBySuccess" @($lastRunCleared)
+
+    Write-JsonFile $State $StatePath
+}
+
 function Write-SingleWorknotesSummary([string]$Folder, [int]$RunLimit) {
     if ([string]::IsNullOrWhiteSpace($Folder) -or !(Test-Path $Folder)) { return }
 
-    $state = Read-JsonFile (Join-Path $Folder "state.json")
+    $statePath = Join-Path $Folder "state.json"
+    $state = Read-JsonFile $statePath
     $currentPath = Join-Path $Folder "current_failures.csv"
     $clearedPath = Join-Path $Folder "cleared_by_success.csv"
     $lifecyclePath = Join-Path $Folder "incident_lifecycle.csv"
 
-    $current = Sort-ActiveRows (Import-ReportCsv $currentPath)
-    $cleared = Sort-ClearedRows (Import-ReportCsv $clearedPath)
-    $lifecycle = Sort-LifecycleRows (Import-ReportCsv $lifecyclePath)
+    $currentImported = Import-ReportCsv $currentPath
+    $clearedImported = Import-ReportCsv $clearedPath
+
+    $reconciled = Reconcile-LatestSuccessfulBackupRows -Current $currentImported -Cleared $clearedImported
+
+    $current = Sort-ActiveRows $reconciled.Current
+    $cleared = Sort-ClearedRows $reconciled.Cleared
+    $lifecycle = Sort-LifecycleRows $reconciled.Lifecycle
+    $movedToCleared = @($reconciled.MovedToCleared)
 
     Save-SortedCsv -Path $currentPath -Rows $current
     Save-SortedCsv -Path $clearedPath -Rows $cleared
     Save-SortedCsv -Path $lifecyclePath -Rows $lifecycle
+    Update-StateWithReconciledRows -State $state -StatePath $statePath -Current $current -Cleared $cleared -Lifecycle $lifecycle -MovedToCleared $movedToCleared
 
     $incident = if ($state -and $state.IncidentNumber) { Clean-Text $state.IncidentNumber } else { Split-Path $Folder -Leaf }
     $windowLabel = if ($state -and $state.WindowLabel) { Clean-Text $state.WindowLabel } else { "" }
@@ -247,6 +425,12 @@ function Write-SingleWorknotesSummary([string]$Folder, [int]$RunLimit) {
         "Lifecycle tally requires review: $activeCount active/unresolved + $clearedCount cleared = $expectedLifecycleTotal, but incident_lifecycle.csv has $lifecycleCount rows. Review incident_lifecycle.csv for row-level detail."
     }
 
+    $latestSuccessReconcileLine = if ($movedToCleared.Count -gt 0) {
+        "Latest-success reconciliation: $($movedToCleared.Count) row(s) were removed from current_failures.csv and moved to cleared_by_success.csv because LatestRunStatus was Succeeded/SucceededWithWarning after LastFailedET."
+    } else {
+        "Latest-success reconciliation: no active rows had a later successful LatestRunStatus."
+    }
+
     $apiStatus = "Complete - all collected scopes returned without recorded lookup warnings."
     if ($warnings.Count -gt 0) {
         $apiStatus = "Incomplete - $($warnings.Count) collection warning(s) recorded. See Incomplete Collection section."
@@ -277,6 +461,7 @@ Generated At: $generated ET
 Evidence Folder: $Folder
 Cohesity API Collection Status: $apiStatus
 Scope: latest $RunLimit runs per protection group/run type.
+CSV Headers: $($script:CsvColumns -join ', ')
 Sort Order: Cluster ascending; active failures by status priority and LastFailedET descending; cleared rows by ClearedET descending; lifecycle rows by status priority and latest activity descending.
 
 Count Source:
@@ -300,11 +485,13 @@ Summary Counts:
 Tally Check:
 - $activeTally
 - $lifecycleTally
+- $latestSuccessReconcileLine
 
 Action Summary:
 - Work active/unresolved rows from current_failures.csv.
 - Use incident_lifecycle.csv for the complete sortable lifecycle view.
 - Rows counted as Needs review / not verified are unresolved until a later successful backup is verified.
+- Rows with LatestRunStatus Succeeded or SucceededWithWarning after LastFailedET are not kept as active failures.
 
 Incomplete Collection:
 $(Format-Warnings $warnings)
@@ -331,6 +518,7 @@ Generated At: $generated ET
 Evidence Folder: $Folder
 Cohesity API Collection Status: $apiStatus
 Scope: latest $RunLimit runs per protection group/run type.
+CSV Headers: $($script:CsvColumns -join ', ')
 
 Closure Counts:
 - Active / unresolved failures: $activeCount
@@ -343,6 +531,7 @@ Closure Counts:
 Tally Check:
 - $activeTally
 - $lifecycleTally
+- $latestSuccessReconcileLine
 
 Carry Forward / Handoff:
 $(if ($activeCount -eq 0) { "No active backup failures remain based on the latest saved state." } else { "$activeCount active/unresolved rows remain in current_failures.csv and should be carried forward or separately tracked." })
@@ -390,7 +579,7 @@ try {
     if ($folder) {
         Write-SingleWorknotesSummary -Folder $folder -RunLimit $NumRuns
         Write-Host ""
-        Write-Host "Text outputs normalized with tally-focused worknotes summary, clusterwise sorting, and no row truncation:"
+        Write-Host "Text outputs normalized with tally-focused worknotes summary, latest-success reconciliation, clusterwise sorting, and no row truncation:"
         Write-Host (Join-Path $folder "worknotes_summary.txt")
         Write-Host (Join-Path $folder "closing_summary.txt")
         if ($ShowGrid) { Open-OutputGrid -Folder $folder }
