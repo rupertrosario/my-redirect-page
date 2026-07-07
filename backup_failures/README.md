@@ -1,6 +1,14 @@
-# Cohesity Backup Failure Window Consolidator
+# Cohesity Backup Failure INC Status Update
 
 ## Script
+
+Operational entry point:
+
+```text
+backup_failures/Cohesity_Backup_Failure_INC_Status_Update.ps1
+```
+
+Main implementation file retained in the same folder:
 
 ```text
 backup_failures/Get-CohesityBackupFailureWindowConsolidator.ps1
@@ -16,14 +24,14 @@ It is not an audit-grade collector for every backup event. It tracks current/lat
 
 ```powershell
 cd X:\PowerShell\Cohesity_API_Scripts\backup_failures
-.\Get-CohesityBackupFailureWindowConsolidator.ps1 -ClusterName "YOUR_CLUSTER_NAME"
+.\Cohesity_Backup_Failure_INC_Status_Update.ps1 -ClusterName "YOUR_CLUSTER_NAME"
 ```
 
 ## Run all clusters
 
 ```powershell
 cd X:\PowerShell\Cohesity_API_Scripts\backup_failures
-.\Get-CohesityBackupFailureWindowConsolidator.ps1
+.\Cohesity_Backup_Failure_INC_Status_Update.ps1
 ```
 
 ## Optional first baseline from existing failure CSV
@@ -31,7 +39,7 @@ cd X:\PowerShell\Cohesity_API_Scripts\backup_failures
 Use this only when you already ran the existing failure-only script and want the first incident baseline from its latest combined CSV:
 
 ```powershell
-.\Get-CohesityBackupFailureWindowConsolidator.ps1 -UseLatestFailureCsv
+.\Cohesity_Backup_Failure_INC_Status_Update.ps1 -UseLatestFailureCsv
 ```
 
 Default legacy CSV location:
@@ -43,7 +51,7 @@ X:\PowerShell\Data\Cohesity\BackupFailures\BackupFailures_AllEnvironments_*.csv
 You can also provide an exact CSV:
 
 ```powershell
-.\Get-CohesityBackupFailureWindowConsolidator.ps1 -UseLatestFailureCsv -LegacyFailureCsvPath "X:\PowerShell\Data\Cohesity\BackupFailures\BackupFailures_AllEnvironments_YYYYMMDD_HHMMSS.csv"
+.\Cohesity_Backup_Failure_INC_Status_Update.ps1 -UseLatestFailureCsv -LegacyFailureCsvPath "X:\PowerShell\Data\Cohesity\BackupFailures\BackupFailures_AllEnvironments_YYYYMMDD_HHMMSS.csv"
 ```
 
 ## Locked design summary
