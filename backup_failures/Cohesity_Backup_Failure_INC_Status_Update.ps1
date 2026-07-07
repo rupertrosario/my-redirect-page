@@ -5,7 +5,7 @@ Entry point for Cohesity Backup Failure INC status updates.
 .DESCRIPTION
 This is the operational entry point for the backup failure incident update workflow.
 It delegates to the main implementation script, then rewrites the human-readable text outputs
-so there is one complete worknotes_summary.txt file with all incident details and no row truncation.
+so there is one concise worknotes_summary.txt file focused on operator action and no row truncation.
 
 Run one cluster:
   .\Cohesity_Backup_Failure_INC_Status_Update.ps1 -ClusterName "CLUSTER_NAME"
@@ -60,7 +60,7 @@ function Get-ReportFolder([string]$Root, [string]$Inc) {
     return ""
 }
 
-function Format-AllRows([string]$Title, $Rows) {
+function Format-ActiveRows([string]$Title, $Rows) {
     $lines = New-Object System.Collections.Generic.List[string]
     $lines.Add("")
     $lines.Add($Title)
@@ -82,17 +82,46 @@ function Format-AllRows([string]$Title, $Rows) {
         $status = Clean-Text $r.Status
         $first = Clean-Text $r.FirstFailedET
         $last = Clean-Text $r.LastFailedET
-        $cleared = Clean-Text $r.ClearedET
         $latest = Clean-Text $r.LatestRunStatus
         $count = Clean-Text $r.ConsecutiveFailureCount
         $msg = Clean-Text $r.Message
 
         if (!$hostName) { $hostName = "-" }
-        if (!$cleared) { $cleared = "-" }
         if (!$latest) { $latest = "-" }
         if (!$count) { $count = "0" }
 
-        $lines.Add(("{0}. Cluster: {1} | Env: {2} | PG: {3} | Host: {4} | Object: {5} | RunType: {6} | Status: {7} | FirstFailedET: {8} | LastFailedET: {9} | ClearedET: {10} | LatestRunStatus: {11} | FailureCount: {12} | Message: {13}" -f $i, $cluster, $env, $pg, $hostName, $obj, $runType, $status, $first, $last, $cleared, $latest, $count, $msg))
+        $lines.Add(("{0}. Cluster: {1} | Env: {2} | PG: {3} | Host: {4} | Object: {5} | RunType: {6} | Status: {7} | FirstFailedET: {8} | LastFailedET: {9} | FailureRuns: {10} | LatestRunStatus: {11} | Message: {12}" -f $i, $cluster, $env, $pg, $hostName, $obj, $runType, $status, $first, $last, $count, $latest, $msg))
+    }
+    return ($lines -join [Environment]::NewLine)
+}
+
+function Format-ClearedRows([string]$Title, $Rows) {
+    $lines = New-Object System.Collections.Generic.List[string]
+    $lines.Add("")
+    $lines.Add($Title)
+    $list = @($Rows)
+    if ($list.Count -eq 0) {
+        $lines.Add("- None")
+        return ($lines -join [Environment]::NewLine)
+    }
+
+    $i = 0
+    foreach ($r in $list) {
+        $i++
+        $cluster = Clean-Text $r.Cluster
+        $env = Clean-Text $r.Environment
+        $pg = Clean-Text $r.ProtectionGroup
+        $hostName = Clean-Text $r.Host
+        $obj = Clean-Text $r.ObjectName
+        $runType = Clean-Text $r.RunType
+        $status = Clean-Text $r.Status
+        $last = Clean-Text $r.LastFailedET
+        $cleared = Clean-Text $r.ClearedET
+
+        if (!$hostName) { $hostName = "-" }
+        if (!$cleared) { $cleared = "-" }
+
+        $lines.Add(("{0}. Cluster: {1} | Env: {2} | PG: {3} | Host: {4} | Object: {5} | RunType: {6} | LastFailedET: {7} | ClearedET: {8} | Status: {9}" -f $i, $cluster, $env, $pg, $hostName, $obj, $runType, $last, $cleared, $status))
     }
     return ($lines -join [Environment]::NewLine)
 }
@@ -108,12 +137,30 @@ function Format-Warnings($Warnings) {
     return ($lines -join [Environment]::NewLine)
 }
 
-function Format-StatusTotals($Rows) {
+function Format-LocalCleanupIssues($RetentionActions) {
+    $issues = @($RetentionActions | Where-Object {
+        $t = Clean-Text $_
+        $t -match "(?i)(fail|failed|error|unable|exception|denied)"
+    })
+    if ($issues.Count -eq 0) { return "" }
+
     $lines = New-Object System.Collections.Generic.List[string]
-    $groups = @($Rows | Group-Object Status | Sort-Object Name)
-    if ($groups.Count -eq 0) { return "- None" }
-    foreach ($g in $groups) { $lines.Add("- $($g.Name): $($g.Count)") }
+    $lines.Add("")
+    $lines.Add("Local Output Cleanup Issues:")
+    foreach ($i in $issues) { $lines.Add("- $(Clean-Text $i)") }
     return ($lines -join [Environment]::NewLine)
+}
+
+function Build-RerunCommand([string]$Incident, [string]$Cluster, [int]$RunLimit) {
+    $line = '.\Cohesity_Backup_Failure_INC_Status_Update.ps1'
+    if ($Incident) { $line += ' -IncidentNumber "' + $Incident + '"' }
+    if ($Cluster) { $line += ' -ClusterName "' + $Cluster + '"' }
+    if ($RunLimit -ne 30) { $line += ' -NumRuns ' + $RunLimit }
+
+    @"
+cd X:\PowerShell\Cohesity_API_Scripts\backup_failures
+$line
+"@
 }
 
 function Write-SingleWorknotesSummary([string]$Folder, [int]$RunLimit) {
@@ -137,79 +184,76 @@ function Write-SingleWorknotesSummary([string]$Folder, [int]$RunLimit) {
     $running = @($current | Where-Object { $_.Status -eq "RunningAtLatestCheck" })
     $cancelled = @($current | Where-Object { $_.Status -eq "CancelledAfterFailure" })
     $unknown = @($current | Where-Object { $_.Status -eq "UnknownNeedsReview" })
-    $consecutive = @($current | Where-Object { [int]($_.ConsecutiveFailureCount) -gt 1 })
 
-    $completeness = "Complete based on successful API/CSV processing for this run."
+    $apiStatus = "Complete - all collected scopes returned without recorded lookup warnings."
     if ($warnings.Count -gt 0) {
-        $completeness = "Incomplete. One or more cluster/protection-group queries failed or timed out. Do not treat missing rows from warned PGs/clusters as cleared unless listed in cleared_by_success.csv."
+        $apiStatus = "Incomplete - $($warnings.Count) collection warning(s) recorded. See Incomplete Collection section."
     }
 
+    $rerunCommand = Build-RerunCommand -Incident $incident -Cluster $ClusterName -RunLimit $RunLimit
+    $followUp = if ($warnings.Count -gt 0) {
+@"
+Retry Failed Collection Scope:
+Run the command below to refresh the incident output after the timed-out Cohesity API scope is available.
+
+$rerunCommand
+
+After the rerun completes, use the refreshed worknotes_summary.txt and incident_lifecycle.csv for the incident update.
+"@
+    } else {
+"Retry Failed Collection Scope:`n- Not required for this run."
+    }
+
+    $localCleanupIssues = Format-LocalCleanupIssues $retention
+
     $worknotesSummary = @"
-Backup Failure Incident Worknotes Summary
+Cohesity Backup Failure Incident Update
 
 Incident: $incident
 Compute Window: $windowLabel
 Generated At: $generated ET
 Evidence Folder: $Folder
+Cohesity API Collection Status: $apiStatus
+Scope: latest $RunLimit runs per protection group/run type.
 
-Report completeness:
-$completeness
+Operator Guidance:
+- If Cohesity API Collection Status is Complete, review and action the Active / Unresolved Failures section.
+- If Cohesity API Collection Status is Incomplete, complete the Retry Failed Collection Scope step and replace the incident update with the refreshed output.
+- For the full lifecycle view, refer to incident_lifecycle.csv.
 
-Current State:
-- Current active/unresolved failures: $($current.Count)
+Counts:
+- Active / unresolved failures: $($current.Count)
+- Cleared by later successful backup: $($cleared.Count)
 - New failures since previous check: $($newFailures.Count)
 - Older/current still failing: $($older.Count)
 - Carried forward still failing: $($carried.Count)
 - Re-failed after earlier clear: $($refailed.Count)
-- Cleared by later successful backup: $($cleared.Count)
 - Running / awaiting completion: $($running.Count)
 - Cancelled after failure: $($cancelled.Count)
 - Unknown / needs review: $($unknown.Count)
-- Consecutive/repeated active failures: $($consecutive.Count)
 - Total lifecycle rows tracked: $($lifecycle.Count)
-- Warnings / incomplete collection: $($warnings.Count)
-- Scope: latest $RunLimit runs per protection group/run type.
+- Incomplete collection warnings: $($warnings.Count)
 
-Lifecycle Status Totals:
-$(Format-StatusTotals $lifecycle)
+$(Format-ActiveRows "Active / Unresolved Failures:" $current)
+$(Format-ClearedRows "Cleared By Later Successful Backup:" $cleared)
 
-Carry Forward / Handoff:
-$(if ($current.Count -eq 0) { "No active backup failures remain based on the latest check." } else { "$($current.Count) active/unresolved objects remain and require follow-up tracking. See current_failures.csv." })
-
-$(Format-AllRows "New Failures Since Previous Check:" $newFailures)
-$(Format-AllRows "Older / Current Still Failing:" $older)
-$(Format-AllRows "Carried Forward Still Failing:" $carried)
-$(Format-AllRows "Re-Failed After Earlier Clear:" $refailed)
-$(Format-AllRows "Consecutive / Repeated Active Failures:" $consecutive)
-$(Format-AllRows "Running / Awaiting Completion:" $running)
-$(Format-AllRows "Cancelled / Not Cleared:" $cancelled)
-$(Format-AllRows "Unknown / Needs Review:" $unknown)
-$(Format-AllRows "Failures Cleared By Later Successful Backup:" $cleared)
-$(Format-AllRows "All Tracked Lifecycle Rows:" $lifecycle)
-
-Warnings / Incomplete Collection:
+Incomplete Collection:
 $(Format-Warnings $warnings)
 
-Retention Actions:
-$(Format-Warnings $retention)
+$followUp
 
-Scope / Limitations:
-- Cohesity run evaluation is limited to the latest $RunLimit runs per protection group/run type.
-- Only Succeeded or SucceededWithWarning clears a previous failure.
-- Running does not clear a previous failure.
-- Cancelled/Canceled does not clear a previous failure.
-- Missing from the current scan is not treated as cleared unless a later successful backup is verified.
-- This is incident lifecycle tracking for observed/latest uncleared failures, not an audit-grade history of every failure event.
+Detailed Lifecycle Reference:
+- incident_lifecycle.csv contains the complete sortable lifecycle view, including all tracked statuses and historical state transitions.
+- Use worknotes_summary.txt for the incident update.
+- Use incident_lifecycle.csv for detailed review/filtering.
 
-CSV Evidence Files:
-- current_failures.csv
-- cleared_by_success.csv
-- incident_lifecycle.csv
-
-Text Evidence Files:
+Files to Attach / Update:
 - worknotes_summary.txt
-- closing_summary.txt
-- state.json
+- incident_lifecycle.csv
+- current_failures.csv, if active failures exist
+- cleared_by_success.csv, if cleared rows exist
+- closing_summary.txt, for closure or handoff
+$localCleanupIssues
 "@
 
     $worknotesSummary | Set-Content -Path (Join-Path $Folder "worknotes_summary.txt") -Encoding UTF8
@@ -221,39 +265,29 @@ Incident: $incident
 Compute Window: $windowLabel
 Generated At: $generated ET
 Evidence Folder: $Folder
-
-Report completeness:
-$completeness
+Cohesity API Collection Status: $apiStatus
+Scope: latest $RunLimit runs per protection group/run type.
 
 Closure State:
-- Active/unresolved failures: $($current.Count)
+- Active / unresolved failures: $($current.Count)
 - Cleared by later successful backup: $($cleared.Count)
 - Running / awaiting completion: $($running.Count)
 - Cancelled after failure: $($cancelled.Count)
 - Unknown / needs review: $($unknown.Count)
-- Consecutive/repeated active failures: $($consecutive.Count)
 - Total lifecycle rows tracked: $($lifecycle.Count)
-- Warnings / incomplete collection: $($warnings.Count)
-- Scope: latest $RunLimit runs per protection group/run type.
+- Incomplete collection warnings: $($warnings.Count)
 
 Carry Forward / Handoff:
 $(if ($current.Count -eq 0) { "No active backup failures remain based on the latest saved state." } else { "$($current.Count) active/unresolved objects remain and should be carried forward or separately tracked." })
 
-$(Format-AllRows "Active / Unresolved Failures:" $current)
-$(Format-AllRows "Failures Cleared By Later Successful Backup:" $cleared)
-$(Format-AllRows "Running / Awaiting Completion:" $running)
-$(Format-AllRows "Cancelled / Not Cleared:" $cancelled)
-$(Format-AllRows "Unknown / Needs Review:" $unknown)
-$(Format-AllRows "All Tracked Lifecycle Rows:" $lifecycle)
+$(Format-ActiveRows "Active / Unresolved Failures:" $current)
+$(Format-ClearedRows "Cleared By Later Successful Backup:" $cleared)
 
-Warnings / Incomplete Collection:
+Incomplete Collection:
 $(Format-Warnings $warnings)
 
-Scope / Limitations:
-- Evaluation is limited to the latest $RunLimit runs per protection group/run type.
-- Only a later Succeeded or SucceededWithWarning backup clears a failure.
-- Running and cancelled runs remain unresolved.
-- This closure summary is generated from the incident state/files; it does not perform a separate Cohesity scan.
+Detailed Lifecycle Reference:
+- incident_lifecycle.csv contains the complete sortable lifecycle view.
 
 Evidence Files:
 - current_failures.csv
@@ -262,6 +296,7 @@ Evidence Files:
 - worknotes_summary.txt
 - closing_summary.txt
 - state.json
+$localCleanupIssues
 "@
     $closing | Set-Content -Path (Join-Path $Folder "closing_summary.txt") -Encoding UTF8
 
@@ -286,7 +321,7 @@ try {
     if ($folder) {
         Write-SingleWorknotesSummary -Folder $folder -RunLimit $NumRuns
         Write-Host ""
-        Write-Host "Text outputs normalized with single worknotes summary and no row truncation:"
+        Write-Host "Text outputs normalized with simplified worknotes summary and no row truncation:"
         Write-Host (Join-Path $folder "worknotes_summary.txt")
         Write-Host (Join-Path $folder "closing_summary.txt")
     } else {
