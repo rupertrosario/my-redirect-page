@@ -369,6 +369,45 @@ function Update-StateWithReconciledRows($State, [string]$StatePath, $Current, $C
     Write-JsonFile $State $StatePath
 }
 
+function Write-FinalMonitorSummary {
+    param(
+        [string]$ApiStatus,
+        [int]$ActiveCount,
+        [int]$ClearedCount,
+        [int]$LifecycleCount,
+        [int]$NewCount,
+        [int]$OlderCount,
+        [int]$CarriedCount,
+        [int]$RefailedCount,
+        [int]$RunningCount,
+        [int]$CancelledCount,
+        [int]$UnknownCount,
+        [int]$WarningCount,
+        [string]$ActiveTally,
+        [string]$LifecycleTally,
+        [string]$LatestSuccessReconcileLine
+    )
+
+    Write-Host ""
+    Write-Host "Final Normalized Summary (matches worknotes_summary.txt):"
+    Write-Host "Cohesity API Collection Status : $ApiStatus"
+    Write-Host "Active / Unresolved Failures  : $ActiveCount"
+    Write-Host "  Newly failed this check     : $NewCount"
+    Write-Host "  Older/current still failing : $OlderCount"
+    Write-Host "  Carried forward still failing: $CarriedCount"
+    Write-Host "  Re-failed after earlier clear: $RefailedCount"
+    Write-Host "  Running / awaiting completion: $RunningCount"
+    Write-Host "  Cancelled after failure     : $CancelledCount"
+    Write-Host "  Needs review / not verified : $UnknownCount"
+    Write-Host "Cleared By Later Success      : $ClearedCount"
+    Write-Host "Total Lifecycle Rows          : $LifecycleCount"
+    Write-Host "Incomplete Collection Warnings: $WarningCount"
+    Write-Host "Tally Check:"
+    Write-Host "  $ActiveTally"
+    Write-Host "  $LifecycleTally"
+    Write-Host "  $LatestSuccessReconcileLine"
+}
+
 function Write-SingleWorknotesSummary([string]$Folder, [int]$RunLimit) {
     if ([string]::IsNullOrWhiteSpace($Folder) -or !(Test-Path $Folder)) { return }
 
@@ -559,6 +598,23 @@ $localCleanupIssues
             Remove-Item -Path $obsoletePath -Force -ErrorAction SilentlyContinue
         }
     }
+
+    Write-FinalMonitorSummary `
+        -ApiStatus $apiStatus `
+        -ActiveCount $activeCount `
+        -ClearedCount $clearedCount `
+        -LifecycleCount $lifecycleCount `
+        -NewCount $newFailures.Count `
+        -OlderCount $older.Count `
+        -CarriedCount $carried.Count `
+        -RefailedCount $refailed.Count `
+        -RunningCount $running.Count `
+        -CancelledCount $cancelled.Count `
+        -UnknownCount $unknown.Count `
+        -WarningCount $warnings.Count `
+        -ActiveTally $activeTally `
+        -LifecycleTally $lifecycleTally `
+        -LatestSuccessReconcileLine $latestSuccessReconcileLine
 }
 
 $target = Join-Path $PSScriptRoot "Get-CohesityBackupFailureWindowConsolidator.ps1"
@@ -570,6 +626,10 @@ $targetParams = @{}
 foreach ($k in $PSBoundParameters.Keys) {
     if ($k -ne "ShowGrid") { $targetParams[$k] = $PSBoundParameters[$k] }
 }
+
+Write-Host ""
+Write-Host "Collection stage will run first. The final normalized summary printed after post-processing is the source of truth and matches worknotes_summary.txt."
+Write-Host ""
 
 & $target @targetParams
 $mainExitCode = $LASTEXITCODE
