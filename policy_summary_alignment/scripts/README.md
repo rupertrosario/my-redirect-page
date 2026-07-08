@@ -1,25 +1,21 @@
-# Policy Scripts
+# Policy Scripts - Old_Branch Source Index
 
-## Actual script locations found in GitHub
-The policy/inventory scripts already exist in the branch under `inventory/`.
+## Correct source branch
+The policy scripts were found in `Old_Branch`.
 
-| Script | Current source location | Purpose |
+## Confirmed scripts
+| Source file in `Old_Branch` | Type | Purpose |
 |---|---|---|
-| `Get-CohesityProtectionInventory.ps1` | `inventory/Get-CohesityProtectionInventory.ps1` | Cohesity protection inventory / policy summary across protection groups. |
-| `Get-PhysicalPGInventory.ps1` | `inventory/Get-PhysicalPGInventory.ps1` | Physical Protection Group inventory and alignment details including policy, protection type, object selection, exclude paths, and last-run status. |
-| `Test-CohesityProtectionInventoryCsv.ps1` | `inventory/Test-CohesityProtectionInventoryCsv.ps1` | Validation script for Cohesity protection inventory CSV output. |
-| `Test-PhysicalPGInventoryCsv.ps1` | `inventory/Test-PhysicalPGInventoryCsv.ps1` | Validation script for physical PG inventory CSV output. |
+| `poli_js_inven` | Dynatrace JavaScript | Cohesity Policy Summary. Uses Dynatrace credential vault, Helios GET-only, gets all clusters, policies, and protection groups, excludes default policies, and produces compact email markdown. |
+| `policy_com` | PowerShell | Cohesity Policy Summary CSV. Multi-cluster Helios GET-only export similar to Cohesity Policy Details UI; one row per non-default policy; includes PG count only. |
+| `poli` | PowerShell | Cohesity Policy → PG Retention Alignment Inventory. Multi-cluster Helios GET-only validation of policy retention against PG naming/environment expectations and replication/log retention. |
 
-## Related documentation found
-| Document | Current source location | Purpose |
-|---|---|---|
-| `Cohesity_Protection_DataContract.md` | `inventory/Cohesity_Protection_DataContract.md` | Data contract for Cohesity protection inventory fields. |
-| `GENERIC_PROTECTION_RUNBOOK.md` | `inventory/GENERIC_PROTECTION_RUNBOOK.md` | Runbook for generic protection inventory workflow. |
-| `GENERIC_PROTECTION_VM_FIELDS.md` | `inventory/GENERIC_PROTECTION_VM_FIELDS.md` | VM field mapping/reference. |
-| `GENERIC_PROTECTION_WORKLOG.md` | `inventory/GENERIC_PROTECTION_WORKLOG.md` | Worklog/status notes. |
-| `PowerBI_Cohesity_Protection_Measures.dax` | `inventory/PowerBI_Cohesity_Protection_Measures.dax` | Power BI measures for protection inventory reporting. |
-| `PowerBI_PhysicalPG_Dashboard_Baseline.md` | `inventory/PowerBI_PhysicalPG_Dashboard_Baseline.md` | Dashboard baseline for physical PG inventory. |
-| `PowerBI_PhysicalPG_Dashboard_Measures.dax` | `inventory/PowerBI_PhysicalPG_Dashboard_Measures.dax` | DAX measures for physical PG dashboard. |
+## Pending source file name confirmation
+There should be one more Dynatrace JavaScript script, approximately 606 lines, described as:
 
-## Note
-This folder is the policy-summary/alignment tracking folder. The working source scripts remain under `inventory/` to avoid breaking existing references. Future enhancements can either continue in `inventory/` or move scripts into this folder with a follow-up PR/change.
+`Dynatrace JS | Cohesity Policy -> PPG Retention Alignment`
+
+I have not yet identified its exact filename in `Old_Branch`. Once the filename is confirmed, it should be added to this index and included in the closure note.
+
+## Current handling
+The scripts remain in `Old_Branch` as the source of truth. This folder tracks the policy-script closure package on `Cohesity_Automations`.
