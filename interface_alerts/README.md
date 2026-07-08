@@ -11,7 +11,7 @@ The root scripts are generic and must stay outside Team/DC folders.
 | File | Purpose | Status |
 |---|---|---|
 | `01_get_alerts.js` | Generic Cohesity Helios alert collector. Pulls alert data and prepares alert rows. | Present |
-| `02_validate_interfaces.js` | Generic interface validation. Confirms current interface DOWN state through Cohesity `/public/interface`. | Pending real 770-line source |
+| `02_validate_interfaces.js` | Generic interface validation. Confirms current interface DOWN state through Cohesity `/public/interface`. | Present - reconstructed JS3 validator |
 | `03_team_iterations.js` | Team-specific ServiceNow search iteration helper. | Present |
 
 ## Correct layout
@@ -19,7 +19,7 @@ The root scripts are generic and must stay outside Team/DC folders.
 ```text
 interface_alerts/
   01_get_alerts.js              # generic alert collector
-  02_validate_interfaces.js     # generic validator - pending real 770-line source
+  02_validate_interfaces.js     # generic validator
   03_team_iterations.js         # Team ServiceNow iteration helper
   shared/
     00_data_contract.md
@@ -31,11 +31,11 @@ interface_alerts/
 
 ## Source note
 
-The previously copied `02_validate_interfaces.js` was removed because it was the shorter 413-line `Old_Branch/interface_workflow/02_validate_interfaces.js` and not the real 770-line Dynatrace JS3 validator shown in the screenshots.
+`02_validate_interfaces.js` is a reconstructed JS3 validator created from the screenshots and older working validator patterns.
 
-The real validator must be copied from the Dynatrace source code or from the exact GitHub file once identified.
+The earlier wrong 413-line copy from `Old_Branch/interface_workflow/02_validate_interfaces.js` was removed.
 
-Known markers from the real file:
+Known markers included in the reconstructed validator:
 
 ```text
 Dynatrace JS3 | Cohesity Helios Interface DOWN validator
