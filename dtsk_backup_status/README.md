@@ -45,5 +45,6 @@ Files in this folder:
 | `09_jira_closure_and_snow_idea.md` | Jira closure and ServiceNow idea notes |
 | `10_ppt_draft_data.md` | PPT draft content/data |
 | `11_confluence_table_draft.md` | Confluence table draft |
+| `policy_summary_alignment/` | Policy summary, alignment status, and Jira update |
 | `99_test_prepare_work_items_mock.js` | Mock test data for prepare work items |
 | `cr_bkup_status.ps1` | PowerShell reference script |
