@@ -19,15 +19,15 @@ param(
     [switch]$ShowGrid
 )
 
-$script:LifecycleColumns = @("Cluster","ProtectionGroup","Environment","Host","ObjectName","ObjectType","RunType","Result","EvidenceLevel","Status","OldestFailedET","NewestFailedET","LatestSuccessET","FailureRuns","Message")
-$script:ObjectFailureColumns = @("Cluster","ProtectionGroup","Environment","Host","ObjectName","ObjectType","RunType","Result","NewestFailedET","FailureRuns","Message")
-$script:ObjectSuccessColumns = @("Cluster","ProtectionGroup","Environment","Host","ObjectName","ObjectType","RunType","Result","LatestSuccessET")
-$script:PgReviewColumns = @("Cluster","ProtectionGroup","Environment","RunType","Result","NewestFailedET","LatestSuccessET","Message")
+$script:FinalColumns = @("Cluster","ProtectionGroup","Environment","Host","ObjectName","ObjectType","RunType","Status","OldestFailedET","NewestFailedET","LatestSuccessET","FailureRuns","Message")
+$script:FailureColumns = @("Cluster","ProtectionGroup","Environment","Host","ObjectName","ObjectType","RunType","Status","OldestFailedET","NewestFailedET","LatestSuccessET","FailureRuns","Message")
+$script:SuccessColumns = @("Cluster","ProtectionGroup","Environment","RunType","LatestSuccessET")
+$script:InternalColumns = @("IncidentNumber","WindowKey","Status","Cluster","Environment","ProtectionGroup","Host","ObjectName","ObjectType","RunType","FirstFailedET","LastFailedET","ClearedET","LastSeenET","LatestRunStatus","ConsecutiveFailureCount","Message","ObjectKey","ClusterId","ProtectionGroupId","EnvironmentFilter","FailedRunKeys")
 
 function Clean($v) {
     if ($null -eq $v) { return "" }
     if ($v -is [array]) { $v = $v -join " | " }
-    return (([string]$v -replace "[\r\n]+", " ") -replace "\s+", " ").Trim()
+    return (([string]$v -replace "[\r\n]+", " ") -replace "\s+", " ").Replace('"', "'").Trim()
 }
 
 function Read-JsonFile([string]$Path) {
@@ -51,7 +51,7 @@ function Save-Csv([string]$Path, $Rows, [string[]]$Columns) {
     if ($list.Count -eq 0) {
         ($Columns -join ",") | Set-Content -Path $Path -Encoding UTF8
     } else {
-        $list | Select-Object $Columns | Export-Csv -Path $Path -NoTypeInformation -Encoding UTF8
+        $list | Select-Object -Property $Columns | Export-Csv -Path $Path -NoTypeInformation -Encoding UTF8
     }
 }
 
@@ -59,6 +59,12 @@ function Set-Prop($o, [string]$n, $v) {
     if ($null -eq $o) { return }
     if ($o.PSObject.Properties[$n]) { $o.$n = $v }
     else { $o | Add-Member -MemberType NoteProperty -Name $n -Value $v -Force }
+}
+
+function As-Array($Value) {
+    if ($null -eq $Value) { return @() }
+    if ($Value -is [array]) { return @($Value) }
+    return @($Value)
 }
 
 function Parse-DateText([string]$Text) {
@@ -75,6 +81,20 @@ function Date-Sort($v) {
     $t = Clean $v
     if ($t) { return $t }
     return "0000-00-00 00:00:00"
+}
+
+function Convert-UsecsToEtTextLocal($Usecs) {
+    if ($null -eq $Usecs) { return "" }
+    try {
+        $u = [int64]$Usecs
+        if ($u -le 0) { return "" }
+        $utc = [DateTimeOffset]::FromUnixTimeMilliseconds([int64]([double]$u / 1000)).UtcDateTime
+        try { $tz = [TimeZoneInfo]::FindSystemTimeZoneById("Eastern Standard Time") }
+        catch { $tz = [TimeZoneInfo]::FindSystemTimeZoneById("America/New_York") }
+        return ([TimeZoneInfo]::ConvertTimeFromUtc($utc, $tz)).ToString("yyyy-MM-dd HH:mm:ss")
+    } catch {
+        return ""
+    }
 }
 
 function Get-ReportFolder([string]$Root, [string]$Inc) {
@@ -94,6 +114,9 @@ function Row-Key($r) {
 }
 
 function Is-Success([string]$s) { (Clean $s) -in @("Succeeded","SucceededWithWarning","kSucceeded","kSucceededWithWarning") }
+function Is-Failed([string]$s) { (Clean $s) -in @("Failed","kFailed") }
+function Is-Running([string]$s) { (Clean $s) -in @("Running","kRunning","Accepted","kAccepted","Queued","kQueued") }
+function Is-Cancelled([string]$s) { (Clean $s) -in @("Canceled","Cancelled","kCanceled","kCancelled","Canceling","kCanceling") }
 function Is-Cleared([string]$s) { (Clean $s) -in @("NewlyClearedThisCheck","ClearedByLaterSuccess") }
 
 function Latest-Success-Clears($r) {
@@ -113,9 +136,9 @@ function Merge-Latest($Rows) {
         $key = Row-Key $r
         if (!$key) { continue }
         if (!$map.ContainsKey($key)) { $map[$key] = $r; continue }
-        $oldSort = Date-Sort $(if ($map[$key].ClearedET) { $map[$key].ClearedET } elseif ($map[$key].LastFailedET) { $map[$key].LastFailedET } else { $map[$key].FirstFailedET })
-        $newSort = Date-Sort $(if ($r.ClearedET) { $r.ClearedET } elseif ($r.LastFailedET) { $r.LastFailedET } else { $r.FirstFailedET })
-        if ($newSort -ge $oldSort) { $map[$key] = $r }
+        $oldValue = if ($map[$key].ClearedET) { $map[$key].ClearedET } elseif ($map[$key].LastFailedET) { $map[$key].LastFailedET } else { $map[$key].FirstFailedET }
+        $newValue = if ($r.ClearedET) { $r.ClearedET } elseif ($r.LastFailedET) { $r.LastFailedET } else { $r.FirstFailedET }
+        if ((Date-Sort $newValue) -ge (Date-Sort $oldValue)) { $map[$key] = $r }
     }
     @($map.Values)
 }
@@ -142,6 +165,290 @@ function Reconcile($Current, $Cleared) {
     }
 }
 
+function Invoke-HeliosGetJsonLocal([string]$Uri, [hashtable]$Headers) {
+    if ($PSVersionTable.PSVersion.Major -lt 6) {
+        $r = Invoke-WebRequest -Method Get -Uri $Uri -Headers $Headers -UseBasicParsing -TimeoutSec 120
+    } else {
+        $r = Invoke-WebRequest -Method Get -Uri $Uri -Headers $Headers -TimeoutSec 120
+    }
+    if (-not $r -or [string]::IsNullOrWhiteSpace($r.Content)) { return $null }
+    $r.Content | ConvertFrom-Json
+}
+
+function Get-CohesityApiKeyLocal {
+    if (!(Test-Path $HelperPath)) { throw "Missing API key helper: $HelperPath" }
+    if (!(Test-Path $EncryptedFile)) { throw "Missing encrypted key file: $EncryptedFile" }
+    . $HelperPath
+    $key = Get-CohesityApiKeyFromAes -EncryptedFile $EncryptedFile
+    if ([string]::IsNullOrWhiteSpace($key)) { throw "API key is blank from AES helper." }
+    $key.Trim()
+}
+
+function Get-FirstLocalBackupInfoLocal($Run) {
+    if ($null -eq $Run -or $null -eq $Run.localBackupInfo) { return $null }
+    @(($Run.localBackupInfo))[0]
+}
+
+function Get-RunEffectiveUsecsLocal($Run) {
+    $i = Get-FirstLocalBackupInfoLocal $Run
+    if (!$i) { return 0 }
+    $end = [int64](Clean $i.endTimeUsecs)
+    if ($end -gt 0) { return $end }
+    [int64](Clean $i.startTimeUsecs)
+}
+
+function Get-ObjectKeyLocal($RunObject, [string]$ClusterId, [string]$EnvironmentLabel, [string]$ProtectionGroupId, [string]$ProtectionGroupName) {
+    if ($null -eq $RunObject -or $null -eq $RunObject.object) { return "" }
+    $obj = $RunObject.object
+    $objId = Clean $obj.id
+    if ($objId) { return "$ClusterId|$EnvironmentLabel|$ProtectionGroupId|$objId" }
+    $sourceId = Clean $obj.sourceId
+    $name = Clean $obj.name
+    $type = Clean $obj.objectType
+    $env = Clean $obj.environment
+    "$ClusterId|$EnvironmentLabel|$ProtectionGroupName|$env|$type|$name|$sourceId"
+}
+
+function Get-FailedAttemptsLocal($RunObject) {
+    try { @(($RunObject.localSnapshotInfo.failedAttempts)) } catch { @() }
+}
+
+function Is-SuccessObjectLocal($RunObject) {
+    if ($null -eq $RunObject -or $null -eq $RunObject.localSnapshotInfo) { return $false }
+    (Get-FailedAttemptsLocal $RunObject).Count -eq 0
+}
+
+function Get-FailureMessageLocal($Attempts) {
+    $msgs = @()
+    foreach ($a in @($Attempts)) {
+        $m = Clean $a.message
+        if ($m) { $msgs += $m }
+    }
+    ($msgs -join " | ")
+}
+
+function Update-RowFailureKeys($Row, $Keys) {
+    $keys2 = @($Keys | Where-Object { $_ } | Select-Object -Unique)
+    Set-Prop $Row "FailedRunKeys" @($keys2)
+    Set-Prop $Row "ConsecutiveFailureCount" $keys2.Count
+    $times = @()
+    foreach ($k in $keys2) {
+        try {
+            $parts = $k -split "\|"
+            $u = [int64]$parts[$parts.Count - 1]
+            if ($u -gt 0) { $times += $u }
+        } catch {}
+    }
+    if ($times.Count -gt 0) {
+        $min = ($times | Measure-Object -Minimum).Minimum
+        $max = ($times | Measure-Object -Maximum).Maximum
+        Set-Prop $Row "FirstFailedET" (Convert-UsecsToEtTextLocal $min)
+        Set-Prop $Row "LastFailedET" (Convert-UsecsToEtTextLocal $max)
+        Set-Prop $Row "LastFailedUsecs" ([int64]$max)
+    }
+}
+
+function New-ObjectTrackingRow {
+    param(
+        [string]$Incident,
+        [string]$WindowKey,
+        $Cluster,
+        $Env,
+        $ProtectionGroup,
+        [string]$ObjectKey,
+        [string]$HostName,
+        [string]$ObjectName,
+        [string]$ObjectType,
+        [string]$RunType,
+        [int64]$StartUsecs,
+        [int64]$EndUsecs,
+        [string]$Message,
+        [string]$Status,
+        [string]$LatestRunStatus,
+        [int64]$LatestRunUsecs,
+        [string[]]$FailedRunKeys
+    )
+    $effective = if ($EndUsecs -gt 0) { $EndUsecs } else { $StartUsecs }
+    if ($LatestRunUsecs -le 0) { $LatestRunUsecs = $effective }
+    [pscustomobject]@{
+        IncidentNumber = $Incident
+        WindowKey = $WindowKey
+        Status = $Status
+        Cluster = Clean $Cluster.Name
+        Environment = Clean $Env.Label
+        ProtectionGroup = Clean $ProtectionGroup.name
+        Host = Clean $HostName
+        ObjectName = Clean $ObjectName
+        ObjectType = Clean $ObjectType
+        RunType = Clean $RunType
+        FirstFailedET = Convert-UsecsToEtTextLocal $effective
+        LastFailedET = Convert-UsecsToEtTextLocal $effective
+        LastFailedUsecs = $effective
+        ClearedET = ""
+        LastSeenET = Convert-UsecsToEtTextLocal $LatestRunUsecs
+        LatestRunStatus = Clean $LatestRunStatus
+        ConsecutiveFailureCount = 1
+        Message = Clean $Message
+        ObjectKey = $ObjectKey
+        ClusterId = [string]$Cluster.Id
+        ProtectionGroupId = [string]$ProtectionGroup.id
+        EnvironmentFilter = Clean $Env.Filter
+        FailedRunKeys = @($FailedRunKeys)
+    }
+}
+
+function Get-ObjectEnvironmentMapLocal {
+    @(
+        [pscustomobject]@{ Label="Oracle";        Filter="kOracle";        ObjectType="kDatabase";       ParentHostNeeded=$true  },
+        [pscustomobject]@{ Label="SQL";           Filter="kSQL";           ObjectType="kDatabase";       ParentHostNeeded=$true  },
+        [pscustomobject]@{ Label="Physical";      Filter="kPhysical";      ObjectType="kHost";           ParentHostNeeded=$false },
+        [pscustomobject]@{ Label="GenericNas";    Filter="kGenericNas";    ObjectType="kHost";           ParentHostNeeded=$false },
+        [pscustomobject]@{ Label="HyperV";        Filter="kHyperV";        ObjectType="kVirtualMachine"; ParentHostNeeded=$false },
+        [pscustomobject]@{ Label="Acropolis";     Filter="kAcropolis";     ObjectType="kVirtualMachine"; ParentHostNeeded=$false },
+        [pscustomobject]@{ Label="RemoteAdapter"; Filter="kRemoteAdapter"; ObjectType="kRemoteAdapter";  ParentHostNeeded=$false },
+        [pscustomobject]@{ Label="Isilon";        Filter="kIsilon";        ObjectType="kHost";           ParentHostNeeded=$false }
+    )
+}
+
+function Collect-ObjectLevelCurrentFailures([string]$Incident, [string]$WindowKey, [int]$RunLimit) {
+    $rows = @()
+    try { $apiKey = Get-CohesityApiKeyLocal } catch { Write-Warning "Object-level refresh skipped: $($_.Exception.Message)"; return @() }
+    $commonHeaders = @{ accept = "application/json"; apiKey = $apiKey }
+    try {
+        $clusterJson = Invoke-HeliosGetJsonLocal -Uri "$BaseUrl/v2/mcm/cluster-mgmt/info" -Headers $commonHeaders
+        $clustersRaw = @($clusterJson.cohesityClusters)
+    } catch {
+        Write-Warning "Object-level refresh skipped; cluster lookup failed: $($_.Exception.Message)"
+        return @()
+    }
+    if ($ClusterName) {
+        $clustersRaw = @($clustersRaw | Where-Object {
+            (Clean $_.name) -eq $ClusterName -or (Clean $_.clusterName) -eq $ClusterName -or (Clean $_.displayName) -eq $ClusterName
+        })
+    }
+    $clusters = @($clustersRaw | ForEach-Object {
+        $n = Clean $_.name
+        if (!$n) { $n = Clean $_.clusterName }
+        if (!$n) { $n = Clean $_.displayName }
+        if (!$n) { $n = "Unknown-$($_.clusterId)" }
+        [pscustomobject]@{ Id = [string]$_.clusterId; Name = $n; Raw = $_ }
+    })
+    foreach ($cluster in $clusters) {
+        $headers = @{ accept = "application/json"; apiKey = $apiKey; accessClusterId = $cluster.Id }
+        foreach ($env in (Get-ObjectEnvironmentMapLocal)) {
+            $filterSet = @($env.Filter.Split(",") | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+            $isNas = $env.Label -in @("GenericNas","Isilon")
+            $pgs = @()
+            foreach ($f in $filterSet) {
+                try {
+                    $pgUri = "$BaseUrl/v2/data-protect/protection-groups?environments=$f&isDeleted=false&isPaused=false&isActive=true"
+                    $pgJson = Invoke-HeliosGetJsonLocal -Uri $pgUri -Headers $headers
+                    if ($pgJson -and $pgJson.protectionGroups) { $pgs += @($pgJson.protectionGroups) }
+                } catch {}
+            }
+            $pgs = @($pgs | Sort-Object id -Unique)
+            foreach ($pg in $pgs) {
+                $pgId = [string]$pg.id
+                $pgName = Clean $pg.name
+                try {
+                    $runsUri = "$BaseUrl/v2/data-protect/protection-groups/$([uri]::EscapeDataString($pgId))/runs?numRuns=$RunLimit&excludeNonRestorableRuns=false&includeObjectDetails=true"
+                    $runsJson = Invoke-HeliosGetJsonLocal -Uri $runsUri -Headers $headers
+                    $runs = @($runsJson.runs)
+                } catch { continue }
+                if ($runs.Count -eq 0) { continue }
+                $runTypes = @($runs | ForEach-Object { $i = Get-FirstLocalBackupInfoLocal $_; if ($i) { Clean $i.runType } } | Where-Object { $_ } | Select-Object -Unique)
+                foreach ($runType in $runTypes) {
+                    $runsForType = @($runs | Where-Object { $i = Get-FirstLocalBackupInfoLocal $_; $i -and (Clean $i.runType) -eq $runType } | Sort-Object { Get-RunEffectiveUsecsLocal $_ } -Descending)
+                    if ($runsForType.Count -eq 0) { continue }
+                    $latestInfo = Get-FirstLocalBackupInfoLocal $runsForType[0]
+                    $latestRunStatus = Clean $latestInfo.status
+                    $latestRunUsecs = Get-RunEffectiveUsecsLocal $runsForType[0]
+                    $idToName = @{}
+                    foreach ($rr in $runsForType) {
+                        foreach ($ob in (As-Array $rr.objects)) {
+                            if ($ob -and $ob.object -and $ob.object.id -and $ob.object.name) { $idToName[[string]$ob.object.id] = Clean $ob.object.name }
+                        }
+                    }
+                    $cleared = New-Object 'System.Collections.Generic.HashSet[string]'
+                    $latestByKey = @{}
+                    $failedKeysByKey = @{}
+                    foreach ($run in $runsForType) {
+                        $info = Get-FirstLocalBackupInfoLocal $run
+                        if (!$info) { continue }
+                        $status = Clean $info.status
+                        $startUsecs = [int64](Clean $info.startTimeUsecs)
+                        $endUsecs = [int64](Clean $info.endTimeUsecs)
+                        $effectiveUsecs = if ($endUsecs -gt 0) { $endUsecs } else { $startUsecs }
+                        $objectsAll = @(As-Array $run.objects | Where-Object { $_ -and $_.object -and $_.localSnapshotInfo })
+                        if (Is-Success $status) {
+                            foreach ($ob in $objectsAll) {
+                                if (Is-SuccessObjectLocal $ob) {
+                                    $ck = Get-ObjectKeyLocal $ob $cluster.Id $env.Label $pgId $pgName
+                                    if ($ck) { [void]$cleared.Add($ck) }
+                                }
+                            }
+                            continue
+                        }
+                        if (!(Is-Failed $status)) { continue }
+
+                        $candidateObjects = @()
+                        if ($isNas) {
+                            $candidateObjects = @($objectsAll | Where-Object { (Get-FailedAttemptsLocal $_).Count -gt 0 })
+                        } else {
+                            $candidateObjects = @($objectsAll | Where-Object {
+                                $objType = Clean $_.object.objectType
+                                $objEnv = Clean $_.object.environment
+                                $objType -eq $env.ObjectType -and (!$objEnv -or ($filterSet -contains $objEnv))
+                            })
+                            if ($env.ParentHostNeeded) {
+                                $hostObjects = @($objectsAll | Where-Object { ((Clean $_.object.objectType) -eq "kHost" -or (Clean $_.object.environment) -eq "kPhysical") -and (Get-FailedAttemptsLocal $_).Count -gt 0 })
+                                $candidateObjects += $hostObjects
+                            }
+                        }
+
+                        foreach ($ob in $candidateObjects) {
+                            $obj = $ob.object
+                            $ok = Get-ObjectKeyLocal $ob $cluster.Id $env.Label $pgId $pgName
+                            if (!$ok -or $cleared.Contains($ok)) { continue }
+                            $attempts = Get-FailedAttemptsLocal $ob
+                            $hasAttempts = $attempts.Count -gt 0
+                            if (!$hasAttempts -and $env.Label -ne "Physical") { continue }
+                            $msg = Get-FailureMessageLocal $attempts
+                            if (!$msg) { $msg = "Run marked Failed; object returned without failedAttempts details" }
+                            $objType = Clean $obj.objectType
+                            $objName = Clean $obj.name
+                            $hostName = ""
+                            if ($env.ParentHostNeeded) {
+                                $sourceId = Clean $obj.sourceId
+                                if ($sourceId -and $idToName.ContainsKey($sourceId)) { $hostName = $idToName[$sourceId] }
+                                if ($objType -eq "kHost" -or (Clean $obj.environment) -eq "kPhysical") {
+                                    $hostName = $objName
+                                    $objName = "No DBs Found (Host-Level Failure)"
+                                }
+                            }
+                            if (!$objName) { continue }
+                            $rowStatus = "NewlyFailedThisCheck"
+                            if ((Is-Running $latestRunStatus) -and $latestRunUsecs -gt $effectiveUsecs) { $rowStatus = "RunningAtLatestCheck" }
+                            elseif ((Is-Cancelled $latestRunStatus) -and $latestRunUsecs -gt $effectiveUsecs) { $rowStatus = "CancelledAfterFailure" }
+                            $runKey = "$($cluster.Id)|$pgId|$ok|$runType|$effectiveUsecs"
+                            if (!$failedKeysByKey.ContainsKey($ok)) { $failedKeysByKey[$ok] = New-Object 'System.Collections.Generic.HashSet[string]' }
+                            [void]$failedKeysByKey[$ok].Add($runKey)
+                            if (!$latestByKey.ContainsKey($ok)) {
+                                $latestByKey[$ok] = New-ObjectTrackingRow -Incident $Incident -WindowKey $WindowKey -Cluster $cluster -Env $env -ProtectionGroup $pg -ObjectKey $ok -HostName $hostName -ObjectName $objName -ObjectType $objType -RunType $runType -StartUsecs $startUsecs -EndUsecs $endUsecs -Message $msg -Status $rowStatus -LatestRunStatus $latestRunStatus -LatestRunUsecs $latestRunUsecs -FailedRunKeys @($runKey)
+                            }
+                        }
+                    }
+                    foreach ($k in $latestByKey.Keys) {
+                        if ($failedKeysByKey.ContainsKey($k)) { Update-RowFailureKeys $latestByKey[$k] @($failedKeysByKey[$k]) }
+                        $rows += $latestByKey[$k]
+                    }
+                }
+            }
+        }
+    }
+    @(Merge-Latest $rows)
+}
+
 function Display-ObjectName($r) {
     $name = Clean $r.ObjectName
     $type = Clean $r.ObjectType
@@ -159,22 +466,10 @@ function Display-ObjectType($r, [string]$DisplayName) {
     return $type
 }
 
-function Get-Result($r) {
-    $s = Clean $r.Status
-    switch ($s) {
-        "RunningAtLatestCheck" { return "Running" }
-        "CancelledAfterFailure" { return "Cancelled" }
-        "NewlyClearedThisCheck" { return "Success" }
-        "ClearedByLaterSuccess" { return "Success" }
-        default { return "Failed" }
-    }
-}
-
 function Convert-LifecycleRows($Rows) {
     foreach ($r in @($Rows)) {
         $dn = Display-ObjectName $r
         $dt = Display-ObjectType $r $dn
-        $evidence = if ($dn -and $dt) { "Object" } else { "RunLevel" }
         [pscustomobject]@{
             Cluster = Clean $r.Cluster
             ProtectionGroup = Clean $r.ProtectionGroup
@@ -183,8 +478,6 @@ function Convert-LifecycleRows($Rows) {
             ObjectName = $dn
             ObjectType = $dt
             RunType = Clean $r.RunType
-            Result = Get-Result $r
-            EvidenceLevel = $evidence
             Status = Clean $r.Status
             OldestFailedET = Clean $r.FirstFailedET
             NewestFailedET = Clean $r.LastFailedET
@@ -251,6 +544,14 @@ function Write-FinalOutputs([string]$Folder, [int]$RunLimit) {
     $clearedPath = Join-Path $Folder "cleared_by_success.csv"
     $lifecyclePath = Join-Path $Folder "incident_lifecycle.csv"
 
+    $incident = if ($state -and $state.IncidentNumber) { Clean $state.IncidentNumber } else { Split-Path $Folder -Leaf }
+    $windowKey = if ($state -and $state.WindowKey) { Clean $state.WindowKey } else { "" }
+
+    $objectCurrent = @(Collect-ObjectLevelCurrentFailures -Incident $incident -WindowKey $windowKey -RunLimit $RunLimit)
+    if ($objectCurrent.Count -gt 0) {
+        Save-Csv $currentPath $objectCurrent $script:InternalColumns
+    }
+
     $reconciled = Reconcile (Import-ReportCsv $currentPath) (Import-ReportCsv $clearedPath)
     $active = @($reconciled.Active)
     $cleared = @($reconciled.Cleared)
@@ -270,33 +571,27 @@ function Write-FinalOutputs([string]$Folder, [int]$RunLimit) {
     }
 
     $lifecycleExport = @(Convert-LifecycleRows $lifecycle | Sort-Object Cluster,ProtectionGroup,Environment,@{Expression={Date-Sort $_.NewestFailedET};Descending=$true})
-    Save-Csv $lifecyclePath $lifecycleExport $script:LifecycleColumns
+    Save-Csv $lifecyclePath $lifecycleExport $script:FinalColumns
 
-    $incident = if ($state -and $state.IncidentNumber) { Clean $state.IncidentNumber } else { Split-Path $Folder -Leaf }
     $windowLabel = if ($state -and $state.WindowLabel) { Clean $state.WindowLabel } else { "" }
     $generated = if ($state -and $state.LastRunET) { Clean $state.LastRunET } else { (Get-Date).ToString("yyyy-MM-dd HH:mm:ss") }
     $warnings = if ($state -and $state.Warnings) { @($state.Warnings) } else { @() }
 
-    $activeExport = @(Convert-LifecycleRows $active | Sort-Object @{Expression={Date-Sort $_.NewestFailedET};Descending=$true})
-    $objectFailures = @($activeExport | Where-Object { $_.EvidenceLevel -eq "Object" })
-    $pgReview = @($activeExport | Where-Object { $_.EvidenceLevel -ne "Object" })
+    $activeStatuses = @("NewlyFailedThisCheck","OlderStillFailing","CurrentStillFailing","CarriedForwardStillFailing","ReFailedAfterClear","RunningAtLatestCheck","CancelledAfterFailure","UnknownNeedsReview")
+    $activeExport = @($lifecycleExport | Where-Object { $activeStatuses -contains $_.Status } | Sort-Object @{Expression={Date-Sort $_.NewestFailedET};Descending=$true})
+    $newlyCleared = @($lifecycleExport | Where-Object { $_.Status -eq "NewlyClearedThisCheck" } | Sort-Object @{Expression={Date-Sort $_.LatestSuccessET};Descending=$true})
+    $previouslyCleared = @($lifecycleExport | Where-Object { $_.Status -eq "ClearedByLaterSuccess" })
+    $expectedLifecycle = $activeExport.Count + $newlyCleared.Count + $previouslyCleared.Count
 
-    $newlyCleared = @($lifecycleExport | Where-Object { $_.Status -eq "NewlyClearedThisCheck" -and $_.EvidenceLevel -eq "Object" } | Sort-Object @{Expression={Date-Sort $_.LatestSuccessET};Descending=$true})
-    $newlyClearedRunLevel = @($lifecycleExport | Where-Object { $_.Status -eq "NewlyClearedThisCheck" -and $_.EvidenceLevel -ne "Object" } | Sort-Object @{Expression={Date-Sort $_.LatestSuccessET};Descending=$true})
-    $previouslyCleared = @($lifecycleExport | Where-Object Status -eq "ClearedByLaterSuccess")
-    $expectedLifecycle = $activeExport.Count + $newlyCleared.Count + $newlyClearedRunLevel.Count + $previouslyCleared.Count
-
-    $activeTally = "Active object-level failures: $($objectFailures.Count); run-level/PG-level review rows: $($pgReview.Count)."
-    $lifecycleTally = if ($expectedLifecycle -eq $lifecycleExport.Count) { "Lifecycle tally: $($activeExport.Count) active/review + $($newlyCleared.Count + $newlyClearedRunLevel.Count) newly successful + $($previouslyCleared.Count) previously successful retained = $($lifecycleExport.Count) total lifecycle rows." } else { "Lifecycle tally requires review: expected $expectedLifecycle rows, but incident_lifecycle.csv has $($lifecycleExport.Count) rows." }
-    $successRecon = if ($moved.Count -gt 0) { "Latest-success reconciliation: $($moved.Count) active row(s) moved to Success because a later successful backup was found." } else { "Latest-success reconciliation: no active rows had a later successful backup." }
+    $activeTally = "Active breakdown tally: $($activeExport.Count) active/unresolved lifecycle rows."
+    $lifecycleTally = if ($expectedLifecycle -eq $lifecycleExport.Count) { "Lifecycle tally: $($activeExport.Count) active/unresolved + $($newlyCleared.Count) newly cleared this check + $($previouslyCleared.Count) previously cleared retained = $($lifecycleExport.Count) total lifecycle rows." } else { "Lifecycle tally requires review: expected $expectedLifecycle rows, but incident_lifecycle.csv has $($lifecycleExport.Count) rows." }
+    $successRecon = if ($moved.Count -gt 0) { "Latest-success reconciliation: $($moved.Count) active row(s) moved to NewlyClearedThisCheck because a later successful backup was found." } else { "Latest-success reconciliation: no active rows had a later successful backup." }
 
     $apiStatus = if ($warnings.Count -gt 0) { "Incomplete - $($warnings.Count) collection warning(s) recorded. See Incomplete Collection section." } else { "Complete - all collected scopes returned without recorded lookup warnings." }
     $followUp = if ($warnings.Count -gt 0) { "Retry Failed Collection Scope:`nRun the command below to refresh the incident output after the timed-out Cohesity API scope is available.`n`n$(Rerun-Command $incident $ClusterName $RunLimit)`n`nAfter the rerun completes, use the refreshed worknotes_summary.txt and incident_lifecycle.csv for the incident update." } else { "Retry Failed Collection Scope:`n- Not required for this run." }
 
-    $failureText = Format-Rows $objectFailures $script:ObjectFailureColumns
-    $successText = Format-Rows (@($newlyCleared | Select-Object $script:ObjectSuccessColumns)) $script:ObjectSuccessColumns
-    $pgReviewText = Format-Rows $pgReview $script:PgReviewColumns
-    $pgSuccessText = Format-Rows $newlyClearedRunLevel $script:PgReviewColumns
+    $failureText = Format-Rows $activeExport $script:FailureColumns
+    $successText = Format-Rows (@($newlyCleared | Select-Object -Property $script:SuccessColumns)) $script:SuccessColumns
 
     @"
 Cohesity Backup Failure Incident Update
@@ -312,11 +607,9 @@ Do Not Edit Generated Files:
 - If the output looks incorrect, stale, or incomplete, rerun the script and use the refreshed files.
 
 Summary Counts:
-- Object-level active failures: $($objectFailures.Count)
-- Run-level / PG-level review rows: $($pgReview.Count)
-- Object-level success this check: $($newlyCleared.Count)
-- Run-level / PG-level success this check: $($newlyClearedRunLevel.Count)
-- Previously successful rows retained in lifecycle CSV: $($previouslyCleared.Count)
+- Active / unresolved failures: $($activeExport.Count)
+- Newly cleared this check: $($newlyCleared.Count)
+- Previously cleared rows retained in lifecycle CSV: $($previouslyCleared.Count)
 - Total lifecycle rows tracked: $($lifecycleExport.Count)
 
 Tally Check:
@@ -325,21 +618,14 @@ Tally Check:
 - $successRecon
 
 Team Focus:
-- Use the Object-Level Failure Section for troubleshooting.
-- Run-Level / PG-Level Review means Cohesity did not return object-level failedAttempts for that failed run.
-- Result is simplified to Failed, Running, Cancelled, or Success.
+- Focus on object-level rows in the Failure Section.
+- Success section only lists rows newly cleared in this check.
 
-Object-Level Failure Section:
+Failure Section:
 $failureText
 
-Object-Level Success Section:
+Success Section:
 $successText
-
-Run-Level / PG-Level Review Section:
-$pgReviewText
-
-Run-Level / PG-Level Success Section:
-$pgSuccessText
 
 Incomplete Collection:
 $(Format-Warnings $warnings)
@@ -365,11 +651,9 @@ Cohesity API Collection Status: $apiStatus
 Scope: latest $RunLimit runs per protection group/run type.
 
 Closure Counts:
-- Object-level active failures: $($objectFailures.Count)
-- Run-level / PG-level review rows: $($pgReview.Count)
-- Object-level success this check: $($newlyCleared.Count)
-- Run-level / PG-level success this check: $($newlyClearedRunLevel.Count)
-- Previously successful rows retained in lifecycle CSV: $($previouslyCleared.Count)
+- Active / unresolved failures: $($activeExport.Count)
+- Newly cleared this check: $($newlyCleared.Count)
+- Previously cleared rows retained in lifecycle CSV: $($previouslyCleared.Count)
 - Total lifecycle rows tracked: $($lifecycleExport.Count)
 
 Tally Check:
@@ -377,17 +661,14 @@ Tally Check:
 - $lifecycleTally
 - $successRecon
 
-Object-Level Failure Section:
+Failure Section:
 $failureText
 
-Object-Level Success Section:
+Success Section:
 $successText
 
-Run-Level / PG-Level Review Section:
-$pgReviewText
-
 Carry Forward / Handoff:
-$(if ($objectFailures.Count -eq 0 -and $pgReview.Count -eq 0) { "No active object-level or run-level backup failures remain based on the latest saved state." } else { "$($objectFailures.Count) object-level active failure row(s) and $($pgReview.Count) run-level/PG-level review row(s) remain in incident_lifecycle.csv." })
+$(if ($activeExport.Count -eq 0) { "No active backup failures remain based on the latest saved state." } else { "$($activeExport.Count) active/unresolved rows remain in incident_lifecycle.csv and should be carried forward or separately tracked." })
 
 Incomplete Collection:
 $(Format-Warnings $warnings)
@@ -406,11 +687,9 @@ Script Memory:
     Write-Host ""
     Write-Host "Final Normalized Summary (matches worknotes_summary.txt):"
     Write-Host "Cohesity API Collection Status : $apiStatus"
-    Write-Host "Object-Level Active Failures   : $($objectFailures.Count)"
-    Write-Host "Run/PG-Level Review Rows       : $($pgReview.Count)"
-    Write-Host "Object-Level Success This Check: $($newlyCleared.Count)"
-    Write-Host "Run/PG-Level Success This Check: $($newlyClearedRunLevel.Count)"
-    Write-Host "Previously Successful Retained : $($previouslyCleared.Count)"
+    Write-Host "Active / Unresolved Failures   : $($activeExport.Count)"
+    Write-Host "Newly Cleared This Check       : $($newlyCleared.Count)"
+    Write-Host "Previously Cleared Retained    : $($previouslyCleared.Count)"
     Write-Host "Total Lifecycle Rows           : $($lifecycleExport.Count)"
     Write-Host "Incomplete Collection Warnings : $($warnings.Count)"
     Write-Host "Tally Check:"
