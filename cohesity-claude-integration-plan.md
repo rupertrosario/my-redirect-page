@@ -99,6 +99,30 @@ lineage), since it already emits a clean markdown table.
 4. Measure actual token spend on this one flow before adding a second
    report type (capacity, interface status, etc.).
 
+## Daily operations: where Claude fits
+
+You mentioned your day is really: management reporting on backup failures,
+CR (change request) tasks, incidents, maintenance, patching, troubleshooting,
+Confluence, and Jira. Not all of these need a pipeline — most don't. Here's
+each one, honestly, with a token-cost tier and whether it needs any setup:
+
+| Work stream | Claude's role | Token tier | Setup needed |
+|---|---|---|---|
+| **Backup-failure / management reporting** | Narrate the digest into a plain-English summary + anomaly flags (this is the Tier 1→2→3 pipeline above) | Low, scheduled | Yes — the pilot above |
+| **Troubleshooting** (scripts, API errors, Cohesity/Dynatrace weirdness) | Interactive Claude Code session — paste the error/script, work it live | Medium, but occasional/bursty | **None — start today** |
+| **CR (change request) write-ups** | You give it bullet points (what's changing, why, blast radius); it drafts the description, risk section, rollback plan | Low-medium, per-CR | None — copy/paste workflow |
+| **Maintenance & patching** | Draft/refresh runbooks and pre/post checklists; summarize vendor patch/release notes into "what changed, what's our risk" | Low, periodic | None |
+| **Incidents** | Draft a timeline summary or stakeholder update from facts you already have (ticket notes, the failure digest) — **not** from raw logs; use it live for troubleshooting during the incident too | Medium, event-driven | Define a small incident digest format first (Phase 4 below) |
+| **Confluence** | Turn rough notes/meeting outcomes into a clean page; keep docs in sync with what a script actually does | Low, occasional | Manual copy/paste works fine; check for an Atlassian MCP connector if you want it wired in directly |
+| **Jira** | Draft ticket descriptions/acceptance criteria; summarize a backlog for standup | Low, occasional | Same as Confluence — connector optional, not required |
+
+**Where to actually start, in order:** troubleshooting first (zero setup,
+useful immediately), then the backup-failure reporting pilot (already
+planned, highest recurring value), then CR/maintenance/patching drafting
+(just paste bullets in — no pipeline to build), then incidents once you have
+a digest format, and Confluence/Jira last since those depend on whether a
+connector exists in your environment.
+
 ## Before rollout to the client repo
 
 - Resolve the `_do_not_delete` / `_test` / `_prod_test` duplication — even
@@ -120,3 +144,38 @@ lineage), since it already emits a clean markdown table.
   express in a BI tool.
 - It does not require rewriting existing production scripts. Tier 1 is
   frozen; only a thin Tier 2/3 gets added.
+
+## Progress checklist
+
+Check these off as you go — this is the running status for the rollout.
+
+**Phase 0 — Setup**
+- [ ] Confirm Claude Code access + Bedrock usage/metering visibility in the client environment
+- [ ] Set a budget/alarm scoped specifically to Claude Code usage
+- [ ] Note which folders are live vs. `_do_not_delete`/`_test` (even a one-line README per folder) so a future `CLAUDE.md` has something accurate to point to
+
+**Phase 1 — Pilot: backup-failure reporting**
+- [ ] Confirm `dyna_backup_failure`'s `markdownTable` output as the Tier-2 digest (no new collector code needed)
+- [ ] Write the fixed Tier-3 prompt template for the daily narrative
+- [ ] Wire a scripted `claude -p` (Haiku) call after the Dynatrace workflow
+- [ ] Run it alongside the existing raw table for ~2 weeks and sanity-check the narrative against ground truth
+- [ ] Measure actual token/cost spend on this one flow before expanding
+
+**Phase 2 — Everyday ad hoc use (no pipeline required)**
+- [ ] Use interactive Claude Code for troubleshooting scripts/errors as they come up
+- [ ] Draft CR descriptions and rollback plans from bullet notes
+- [ ] Draft/refresh maintenance and patching runbooks and checklists
+
+**Phase 3 — Expand reporting**
+- [ ] Apply the same Tier-2/Tier-3 pattern to a second report (capacity or interface status)
+- [ ] Add day-over-day diffing as a deterministic script step (not an LLM call), feeding the "what's new since yesterday" into the narrative prompt
+
+**Phase 4 — Incidents**
+- [ ] Define a lightweight incident digest format (timeline + key facts — not raw logs)
+- [ ] Use Claude to draft RCA/stakeholder-update drafts from that digest
+- [ ] Use Claude interactively during live incidents for troubleshooting
+
+**Phase 5 — Confluence & Jira**
+- [ ] Check whether an Atlassian (Confluence/Jira) MCP connector is available in your environment
+- [ ] If yes: pilot auto-drafting one doc page or one ticket type
+- [ ] If no: keep using manual copy/paste (draft in Claude, paste into Confluence/Jira) — still useful, zero integration risk
