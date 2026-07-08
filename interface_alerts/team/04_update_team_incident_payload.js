@@ -1,53 +1,12 @@
-// ------------------------------------------------------------
-// Build Team update payload from comparison output
-// ------------------------------------------------------------
-// Note:
-// The current Dynatrace ServiceNow Update Incident action may expose
-// only Incident number and Comment fields. In that case, map directly:
-//
-//   Incident number = {{ _.item.number }}
-//   Comment         = {{ _.item.comment }}
-//
-// This helper is retained only for workflows that use a custom ServiceNow
-// table/API update task and need a payload object.
-// ------------------------------------------------------------
-
-import { result } from "@dynatrace-sdk/automation-utils";
+// Dynatrace JS action: Build update target and payload from normalized Team output.
+import { execution } from "@dynatrace-sdk/automation-utils";
 
 export default async function () {
-  const compareRows = await result("compare_team_incident_state");
-  const validateResult = await result("validate_interfaces");
-
-  const compare =
-    Array.isArray(compareRows)
-      ? compareRows[0]
-      : compareRows;
-
-  if (!compare || compare.shouldUpdate !== true) {
-    throw new Error("Team update payload requires shouldUpdate=true.");
+  var normalizeExec = await execution("normalize_team_search_result");
+  var normalized = normalizeExec && normalizeExec.result ? normalizeExec.result : (normalizeExec || {});
+  var candidate = normalized.candidate || {};
+  if (normalized.action !== "update" || !normalized.sys_id) {
+    throw new Error("Update payload requires action update and a sys_id.");
   }
-
-  const teamItems =
-    Array.isArray(validateResult?.teamIncidents)
-      ? validateResult.teamIncidents
-      : Array.isArray(validateResult?.teamincident)
-        ? validateResult.teamincident
-        : [];
-
-  const candidate =
-    teamItems.find(function (x) {
-      return String(x?.correlation_id || x?.CorrelationId || "").trim() === String(compare.correlation_id || "").trim();
-    }) || {};
-
-  const comment =
-    String(candidate.comment || candidate.WorkNotes || candidate.work_notes || candidate.description || candidate.Description || "").trim();
-
-  return {
-    sys_id: compare.sys_id || "",
-    number: compare.number || "",
-    comment: comment,
-    payload: {
-      comments: comment
-    }
-  };
+  return { sys_id: normalized.sys_id, payload: { work_notes: candidate.WorkNotes || "" } };
 }
