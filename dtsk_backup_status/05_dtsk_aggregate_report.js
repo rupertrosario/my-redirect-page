@@ -8,6 +8,8 @@
 // - Collects all loop outputs
 // - Flattens all rows into one simple report
 // - Creates manager-friendly Markdown for email
+// - Shows DTSK assignment ownership in the email output
+// - Keeps cluster diagnostics out of the Cluster column
 // - Clearly reports when there are no active decommission DTSKs
 //
 // Workflow position:
@@ -55,8 +57,13 @@ export default async function () {
       .replace(/\r?\n/g, " ");
   }
 
+  function assignmentActionFromAssignedTo(assignedTo) {
+    return safeText(assignedTo) === "N/A" ? "Please assign" : "Assigned";
+  }
+
   function normalizeRow(row) {
     const backupTypeRaw = safeText(row?.BackupType);
+    const assignedTo = safeText(row?.AssignedTo);
     const displayMap = {
       NoObject: "No Backup Found",
       NoFSBackupFound: "DB Only / No Server Backup",
@@ -67,6 +74,9 @@ export default async function () {
     return {
       DTSK: safeText(row?.DTSK),
       DecomRequest: safeText(row?.DecomRequest),
+      AssignedTo: assignedTo,
+      AssignmentGroup: safeText(row?.AssignmentGroup),
+      AssignmentAction: safeText(row?.AssignmentAction) !== "N/A" ? safeText(row?.AssignmentAction) : assignmentActionFromAssignedTo(assignedTo),
       ServerName: safeText(row?.ServerName),
       BackupType: backupTypeRaw,
       BackupTypeDisplay: displayMap[backupTypeRaw] || backupTypeRaw,
@@ -74,7 +84,8 @@ export default async function () {
       SourceName: safeText(row?.SourceName),
       ClusterName: safeText(row?.ClusterName),
       ProtectionGroup: safeText(row?.ProtectionGroup),
-      LastBackupTime: safeText(row?.LastBackupTime)
+      LastBackupTime: safeText(row?.LastBackupTime),
+      ClustersChecked: safeText(row?.ClustersChecked)
     };
   }
 
@@ -86,6 +97,8 @@ export default async function () {
       const key = [
         row.DTSK,
         row.DecomRequest,
+        row.AssignedTo,
+        row.AssignmentAction,
         row.ServerName,
         row.BackupType,
         row.ObjectName,
@@ -117,6 +130,9 @@ export default async function () {
     };
 
     return [...rows].sort((a, b) => {
+      const dtskCompare = String(a.DTSK || "").localeCompare(String(b.DTSK || ""));
+      if (dtskCompare !== 0) return dtskCompare;
+
       const serverCompare = String(a.ServerName || "").localeCompare(String(b.ServerName || ""));
       if (serverCompare !== 0) return serverCompare;
 
@@ -182,6 +198,8 @@ export default async function () {
     const headers = [
       ["DTSK", "DTSK"],
       ["Decom Request", "DecomRequest"],
+      ["Assigned To", "AssignedTo"],
+      ["Assignment Action", "AssignmentAction"],
       ["Server", "ServerName"],
       ["Backup Type", "BackupTypeDisplay"],
       ["Object", "ObjectName"],
@@ -219,6 +237,8 @@ export default async function () {
       "| Metric | Count |",
       "|---|---:|",
       `| **DTSKs reviewed** | **${summary.totalDtsks}** |`,
+      `| **Assigned DTSKs** | **${summary.assignedDtskCount}** |`,
+      `| **Unassigned DTSKs** | **${summary.unassignedDtskCount}** |`,
       `| **Total validation rows** | **${summary.totalRows}** |`,
       `| **Server-level protected CIs** | **${summary.serverLevelProtectedCiCount}** |`,
       `| **DB-protected CIs** | **${summary.dbProtectedCiCount}** |`,
@@ -249,7 +269,8 @@ export default async function () {
       "- NAS backups are excluded from this server decommission validation.",
       "- **No Backup Found** means no in-scope Cohesity backup object was found for the CI.",
       "- **DB Only / No Server Backup** means a SQL/Oracle backup was found, but no FS, VM, Hyper-V, or Nutanix/AHV backup was found for the server.",
-      "- Servers with naming patterns such as `db` or `cn` may require DB-level backup review if only FS/VM backup is found."
+      "- **Assignment Action** is derived from ServiceNow: `Assigned` when Assigned To is populated, otherwise `Please assign`.",
+      "- Cluster search diagnostics are retained in task JSON but are not shown in the email Cluster column."
     ].join("\n");
   }
 
@@ -287,6 +308,9 @@ export default async function () {
     totalDtsks: workItems.length,
     validationOutputCount: validationOutputs.length,
     totalRows: finalRows.length,
+
+    assignedDtskCount: workItems.filter(x => safeText(x?.assignedTo) !== "N/A").length,
+    unassignedDtskCount: workItems.filter(x => safeText(x?.assignedTo) === "N/A").length,
 
     fsRowCount: countRows(finalRows, "FS"),
     vmRowCount: countRows(finalRows, "VM"),
