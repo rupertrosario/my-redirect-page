@@ -19,8 +19,10 @@ param(
     [switch]$ShowGrid
 )
 
-$script:LifecycleColumns = @("Cluster","ProtectionGroup","Environment","Host","ObjectName","ObjectType","RunType","Status","OldestFailedET","NewestFailedET","LatestSuccessET","FailureRuns","Message")
-$script:SuccessColumns = @("Cluster","ProtectionGroup","Environment","RunType","LatestSuccessET")
+$script:LifecycleColumns = @("Cluster","ProtectionGroup","Environment","Host","ObjectName","ObjectType","RunType","Result","EvidenceLevel","Status","OldestFailedET","NewestFailedET","LatestSuccessET","FailureRuns","Message")
+$script:ObjectFailureColumns = @("Cluster","ProtectionGroup","Environment","Host","ObjectName","ObjectType","RunType","Result","NewestFailedET","FailureRuns","Message")
+$script:ObjectSuccessColumns = @("Cluster","ProtectionGroup","Environment","Host","ObjectName","ObjectType","RunType","Result","LatestSuccessET")
+$script:PgReviewColumns = @("Cluster","ProtectionGroup","Environment","RunType","Result","NewestFailedET","LatestSuccessET","Message")
 
 function Clean($v) {
     if ($null -eq $v) { return "" }
@@ -157,17 +159,32 @@ function Display-ObjectType($r, [string]$DisplayName) {
     return $type
 }
 
+function Get-Result($r) {
+    $s = Clean $r.Status
+    switch ($s) {
+        "RunningAtLatestCheck" { return "Running" }
+        "CancelledAfterFailure" { return "Cancelled" }
+        "NewlyClearedThisCheck" { return "Success" }
+        "ClearedByLaterSuccess" { return "Success" }
+        default { return "Failed" }
+    }
+}
+
 function Convert-LifecycleRows($Rows) {
     foreach ($r in @($Rows)) {
         $dn = Display-ObjectName $r
+        $dt = Display-ObjectType $r $dn
+        $evidence = if ($dn -and $dt) { "Object" } else { "RunLevel" }
         [pscustomobject]@{
             Cluster = Clean $r.Cluster
             ProtectionGroup = Clean $r.ProtectionGroup
             Environment = Clean $r.Environment
             Host = Clean $r.Host
             ObjectName = $dn
-            ObjectType = Display-ObjectType $r $dn
+            ObjectType = $dt
             RunType = Clean $r.RunType
+            Result = Get-Result $r
+            EvidenceLevel = $evidence
             Status = Clean $r.Status
             OldestFailedET = Clean $r.FirstFailedET
             NewestFailedET = Clean $r.LastFailedET
@@ -261,28 +278,25 @@ function Write-FinalOutputs([string]$Folder, [int]$RunLimit) {
     $warnings = if ($state -and $state.Warnings) { @($state.Warnings) } else { @() }
 
     $activeExport = @(Convert-LifecycleRows $active | Sort-Object @{Expression={Date-Sort $_.NewestFailedET};Descending=$true})
-    $new = @($active | Where-Object Status -eq "NewlyFailedThisCheck")
-    $older = @($active | Where-Object { $_.Status -eq "OlderStillFailing" -or $_.Status -eq "CurrentStillFailing" })
-    $carried = @($active | Where-Object Status -eq "CarriedForwardStillFailing")
-    $refailed = @($active | Where-Object Status -eq "ReFailedAfterClear")
-    $running = @($active | Where-Object Status -eq "RunningAtLatestCheck")
-    $cancelled = @($active | Where-Object Status -eq "CancelledAfterFailure")
-    $unknown = @($active | Where-Object Status -eq "UnknownNeedsReview")
-    $activeBreakdown = $new.Count + $older.Count + $carried.Count + $refailed.Count + $running.Count + $cancelled.Count + $unknown.Count
+    $objectFailures = @($activeExport | Where-Object { $_.EvidenceLevel -eq "Object" })
+    $pgReview = @($activeExport | Where-Object { $_.EvidenceLevel -ne "Object" })
 
-    $newlyCleared = @($lifecycleExport | Where-Object Status -eq "NewlyClearedThisCheck" | Sort-Object @{Expression={Date-Sort $_.LatestSuccessET};Descending=$true})
+    $newlyCleared = @($lifecycleExport | Where-Object { $_.Status -eq "NewlyClearedThisCheck" -and $_.EvidenceLevel -eq "Object" } | Sort-Object @{Expression={Date-Sort $_.LatestSuccessET};Descending=$true})
+    $newlyClearedRunLevel = @($lifecycleExport | Where-Object { $_.Status -eq "NewlyClearedThisCheck" -and $_.EvidenceLevel -ne "Object" } | Sort-Object @{Expression={Date-Sort $_.LatestSuccessET};Descending=$true})
     $previouslyCleared = @($lifecycleExport | Where-Object Status -eq "ClearedByLaterSuccess")
-    $expectedLifecycle = $active.Count + $newlyCleared.Count + $previouslyCleared.Count
+    $expectedLifecycle = $activeExport.Count + $newlyCleared.Count + $newlyClearedRunLevel.Count + $previouslyCleared.Count
 
-    $activeTally = if ($activeBreakdown -eq $active.Count) { "Active breakdown tally: $activeBreakdown = $($active.Count) active/unresolved lifecycle rows." } else { "Active breakdown tally requires review: child status total $activeBreakdown does not match $($active.Count) active/unresolved lifecycle rows." }
-    $lifecycleTally = if ($expectedLifecycle -eq $lifecycleExport.Count) { "Lifecycle tally: $($active.Count) active/unresolved + $($newlyCleared.Count) newly cleared this check + $($previouslyCleared.Count) previously cleared retained = $($lifecycleExport.Count) total lifecycle rows." } else { "Lifecycle tally requires review: $($active.Count) active/unresolved + $($newlyCleared.Count) newly cleared this check + $($previouslyCleared.Count) previously cleared retained = $expectedLifecycle, but incident_lifecycle.csv has $($lifecycleExport.Count) rows." }
-    $successRecon = if ($moved.Count -gt 0) { "Latest-success reconciliation: $($moved.Count) active row(s) moved to NewlyClearedThisCheck because a later successful backup was found." } else { "Latest-success reconciliation: no active rows had a later successful backup." }
+    $activeTally = "Active object-level failures: $($objectFailures.Count); run-level/PG-level review rows: $($pgReview.Count)."
+    $lifecycleTally = if ($expectedLifecycle -eq $lifecycleExport.Count) { "Lifecycle tally: $($activeExport.Count) active/review + $($newlyCleared.Count + $newlyClearedRunLevel.Count) newly successful + $($previouslyCleared.Count) previously successful retained = $($lifecycleExport.Count) total lifecycle rows." } else { "Lifecycle tally requires review: expected $expectedLifecycle rows, but incident_lifecycle.csv has $($lifecycleExport.Count) rows." }
+    $successRecon = if ($moved.Count -gt 0) { "Latest-success reconciliation: $($moved.Count) active row(s) moved to Success because a later successful backup was found." } else { "Latest-success reconciliation: no active rows had a later successful backup." }
 
     $apiStatus = if ($warnings.Count -gt 0) { "Incomplete - $($warnings.Count) collection warning(s) recorded. See Incomplete Collection section." } else { "Complete - all collected scopes returned without recorded lookup warnings." }
     $followUp = if ($warnings.Count -gt 0) { "Retry Failed Collection Scope:`nRun the command below to refresh the incident output after the timed-out Cohesity API scope is available.`n`n$(Rerun-Command $incident $ClusterName $RunLimit)`n`nAfter the rerun completes, use the refreshed worknotes_summary.txt and incident_lifecycle.csv for the incident update." } else { "Retry Failed Collection Scope:`n- Not required for this run." }
 
-    $failureText = Format-Rows $activeExport $script:LifecycleColumns
-    $successText = Format-Rows (@($newlyCleared | Select-Object $script:SuccessColumns)) $script:SuccessColumns
+    $failureText = Format-Rows $objectFailures $script:ObjectFailureColumns
+    $successText = Format-Rows (@($newlyCleared | Select-Object $script:ObjectSuccessColumns)) $script:ObjectSuccessColumns
+    $pgReviewText = Format-Rows $pgReview $script:PgReviewColumns
+    $pgSuccessText = Format-Rows $newlyClearedRunLevel $script:PgReviewColumns
 
     @"
 Cohesity Backup Failure Incident Update
@@ -298,9 +312,11 @@ Do Not Edit Generated Files:
 - If the output looks incorrect, stale, or incomplete, rerun the script and use the refreshed files.
 
 Summary Counts:
-- Active / unresolved failures: $($active.Count)
-- Newly cleared this check: $($newlyCleared.Count)
-- Previously cleared rows retained in lifecycle CSV: $($previouslyCleared.Count)
+- Object-level active failures: $($objectFailures.Count)
+- Run-level / PG-level review rows: $($pgReview.Count)
+- Object-level success this check: $($newlyCleared.Count)
+- Run-level / PG-level success this check: $($newlyClearedRunLevel.Count)
+- Previously successful rows retained in lifecycle CSV: $($previouslyCleared.Count)
 - Total lifecycle rows tracked: $($lifecycleExport.Count)
 
 Tally Check:
@@ -309,14 +325,21 @@ Tally Check:
 - $successRecon
 
 Team Focus:
-- Focus on OlderStillFailing and UnknownNeedsReview rows in the Failure section.
-- Success section only lists rows newly cleared in this check.
+- Use the Object-Level Failure Section for troubleshooting.
+- Run-Level / PG-Level Review means Cohesity did not return object-level failedAttempts for that failed run.
+- Result is simplified to Failed, Running, Cancelled, or Success.
 
-Failure Section:
+Object-Level Failure Section:
 $failureText
 
-Success Section:
+Object-Level Success Section:
 $successText
+
+Run-Level / PG-Level Review Section:
+$pgReviewText
+
+Run-Level / PG-Level Success Section:
+$pgSuccessText
 
 Incomplete Collection:
 $(Format-Warnings $warnings)
@@ -341,14 +364,12 @@ Generated At: $generated ET
 Cohesity API Collection Status: $apiStatus
 Scope: latest $RunLimit runs per protection group/run type.
 
-Do Not Edit Generated Files:
-- Do not manually edit incident_lifecycle.csv, worknotes_summary.txt, closing_summary.txt, or state.json.
-- If the output looks incorrect, stale, or incomplete, rerun the script and use the refreshed files.
-
 Closure Counts:
-- Active / unresolved failures: $($active.Count)
-- Newly cleared this check: $($newlyCleared.Count)
-- Previously cleared rows retained in lifecycle CSV: $($previouslyCleared.Count)
+- Object-level active failures: $($objectFailures.Count)
+- Run-level / PG-level review rows: $($pgReview.Count)
+- Object-level success this check: $($newlyCleared.Count)
+- Run-level / PG-level success this check: $($newlyClearedRunLevel.Count)
+- Previously successful rows retained in lifecycle CSV: $($previouslyCleared.Count)
 - Total lifecycle rows tracked: $($lifecycleExport.Count)
 
 Tally Check:
@@ -356,14 +377,17 @@ Tally Check:
 - $lifecycleTally
 - $successRecon
 
-Failure Section:
+Object-Level Failure Section:
 $failureText
 
-Success Section:
+Object-Level Success Section:
 $successText
 
+Run-Level / PG-Level Review Section:
+$pgReviewText
+
 Carry Forward / Handoff:
-$(if ($active.Count -eq 0) { "No active backup failures remain based on the latest saved state." } else { "$($active.Count) active/unresolved rows remain in incident_lifecycle.csv and should be carried forward or separately tracked." })
+$(if ($objectFailures.Count -eq 0 -and $pgReview.Count -eq 0) { "No active object-level or run-level backup failures remain based on the latest saved state." } else { "$($objectFailures.Count) object-level active failure row(s) and $($pgReview.Count) run-level/PG-level review row(s) remain in incident_lifecycle.csv." })
 
 Incomplete Collection:
 $(Format-Warnings $warnings)
@@ -382,9 +406,11 @@ Script Memory:
     Write-Host ""
     Write-Host "Final Normalized Summary (matches worknotes_summary.txt):"
     Write-Host "Cohesity API Collection Status : $apiStatus"
-    Write-Host "Active / Unresolved Failures   : $($active.Count)"
-    Write-Host "Newly Cleared This Check       : $($newlyCleared.Count)"
-    Write-Host "Previously Cleared Retained    : $($previouslyCleared.Count)"
+    Write-Host "Object-Level Active Failures   : $($objectFailures.Count)"
+    Write-Host "Run/PG-Level Review Rows       : $($pgReview.Count)"
+    Write-Host "Object-Level Success This Check: $($newlyCleared.Count)"
+    Write-Host "Run/PG-Level Success This Check: $($newlyClearedRunLevel.Count)"
+    Write-Host "Previously Successful Retained : $($previouslyCleared.Count)"
     Write-Host "Total Lifecycle Rows           : $($lifecycleExport.Count)"
     Write-Host "Incomplete Collection Warnings : $($warnings.Count)"
     Write-Host "Tally Check:"
