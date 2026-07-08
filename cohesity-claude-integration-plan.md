@@ -82,6 +82,83 @@ JS → Helios API            rows, produce a small       template, reading ONLY 
    in the client environment, scope it to a `digests/` or `reports/`
    directory rather than the full script tree.
 
+## ACU metering — how usage is actually measured
+
+Your org meters Claude Code usage in **ACUs**, not raw tokens:
+
+```
+ACU = (effective_input + effective_output) × model_weight
+
+effective_input  = input_tokens × 1.0
+                  + cache_read × 0.1
+                  + cache_write_5m × 1.25
+                  + cache_write_1h × 2.0
+
+effective_output = output_tokens × output_ratio
+```
+
+| Model | Weight | Output ratio |
+|---|---|---|
+| Claude Haiku | **0.33** | 5x |
+| Claude Sonnet | 1.0 (baseline) | 5x |
+| Claude Opus | 1.67 | 5x |
+
+(Non-Claude models not listed here for brevity — see the org reference doc.
+Unlisted models default to 1.0.)
+
+| Token type | Multiplier | Why |
+|---|---|---|
+| Uncached input | 1.0x | base price |
+| Cache read (hit) | **0.1x** | 90% cheaper than base |
+| Cache write (5 min) | 1.25x | 25% surcharge to cache |
+| Cache write (1 hour) | 2.0x | 100% surcharge to cache |
+| Output tokens | **5x** (Claude) | output is 5x more expensive than input, before model weight |
+
+**Cost reference:** 1 ACU ≈ $0.000003 (Sonnet input pricing, $3/MTok). Current
+limit: **3,200,000 ACU ≈ $9.60 per window**.
+
+**Throttle windows:** a 5-hour window (resets 00:00, 05:00, 10:00, 15:00,
+20:00 ET) and a weekly window (resets Monday 00:00 ET), tracked
+simultaneously. **Crossing either threshold sends an alert to your Sr
+Director** — this is the part that matters for the justification doc: your
+efficiency claim isn't self-reported, it's the same number your management
+chain already sees.
+
+### What this math actually implies for daily use
+
+1. **Output length is the single biggest lever, not model choice.** Output
+   tokens are weighted 5x before the model multiplier even applies. Asking
+   for a 150-word bullet summary instead of a 600-word narrative is a ~4x
+   ACU cut on the output term regardless of which model answers.
+2. **Default to Haiku for routine/scheduled work.** Haiku's 0.33 weight vs.
+   Sonnet's 1.0 is a 3x discount on identical token counts — appropriate for
+   pattern/anomaly narration over a small digest (Tier 3 above), where the
+   task isn't reasoning-heavy.
+3. **Caching pays off on repeated reads within a window, not one-shot
+   calls.** A cache write costs *more* than uncached input (1.25x–2x) and
+   only becomes worth it once you've read it back a few times at 0.1x. That
+   fits interactive troubleshooting (many turns, same system context) far
+   better than a once-a-day scheduled report (one read, no payback).
+4. **Never feed raw API JSON — this is the same rule as the digest-first
+   pipeline above, now quantified.** A raw Helios payload as uncached input
+   at 1.0x, summarized by Opus (1.67x) with a verbose response, is easily
+   two orders of magnitude more ACU than the same task done as: cached
+   digest read (0.1x) → Haiku (0.33x) → a short, structured answer.
+
+### Illustrative comparison (placeholder token counts — replace with real numbers after piloting)
+
+| Approach | Input treatment | Model | Output | Rough ACU |
+|---|---|---|---|---|
+| Naive: raw JSON, verbose answer | ~50,000 tokens uncached (1.0x) | Opus (1.67) | ~800 tokens × 5 | ~90,000 |
+| Disciplined: digest, cached, terse | ~800 tokens, cache-read steady state (0.1x) | Haiku (0.33) | ~150 tokens × 5 | ~270 |
+
+That's roughly two orders of magnitude apart on the same underlying task —
+not because Claude is "smarter" one way or the other, but because of the
+pipeline (digest-first) and habits (short output, right-sized model)
+described in this plan. Don't quote this ratio to your Sr Director as
+measured fact; run the pilot, pull the real ACU numbers from the dashboard,
+and swap them in — the methodology is what's solid, not these placeholders.
+
 ## Pilot recommendation
 
 Start with **one** flow end-to-end before generalizing: the backup-failures
@@ -131,8 +208,11 @@ connector exists in your environment.
   overhead any future Claude Code session (or teammate) pays.
 - Decide where digests live (e.g. `reports/<name>/latest.md`) so Tier 3
   prompts can hardcode paths instead of searching.
-- Set a Bedrock budget/alarm for the Claude Code usage specifically, since
-  it's metered separately from the rest of the AWS bill.
+- Know your ACU budget going in: 3,200,000 ACU per window (5-hour and weekly
+  windows tracked simultaneously), ≈ $9.60/window. Crossing it alerts your Sr
+  Director automatically — build habits (Haiku-first, digest-first, terse
+  output) that keep routine daily use a small fraction of that, and reserve
+  headroom for occasional Sonnet/Opus investigation work.
 
 ## What this plan deliberately does NOT do
 
@@ -150,8 +230,8 @@ connector exists in your environment.
 Check these off as you go — this is the running status for the rollout.
 
 **Phase 0 — Setup**
-- [ ] Confirm Claude Code access + Bedrock usage/metering visibility in the client environment
-- [ ] Set a budget/alarm scoped specifically to Claude Code usage
+- [x] Learn the org's ACU metering formula, model weights, cache multipliers, and throttle windows
+- [ ] Confirm individual (not shared) login so ACU usage is attributable to you specifically
 - [ ] Note which folders are live vs. `_do_not_delete`/`_test` (even a one-line README per folder) so a future `CLAUDE.md` has something accurate to point to
 
 **Phase 1 — Pilot: backup-failure reporting**
