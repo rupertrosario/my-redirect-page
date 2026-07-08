@@ -7,7 +7,7 @@ cd X:\PowerShell\Cohesity_API_Scripts\backup_failures
 .\Cohesity_Backup_Failure_INC_Status_Update.ps1
 ```
 
-Optional one-cluster run:
+One cluster test:
 
 ```powershell
 .\Cohesity_Backup_Failure_INC_Status_Update.ps1 -ClusterName "YOUR_CLUSTER_NAME"
@@ -29,111 +29,94 @@ closing_summary.txt
 
 `state.json` is script memory. Do not manually edit it and do not attach it to the incident.
 
-Temporary collector files are removed after final normalization:
+## Main output model
+
+The operator output is now split by evidence level.
 
 ```text
-current_failures.csv
-cleared_by_success.csv
-worknotes.txt
-summary.txt
+Object-Level Failure Section
+Object-Level Success Section
+Run-Level / PG-Level Review Section
+Run-Level / PG-Level Success Section
 ```
 
-## Do not edit generated files
+Use the object-level sections for normal troubleshooting.
 
-Do not manually edit:
+Run-level / PG-level rows mean Cohesity reported the run or protection group as failed, but did not return object-level failedAttempts for that row.
+
+## Simple Result values
+
+Operator-facing result values are simplified:
 
 ```text
-incident_lifecycle.csv
-worknotes_summary.txt
-closing_summary.txt
-state.json
+Failed
+Running
+Cancelled
+Success
 ```
 
-If output looks incorrect, stale, or incomplete, rerun the script and use the refreshed files.
+Internal lifecycle status is still retained in `incident_lifecycle.csv` and `state.json` for script tracking.
 
 ## incident_lifecycle.csv
 
 Final CSV columns:
 
 ```text
-Cluster,ProtectionGroup,Environment,Host,ObjectName,ObjectType,RunType,Status,OldestFailedET,NewestFailedET,LatestSuccessET,FailureRuns,Message
+Cluster,ProtectionGroup,Environment,Host,ObjectName,ObjectType,RunType,Result,EvidenceLevel,Status,OldestFailedET,NewestFailedET,LatestSuccessET,FailureRuns,Message
+```
+
+Important fields:
+
+```text
+Result        = Failed, Running, Cancelled, or Success
+EvidenceLevel = Object or RunLevel
+Status        = internal lifecycle state retained for script tracking
 ```
 
 Object handling:
 
 ```text
-If Cohesity did not return an object, ObjectName is blank and ObjectType is blank.
+Object-level row: ObjectName and ObjectType are populated.
+Run-level row: ObjectName and ObjectType are blank in final normalized output.
 The script does not copy ProtectionGroup into ObjectName.
 ```
 
-## Worknotes
+## Object-level rule
 
-`worknotes_summary.txt` has two row sections.
+For object-level troubleshooting, check by object:
 
-### Failure Section
+```text
+Same cluster + protection group + environment + run type + object identity
+Later successful backup found
+= object should not remain in the Object-Level Failure Section
+```
 
-Shows active/unresolved lifecycle rows.
+Rows without object evidence are not mixed into object-level failures. They are moved to the Run-Level / PG-Level Review Section.
+
+## Worknotes sections
+
+### Object-Level Failure Section
 
 Columns:
 
 ```text
-Cluster | ProtectionGroup | Environment | Host | ObjectName | ObjectType | RunType | Status | OldestFailedET | NewestFailedET | LatestSuccessET | FailureRuns | Message
+Cluster | ProtectionGroup | Environment | Host | ObjectName | ObjectType | RunType | Result | NewestFailedET | FailureRuns | Message
 ```
 
-Sorted by:
+### Object-Level Success Section
+
+Columns:
 
 ```text
-NewestFailedET descending
+Cluster | ProtectionGroup | Environment | Host | ObjectName | ObjectType | RunType | Result | LatestSuccessET
 ```
 
-Team should focus on:
+### Run-Level / PG-Level Review Section
+
+Columns:
 
 ```text
-OlderStillFailing
-UnknownNeedsReview
-```
-
-### Success Section
-
-Shows only rows newly cleared during the current check.
-
-Included:
-
-```text
-NewlyClearedThisCheck
-```
-
-Not shown in worknotes Success Section:
-
-```text
-ClearedByLaterSuccess
-```
-
-`ClearedByLaterSuccess` remains in `incident_lifecycle.csv` and `state.json`, but is not pasted into worknotes.
-
-Success Section columns:
-
-```text
-Cluster | ProtectionGroup | Environment | RunType | LatestSuccessET
-```
-
-The Success Section does not show object fields, host, status, old/new failure time, message, or failure count. This avoids confusion when Cohesity did not return object-level data.
-
-## Counts
-
-```text
-Active / unresolved failures = active lifecycle rows
-Newly cleared this check = NewlyClearedThisCheck rows
-Previously cleared retained = ClearedByLaterSuccess rows
-Total lifecycle rows = all rows in incident_lifecycle.csv
-```
-
-## Closing summary
-
-`closing_summary.txt` uses the same Failure and Success section model and keeps:
-
-```text
-Carry Forward / Handoff
+Cluster | ProtectionGroup | Environment | RunType | Result | NewestFailedET | LatestSuccessET | Message
 ```
 
 ## Notes
