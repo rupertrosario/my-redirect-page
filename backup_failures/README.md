@@ -19,6 +19,26 @@ Optional grid view:
 .\Cohesity_Backup_Failure_INC_Status_Update.ps1 -ShowGrid
 ```
 
+Optional shorter request timeout per Cohesity call:
+
+```powershell
+.\Cohesity_Backup_Failure_INC_Status_Update.ps1 -ClusterName "YOUR_CLUSTER_NAME" -RequestTimeoutSec 45
+```
+
+## Script responsibility
+
+Main collection logic is in:
+
+```text
+Get-CohesityBackupFailureWindowConsolidator.ps1
+```
+
+The wrapper only calls the main collector and prints final file paths:
+
+```text
+Cohesity_Backup_Failure_INC_Status_Update.ps1
+```
+
 ## Final operator-facing files
 
 ```text
@@ -38,7 +58,7 @@ Failure Section
 Success Section
 ```
 
-The script refreshes the final failure list at object level using the protection group runs endpoint with:
+The main collector refreshes the failure list at object level using the protection group runs endpoint with:
 
 ```text
 includeObjectDetails=true
