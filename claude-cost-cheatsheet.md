@@ -11,6 +11,21 @@
 
 Rule of thumb: **never send raw API JSON, keep output short, default to Haiku.** That's the whole cost strategy — output tokens cost 5x input, and Haiku is ~3x cheaper than Sonnet for the same tokens.
 
+## Use cases (speculative — swap the Freq column for your real numbers)
+
+| Use case | Freq/mo | Model | ACU/run | $/run | $/month |
+|---|---|---|---|---|---|
+| Backup-failure report (digest → summary) | 30 | Haiku | 825 | $0.0025 | $0.08 |
+| CR write-up draft (ServiceNow) | 10 | Haiku | 925 | $0.0028 | $0.03 |
+| Maintenance/patch-note summary | 4 | Haiku | 1,155 | $0.0035 | $0.01 |
+| Confluence page draft | 4 | Haiku | 1,155 | $0.0035 | $0.01 |
+| Jira ticket draft | 8 | Haiku | 480 | $0.0014 | $0.01 |
+| Incident timeline/RCA draft | 2 | Sonnet | 3,500 | $0.0105 | $0.02 |
+| Troubleshooting session (multi-turn) | 10 | Sonnet | 13,000 | $0.039 | $0.39 |
+| **Total** | | | | | **~$0.55/mo** |
+
+Troubleshooting costs the most per-instance (multi-turn, output-heavy) — that's expected, not a red flag. Everything else stays cheap because it's single-shot, digest-in, Haiku. Full realistic month across every use case: **well under $1**, nowhere near the $9.60/window budget.
+
 ## Persona prompt (paste into Claude Code at work)
 
 ```
