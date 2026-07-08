@@ -16,6 +16,7 @@ param(
     [string]$LegacyFailureCsvPath = "",
     [int]$KeepFoldersDays = 14,
     [int]$ArchiveFoldersUntilDays = 35,
+    [int]$RequestTimeoutSec = 60,
     [switch]$ShowGrid
 )
 
@@ -167,9 +168,9 @@ function Reconcile($Current, $Cleared) {
 
 function Invoke-HeliosGetJsonLocal([string]$Uri, [hashtable]$Headers) {
     if ($PSVersionTable.PSVersion.Major -lt 6) {
-        $r = Invoke-WebRequest -Method Get -Uri $Uri -Headers $Headers -UseBasicParsing -TimeoutSec 120
+        $r = Invoke-WebRequest -Method Get -Uri $Uri -Headers $Headers -UseBasicParsing -TimeoutSec $RequestTimeoutSec
     } else {
-        $r = Invoke-WebRequest -Method Get -Uri $Uri -Headers $Headers -TimeoutSec 120
+        $r = Invoke-WebRequest -Method Get -Uri $Uri -Headers $Headers -TimeoutSec $RequestTimeoutSec
     }
     if (-not $r -or [string]::IsNullOrWhiteSpace($r.Content)) { return $null }
     $r.Content | ConvertFrom-Json
@@ -332,7 +333,7 @@ function Collect-ObjectLevelCurrentFailures([string]$Incident, [string]$WindowKe
         if (!$n) { $n = Clean $_.displayName }
         if (!$n) { $n = "Unknown-$($_.clusterId)" }
         [pscustomobject]@{ Id = [string]$_.clusterId; Name = $n; Raw = $_ }
-    })
+    } | Sort-Object Name)
     foreach ($cluster in $clusters) {
         $headers = @{ accept = "application/json"; apiKey = $apiKey; accessClusterId = $cluster.Id }
         foreach ($env in (Get-ObjectEnvironmentMapLocal)) {
@@ -346,7 +347,7 @@ function Collect-ObjectLevelCurrentFailures([string]$Incident, [string]$WindowKe
                     if ($pgJson -and $pgJson.protectionGroups) { $pgs += @($pgJson.protectionGroups) }
                 } catch {}
             }
-            $pgs = @($pgs | Sort-Object id -Unique)
+            $pgs = @($pgs | Sort-Object name,id -Unique)
             foreach ($pg in $pgs) {
                 $pgId = [string]$pg.id
                 $pgName = Clean $pg.name
@@ -354,7 +355,10 @@ function Collect-ObjectLevelCurrentFailures([string]$Incident, [string]$WindowKe
                     $runsUri = "$BaseUrl/v2/data-protect/protection-groups/$([uri]::EscapeDataString($pgId))/runs?numRuns=$RunLimit&excludeNonRestorableRuns=false&includeObjectDetails=true"
                     $runsJson = Invoke-HeliosGetJsonLocal -Uri $runsUri -Headers $headers
                     $runs = @($runsJson.runs)
-                } catch { continue }
+                } catch {
+                    Write-Warning "Object-level runs lookup skipped after timeout/error for $($cluster.Name) / $pgName : $($_.Exception.Message)"
+                    continue
+                }
                 if ($runs.Count -eq 0) { continue }
                 $runTypes = @($runs | ForEach-Object { $i = Get-FirstLocalBackupInfoLocal $_; if ($i) { Clean $i.runType } } | Where-Object { $_ } | Select-Object -Unique)
                 foreach ($runType in $runTypes) {
@@ -703,7 +707,7 @@ if (!(Test-Path $target)) { throw "Main implementation script not found: $target
 
 $targetParams = @{}
 foreach ($k in $PSBoundParameters.Keys) {
-    if ($k -ne "ShowGrid") { $targetParams[$k] = $PSBoundParameters[$k] }
+    if ($k -ne "ShowGrid" -and $k -ne "RequestTimeoutSec") { $targetParams[$k] = $PSBoundParameters[$k] }
 }
 
 Write-Host ""
