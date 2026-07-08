@@ -1,29 +1,39 @@
+// ------------------------------------------------------------
 // Dynatrace JS action: Team iterations for ServiceNow search
-// Purpose: Take validate_interfaces.teamincident[] and add a ServiceNow query per item.
-// ServiceNow search is NOT a JS task; it loops over this output and uses loopItemValue.query.
+// ------------------------------------------------------------
+// Purpose:
+// - Read validate_interfaces output
+// - Build one Team search item per cluster-level Team candidate
+// - Keep Team correlation at cluster level only
+//
+// ServiceNow search should loop over this output and use:
+//   sysparm_query = {{ _.item.query }}
+// ------------------------------------------------------------
 
-import { execution } from "@dynatrace-sdk/automation-utils";
+import { result } from "@dynatrace-sdk/automation-utils";
 
 export default async function () {
-  const validateExec = await execution("validate_interfaces");
-  const validateResult = validateExec?.result || validateExec || {};
+  const validateResult = await result("validate_interfaces");
 
-  const source = Array.isArray(validateResult.teamincident)
-    ? validateResult.teamincident
-    : [];
+  const source =
+    Array.isArray(validateResult?.teamIncidents)
+      ? validateResult.teamIncidents
+      : Array.isArray(validateResult?.teamincident)
+        ? validateResult.teamincident
+        : Array.isArray(validateResult?.teamIncidentCandidates)
+          ? validateResult.teamIncidentCandidates
+          : [];
 
-  const teamincident = source.map((item) => {
+  const teamincident = source.map(function (item) {
     const correlation_id = String(
-      item.correlation_id ||
-      item.CorrelationId ||
+      item?.correlation_id ||
+      item?.CorrelationId ||
       ""
     ).trim();
 
     return {
       ...item,
-
       correlation_id: correlation_id,
-
       query:
         "correlation_id=" +
         correlation_id +
@@ -33,6 +43,7 @@ export default async function () {
 
   return {
     teamCount: teamincident.length,
-    teamincident: teamincident
+    teamincident: teamincident,
+    teamIncidents: teamincident
   };
 }
