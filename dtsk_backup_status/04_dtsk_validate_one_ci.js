@@ -1,14 +1,15 @@
 // ==========================================================
 // Dynatrace JS Task
 // Task name: dtsk_validate_one_ci
-// Phase: Real Cohesity validation - version 6
+// Phase: Real Cohesity validation - version 7
 //
 // Corrected to match PowerShell logic:
 // - Uses protected-objects search as source of protected object rows
 // - Flattens childObjects and DB params
 // - Gets ProtectionGroup from latestSnapshotsInfo/protectionGroupName first
 // - Adds DB/CN fallback search for SQL/Oracle objects across all clusters
-// - Does not add a failure row for DB-missing yet; report-only monitoring
+// - Keeps assignment ownership fields from ServiceNow work item
+// - Does not place diagnostic cluster-count text in the email Cluster column
 // - GET only
 // ==========================================================
 
@@ -72,6 +73,11 @@ export default async function (input = {}) {
     return String(value).trim();
   }
 
+  function safeText(value, fallback = "N/A") {
+    const t = toText(value);
+    return t ? t : fallback;
+  }
+
   function firstNonBlank(...values) {
     for (const v of values) {
       const t = toText(v);
@@ -81,7 +87,7 @@ export default async function (input = {}) {
   }
 
   function normalizeName(value) {
-    return String(value || "").trim().replace(/^['"]|['"]$/g, "").toLowerCase();
+    return String(value || "").trim().replace(/^[']|[']$/g, "").replace(/^[\"]|[\"]$/g, "").toLowerCase();
   }
 
   function shortName(value) {
@@ -152,6 +158,19 @@ export default async function (input = {}) {
     const terms = [...aliases];
     for (const a of aliases) terms.push(shortName(a));
     return uniqueStrings(terms);
+  }
+
+  function getAssignedTo(workItem) {
+    return safeText(workItem?.assignedTo);
+  }
+
+  function getAssignmentGroup(workItem) {
+    return safeText(workItem?.assignmentGroup);
+  }
+
+  function getAssignmentAction(workItem) {
+    const assignedTo = getAssignedTo(workItem);
+    return assignedTo === "N/A" ? "Please assign" : "Assigned";
   }
 
   async function getApiKey() {
@@ -532,10 +551,21 @@ export default async function (input = {}) {
     return objectName || "-";
   }
 
+  function getWorkItemFields(workItem) {
+    return {
+      DTSK: safeText(workItem?.dtsk),
+      DecomRequest: safeText(workItem?.decomRequest),
+      AssignedTo: getAssignedTo(workItem),
+      AssignmentGroup: getAssignmentGroup(workItem),
+      AssignmentAction: getAssignmentAction(workItem)
+    };
+  }
+
   function convertFlatObjectToBackupRow(flatObject, ci, candidateCluster) {
     const obj = flatObject.Object;
     const snap = getBestSnapshot(obj);
     const backupType = getBackupType(flatObject);
+    const ownership = getWorkItemFields(candidateCluster.workItem);
 
     if (backupType === "Container") return null;
     if (backupType === "Oracle" && !flatObject.OracleHostName) return null;
@@ -566,8 +596,7 @@ export default async function (input = {}) {
     }
 
     return {
-      DTSK: candidateCluster.workItem?.dtsk || "N/A",
-      DecomRequest: candidateCluster.workItem?.decomRequest || "N/A",
+      ...ownership,
       ServerName: ci,
       BackupType: backupType,
       ObjectName: objectNameOut,
@@ -575,7 +604,8 @@ export default async function (input = {}) {
       ClusterName: String(candidateCluster.clusterName || "N/A"),
       ProtectionGroup: pg || "-",
       LastBackupTime: lastBackupTime,
-      LastBackupUsecs: usecs || 0
+      LastBackupUsecs: usecs || 0,
+      ClustersChecked: "N/A"
     };
   }
 
@@ -614,6 +644,11 @@ export default async function (input = {}) {
     }
     if (!FALLBACK_WHEN_NO_GLOBAL_OBJECT) return [];
     return asArray(allClusters).map(c => ({ clusterId: String(c.clusterId || ""), clusterName: c.clusterName || getClusterName(clusterMap, c.clusterId), searchMode: "fallback" })).filter(c => c.clusterId);
+  }
+
+  function getClusterNamesChecked(candidateClusters) {
+    const names = uniqueStrings(asArray(candidateClusters).map(c => c.clusterName || getClusterName({}, c.clusterId)));
+    return names.length ? names.join(", ") : "N/A";
   }
 
   async function searchProtectedObjectsOnClusters(apiKey, ci, ciAliases, searchTerms, candidateClusters, workItem, options = {}) {
@@ -699,17 +734,17 @@ export default async function (input = {}) {
     });
   }
 
-  function makeSpecialRow(workItem, backupType, objectName, sourceName, clusterName, protectionGroup, lastBackupTime) {
+  function makeSpecialRow(workItem, backupType, objectName, sourceName, clusterName, protectionGroup, lastBackupTime, clustersChecked = "N/A") {
     return {
-      DTSK: workItem?.dtsk || "N/A",
-      DecomRequest: workItem?.decomRequest || "N/A",
+      ...getWorkItemFields(workItem),
       ServerName: workItem?.ciName || "N/A",
       BackupType: backupType,
       ObjectName: objectName || "N/A",
       SourceName: sourceName || "N/A",
       ClusterName: clusterName || "N/A",
       ProtectionGroup: protectionGroup || "-",
-      LastBackupTime: lastBackupTime || "N/A"
+      LastBackupTime: lastBackupTime || "N/A",
+      ClustersChecked: clustersChecked || "N/A"
     };
   }
 
@@ -739,6 +774,7 @@ export default async function (input = {}) {
   warnings.push(...globalResult.warnings);
 
   const candidateClusters = candidateClustersFromGlobal(globalResult.objects, clusters, clusterMap);
+  const clustersCheckedText = getClusterNamesChecked(candidateClusters);
   const searchResult = await searchProtectedObjectsOnClusters(apiKey, workItem.ciName, aliases, searchTerms, candidateClusters, workItem);
   warnings.push(...searchResult.warnings);
 
@@ -783,11 +819,11 @@ export default async function (input = {}) {
   const hasServerLevelBackup = rows.some(r => SERVER_LEVEL_BACKUP_TYPES.includes(r.BackupType));
 
   if (hasDbBackup && !hasServerLevelBackup) {
-    rows.push(makeSpecialRow(workItem, "NoFSBackupFound", workItem.ciName, workItem.ciName, "N/A", "-", "NoFSBackupFound"));
+    rows.push(makeSpecialRow(workItem, "NoFSBackupFound", workItem.ciName, workItem.ciName, "N/A", "-", "NoFSBackupFound", clustersCheckedText));
   }
 
   if (rows.length === 0) {
-    rows = [makeSpecialRow(workItem, "NoObject", workItem.ciName, "N/A", `${candidateClusters.length} cluster(s) checked`, "-", "NoBackupFound")];
+    rows = [makeSpecialRow(workItem, "NoObject", workItem.ciName, "N/A", "N/A", "-", "NoBackupFound", clustersCheckedText)];
   }
 
   rows = sortRows(rows);
@@ -803,6 +839,9 @@ export default async function (input = {}) {
     summary: {
       dtsk: workItem.dtsk || "N/A",
       ciName: workItem.ciName || "N/A",
+      assignedTo: getAssignedTo(workItem),
+      assignmentGroup: getAssignmentGroup(workItem),
+      assignmentAction: getAssignmentAction(workItem),
       rowCount: rows.length,
       fsRowCount: rows.filter(r => r.BackupType === "FS").length,
       vmRowCount: rows.filter(r => r.BackupType === "VM").length,
