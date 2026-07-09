@@ -15,12 +15,12 @@ Current scope:
 Email output:
 
 - Shows `SLA Due`, `SLA Status`, `Assigned To`, and `Assignment Action` from ServiceNow DTSK data.
-- Correct SLA for this report is the 2-day SLA from when the DTSK was assigned to the Backup group.
-- SLA source order:
-  1. Use ServiceNow `sla_due` if it is already calculated from Backup-group assignment time.
-  2. If `sla_due` is missing, use the first populated assignment timestamp from `u_backup_assignment_time`, `u_assigned_to_backup_on`, `u_assignment_group_assigned_on`, or `assignment_group_assigned_on`, then add 2 days.
-  3. If neither source is available, show `SLA Missing`.
-- `SLA Status` values: `Within SLA`, `Breached SLA`, or `SLA Missing`.
+- Correct SLA for this report is the 2-day SLA from when the DTSK came to the Backup group.
+- Current implementation calculates SLA in Dynatrace using `sys_created_on` as the Backup-group start timestamp.
+- SLA calculation:
+  - `SLA Start = sys_created_on`
+  - `SLA Due = sys_created_on + 2 days`
+  - `SLA Status = Within SLA | Breached SLA | SLA Missing`
 - `Assignment Action` is `Assigned` when `assigned_to` is populated; otherwise it is `Please assign`.
 - The `Cluster` column shows only the Cohesity cluster where backup evidence was found.
 - Search diagnostics such as `1 cluster(s) checked` are not shown in the email `Cluster` column. They remain only in task JSON/debug summary.
