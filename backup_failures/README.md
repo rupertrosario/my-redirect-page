@@ -14,6 +14,12 @@ The wrapper calls the main collector:
 Get-CohesityBackupFailureWindowConsolidator.ps1
 ```
 
+The collector logic is now aligned to the original working report:
+
+```text
+backup_failures/Cohesity_Backup_Failures
+```
+
 Diagnostic script is only for troubleshooting:
 
 ```powershell
@@ -22,17 +28,17 @@ Test-CohesityRunObjectDetails.ps1
 
 ## Current commits
 
-Current collector fix:
+Collector aligned with OG object-selection logic:
 
 ```text
-adaeffed56b9be9a120e83f20ff66ac400955d16
+75ce3a14c11120fc3291f3e6bee090b34270de10
 backup_failures/Get-CohesityBackupFailureWindowConsolidator.ps1
 ```
 
-Wrapper production defaults and PG-level cleanup:
+Wrapper restored to entry-point only:
 
 ```text
-c1ff8493e4f0365e609e06872ef9c93fb65b03ec
+661a03f24f891a4074717cfb5d8703049d07232a
 backup_failures/Cohesity_Backup_Failure_INC_Status_Update.ps1
 ```
 
@@ -156,31 +162,43 @@ Do not manually edit `state.json` and do not attach it to the incident.
 
 Object-level rows are the source of truth.
 
-```text
-If run.objects has failed object evidence:
-  report object-level rows only.
-
-If run.objects has objects but no explicit failed object evidence:
-  report object rows as review rows.
-
-If run.objects has no objects at all:
-  only then allow blank PG/run-level review row.
-```
-
-The wrapper also removes stale blank PG/run-level rows created by older runs:
+The collector now follows the OG report selection model:
 
 ```text
-1. Blank ObjectName/ObjectType rows are removed if object-level rows exist for the same Cluster + ProtectionGroup + Environment + RunType.
-2. Blank PG/run-level rows with stale statuses are removed:
-   - NewlyFailedThisCheck
-   - OlderStillFailing
-   - CurrentStillFailing
-   - CarriedForwardStillFailing
-   - ReFailedAfterClear
-3. True no-object-evidence review rows are still allowed.
+For each Cluster + ProtectionGroup + RunType:
+  1. Read latest runs with includeObjectDetails=true.
+  2. Process runs newest to oldest.
+  3. Build a cleared object set from newer successful object rows.
+  4. Build latestFailByKey from object-level failed rows.
+  5. If an object already has a newer success, it is not active.
+  6. Keep only the latest unresolved failure per object key.
+  7. Do not create or retain PG-level failure rows when object-level evidence exists.
+  8. Create blank PG/run-level review row only when Cohesity returns no object evidence at all.
 ```
 
-This prevents old PG-level rows from remaining as `CarriedForwardStillFailing` when object-level evidence exists.
+Object identity is based on:
+
+```text
+clusterId | environmentLabel | object.environment | object.objectType | object.name | object.id | object.sourceId
+```
+
+## PG-level fallback rule
+
+Blank PG/run-level rows are only allowed for true no-object-evidence cases:
+
+```text
+Failed run + no run.objects returned = PG/run-level review row allowed.
+Failed run + run.objects returned = object-level rows only.
+Failed object + newer object success = not active; appears as cleared if captured in lifecycle.
+```
+
+This prevents stale rows such as:
+
+```text
+CarriedForwardStillFailing with blank ObjectName/ObjectType
+```
+
+from remaining when object-level evidence exists.
 
 ## What was fixed
 
@@ -197,12 +215,11 @@ The current behavior is:
 2. Promotes object.name to ObjectName.
 3. Promotes object.objectType to ObjectType.
 4. Carries ProtectionGroup from the active protection group being queried.
-5. Treats object-level failedAttempts/status/error/message as failure evidence.
-6. Suppresses newer-success-cleared objects from active Failure Section.
-7. Retains same-scan cleared objects in cleared_by_success.csv, incident_lifecycle.csv, and Success Section.
-8. Removes stale PG-level carried-forward rows when object-level rows exist.
-9. Keeps ObjectName/ObjectType blank only when Cohesity returns no object evidence.
-10. Does not copy ProtectionGroup name into ObjectName.
+5. Uses newer object success to clear older object failure.
+6. Keeps only latest unresolved object failure per object key.
+7. Removes stale PG-level carried-forward behavior by not generating/carrying those rows.
+8. Keeps ObjectName/ObjectType blank only when Cohesity returns no object evidence.
+9. Does not copy ProtectionGroup name into ObjectName.
 ```
 
 ## Acceptance criteria
@@ -221,7 +238,7 @@ Expected:
 ```text
 1. Active failed objects appear in current_failures.csv.
 2. Active failed objects appear in Failure Section of worknotes_summary.txt.
-3. Failed objects that already have a newer success appear in cleared_by_success.csv.
+3. Failed objects that already have a newer success appear in cleared_by_success.csv when captured by lifecycle.
 4. Same-scan cleared objects appear in Success Section of worknotes_summary.txt.
 5. All failed/cleared object evidence appears in incident_lifecycle.csv.
 6. ProtectionGroup is populated.
@@ -325,6 +342,7 @@ Cohesity_Backup_Failure_INC_Status_Update.ps1      Production entry point
 Get-CohesityBackupFailureWindowConsolidator.ps1   Main collector logic
 Test-CohesityRunObjectDetails.ps1                 Diagnostic only
 README.md                                         Operator handoff
+Cohesity_Backup_Failures                          Original working report used as behavior reference
 ```
 
 ## Final rule
