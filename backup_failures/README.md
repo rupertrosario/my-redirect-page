@@ -4,27 +4,34 @@
 
 This workflow is being corrected for object-level backup failure reporting.
 
-The current confirmed issue is:
+Latest fix pushed:
 
 ```text
-The Cohesity diagnostic probe shows failed object names, but the main collector output does not promote those objects into the normal failure outputs.
+df9ad3086fec028d9933d661342a663a9974fa7e
+backup_failures/Get-CohesityBackupFailureWindowConsolidator.ps1
 ```
 
-Confirmed observation:
+What the fix does:
 
 ```text
-Diagnostic output has the failed object names.
-current_failures.csv / incident_lifecycle.csv / worknotes_summary.txt do not show the same objects.
-ProtectionGroup is also missing or not consistently carried into the normal output for those rows.
+1. Promotes failed objects from run.objects into normal collector output.
+2. Uses object.name and object.objectType the same way the diagnostic probe does.
+3. Treats object-level failedAttempts/status/error evidence as a failed object even when the parent run is not simply Failed.
+4. Carries ProtectionGroup from the active protection group being queried.
+5. Keeps ObjectName/ObjectType blank only when Cohesity returns no object evidence.
+6. Does not copy ProtectionGroup name into ObjectName.
+7. Keeps wrapper unchanged.
 ```
 
-This means Cohesity is returning object evidence. The defect is in the collector mapping/normalization path, not in the API returning no objects.
-
-Do not add logic to the wrapper. Patch only:
+The previous confirmed issue was:
 
 ```text
-Get-CohesityBackupFailureWindowConsolidator.ps1
+Diagnostic output had failed object names.
+current_failures.csv / incident_lifecycle.csv / worknotes_summary.txt did not show the same objects.
+ProtectionGroup was also missing or not consistently carried for those rows.
 ```
+
+The defect was in the main collector mapping/export path, not in the Cohesity API response.
 
 ## Repo context
 
@@ -45,7 +52,7 @@ README.md
 
 ## Script responsibility
 
-Main collection logic must stay in:
+Main collection logic stays in:
 
 ```text
 Get-CohesityBackupFailureWindowConsolidator.ps1
@@ -57,11 +64,11 @@ Wrapper responsibility only:
 Cohesity_Backup_Failure_INC_Status_Update.ps1
 ```
 
-The wrapper must only call the main collector and print final file paths. Do not add object collection or reconciliation logic to the wrapper.
+The wrapper only calls the main collector and prints final file paths. Do not add object collection or reconciliation logic to the wrapper.
 
 ## Required object-level behavior
 
-The collector must query PG runs with:
+The collector queries PG runs with:
 
 ```text
 /v2/data-protect/protection-groups/{pgId}/runs?numRuns=30&excludeNonRestorableRuns=false&includeObjectDetails=true
@@ -72,7 +79,7 @@ Rules:
 ```text
 1. Report failures at object level, not PG level.
 2. Identify the actual failed object from run.objects.
-3. Object identity should use object.id when available.
+3. Object identity uses object.id when available.
 4. If object.id is unavailable, use environment | objectType | object.name | sourceId.
 5. If the same object has a later successful backup, do not show it as active.
 6. If the same object is still failing, show actual ObjectName and ObjectType.
@@ -81,91 +88,47 @@ Rules:
 9. Worknotes must stay simple: Failure Section and Success Section only.
 10. Do not add extra worknote sections.
 11. If the diagnostic probe has ObjectName/ObjectType for a failed run, the main collector must carry the same ObjectName/ObjectType into current_failures.csv, incident_lifecycle.csv, and worknotes_summary.txt.
-12. ProtectionGroup must be carried from the active PG being queried, or from run-level PG metadata if present.
+12. ProtectionGroup must be carried from the active PG being queried.
 ```
 
-## Current mapping defect to fix
+## Fix validation command
 
-The diagnostic probe reads:
-
-```powershell
-$runObjects = @(As-Array (Get-Prop $run "objects" @()))
-ObjectName  = Clean (Get-Prop $obj "name" "")
-ObjectType  = Clean (Get-Prop $obj "objectType" "")
-```
-
-The main collector must use equivalent extraction for every failed run object and must not drop the object during later lifecycle/export conversion.
-
-Expected fix area:
-
-```text
-Collect-CurrentObjectFailures
-Convert-LifecycleRows
-```
-
-Validation after fix:
-
-```text
-For the same affected PG/run:
-- Diagnostic CSV ObjectName must match current_failures.csv ObjectName.
-- Diagnostic CSV ObjectType must match current_failures.csv ObjectType.
-- ProtectionGroup must be populated in current_failures.csv and worknotes_summary.txt.
-- If object details are missing only then ObjectName/ObjectType can be blank.
-```
-
-## Current commits
-
-Main collector rebuilt, but object promotion from diagnostic evidence is not confirmed good:
-
-```text
-backup_failures/Get-CohesityBackupFailureWindowConsolidator.ps1
-```
-
-Wrapper simplified:
-
-```text
-backup_failures/Cohesity_Backup_Failure_INC_Status_Update.ps1
-```
-
-Diagnostic probe added:
-
-```text
-backup_failures/Test-CohesityRunObjectDetails.ps1
-```
-
-README updated with this handoff:
-
-```text
-This README section is the current handoff baseline.
-```
-
-## Normal run
-
-```powershell
-cd X:\PowerShell\Cohesity_API_Scripts\backup_failures
-.\Cohesity_Backup_Failure_INC_Status_Update.ps1 -ClusterName "YOUR_CLUSTER_NAME"
-```
-
-Timeout-sensitive run:
-
-```powershell
-.\Cohesity_Backup_Failure_INC_Status_Update.ps1 -ClusterName "YOUR_CLUSTER_NAME" -RequestTimeoutSec 45
-```
-
-Optional grid view:
-
-```powershell
-.\Cohesity_Backup_Failure_INC_Status_Update.ps1 -ClusterName "YOUR_CLUSTER_NAME" -ShowGrid
-```
-
-## Diagnostic probe
-
-Use this before the next collector code change.
+Run against a clean output root first, so old state does not carry blank historical rows forward:
 
 ```powershell
 cd X:\PowerShell\Cohesity_API_Scripts
 git pull --ff-only origin Cohesity_Automations
 
+cd X:\PowerShell\Cohesity_API_Scripts\backup_failures
+.\Cohesity_Backup_Failure_INC_Status_Update.ps1 `
+  -ClusterName "YOUR_CLUSTER_NAME" `
+  -IncidentNumber "INCTEST12345" `
+  -OutputRoot "X:\PowerShell\Data\Cohesity\BackupFailureWindow_TEST" `
+  -RequestTimeoutSec 90
+```
+
+Then check:
+
+```text
+X:\PowerShell\Data\Cohesity\BackupFailureWindow_TEST\INCTEST12345\current_failures.csv
+X:\PowerShell\Data\Cohesity\BackupFailureWindow_TEST\INCTEST12345\incident_lifecycle.csv
+X:\PowerShell\Data\Cohesity\BackupFailureWindow_TEST\INCTEST12345\worknotes_summary.txt
+```
+
+Expected result:
+
+```text
+Diagnostic CSV ObjectName == current_failures.csv ObjectName
+Diagnostic CSV ObjectType == current_failures.csv ObjectType
+ProtectionGroup is populated in current_failures.csv and worknotes_summary.txt
+ObjectName/ObjectType are blank only if run.objects has no object evidence
+```
+
+## Diagnostic probe
+
+Use this if the output still does not match the Cohesity UI:
+
+```powershell
 cd X:\PowerShell\Cohesity_API_Scripts\backup_failures
 .\Test-CohesityRunObjectDetails.ps1 -ClusterName "YOUR_CLUSTER_NAME" -ProtectionGroupName "YOUR_PG_NAME" -NumRuns 10
 ```
@@ -201,32 +164,6 @@ FailedAttemptsCount
 FailedMessage
 ```
 
-Paste 5-10 rows from the diagnostic CSV for one affected PG, especially the failed run rows. Then patch only `Get-CohesityBackupFailureWindowConsolidator.ps1` based on the actual API response.
-
-## Older pasted script reference
-
-The older pasted script was able to get object data better using:
-
-```powershell
-$runsUri = "$baseUrl/v2/data-protect/protection-groups/$pgId/runs?numRuns=10&excludeNonRestorableRuns=false&includeObjectDetails=true"
-```
-
-Useful behavior to retain:
-
-```text
-- Uses includeObjectDetails=true.
-- Builds object key from environment | objectType | name | id | sourceId.
-- Treats newer object entries with no failedAttempts[] as success/clear.
-- For NAS/Isilon, captures any object with failedAttempts[], not only kHost.
-- Has fallback logic when object-level failedAttempts[] are not returned.
-```
-
-Bad behavior to avoid:
-
-```text
-- Do not set ObjectName = ProtectionGroup name when object name is missing.
-```
-
 ## Final operator-facing files
 
 ```text
@@ -256,8 +193,8 @@ Summary Counts:
 
 Failure Section:
 Cluster | ProtectionGroup | Environment | Host | ObjectName | ObjectType | RunType | Status | OldestFailedET | NewestFailedET | LatestSuccessET | FailureRuns | Message
-cluster-a | PG_SQL_PROD | SQL | sqlhost01 | DB_APP01 | kDatabase | kRegular | Failed | 2026-07-08 22:10:00 | 2026-07-08 22:10:00 |  | 1 | backup failed message
-cluster-b | PG_AHV_PROD | Acropolis |  | vm-app-22 | kVirtualMachine | kRegular | Failed | 2026-07-08 23:40:00 | 2026-07-08 23:40:00 |  | 1 | backup failed message
+cluster-a | PG_SQL_PROD | SQL | sqlhost01 | DB_APP01 | kDatabase | kRegular | OlderStillFailing | 2026-07-08 22:10:00 | 2026-07-08 22:10:00 |  | 1 | backup failed message
+cluster-b | PG_AHV_PROD | Acropolis |  | vm-app-22 | kVirtualMachine | kRegular | NewlyFailedThisCheck | 2026-07-08 23:40:00 | 2026-07-08 23:40:00 |  | 1 | backup failed message
 
 Success Section:
 Cluster | ProtectionGroup | Environment | RunType | LatestSuccessET
@@ -277,5 +214,3 @@ ObjectName must be blank.
 ObjectType must be blank.
 Do not copy PG name into ObjectName.
 ```
-
-## Notes
