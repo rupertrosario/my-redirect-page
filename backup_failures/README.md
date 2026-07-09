@@ -22,28 +22,37 @@ Test-CohesityRunObjectDetails.ps1
 
 ## Current final fix
 
-Collector fix commit:
+Current collector fix commit:
 
 ```text
-df9ad3086fec028d9933d661342a663a9974fa7e
+adaeffed56b9be9a120e83f20ff66ac400955d16
 backup_failures/Get-CohesityBackupFailureWindowConsolidator.ps1
 ```
 
-README cleanup commit:
+README cleanup / handoff file:
 
 ```text
-This file is the simplified operator handoff.
+backup_failures/README.md
 ```
 
 ## What was fixed
 
-The earlier issue was:
+The issue was:
 
 ```text
 Diagnostic output showed failed object names, but normal outputs did not show the same objects or ProtectionGroup.
 ```
 
-The collector now:
+The earlier collector fix promoted active failed objects, but it could still hide this case:
+
+```text
+RunIndex 1 = newer success for same object
+RunIndex 2/3/etc. = older failed object visible in diagnostic
+```
+
+In that case the failed object was correctly not active, but it disappeared from all normal outputs. That was not acceptable for operator validation.
+
+The current collector now:
 
 ```text
 1. Reads failed objects from run.objects.
@@ -51,9 +60,10 @@ The collector now:
 3. Promotes object.objectType to ObjectType.
 4. Carries ProtectionGroup from the active protection group being queried.
 5. Treats object-level failedAttempts/status/error/message as failure evidence.
-6. Suppresses an object from active failures only when a later successful backup for the same object exists.
-7. Keeps ObjectName/ObjectType blank only when Cohesity returns no object evidence.
-8. Does not copy ProtectionGroup name into ObjectName.
+6. Suppresses newer-success-cleared objects from active Failure Section.
+7. Retains those same-scan cleared objects in incident_lifecycle.csv and Success Section.
+8. Keeps ObjectName/ObjectType blank only when Cohesity returns no object evidence.
+9. Does not copy ProtectionGroup name into ObjectName.
 ```
 
 ## Normal production run
@@ -111,6 +121,7 @@ Check these files:
 
 ```text
 X:\PowerShell\Data\Cohesity\BackupFailureWindow_TEST\INCTEST12345\current_failures.csv
+X:\PowerShell\Data\Cohesity\BackupFailureWindow_TEST\INCTEST12345\cleared_by_success.csv
 X:\PowerShell\Data\Cohesity\BackupFailureWindow_TEST\INCTEST12345\incident_lifecycle.csv
 X:\PowerShell\Data\Cohesity\BackupFailureWindow_TEST\INCTEST12345\worknotes_summary.txt
 ```
@@ -118,12 +129,14 @@ X:\PowerShell\Data\Cohesity\BackupFailureWindow_TEST\INCTEST12345\worknotes_summ
 Acceptance criteria:
 
 ```text
-1. Failed object names appear in current_failures.csv.
-2. Same object names appear in incident_lifecycle.csv.
-3. Same object names appear in worknotes_summary.txt.
-4. ProtectionGroup is populated.
-5. ObjectName/ObjectType are blank only when Cohesity returns no object evidence.
-6. ProtectionGroup is never copied into ObjectName.
+1. Active failed objects appear in current_failures.csv.
+2. Active failed objects appear in Failure Section of worknotes_summary.txt.
+3. Failed objects that already have a newer success appear in cleared_by_success.csv.
+4. Same-scan cleared objects appear in Success Section of worknotes_summary.txt.
+5. All failed/cleared object evidence appears in incident_lifecycle.csv.
+6. ProtectionGroup is populated.
+7. ObjectName/ObjectType are blank only when Cohesity returns no object evidence.
+8. ProtectionGroup is never copied into ObjectName.
 ```
 
 ## Output files
@@ -134,6 +147,12 @@ Operator-facing files:
 worknotes_summary.txt
 incident_lifecycle.csv
 closing_summary.txt
+```
+
+Additional validation/output file:
+
+```text
+cleared_by_success.csv
 ```
 
 Script memory file:
@@ -156,19 +175,18 @@ Cohesity API Collection Status: Complete
 Scope: latest 30 runs per protection group/run type.
 
 Summary Counts:
-- Active / unresolved failures: 2
+- Active / unresolved failures: 1
 - Newly cleared this check: 1
-- Previously cleared rows retained in lifecycle CSV: 3
-- Total lifecycle rows tracked: 6
+- Previously cleared rows retained in lifecycle CSV: 0
+- Total lifecycle rows tracked: 2
 
 Failure Section:
 Cluster | ProtectionGroup | Environment | Host | ObjectName | ObjectType | RunType | Status | OldestFailedET | NewestFailedET | LatestSuccessET | FailureRuns | Message
 cluster-a | PG_SQL_PROD | SQL | sqlhost01 | DB_APP01 | kDatabase | kRegular | OlderStillFailing | 2026-07-08 22:10:00 | 2026-07-08 22:10:00 |  | 1 | backup failed message
-cluster-b | PG_AHV_PROD | Acropolis |  | vm-app-22 | kVirtualMachine | kRegular | NewlyFailedThisCheck | 2026-07-08 23:40:00 | 2026-07-08 23:40:00 |  | 1 | backup failed message
 
 Success Section:
-Cluster | ProtectionGroup | Environment | RunType | LatestSuccessET
-cluster-c | PG_FS_PROD | Physical | kRegular | 2026-07-09 01:20:00
+Cluster | ProtectionGroup | Environment | Host | ObjectName | ObjectType | RunType | LatestSuccessET | Message
+cluster-a | PG_SQL_PROD | SQL | sqlhost02 | DB_APP02 | kDatabase | kRegular | 2026-07-09 01:20:00 | backup failed message from earlier failed run
 ```
 
 ## Troubleshooting only
@@ -222,7 +240,7 @@ If production output fails after the current fix, collect only:
 
 ```text
 1. 3-5 failed rows from diagnostic CSV.
-2. Matching rows from current_failures.csv.
+2. Matching rows from current_failures.csv and cleared_by_success.csv.
 3. Console error/output if any.
 ```
 
@@ -249,5 +267,5 @@ Production use is:
 
 ```text
 Run Cohesity_Backup_Failure_INC_Status_Update.ps1
-Review worknotes_summary.txt and incident_lifecycle.csv
+Review worknotes_summary.txt, current_failures.csv, cleared_by_success.csv, and incident_lifecycle.csv
 ```
