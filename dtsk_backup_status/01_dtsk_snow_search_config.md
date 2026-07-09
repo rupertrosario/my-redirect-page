@@ -25,18 +25,35 @@ assignment_group.name=<BACKUP_GROUP_NAME>^assigned_toISNOTEMPTY^stateNOT IN6,7
 ## Fields
 
 ```text
-sys_id,number,short_description,state,sys_created_on,assignment_group.name,assigned_to.name,due_date,sla_due,made_sla,u_sla,u_sla_due,sla,decom_request.number,decom_request.ci_name.name
+sys_id,number,short_description,state,sys_created_on,assignment_group.name,assigned_to.name,sla_due,due_date,made_sla,u_backup_assignment_time,u_assigned_to_backup_on,u_assignment_group_assigned_on,assignment_group_assigned_on,decom_request.number,decom_request.ci_name.name
 ```
 
-## SLA field note
+## SLA rule
 
-The prepare task checks these ServiceNow fields in order and uses the first populated value:
+Correct SLA for this report is the 2-day SLA from when the DTSK was assigned to the Backup group.
+
+Preferred source:
 
 ```text
-u_sla,u_sla_due,sla,sla_due,due_date,made_sla
+sla_due
 ```
 
-If the actual DTSK SLA column has a different ServiceNow field name, add that field to the Fields list and to `02_dtsk_prepare_work_items.js`.
+Use `sla_due` if ServiceNow already calculates it from Backup-group assignment time.
+
+Fallback source if `sla_due` is not available:
+
+```text
+u_backup_assignment_time,u_assigned_to_backup_on,u_assignment_group_assigned_on,assignment_group_assigned_on
+```
+
+The prepare task adds 2 days to the first populated assignment timestamp and calculates:
+
+```text
+SLA Due
+SLA Status = Within SLA | Breached SLA | SLA Missing
+```
+
+If the actual DTSK assignment timestamp has a different ServiceNow field name, add that field to the Fields list and to `02_dtsk_prepare_work_items.js`.
 
 ## Notes
 
