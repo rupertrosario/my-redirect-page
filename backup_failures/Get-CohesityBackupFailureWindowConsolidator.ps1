@@ -4,16 +4,14 @@ Cohesity Backup Failure Window Consolidator.
 
 .DESCRIPTION
 GET-only Cohesity Helios collector for backup failure incident updates.
-This version promotes failed objects from run.objects into the normal outputs.
-If the diagnostic probe can see object.name/objectType, this collector must carry the same object into current_failures.csv, incident_lifecycle.csv, and worknotes_summary.txt.
 
-Object-selection model:
-- Object-level failedAttempts/status/error evidence is treated as a failed object even when the parent run is not simply Failed.
-- Failed run + failed object evidence => object-level row.
-- Failed run + objects returned but no explicit failed object evidence => object-level review rows.
-- Failed run + no objects returned => blank object run-level review row.
-- A previously failed object is suppressed when the same object has a later successful object backup.
-- ProtectionGroup name is never copied into ObjectName.
+Production behavior:
+- Reads protection group runs with includeObjectDetails=true.
+- Promotes failed objects from run.objects into normal outputs.
+- If an object failed in an older run but has a newer success in the same scan, it is retained as a cleared row instead of disappearing.
+- Active failures appear in Failure Section.
+- Cleared object failures appear in Success Section and incident_lifecycle.csv.
+- ProtectionGroup is never copied into ObjectName.
 #>
 [CmdletBinding()]
 param(
@@ -37,7 +35,7 @@ $script:Warnings = New-Object System.Collections.Generic.List[string]
 $script:CsvColumns = @('IncidentNumber','WindowKey','Status','Cluster','Environment','ProtectionGroup','Host','ObjectName','ObjectType','RunType','FirstFailedET','LastFailedET','ClearedET','LastSeenET','LatestRunStatus','ConsecutiveFailureCount','Message','ObjectKey','ClusterId','ProtectionGroupId','EnvironmentFilter','FailedRunKeys')
 $script:LifecycleColumns = @('Cluster','ProtectionGroup','Environment','Host','ObjectName','ObjectType','RunType','Status','OldestFailedET','NewestFailedET','LatestSuccessET','FailureRuns','Message')
 $script:FailureColumns = @('Cluster','ProtectionGroup','Environment','Host','ObjectName','ObjectType','RunType','Status','OldestFailedET','NewestFailedET','LatestSuccessET','FailureRuns','Message')
-$script:SuccessColumns = @('Cluster','ProtectionGroup','Environment','RunType','LatestSuccessET')
+$script:SuccessColumns = @('Cluster','ProtectionGroup','Environment','Host','ObjectName','ObjectType','RunType','LatestSuccessET','Message')
 
 function Clean($Value) {
     if ($null -eq $Value) { return '' }
@@ -271,6 +269,7 @@ function Is-SuccessStatus([string]$Status) { (Clean $Status) -in @('Succeeded','
 function Is-RunningStatus([string]$Status) { (Clean $Status) -in @('Running','kRunning','Accepted','kAccepted','Queued','kQueued') }
 function Is-CancelledStatus([string]$Status) { (Clean $Status) -in @('Canceled','Cancelled','kCanceled','kCancelled','Canceling','kCanceling') }
 function Is-ActiveLifecycleStatus([string]$Status) { (Clean $Status) -in @('NewlyFailedThisCheck','OlderStillFailing','CurrentStillFailing','CarriedForwardStillFailing','ReFailedAfterClear','RunningAtLatestCheck','CancelledAfterFailure','UnknownNeedsReview') }
+function Is-ClearedLifecycleStatus([string]$Status) { (Clean $Status) -in @('NewlyClearedThisCheck','ClearedByLaterSuccess') }
 
 function Get-FirstLocalBackupInfo($Run) {
     @(As-Array (Get-Prop $Run 'localBackupInfo' @()) | Select-Object -First 1)[0]
@@ -371,7 +370,7 @@ function Get-ObjectFailureEvidence($RunObject) {
     }
 }
 
-function Get-ObjectKey($RunObject, [string]$ClusterId, [string]$EnvironmentLabel, [string]$ProtectionGroupId, [string]$ProtectionGroupName) {
+function Get-ObjectKey($RunObject, [string]$ClusterId, [string]$EnvironmentLabel) {
     if ($null -eq $RunObject -or $null -eq (Get-Prop $RunObject 'object' $null)) { return '' }
     $obj = Get-Prop $RunObject 'object' $null
     $objId = Clean (Get-Prop $obj 'id' '')
@@ -481,6 +480,15 @@ function New-TrackingRow {
     }
 }
 
+function Mark-RowCleared($Row, [hashtable]$SuccessIndex, [string]$Key) {
+    Set-ObjProp $Row 'Status' 'NewlyClearedThisCheck'
+    if ($SuccessIndex.ContainsKey($Key)) {
+        Set-ObjProp $Row 'ClearedET' (Clean $SuccessIndex[$Key].ET)
+        Set-ObjProp $Row 'LastSeenET' (Clean $SuccessIndex[$Key].ET)
+        Set-ObjProp $Row 'LatestRunStatus' (Clean $SuccessIndex[$Key].Status)
+    }
+}
+
 function Get-ProtectionGroups($Cluster, $Env, [string]$ApiKey) {
     $clusterId = Clean (Get-Prop $Cluster 'clusterId' '')
     $headers = @{ accept = 'application/json'; apiKey = $ApiKey; accessClusterId = $clusterId }
@@ -535,7 +543,7 @@ function Merge-UniqueRowsByKey($Rows) {
     @($h.Values)
 }
 
-function Collect-CurrentObjectFailures($Incident, $Window, $Clusters, [string]$ApiKey) {
+function Collect-RunRows($Incident, $Window, $Clusters, [string]$ApiKey) {
     $rows = @()
     $successIndex = @{}
     $clusterList = @($Clusters | Sort-Object @{Expression={ Get-ClusterName $_ }})
@@ -582,9 +590,8 @@ function Collect-CurrentObjectFailures($Incident, $Window, $Clusters, [string]$A
                     $latestRunStatus = Clean (Get-Prop $latestInfo 'status' '')
                     $latestRunUsecs = Get-RunEffectiveUsecs $runsForType[0]
                     $objectNameById = Get-ObjectNameMap $runsForType
-                    $cleared = New-Object 'System.Collections.Generic.HashSet[string]'
-                    $latestByKey = @{}
                     $failedKeysByKey = @{}
+                    $latestByKey = @{}
                     $runLevelKey = Get-RunLevelKey $clusterId $env.Label $pgId $pgName $runType
 
                     foreach ($run in $runsForType) {
@@ -595,21 +602,16 @@ function Collect-CurrentObjectFailures($Incident, $Window, $Clusters, [string]$A
                         $startUsecs = To-Int64 (Get-Prop $info 'startTimeUsecs' 0)
                         $endUsecs = To-Int64 (Get-Prop $info 'endTimeUsecs' 0)
                         $effectiveUsecs = if ($endUsecs -gt 0) { $endUsecs } else { $startUsecs }
-
                         $objectsAll = @(As-Array (Get-Prop $run 'objects' @()) | Where-Object { $_ -and (Get-Prop $_ 'object' $null) })
                         $candidateObjects = @($objectsAll | Where-Object { (Get-ObjectFailureEvidence $_).HasFailure })
 
                         if ((Is-SuccessStatus $status) -and $candidateObjects.Count -eq 0) {
                             if ($objectsAll.Count -eq 0) {
-                                [void]$cleared.Add($runLevelKey)
                                 Add-SuccessIndex $successIndex $runLevelKey $effectiveUsecs $status
                             }
                             foreach ($ob in $objectsAll) {
-                                $ck = Get-ObjectKey $ob $clusterId $env.Label $pgId $pgName
-                                if ($ck) {
-                                    [void]$cleared.Add($ck)
-                                    Add-SuccessIndex $successIndex $ck $effectiveUsecs $status
-                                }
+                                $ck = Get-ObjectKey $ob $clusterId $env.Label
+                                if ($ck) { Add-SuccessIndex $successIndex $ck $effectiveUsecs $status }
                             }
                             continue
                         }
@@ -620,7 +622,6 @@ function Collect-CurrentObjectFailures($Incident, $Window, $Clusters, [string]$A
                         if ($candidateObjects.Count -eq 0 -and (Is-FailedStatus $status) -and $objectsAll.Count -gt 0) {
                             $reviewObjects = @($objectsAll)
                         }
-
                         $objectsToWrite = @($candidateObjects + $reviewObjects)
                         $foundObjectFailure = $false
 
@@ -628,8 +629,8 @@ function Collect-CurrentObjectFailures($Incident, $Window, $Clusters, [string]$A
                             $obj = Get-Prop $ob 'object' $null
                             if ($null -eq $obj) { continue }
 
-                            $ok = Get-ObjectKey $ob $clusterId $env.Label $pgId $pgName
-                            if (!$ok -or $cleared.Contains($ok)) { continue }
+                            $ok = Get-ObjectKey $ob $clusterId $env.Label
+                            if (!$ok) { continue }
 
                             $evidence = Get-ObjectFailureEvidence $ob
                             $msg = Clean $evidence.Message
@@ -650,29 +651,39 @@ function Collect-CurrentObjectFailures($Incident, $Window, $Clusters, [string]$A
                                 if ($objType -eq 'kHost' -or (Clean (Get-Prop $obj 'environment' '')) -eq 'kPhysical') { $hostName = $objName }
                             }
 
+                            $alreadyCleared = $successIndex.ContainsKey($ok)
                             $rowStatus = 'NewlyFailedThisCheck'
-                            if ((Is-RunningStatus $latestRunStatus) -and $latestRunUsecs -gt $effectiveUsecs) { $rowStatus = 'RunningAtLatestCheck' }
+                            if ($alreadyCleared) { $rowStatus = 'NewlyClearedThisCheck' }
+                            elseif ((Is-RunningStatus $latestRunStatus) -and $latestRunUsecs -gt $effectiveUsecs) { $rowStatus = 'RunningAtLatestCheck' }
                             elseif ((Is-CancelledStatus $latestRunStatus) -and $latestRunUsecs -gt $effectiveUsecs) { $rowStatus = 'CancelledAfterFailure' }
                             elseif ($reviewObjects.Count -gt 0 -and $candidateObjects.Count -eq 0) { $rowStatus = 'UnknownNeedsReview' }
 
                             $runKey = ('{0}|{1}|{2}|{3}|{4}' -f $clusterId, $pgId, $ok, $runType, $effectiveUsecs)
                             Add-FailureRunKey $failedKeysByKey $ok $runKey
+
                             if (!$latestByKey.ContainsKey($ok)) {
-                                $latestByKey[$ok] = New-TrackingRow -IncidentNumber $Incident -Window $Window -ClusterName $clusterName -ClusterId $clusterId -Env $env -ProtectionGroupName $pgName -ProtectionGroupId $pgId -ObjectKey $ok -HostName $hostName -ObjectName $objName -ObjectType $objType -RunType $runType -StartUsecs $startUsecs -EndUsecs $endUsecs -Message $msg -Status $rowStatus -LatestRunStatus $latestRunStatus -LatestRunUsecs $latestRunUsecs -FailedRunKeys @($runKey)
+                                $row = New-TrackingRow -IncidentNumber $Incident -Window $Window -ClusterName $clusterName -ClusterId $clusterId -Env $env -ProtectionGroupName $pgName -ProtectionGroupId $pgId -ObjectKey $ok -HostName $hostName -ObjectName $objName -ObjectType $objType -RunType $runType -StartUsecs $startUsecs -EndUsecs $endUsecs -Message $msg -Status $rowStatus -LatestRunStatus $latestRunStatus -LatestRunUsecs $latestRunUsecs -FailedRunKeys @($runKey)
+                                if ($alreadyCleared) { Mark-RowCleared $row $successIndex $ok }
+                                $latestByKey[$ok] = $row
+                            } elseif ($alreadyCleared -and !(Is-ClearedLifecycleStatus (Get-Prop $latestByKey[$ok] 'Status' ''))) {
+                                Mark-RowCleared $latestByKey[$ok] $successIndex $ok
                             }
                             $foundObjectFailure = $true
                         }
 
-                        if (!$foundObjectFailure -and $objectsAll.Count -eq 0 -and (Is-FailedStatus $status) -and !$cleared.Contains($runLevelKey)) {
+                        if (!$foundObjectFailure -and $objectsAll.Count -eq 0 -and (Is-FailedStatus $status)) {
+                            $alreadyCleared = $successIndex.ContainsKey($runLevelKey)
                             $msg = Clean (Get-Prop $info 'messages' '')
                             if (!$msg) { $msg = 'Run marked failed; no object-level details returned' }
-                            $rowStatus = 'UnknownNeedsReview'
-                            if ((Is-RunningStatus $latestRunStatus) -and $latestRunUsecs -gt $effectiveUsecs) { $rowStatus = 'RunningAtLatestCheck' }
-                            elseif ((Is-CancelledStatus $latestRunStatus) -and $latestRunUsecs -gt $effectiveUsecs) { $rowStatus = 'CancelledAfterFailure' }
+                            $rowStatus = if ($alreadyCleared) { 'NewlyClearedThisCheck' } else { 'UnknownNeedsReview' }
+                            if (!$alreadyCleared -and (Is-RunningStatus $latestRunStatus) -and $latestRunUsecs -gt $effectiveUsecs) { $rowStatus = 'RunningAtLatestCheck' }
+                            elseif (!$alreadyCleared -and (Is-CancelledStatus $latestRunStatus) -and $latestRunUsecs -gt $effectiveUsecs) { $rowStatus = 'CancelledAfterFailure' }
                             $runKey = ('{0}|{1}|{2}|{3}|{4}' -f $clusterId, $pgId, $runLevelKey, $runType, $effectiveUsecs)
                             Add-FailureRunKey $failedKeysByKey $runLevelKey $runKey
                             if (!$latestByKey.ContainsKey($runLevelKey)) {
-                                $latestByKey[$runLevelKey] = New-TrackingRow -IncidentNumber $Incident -Window $Window -ClusterName $clusterName -ClusterId $clusterId -Env $env -ProtectionGroupName $pgName -ProtectionGroupId $pgId -ObjectKey $runLevelKey -HostName '' -ObjectName '' -ObjectType '' -RunType $runType -StartUsecs $startUsecs -EndUsecs $endUsecs -Message $msg -Status $rowStatus -LatestRunStatus $latestRunStatus -LatestRunUsecs $latestRunUsecs -FailedRunKeys @($runKey)
+                                $row = New-TrackingRow -IncidentNumber $Incident -Window $Window -ClusterName $clusterName -ClusterId $clusterId -Env $env -ProtectionGroupName $pgName -ProtectionGroupId $pgId -ObjectKey $runLevelKey -HostName '' -ObjectName '' -ObjectType '' -RunType $runType -StartUsecs $startUsecs -EndUsecs $endUsecs -Message $msg -Status $rowStatus -LatestRunStatus $latestRunStatus -LatestRunUsecs $latestRunUsecs -FailedRunKeys @($runKey)
+                                if ($alreadyCleared) { Mark-RowCleared $row $successIndex $runLevelKey }
+                                $latestByKey[$runLevelKey] = $row
                             }
                         }
                     }
@@ -683,13 +694,13 @@ function Collect-CurrentObjectFailures($Incident, $Window, $Clusters, [string]$A
                     }
                 }
             }
-            $envFailures = $rows.Count - $before
-            Write-Host ('  {0,-13}: PGs checked: {1} | failures: {2}' -f $env.Label, $pgsChecked, $envFailures)
+            $envRows = $rows.Count - $before
+            Write-Host ('  {0,-13}: PGs checked: {1} | rows: {2}' -f $env.Label, $pgsChecked, $envRows)
         }
     }
 
     [pscustomobject]@{
-        CurrentFailures = @(Merge-UniqueRowsByKey $rows)
+        Rows = @(Merge-UniqueRowsByKey $rows)
         SuccessIndex = $successIndex
     }
 }
@@ -733,13 +744,15 @@ function Merge-FailedRunKeys($ExistingRow, $NewRow) {
     @($keys | Where-Object { $_ } | Select-Object -Unique)
 }
 
-function Merge-Lifecycle($CurrentRows, $PreviousOpenRows, $PreviousClearedRows, [hashtable]$SuccessIndex) {
+function Merge-Lifecycle($CollectedRows, $PreviousOpenRows, $PreviousClearedRows, [hashtable]$SuccessIndex) {
     $current = @()
     $clearedThisRun = @()
-    $currentByKey = Index-ByKey $CurrentRows
+    $collectedActive = @($CollectedRows | Where-Object { Is-ActiveLifecycleStatus (Get-Prop $_ 'Status' '') })
+    $collectedCleared = @($CollectedRows | Where-Object { Is-ClearedLifecycleStatus (Get-Prop $_ 'Status' '') })
+    $currentByKey = Index-ByKey $collectedActive
     $previousOpenByKey = Index-ByKey $PreviousOpenRows
 
-    foreach ($c in @($CurrentRows)) {
+    foreach ($c in @($collectedActive)) {
         $key = Clean (Get-Prop $c 'ObjectKey' '')
         $n = Clone-Row $c
         if ($previousOpenByKey.ContainsKey($key)) {
@@ -753,9 +766,21 @@ function Merge-Lifecycle($CurrentRows, $PreviousOpenRows, $PreviousClearedRows, 
         $current += $n
     }
 
+    foreach ($c in @($collectedCleared)) {
+        $n = Clone-Row $c
+        $key = Clean (Get-Prop $n 'ObjectKey' '')
+        if ($previousOpenByKey.ContainsKey($key)) {
+            $p = $previousOpenByKey[$key]
+            Set-ObjProp $n 'FirstFailedET' (Clean (Get-Prop $p 'FirstFailedET' (Get-Prop $n 'FirstFailedET' '')))
+            Update-RowFailureFields $n (Merge-FailedRunKeys $p $n)
+        }
+        $clearedThisRun += $n
+    }
+
     foreach ($p in @($PreviousOpenRows)) {
         $key = Clean (Get-Prop $p 'ObjectKey' '')
         if (!$key -or $currentByKey.ContainsKey($key)) { continue }
+        if (@($collectedCleared | Where-Object { (Clean (Get-Prop $_ 'ObjectKey' '')) -eq $key }).Count -gt 0) { continue }
         $lastFailed = To-Int64 (Get-Prop $p 'LastFailedUsecs' 0)
         if ($lastFailed -le 0) { $lastFailed = Convert-EtTextToUsecs (Clean (Get-Prop $p 'LastFailedET' '')) }
         if ($SuccessIndex.ContainsKey($key) -and [int64]$SuccessIndex[$key].Usecs -gt $lastFailed) {
@@ -842,7 +867,7 @@ function Get-OutputFolder($IncidentEntry) {
 
 function Write-TextOutputs($Folder, $Incident, $Window, $LifecycleExport, $CurrentExport, $NewlyClearedExport, $PreviouslyClearedCount) {
     $failureText = Format-Rows $CurrentExport $script:FailureColumns
-    $successText = Format-Rows (@($NewlyClearedExport | Select-Object -Property $script:SuccessColumns)) $script:SuccessColumns
+    $successText = Format-Rows $NewlyClearedExport $script:SuccessColumns
     $lines = New-Object System.Collections.Generic.List[string]
     $lines.Add('Cohesity Backup Failure Incident Update')
     $lines.Add('')
@@ -927,8 +952,8 @@ if ($previousState) {
     $previousCleared = Normalize-ExistingRows (As-Array (Get-Prop $previousState 'ClearedBySuccess' @())) $incident $window
 }
 
-$collection = Collect-CurrentObjectFailures -Incident $incident -Window $window -Clusters $clusters -ApiKey $apiKey
-$merged = Merge-Lifecycle -CurrentRows $collection.CurrentFailures -PreviousOpenRows $previousOpen -PreviousClearedRows $previousCleared -SuccessIndex $collection.SuccessIndex
+$collection = Collect-RunRows -Incident $incident -Window $window -Clusters $clusters -ApiKey $apiKey
+$merged = Merge-Lifecycle -CollectedRows $collection.Rows -PreviousOpenRows $previousOpen -PreviousClearedRows $previousCleared -SuccessIndex $collection.SuccessIndex
 
 $currentRows = @($merged.Current | Sort-Object Cluster,ProtectionGroup,Environment,@{Expression={Date-Sort (Get-Prop $_ 'LastFailedET' '')};Descending=$true})
 $newlyClearedRows = @($merged.ClearedThisRun | Sort-Object @{Expression={Date-Sort (Get-Prop $_ 'ClearedET' '')};Descending=$true})
