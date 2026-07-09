@@ -8,7 +8,7 @@
 // - Collects all loop outputs
 // - Flattens all rows into one simple report
 // - Creates manager-friendly Markdown for email
-// - Shows DTSK assignment ownership and SLA status in the email output
+// - Shows DTSK assignment ownership and calculated SLA status in the email output
 // - Keeps cluster diagnostics out of the Cluster column
 // - Clearly reports when there are no active decommission DTSKs
 //
@@ -64,7 +64,6 @@ export default async function () {
       const dtsk = safeText(item?.dtsk);
       const ciName = safeText(item?.ciName);
       if (dtsk === "N/A") continue;
-
       byDtsk.set(dtsk.toLowerCase(), item);
       if (ciName !== "N/A") byDtskAndCi.set(makeWorkItemKey(dtsk, ciName), item);
     }
@@ -82,6 +81,7 @@ export default async function () {
     const backupTypeRaw = safeText(row?.BackupType);
     const item = findWorkItemForRow(row, lookup);
     const assignedTo = safeText(row?.AssignedTo) !== "N/A" ? safeText(row?.AssignedTo) : safeText(item?.assignedTo);
+
     const displayMap = {
       NoObject: "No Backup Found",
       NoFSBackupFound: "DB Only / No Server Backup",
@@ -154,17 +154,13 @@ export default async function () {
     return [...rows].sort((a, b) => {
       const dtskCompare = String(a.DTSK || "").localeCompare(String(b.DTSK || ""));
       if (dtskCompare !== 0) return dtskCompare;
-
       const serverCompare = String(a.ServerName || "").localeCompare(String(b.ServerName || ""));
       if (serverCompare !== 0) return serverCompare;
-
       const ra = rank[a.BackupType] ?? 500;
       const rb = rank[b.BackupType] ?? 500;
       if (ra !== rb) return ra - rb;
-
       const objectCompare = String(a.ObjectName || "").localeCompare(String(b.ObjectName || ""));
       if (objectCompare !== 0) return objectCompare;
-
       return String(a.ProtectionGroup || "").localeCompare(String(b.ProtectionGroup || ""));
     });
   }
@@ -289,7 +285,7 @@ export default async function () {
   function makeNoteMarkdown() {
     return [
       "- NAS backups are excluded from this server decommission validation.",
-      "- **SLA Status** is calculated from ServiceNow `sla_due`; if missing, from Backup-group assignment timestamp + 2 days; otherwise `SLA Missing`.",
+      "- **SLA Status** is calculated in Dynatrace as 2 days from `sys_created_on`, which is treated as the time the DTSK came to the Backup group for this report.",
       "- **No Backup Found** means no in-scope Cohesity backup object was found for the CI.",
       "- **DB Only / No Server Backup** means a SQL/Oracle backup was found, but no FS, VM, Hyper-V, or Nutanix/AHV backup was found for the server.",
       "- **Assignment Action** is derived from ServiceNow: `Assigned` when Assigned To is populated, otherwise `Please assign`.",
