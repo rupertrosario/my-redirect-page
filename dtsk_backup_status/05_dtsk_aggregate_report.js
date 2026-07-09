@@ -8,16 +8,9 @@
 // - Collects all loop outputs
 // - Flattens all rows into one simple report
 // - Creates manager-friendly Markdown for email
-// - Shows DTSK assignment ownership and SLA in the email output
+// - Shows DTSK assignment ownership and SLA status in the email output
 // - Keeps cluster diagnostics out of the Cluster column
 // - Clearly reports when there are no active decommission DTSKs
-//
-// Workflow position:
-// dtsk_snow_search
-//   -> dtsk_prepare_work_items
-//   -> dtsk_get_cluster_map
-//   -> dtsk_validate_one_ci  (LOOP)
-//   -> dtsk_aggregate_report (NO LOOP)
 //
 // Strictly read/aggregate only. No HTTP calls. No writes.
 // ==========================================================
@@ -52,9 +45,7 @@ export default async function () {
   }
 
   function markdownEscape(value) {
-    return safeText(value)
-      .replace(/\|/g, "\\|")
-      .replace(/\r?\n/g, " ");
+    return safeText(value).replace(/\|/g, "\\|").replace(/\r?\n/g, " ");
   }
 
   function assignmentActionFromAssignedTo(assignedTo) {
@@ -101,7 +92,8 @@ export default async function () {
     return {
       DTSK: safeText(row?.DTSK),
       DecomRequest: safeText(row?.DecomRequest) !== "N/A" ? safeText(row?.DecomRequest) : safeText(item?.decomRequest),
-      SLA: safeText(row?.SLA) !== "N/A" ? safeText(row?.SLA) : safeText(item?.sla),
+      SLADue: safeText(row?.SLADue) !== "N/A" ? safeText(row?.SLADue) : safeText(item?.slaDue),
+      SLAStatus: safeText(row?.SLAStatus) !== "N/A" ? safeText(row?.SLAStatus) : safeText(item?.slaStatus),
       AssignedTo: assignedTo,
       AssignmentGroup: safeText(row?.AssignmentGroup) !== "N/A" ? safeText(row?.AssignmentGroup) : safeText(item?.assignmentGroup),
       AssignmentAction: safeText(row?.AssignmentAction) !== "N/A" ? safeText(row?.AssignmentAction) : assignmentActionFromAssignedTo(assignedTo),
@@ -125,7 +117,8 @@ export default async function () {
       const key = [
         row.DTSK,
         row.DecomRequest,
-        row.SLA,
+        row.SLADue,
+        row.SLAStatus,
         row.AssignedTo,
         row.AssignmentAction,
         row.ServerName,
@@ -193,7 +186,6 @@ export default async function () {
   function extractValidationOutputs(value, out = [], depth = 0, seen = new Set()) {
     if (depth > 10 || value === null || value === undefined) return out;
     if (typeof value !== "object") return out;
-
     if (seen.has(value)) return out;
     seen.add(value);
 
@@ -207,11 +199,7 @@ export default async function () {
       return out;
     }
 
-    const preferredKeys = [
-      "results", "result", "outputs", "output", "values", "items", "executions", "tasks", "data"
-    ];
-
-    for (const key of preferredKeys) {
+    for (const key of ["results", "result", "outputs", "output", "values", "items", "executions", "tasks", "data"]) {
       if (value[key] !== undefined) extractValidationOutputs(value[key], out, depth + 1, seen);
     }
 
@@ -227,7 +215,8 @@ export default async function () {
     const headers = [
       ["DTSK", "DTSK"],
       ["Decom Request", "DecomRequest"],
-      ["SLA", "SLA"],
+      ["SLA Due", "SLADue"],
+      ["SLA Status", "SLAStatus"],
       ["Assigned To", "AssignedTo"],
       ["Assignment Action", "AssignmentAction"],
       ["Server", "ServerName"],
@@ -267,10 +256,11 @@ export default async function () {
       "| Metric | Count |",
       "|---|---:|",
       `| **DTSKs reviewed** | **${summary.totalDtsks}** |`,
+      `| **Within SLA** | **${summary.withinSlaDtskCount}** |`,
+      `| **Breached SLA** | **${summary.breachedSlaDtskCount}** |`,
+      `| **SLA missing** | **${summary.slaMissingDtskCount}** |`,
       `| **Assigned DTSKs** | **${summary.assignedDtskCount}** |`,
       `| **Unassigned DTSKs** | **${summary.unassignedDtskCount}** |`,
-      `| **SLA populated DTSKs** | **${summary.slaPopulatedDtskCount}** |`,
-      `| **SLA missing DTSKs** | **${summary.slaMissingDtskCount}** |`,
       `| **Total validation rows** | **${summary.totalRows}** |`,
       `| **Server-level protected CIs** | **${summary.serverLevelProtectedCiCount}** |`,
       `| **DB-protected CIs** | **${summary.dbProtectedCiCount}** |`,
@@ -299,10 +289,10 @@ export default async function () {
   function makeNoteMarkdown() {
     return [
       "- NAS backups are excluded from this server decommission validation.",
+      "- **SLA Status** is calculated from ServiceNow `sla_due`; if missing, from Backup-group assignment timestamp + 2 days; otherwise `SLA Missing`.",
       "- **No Backup Found** means no in-scope Cohesity backup object was found for the CI.",
       "- **DB Only / No Server Backup** means a SQL/Oracle backup was found, but no FS, VM, Hyper-V, or Nutanix/AHV backup was found for the server.",
       "- **Assignment Action** is derived from ServiceNow: `Assigned` when Assigned To is populated, otherwise `Please assign`.",
-      "- **SLA** is taken from the ServiceNow DTSK search output using the first populated field from `u_sla`, `u_sla_due`, `sla`, `sla_due`, `due_date`, or `made_sla`.",
       "- Cluster search diagnostics are retained in task JSON but are not shown in the email Cluster column."
     ].join("\n");
   }
@@ -343,10 +333,11 @@ export default async function () {
     validationOutputCount: validationOutputs.length,
     totalRows: finalRows.length,
 
+    withinSlaDtskCount: workItems.filter(x => safeText(x?.slaStatus) === "Within SLA").length,
+    breachedSlaDtskCount: workItems.filter(x => safeText(x?.slaStatus) === "Breached SLA").length,
+    slaMissingDtskCount: workItems.filter(x => safeText(x?.slaStatus) === "SLA Missing").length,
     assignedDtskCount: workItems.filter(x => safeText(x?.assignedTo) !== "N/A").length,
     unassignedDtskCount: workItems.filter(x => safeText(x?.assignedTo) === "N/A").length,
-    slaPopulatedDtskCount: workItems.filter(x => safeText(x?.sla) !== "N/A").length,
-    slaMissingDtskCount: workItems.filter(x => safeText(x?.sla) === "N/A").length,
 
     fsRowCount: countRows(finalRows, "FS"),
     vmRowCount: countRows(finalRows, "VM"),
@@ -358,16 +349,8 @@ export default async function () {
     noObjectRowCount: countRows(finalRows, "NoObject"),
     unknownRowCount: countRows(finalRows, "Unknown"),
 
-    serverLevelProtectedCiCount: distinctCount(
-      finalRows,
-      r => ["FS", "VM", "HyperV", "Nutanix"].includes(r.BackupType),
-      "ServerName"
-    ),
-    dbProtectedCiCount: distinctCount(
-      finalRows,
-      r => ["SQL", "Oracle"].includes(r.BackupType),
-      "ServerName"
-    ),
+    serverLevelProtectedCiCount: distinctCount(finalRows, r => ["FS", "VM", "HyperV", "Nutanix"].includes(r.BackupType), "ServerName"),
+    dbProtectedCiCount: distinctCount(finalRows, r => ["SQL", "Oracle"].includes(r.BackupType), "ServerName"),
 
     dbNamedServerCount,
     dbCnFallbackAppliedCount,
