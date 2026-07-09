@@ -7,6 +7,7 @@ Run this wrapper for normal operation.
 - If IncidentNumber is not supplied, the main collector asks once and stores it for the current 18:00 ET window.
 - If ClusterName is not supplied, all clusters are scanned.
 - OutputRoot defaults to the normal production folder.
+- NumRuns is forced to 20 by default for production balance.
 - RequestTimeoutSec is forced to 120 seconds by default for the main collector.
 #>
 [CmdletBinding()]
@@ -17,7 +18,7 @@ param(
     [string]$HelperPath = ("X:\PowerShell\Cohesity_API_Scripts\Common\" + "Api" + "KeyAesHelper.ps1"),
     [string]$EncryptedFile = ("X:\PowerShell\Cohesity_API_Scripts\Common\Secure\cohesity_" + "api" + "key.enc"),
     [string]$ClusterName = "",
-    [int]$NumRuns = 30,
+    [int]$NumRuns = 20,
     [string]$IncidentNumber = "",
     [switch]$UseLatestFailureCsv,
     [string]$LegacyFailureCsvPath = "",
@@ -66,8 +67,11 @@ foreach ($k in $PSBoundParameters.Keys) {
     if ($k -ne "ShowGrid") { $targetParams[$k] = $PSBoundParameters[$k] }
 }
 
-# Always pass the production timeout even when the caller does not specify it.
+# Always pass production defaults even when the caller does not specify them.
 # PowerShell does not include defaulted parameters in $PSBoundParameters.
+if (!$targetParams.ContainsKey("NumRuns")) {
+    $targetParams["NumRuns"] = $NumRuns
+}
 if (!$targetParams.ContainsKey("RequestTimeoutSec")) {
     $targetParams["RequestTimeoutSec"] = $RequestTimeoutSec
 }
@@ -75,6 +79,7 @@ if (!$targetParams.ContainsKey("RequestTimeoutSec")) {
 Write-Host ""
 Write-Host "Running main Cohesity backup failure collector."
 Write-Host ("OutputRoot        : {0}" -f $OutputRoot)
+Write-Host ("NumRuns           : {0}" -f $targetParams["NumRuns"])
 Write-Host ("RequestTimeoutSec : {0}" -f $targetParams["RequestTimeoutSec"])
 if ($ClusterName) { Write-Host ("ClusterName       : {0}" -f $ClusterName) } else { Write-Host "ClusterName       : ALL CLUSTERS" }
 if ($IncidentNumber) { Write-Host ("IncidentNumber    : {0}" -f $IncidentNumber) } else { Write-Host "IncidentNumber    : prompt/reuse current window" }
