@@ -8,7 +8,7 @@
 // - Collects all loop outputs
 // - Flattens all rows into one simple report
 // - Creates manager-friendly Markdown for email
-// - Shows DTSK assignment ownership in the email output
+// - Shows DTSK assignment ownership and SLA in the email output
 // - Keeps cluster diagnostics out of the Cluster column
 // - Clearly reports when there are no active decommission DTSKs
 //
@@ -61,9 +61,36 @@ export default async function () {
     return safeText(assignedTo) === "N/A" ? "Please assign" : "Assigned";
   }
 
-  function normalizeRow(row) {
+  function makeWorkItemKey(dtsk, serverName) {
+    return `${safeText(dtsk).toLowerCase()}|${safeText(serverName).toLowerCase()}`;
+  }
+
+  function buildWorkItemLookup(workItems) {
+    const byDtskAndCi = new Map();
+    const byDtsk = new Map();
+
+    for (const item of workItems || []) {
+      const dtsk = safeText(item?.dtsk);
+      const ciName = safeText(item?.ciName);
+      if (dtsk === "N/A") continue;
+
+      byDtsk.set(dtsk.toLowerCase(), item);
+      if (ciName !== "N/A") byDtskAndCi.set(makeWorkItemKey(dtsk, ciName), item);
+    }
+
+    return { byDtskAndCi, byDtsk };
+  }
+
+  function findWorkItemForRow(row, lookup) {
+    const byDtskAndCi = lookup?.byDtskAndCi || new Map();
+    const byDtsk = lookup?.byDtsk || new Map();
+    return byDtskAndCi.get(makeWorkItemKey(row?.DTSK, row?.ServerName)) || byDtsk.get(safeText(row?.DTSK).toLowerCase()) || null;
+  }
+
+  function normalizeRow(row, lookup) {
     const backupTypeRaw = safeText(row?.BackupType);
-    const assignedTo = safeText(row?.AssignedTo);
+    const item = findWorkItemForRow(row, lookup);
+    const assignedTo = safeText(row?.AssignedTo) !== "N/A" ? safeText(row?.AssignedTo) : safeText(item?.assignedTo);
     const displayMap = {
       NoObject: "No Backup Found",
       NoFSBackupFound: "DB Only / No Server Backup",
@@ -73,9 +100,10 @@ export default async function () {
 
     return {
       DTSK: safeText(row?.DTSK),
-      DecomRequest: safeText(row?.DecomRequest),
+      DecomRequest: safeText(row?.DecomRequest) !== "N/A" ? safeText(row?.DecomRequest) : safeText(item?.decomRequest),
+      SLA: safeText(row?.SLA) !== "N/A" ? safeText(row?.SLA) : safeText(item?.sla),
       AssignedTo: assignedTo,
-      AssignmentGroup: safeText(row?.AssignmentGroup),
+      AssignmentGroup: safeText(row?.AssignmentGroup) !== "N/A" ? safeText(row?.AssignmentGroup) : safeText(item?.assignmentGroup),
       AssignmentAction: safeText(row?.AssignmentAction) !== "N/A" ? safeText(row?.AssignmentAction) : assignmentActionFromAssignedTo(assignedTo),
       ServerName: safeText(row?.ServerName),
       BackupType: backupTypeRaw,
@@ -97,6 +125,7 @@ export default async function () {
       const key = [
         row.DTSK,
         row.DecomRequest,
+        row.SLA,
         row.AssignedTo,
         row.AssignmentAction,
         row.ServerName,
@@ -198,6 +227,7 @@ export default async function () {
     const headers = [
       ["DTSK", "DTSK"],
       ["Decom Request", "DecomRequest"],
+      ["SLA", "SLA"],
       ["Assigned To", "AssignedTo"],
       ["Assignment Action", "AssignmentAction"],
       ["Server", "ServerName"],
@@ -239,6 +269,8 @@ export default async function () {
       `| **DTSKs reviewed** | **${summary.totalDtsks}** |`,
       `| **Assigned DTSKs** | **${summary.assignedDtskCount}** |`,
       `| **Unassigned DTSKs** | **${summary.unassignedDtskCount}** |`,
+      `| **SLA populated DTSKs** | **${summary.slaPopulatedDtskCount}** |`,
+      `| **SLA missing DTSKs** | **${summary.slaMissingDtskCount}** |`,
       `| **Total validation rows** | **${summary.totalRows}** |`,
       `| **Server-level protected CIs** | **${summary.serverLevelProtectedCiCount}** |`,
       `| **DB-protected CIs** | **${summary.dbProtectedCiCount}** |`,
@@ -270,6 +302,7 @@ export default async function () {
       "- **No Backup Found** means no in-scope Cohesity backup object was found for the CI.",
       "- **DB Only / No Server Backup** means a SQL/Oracle backup was found, but no FS, VM, Hyper-V, or Nutanix/AHV backup was found for the server.",
       "- **Assignment Action** is derived from ServiceNow: `Assigned` when Assigned To is populated, otherwise `Please assign`.",
+      "- **SLA** is taken from the ServiceNow DTSK search output using the first populated field from `u_sla`, `u_sla_due`, `sla`, `sla_due`, `due_date`, or `made_sla`.",
       "- Cluster search diagnostics are retained in task JSON but are not shown in the email Cluster column."
     ].join("\n");
   }
@@ -278,6 +311,7 @@ export default async function () {
   const validateRaw = await result("dtsk_validate_one_ci");
 
   const workItems = asArray(prepareResult?.workItems);
+  const workItemLookup = buildWorkItemLookup(workItems);
   const validationOutputs = extractValidationOutputs(validateRaw);
 
   const warnings = [];
@@ -288,7 +322,7 @@ export default async function () {
   let dbCnFallbackRowsFound = 0;
 
   for (const output of validationOutputs) {
-    for (const row of asArray(output?.rows)) rows.push(normalizeRow(row));
+    for (const row of asArray(output?.rows)) rows.push(normalizeRow(row, workItemLookup));
 
     const s = output?.summary || {};
     if (s.dbNamedServer === true) dbNamedServerCount += 1;
@@ -311,6 +345,8 @@ export default async function () {
 
     assignedDtskCount: workItems.filter(x => safeText(x?.assignedTo) !== "N/A").length,
     unassignedDtskCount: workItems.filter(x => safeText(x?.assignedTo) === "N/A").length,
+    slaPopulatedDtskCount: workItems.filter(x => safeText(x?.sla) !== "N/A").length,
+    slaMissingDtskCount: workItems.filter(x => safeText(x?.sla) === "N/A").length,
 
     fsRowCount: countRows(finalRows, "FS"),
     vmRowCount: countRows(finalRows, "VM"),
