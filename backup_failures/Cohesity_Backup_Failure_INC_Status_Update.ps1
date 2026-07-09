@@ -1,6 +1,13 @@
 <#
 .SYNOPSIS
-Entry point for Cohesity Backup Failure INC status updates.
+Production entry point for Cohesity Backup Failure INC status updates.
+
+.DESCRIPTION
+Run this wrapper for normal operation.
+- If IncidentNumber is not supplied, the main collector asks once and stores it for the current 18:00 ET window.
+- If ClusterName is not supplied, all clusters are scanned.
+- OutputRoot defaults to the normal production folder.
+- RequestTimeoutSec is forced to 120 seconds by default for the main collector.
 #>
 [CmdletBinding()]
 param(
@@ -16,7 +23,7 @@ param(
     [string]$LegacyFailureCsvPath = "",
     [int]$KeepFoldersDays = 14,
     [int]$ArchiveFoldersUntilDays = 35,
-    [int]$RequestTimeoutSec = 60,
+    [int]$RequestTimeoutSec = 120,
     [switch]$ShowGrid
 )
 
@@ -59,8 +66,18 @@ foreach ($k in $PSBoundParameters.Keys) {
     if ($k -ne "ShowGrid") { $targetParams[$k] = $PSBoundParameters[$k] }
 }
 
+# Always pass the production timeout even when the caller does not specify it.
+# PowerShell does not include defaulted parameters in $PSBoundParameters.
+if (!$targetParams.ContainsKey("RequestTimeoutSec")) {
+    $targetParams["RequestTimeoutSec"] = $RequestTimeoutSec
+}
+
 Write-Host ""
 Write-Host "Running main Cohesity backup failure collector."
+Write-Host ("OutputRoot        : {0}" -f $OutputRoot)
+Write-Host ("RequestTimeoutSec : {0}" -f $targetParams["RequestTimeoutSec"])
+if ($ClusterName) { Write-Host ("ClusterName       : {0}" -f $ClusterName) } else { Write-Host "ClusterName       : ALL CLUSTERS" }
+if ($IncidentNumber) { Write-Host ("IncidentNumber    : {0}" -f $IncidentNumber) } else { Write-Host "IncidentNumber    : prompt/reuse current window" }
 Write-Host ""
 
 & $target @targetParams
@@ -73,6 +90,8 @@ if ($folder) {
     Write-Host (Join-Path $folder "worknotes_summary.txt")
     Write-Host (Join-Path $folder "incident_lifecycle.csv")
     Write-Host (Join-Path $folder "closing_summary.txt")
+    $clearedPath = Join-Path $folder "cleared_by_success.csv"
+    if (Test-Path $clearedPath) { Write-Host $clearedPath }
     Write-Host "Script memory retained, do not edit:"
     Write-Host (Join-Path $folder "state.json")
     if ($ShowGrid) { Open-Grid $folder }
