@@ -7,10 +7,24 @@ This workflow is being corrected for object-level backup failure reporting.
 The current confirmed issue is:
 
 ```text
-The Cohesity UI shows the failed object, but the incident workflow output is still not showing that object.
+The Cohesity diagnostic probe shows failed object names, but the main collector output does not promote those objects into the normal failure outputs.
 ```
 
-Do not make more collector changes blindly. First run the diagnostic probe for one affected protection group and review the actual `run.objects` shape returned by Cohesity.
+Confirmed observation:
+
+```text
+Diagnostic output has the failed object names.
+current_failures.csv / incident_lifecycle.csv / worknotes_summary.txt do not show the same objects.
+ProtectionGroup is also missing or not consistently carried into the normal output for those rows.
+```
+
+This means Cohesity is returning object evidence. The defect is in the collector mapping/normalization path, not in the API returning no objects.
+
+Do not add logic to the wrapper. Patch only:
+
+```text
+Get-CohesityBackupFailureWindowConsolidator.ps1
+```
 
 ## Repo context
 
@@ -66,28 +80,56 @@ Rules:
 8. If Cohesity returns no object evidence, ObjectName and ObjectType must stay blank.
 9. Worknotes must stay simple: Failure Section and Success Section only.
 10. Do not add extra worknote sections.
+11. If the diagnostic probe has ObjectName/ObjectType for a failed run, the main collector must carry the same ObjectName/ObjectType into current_failures.csv, incident_lifecycle.csv, and worknotes_summary.txt.
+12. ProtectionGroup must be carried from the active PG being queried, or from run-level PG metadata if present.
+```
+
+## Current mapping defect to fix
+
+The diagnostic probe reads:
+
+```powershell
+$runObjects = @(As-Array (Get-Prop $run "objects" @()))
+ObjectName  = Clean (Get-Prop $obj "name" "")
+ObjectType  = Clean (Get-Prop $obj "objectType" "")
+```
+
+The main collector must use equivalent extraction for every failed run object and must not drop the object during later lifecycle/export conversion.
+
+Expected fix area:
+
+```text
+Collect-CurrentObjectFailures
+Convert-LifecycleRows
+```
+
+Validation after fix:
+
+```text
+For the same affected PG/run:
+- Diagnostic CSV ObjectName must match current_failures.csv ObjectName.
+- Diagnostic CSV ObjectType must match current_failures.csv ObjectType.
+- ProtectionGroup must be populated in current_failures.csv and worknotes_summary.txt.
+- If object details are missing only then ObjectName/ObjectType can be blank.
 ```
 
 ## Current commits
 
-Main collector rebuilt, but not confirmed good:
+Main collector rebuilt, but object promotion from diagnostic evidence is not confirmed good:
 
 ```text
-5aa2fb0c2b3d673657d692585b9bafbc7ef01131
 backup_failures/Get-CohesityBackupFailureWindowConsolidator.ps1
 ```
 
 Wrapper simplified:
 
 ```text
-785de011b536095d7ae08852db9372b04be68c8b
 backup_failures/Cohesity_Backup_Failure_INC_Status_Update.ps1
 ```
 
 Diagnostic probe added:
 
 ```text
-facf547570d217ff3052706edb0f527154549aff
 backup_failures/Test-CohesityRunObjectDetails.ps1
 ```
 
@@ -237,15 +279,3 @@ Do not copy PG name into ObjectName.
 ```
 
 ## Notes
-
-```text
-- Keep it simple.
-- No extra worknotes sections.
-- No wrapper-side collector logic.
-- Main collector owns object-level detection.
-- Cohesity calls are GET-only.
-- ET timestamps.
-- Do not show System.Object[].
-- No ServiceNow writes.
-- No Excel output.
-```
