@@ -7,10 +7,11 @@ Run this wrapper for normal operation.
 - If IncidentNumber is not supplied, the main collector asks once and stores it for the current 18:00 ET window.
 - If ClusterName is not supplied, all clusters are scanned.
 - OutputRoot defaults to the normal production folder.
-- NumRuns is 20 by default for production balance.
+- NumRuns is 15 by default for same-window incremental reruns.
+- The main collector automatically uses 30 runs for a new window / new INC baseline.
 - RequestTimeoutSec is 120 seconds by default.
 
-All collection, object-selection, lifecycle, and PG/object precedence logic belongs in:
+All collection, object-selection, lifecycle, state, and PG/object precedence logic belongs in:
 Get-CohesityBackupFailureWindowConsolidator.ps1
 #>
 [CmdletBinding()]
@@ -21,7 +22,7 @@ param(
     [string]$HelperPath = ("X:\PowerShell\Cohesity_API_Scripts\Common\" + "Api" + "KeyAesHelper.ps1"),
     [string]$EncryptedFile = ("X:\PowerShell\Cohesity_API_Scripts\Common\Secure\cohesity_" + "api" + "key.enc"),
     [string]$ClusterName = "",
-    [int]$NumRuns = 20,
+    [int]$NumRuns = 15,
     [string]$IncidentNumber = "",
     [switch]$UseLatestFailureCsv,
     [string]$LegacyFailureCsvPath = "",
@@ -81,11 +82,12 @@ if (!$targetParams.ContainsKey("RequestTimeoutSec")) {
 
 Write-Host ""
 Write-Host "Running main Cohesity backup failure collector."
-Write-Host ("OutputRoot        : {0}" -f $OutputRoot)
-Write-Host ("NumRuns           : {0}" -f $targetParams["NumRuns"])
-Write-Host ("RequestTimeoutSec : {0}" -f $targetParams["RequestTimeoutSec"])
-if ($ClusterName) { Write-Host ("ClusterName       : {0}" -f $ClusterName) } else { Write-Host "ClusterName       : ALL CLUSTERS" }
-if ($IncidentNumber) { Write-Host ("IncidentNumber    : {0}" -f $IncidentNumber) } else { Write-Host "IncidentNumber    : prompt/reuse current window" }
+Write-Host ("OutputRoot              : {0}" -f $OutputRoot)
+Write-Host ("Incremental NumRuns    : {0}" -f $targetParams["NumRuns"])
+Write-Host "Baseline NumRuns       : 30 when new window / new INC"
+Write-Host ("RequestTimeoutSec      : {0}" -f $targetParams["RequestTimeoutSec"])
+if ($ClusterName) { Write-Host ("ClusterName             : {0}" -f $ClusterName) } else { Write-Host "ClusterName             : ALL CLUSTERS" }
+if ($IncidentNumber) { Write-Host ("IncidentNumber          : {0}" -f $IncidentNumber) } else { Write-Host "IncidentNumber          : prompt/reuse current window" }
 Write-Host ""
 
 & $target @targetParams
