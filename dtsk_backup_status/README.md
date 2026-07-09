@@ -14,7 +14,8 @@ Current scope:
 
 Email output:
 
-- Shows `Assigned To` and `Assignment Action` from ServiceNow DTSK data.
+- Shows `SLA`, `Assigned To`, and `Assignment Action` from ServiceNow DTSK data.
+- `SLA` is derived from the first populated DTSK field in this order: `u_sla`, `u_sla_due`, `sla`, `sla_due`, `due_date`, `made_sla`.
 - `Assignment Action` is `Assigned` when `assigned_to` is populated; otherwise it is `Please assign`.
 - The `Cluster` column shows only the Cohesity cluster where backup evidence was found.
 - Search diagnostics such as `1 cluster(s) checked` are not shown in the email `Cluster` column. They remain only in task JSON/debug summary.
