@@ -14,8 +14,13 @@ Current scope:
 
 Email output:
 
-- Shows `SLA`, `Assigned To`, and `Assignment Action` from ServiceNow DTSK data.
-- `SLA` is derived from the first populated DTSK field in this order: `u_sla`, `u_sla_due`, `sla`, `sla_due`, `due_date`, `made_sla`.
+- Shows `SLA Due`, `SLA Status`, `Assigned To`, and `Assignment Action` from ServiceNow DTSK data.
+- Correct SLA for this report is the 2-day SLA from when the DTSK was assigned to the Backup group.
+- SLA source order:
+  1. Use ServiceNow `sla_due` if it is already calculated from Backup-group assignment time.
+  2. If `sla_due` is missing, use the first populated assignment timestamp from `u_backup_assignment_time`, `u_assigned_to_backup_on`, `u_assignment_group_assigned_on`, or `assignment_group_assigned_on`, then add 2 days.
+  3. If neither source is available, show `SLA Missing`.
+- `SLA Status` values: `Within SLA`, `Breached SLA`, or `SLA Missing`.
 - `Assignment Action` is `Assigned` when `assigned_to` is populated; otherwise it is `Please assign`.
 - The `Cluster` column shows only the Cohesity cluster where backup evidence was found.
 - Search diagnostics such as `1 cluster(s) checked` are not shown in the email `Cluster` column. They remain only in task JSON/debug summary.
@@ -36,7 +41,7 @@ Files in this folder:
 | File | Purpose |
 |---|---|
 | `01_dtsk_snow_search_config.md` | ServiceNow DTSK search configuration |
-| `02_dtsk_prepare_work_items.js` | Converts DTSK records into clean loop work items |
+| `02_dtsk_prepare_work_items.js` | Converts DTSK records into clean loop work items and calculates SLA due/status |
 | `03_dtsk_get_cluster_map.js` | Gets Cohesity cluster list and cluster map |
 | `04_dtsk_validate_one_ci.js` | Loop worker with Cohesity validation logic and ownership fields |
 | `05_dtsk_aggregate_report.js` | Aggregates loop outputs and builds email markdown |
