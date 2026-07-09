@@ -25,35 +25,22 @@ assignment_group.name=<BACKUP_GROUP_NAME>^assigned_toISNOTEMPTY^stateNOT IN6,7
 ## Fields
 
 ```text
-sys_id,number,short_description,state,sys_created_on,assignment_group.name,assigned_to.name,sla_due,due_date,made_sla,u_backup_assignment_time,u_assigned_to_backup_on,u_assignment_group_assigned_on,assignment_group_assigned_on,decom_request.number,decom_request.ci_name.name
+sys_id,number,short_description,state,sys_created_on,assignment_group.name,assigned_to.name,decom_request.number,decom_request.ci_name.name
 ```
 
 ## SLA rule
 
-Correct SLA for this report is the 2-day SLA from when the DTSK was assigned to the Backup group.
+The report does not depend on ServiceNow SLA fields.
 
-Preferred source:
-
-```text
-sla_due
-```
-
-Use `sla_due` if ServiceNow already calculates it from Backup-group assignment time.
-
-Fallback source if `sla_due` is not available:
+Correct SLA for this report is calculated in Dynatrace:
 
 ```text
-u_backup_assignment_time,u_assigned_to_backup_on,u_assignment_group_assigned_on,assignment_group_assigned_on
-```
-
-The prepare task adds 2 days to the first populated assignment timestamp and calculates:
-
-```text
-SLA Due
+SLA Start  = time DTSK came to the Backup group
+SLA Due    = SLA Start + 2 days
 SLA Status = Within SLA | Breached SLA | SLA Missing
 ```
 
-If the actual DTSK assignment timestamp has a different ServiceNow field name, add that field to the Fields list and to `02_dtsk_prepare_work_items.js`.
+For the current report-only implementation, `sys_created_on` is used as the DTSK Backup-group start timestamp because these DTSKs are searched from the Backup assignment group queue. If the task can be reassigned to Backup later than creation, the workflow must be extended to fetch the group-assignment timestamp from ServiceNow audit/history or a dedicated field.
 
 ## Notes
 
