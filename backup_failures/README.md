@@ -29,10 +29,10 @@ adaeffed56b9be9a120e83f20ff66ac400955d16
 backup_failures/Get-CohesityBackupFailureWindowConsolidator.ps1
 ```
 
-Wrapper default timeout / simplified production entry point:
+Wrapper production defaults:
 
 ```text
-7c7d75fe9f2ea591a7829c04e3f8c293efd86328
+f613b1c8a9f89cb5e1aae17b00661877ca4d86f1
 backup_failures/Cohesity_Backup_Failure_INC_Status_Update.ps1
 ```
 
@@ -57,7 +57,7 @@ No -ClusterName       = scan all clusters
 No -IncidentNumber    = ask once, then reuse for the current 18:00 ET backup-failure window
 No -OutputRoot        = use X:\PowerShell\Data\Cohesity\BackupFailureWindow
 No -RequestTimeoutSec = use 120 seconds from wrapper code
-No -NumRuns           = use 30 runs per protection group
+No -NumRuns           = use 20 runs per protection group from wrapper code
 ```
 
 ## Optional commands
@@ -80,7 +80,14 @@ Run with more PG runs only if needed:
 
 ```powershell
 .\Cohesity_Backup_Failure_INC_Status_Update.ps1 `
-  -NumRuns 50
+  -NumRuns 30
+```
+
+Run faster with lower run depth only if accepted operationally:
+
+```powershell
+.\Cohesity_Backup_Failure_INC_Status_Update.ps1 `
+  -NumRuns 10
 ```
 
 ## Incident handling
@@ -200,7 +207,7 @@ Incident: INC1234567
 Compute Window: 2026-07-08 18:00 ET -> 2026-07-09 18:00 ET
 Generated At: 2026-07-09 04:30:00 ET
 Cohesity API Collection Status: Complete
-Scope: latest 30 runs per protection group/run type.
+Scope: latest 20 runs per protection group/run type.
 
 Summary Counts:
 - Active / unresolved failures: 1
