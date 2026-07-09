@@ -3,6 +3,7 @@ import { result } from "@dynatrace-sdk/automation-utils";
 export default async function () {
 
   const snowResult = await result("dtsk_snow_search");
+  const TWO_DAYS_MS = 2 * 24 * 60 * 60 * 1000;
 
   function extractRows(payload) {
     if (!payload) return [];
@@ -10,11 +11,7 @@ export default async function () {
     let body = payload.body;
 
     if (typeof body === "string") {
-      try {
-        body = JSON.parse(body);
-      } catch {
-        body = null;
-      }
+      try { body = JSON.parse(body); } catch { body = null; }
     }
 
     if (Array.isArray(payload)) return payload;
@@ -99,12 +96,7 @@ export default async function () {
   function getShortName(value) {
     const v = String(value || "").trim();
     if (!v) return "";
-
-    if (v.includes(".")) {
-      return v.split(".")[0].trim();
-    }
-
-    return v;
+    return v.includes(".") ? v.split(".")[0].trim() : v;
   }
 
   function normalizeName(value) {
@@ -120,10 +112,7 @@ export default async function () {
     const shortName = getShortName(ci);
 
     if (ci) aliases.push(ci);
-
-    if (shortName && normalizeName(shortName) !== normalizeName(ci)) {
-      aliases.push(shortName);
-    }
+    if (shortName && normalizeName(shortName) !== normalizeName(ci)) aliases.push(shortName);
 
     return [...new Set(aliases.filter(Boolean))];
   }
@@ -139,15 +128,95 @@ export default async function () {
     return false;
   }
 
-  function getSlaValue(row) {
+  function parseServiceNowDate(value) {
+    const raw = String(value || "").trim();
+    if (!raw || raw.toUpperCase() === "N/A") return null;
+
+    const normalized = raw
+      .replace(/\//g, "-")
+      .replace(" ", "T");
+
+    const candidates = [
+      raw,
+      normalized,
+      normalized.endsWith("Z") ? normalized : `${normalized}Z`
+    ];
+
+    for (const c of candidates) {
+      const d = new Date(c);
+      if (!Number.isNaN(d.getTime())) return d;
+    }
+
+    return null;
+  }
+
+  function formatEt(date) {
+    if (!(date instanceof Date) || Number.isNaN(date.getTime())) return "N/A";
+    return new Intl.DateTimeFormat("en-US", {
+      timeZone: "America/New_York",
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+      hour12: false
+    }).format(date).replace(",", "") + " ET";
+  }
+
+  function getBackupAssignmentTime(row) {
     return firstNonBlank(
-      getField(row, "u_sla"),
-      getField(row, "u_sla_due"),
-      getField(row, "sla"),
+      getField(row, "u_backup_assignment_time"),
+      getField(row, "u_assigned_to_backup_on"),
+      getField(row, "u_assignment_group_assigned_on"),
+      getField(row, "assignment_group_assigned_on")
+    ) || "N/A";
+  }
+
+  function getServiceNowSlaDue(row) {
+    return firstNonBlank(
       getField(row, "sla_due"),
       getField(row, "due_date"),
-      getField(row, "made_sla")
+      getField(row, "u_sla_due")
     ) || "N/A";
+  }
+
+  function getMadeSla(row) {
+    return firstNonBlank(getField(row, "made_sla")) || "N/A";
+  }
+
+  function calculateSla(row) {
+    const serviceNowDueRaw = getServiceNowSlaDue(row);
+    const serviceNowDue = parseServiceNowDate(serviceNowDueRaw);
+
+    let dueDate = serviceNowDue;
+    let slaBasis = serviceNowDue ? "ServiceNow SLA Due" : "N/A";
+
+    const assignmentTimeRaw = getBackupAssignmentTime(row);
+    const assignmentTime = parseServiceNowDate(assignmentTimeRaw);
+
+    if (!dueDate && assignmentTime) {
+      dueDate = new Date(assignmentTime.getTime() + TWO_DAYS_MS);
+      slaBasis = "Backup Assignment + 2 Days";
+    }
+
+    let slaDue = dueDate ? formatEt(dueDate) : (serviceNowDueRaw !== "N/A" ? serviceNowDueRaw : "N/A");
+    let slaStatus = "SLA Missing";
+
+    if (dueDate) {
+      slaStatus = new Date().getTime() > dueDate.getTime() ? "Breached SLA" : "Within SLA";
+    } else {
+      const madeSla = String(getMadeSla(row)).trim().toLowerCase();
+      if (["true", "yes", "1"].includes(madeSla)) slaStatus = "Within SLA";
+      else if (["false", "no", "0"].includes(madeSla)) slaStatus = "Breached SLA";
+    }
+
+    return {
+      slaDue,
+      slaStatus,
+      slaBasis,
+      assignedToBackupOn: assignmentTime ? formatEt(assignmentTime) : assignmentTimeRaw
+    };
   }
 
   const dtskRows = extractRows(snowResult);
@@ -155,27 +224,11 @@ export default async function () {
 
   for (const row of dtskRows) {
 
-    const sysId = firstNonBlank(
-      getField(row, "sys_id"),
-      getField(row, "sysId")
-    );
-
-    const dtsk = firstNonBlank(
-      getField(row, "number")
-    ) || "N/A";
-
-    const shortDescription = firstNonBlank(
-      getField(row, "short_description")
-    ) || "N/A";
-
-    const state = firstNonBlank(
-      getField(row, "state")
-    ) || "N/A";
-
-    const createdOn = firstNonBlank(
-      getField(row, "sys_created_on"),
-      getField(row, "opened_at")
-    ) || "N/A";
+    const sysId = firstNonBlank(getField(row, "sys_id"), getField(row, "sysId"));
+    const dtsk = firstNonBlank(getField(row, "number")) || "N/A";
+    const shortDescription = firstNonBlank(getField(row, "short_description")) || "N/A";
+    const state = firstNonBlank(getField(row, "state")) || "N/A";
+    const createdOn = firstNonBlank(getField(row, "sys_created_on"), getField(row, "opened_at")) || "N/A";
 
     const assignmentGroup = firstNonBlank(
       getField(row, "assignment_group.name"),
@@ -186,8 +239,6 @@ export default async function () {
       getField(row, "assigned_to.name"),
       getField(row, "assigned_to_name")
     ) || "N/A";
-
-    const sla = getSlaValue(row);
 
     const decomRequest = firstNonBlank(
       getField(row, "decom_request.number"),
@@ -203,6 +254,7 @@ export default async function () {
 
     const aliases = buildAliases(ciName);
     const ciValid = !isBadCiName(ciName);
+    const sla = calculateSla(row);
 
     workItems.push({
       sysId,
@@ -214,7 +266,10 @@ export default async function () {
       assignedTo,
       assignmentGroup,
       assignmentAction: assignedTo === "N/A" ? "Please assign" : "Assigned",
-      sla,
+      slaDue: sla.slaDue,
+      slaStatus: sla.slaStatus,
+      slaBasis: sla.slaBasis,
+      assignedToBackupOn: sla.assignedToBackupOn,
       createdOn,
       state,
       shortDescription
@@ -227,8 +282,9 @@ export default async function () {
     invalidCiCount: workItems.filter(x => !x.ciValid).length,
     assignedCount: workItems.filter(x => x.assignmentAction === "Assigned").length,
     unassignedCount: workItems.filter(x => x.assignmentAction === "Please assign").length,
-    slaPopulatedCount: workItems.filter(x => x.sla && x.sla !== "N/A").length,
-    slaMissingCount: workItems.filter(x => !x.sla || x.sla === "N/A").length
+    withinSlaCount: workItems.filter(x => x.slaStatus === "Within SLA").length,
+    breachedSlaCount: workItems.filter(x => x.slaStatus === "Breached SLA").length,
+    slaMissingCount: workItems.filter(x => x.slaStatus === "SLA Missing").length
   };
 
   console.log("==== DTSK PREPARE WORK ITEMS SUMMARY ====");
@@ -237,8 +293,5 @@ export default async function () {
   console.log("==== WORK ITEMS ====");
   console.log(JSON.stringify(workItems, null, 2));
 
-  return {
-    workItems,
-    summary
-  };
+  return { workItems, summary };
 }
