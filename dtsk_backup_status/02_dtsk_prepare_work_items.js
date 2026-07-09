@@ -164,58 +164,26 @@ export default async function () {
     }).format(date).replace(",", "") + " ET";
   }
 
-  function getBackupAssignmentTime(row) {
-    return firstNonBlank(
-      getField(row, "u_backup_assignment_time"),
-      getField(row, "u_assigned_to_backup_on"),
-      getField(row, "u_assignment_group_assigned_on"),
-      getField(row, "assignment_group_assigned_on")
-    ) || "N/A";
-  }
+  function calculateSlaFromBackupGroupStart(backupGroupStartRaw) {
+    const startDate = parseServiceNowDate(backupGroupStartRaw);
 
-  function getServiceNowSlaDue(row) {
-    return firstNonBlank(
-      getField(row, "sla_due"),
-      getField(row, "due_date"),
-      getField(row, "u_sla_due")
-    ) || "N/A";
-  }
-
-  function getMadeSla(row) {
-    return firstNonBlank(getField(row, "made_sla")) || "N/A";
-  }
-
-  function calculateSla(row) {
-    const serviceNowDueRaw = getServiceNowSlaDue(row);
-    const serviceNowDue = parseServiceNowDate(serviceNowDueRaw);
-
-    let dueDate = serviceNowDue;
-    let slaBasis = serviceNowDue ? "ServiceNow SLA Due" : "N/A";
-
-    const assignmentTimeRaw = getBackupAssignmentTime(row);
-    const assignmentTime = parseServiceNowDate(assignmentTimeRaw);
-
-    if (!dueDate && assignmentTime) {
-      dueDate = new Date(assignmentTime.getTime() + TWO_DAYS_MS);
-      slaBasis = "Backup Assignment + 2 Days";
+    if (!startDate) {
+      return {
+        slaStart: "N/A",
+        slaDue: "N/A",
+        slaStatus: "SLA Missing",
+        slaBasis: "Backup Group Start + 2 Days"
+      };
     }
 
-    let slaDue = dueDate ? formatEt(dueDate) : (serviceNowDueRaw !== "N/A" ? serviceNowDueRaw : "N/A");
-    let slaStatus = "SLA Missing";
-
-    if (dueDate) {
-      slaStatus = new Date().getTime() > dueDate.getTime() ? "Breached SLA" : "Within SLA";
-    } else {
-      const madeSla = String(getMadeSla(row)).trim().toLowerCase();
-      if (["true", "yes", "1"].includes(madeSla)) slaStatus = "Within SLA";
-      else if (["false", "no", "0"].includes(madeSla)) slaStatus = "Breached SLA";
-    }
+    const dueDate = new Date(startDate.getTime() + TWO_DAYS_MS);
+    const nowMs = Date.now();
 
     return {
-      slaDue,
-      slaStatus,
-      slaBasis,
-      assignedToBackupOn: assignmentTime ? formatEt(assignmentTime) : assignmentTimeRaw
+      slaStart: formatEt(startDate),
+      slaDue: formatEt(dueDate),
+      slaStatus: nowMs > dueDate.getTime() ? "Breached SLA" : "Within SLA",
+      slaBasis: "Backup Group Start + 2 Days"
     };
   }
 
@@ -228,7 +196,17 @@ export default async function () {
     const dtsk = firstNonBlank(getField(row, "number")) || "N/A";
     const shortDescription = firstNonBlank(getField(row, "short_description")) || "N/A";
     const state = firstNonBlank(getField(row, "state")) || "N/A";
-    const createdOn = firstNonBlank(getField(row, "sys_created_on"), getField(row, "opened_at")) || "N/A";
+
+    // Current report-only model: DTSKs are searched from the Backup group queue.
+    // Therefore sys_created_on is treated as the timestamp the DTSK came to the Backup group.
+    // If ServiceNow allows reassignment into Backup after creation, replace this with the real group-assignment timestamp.
+    const backupGroupStartRaw = firstNonBlank(
+      getField(row, "sys_created_on"),
+      getField(row, "opened_at")
+    ) || "N/A";
+
+    const createdOn = backupGroupStartRaw;
+    const sla = calculateSlaFromBackupGroupStart(backupGroupStartRaw);
 
     const assignmentGroup = firstNonBlank(
       getField(row, "assignment_group.name"),
@@ -254,7 +232,6 @@ export default async function () {
 
     const aliases = buildAliases(ciName);
     const ciValid = !isBadCiName(ciName);
-    const sla = calculateSla(row);
 
     workItems.push({
       sysId,
@@ -266,10 +243,10 @@ export default async function () {
       assignedTo,
       assignmentGroup,
       assignmentAction: assignedTo === "N/A" ? "Please assign" : "Assigned",
+      slaStart: sla.slaStart,
       slaDue: sla.slaDue,
       slaStatus: sla.slaStatus,
       slaBasis: sla.slaBasis,
-      assignedToBackupOn: sla.assignedToBackupOn,
       createdOn,
       state,
       shortDescription
