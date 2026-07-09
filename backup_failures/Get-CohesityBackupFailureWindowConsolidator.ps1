@@ -283,9 +283,52 @@ function Get-FailedAttempts($RunObject) {
     try { @(Get-Prop (Get-Prop $RunObject "localSnapshotInfo" $null) "failedAttempts" @()) } catch { @() }
 }
 
+function Get-FailureMessage($Attempts) {
+    $msgs = @()
+    foreach ($a in @($Attempts)) {
+        $m = Clean (Get-Prop $a "message" "")
+        if ($m) { $msgs += $m }
+    }
+    ($msgs -join " | ")
+}
+
+function Get-ObjectFailureEvidence($RunObject) {
+    if ($null -eq $RunObject -or $null -eq (Get-Prop $RunObject "object" $null)) {
+        return [pscustomobject]@{ HasFailure = $false; Message = "" }
+    }
+
+    $lsi = Get-Prop $RunObject "localSnapshotInfo" $null
+    $snapshotInfo = Get-Prop $lsi "snapshotInfo" $null
+    $attempts = Get-FailedAttempts $RunObject
+
+    $localStatus = Clean (Get-Prop $lsi "status" "")
+    $snapshotStatus = Clean (Get-Prop $snapshotInfo "status" "")
+    $snapshotError = Clean (Get-Prop $snapshotInfo "error" "")
+    $localError = Clean (Get-Prop $lsi "error" "")
+    $localMessage = Clean (Get-Prop $lsi "message" "")
+
+    $msg = Get-FailureMessage $attempts
+    if (!$msg) { $msg = $snapshotError }
+    if (!$msg) { $msg = $localError }
+    if (!$msg) { $msg = $localMessage }
+
+    $hasFailure =
+        ($attempts.Count -gt 0) -or
+        ($localStatus -in @("Failed", "kFailed")) -or
+        ($snapshotStatus -in @("Failed", "kFailed")) -or
+        $snapshotError -or
+        $localError
+
+    [pscustomobject]@{
+        HasFailure = [bool]$hasFailure
+        Message = Clean $msg
+    }
+}
+
 function Is-SuccessObject($RunObject) {
-    if ($null -eq $RunObject -or $null -eq (Get-Prop $RunObject "localSnapshotInfo" $null)) { return $false }
-    (Get-FailedAttempts $RunObject).Count -eq 0
+    if ($null -eq $RunObject -or $null -eq (Get-Prop $RunObject "object" $null)) { return $false }
+    $evidence = Get-ObjectFailureEvidence $RunObject
+    return (-not $evidence.HasFailure)
 }
 
 function Get-ObjectKey($RunObject, [string]$ClusterId, [string]$EnvironmentLabel, [string]$ProtectionGroupId, [string]$ProtectionGroupName) {
@@ -302,15 +345,6 @@ function Get-ObjectKey($RunObject, [string]$ClusterId, [string]$EnvironmentLabel
 
 function Get-RunLevelKey([string]$ClusterId, [string]$EnvironmentLabel, [string]$ProtectionGroupId, [string]$ProtectionGroupName, [string]$RunType) {
     "$ClusterId|$EnvironmentLabel|$ProtectionGroupId|RUNLEVEL|$RunType|$ProtectionGroupName"
-}
-
-function Get-FailureMessage($Attempts) {
-    $msgs = @()
-    foreach ($a in @($Attempts)) {
-        $m = Clean (Get-Prop $a "message" "")
-        if ($m) { $msgs += $m }
-    }
-    ($msgs -join " | ")
 }
 
 function Add-SuccessIndex([hashtable]$Index, [string]$Key, [int64]$Usecs, [string]$Status) {
@@ -499,8 +533,6 @@ function Collect-CurrentObjectFailures($Incident, $Window, $Clusters, [string]$A
             $before = $rows.Count
             $pgsChecked = 0
             $pgs = Get-ProtectionGroups -Cluster $cluster -Env $env -ApiKey $ApiKey
-            $filterSet = @($env.Filter.Split(",") | ForEach-Object { $_.Trim() } | Where-Object { $_ })
-            $isNas = $env.Label -in @("GenericNas", "Isilon")
 
             foreach ($pg in $pgs) {
                 $pgsChecked++
@@ -543,28 +575,36 @@ function Collect-CurrentObjectFailures($Incident, $Window, $Clusters, [string]$A
                             if (!$info) { continue }
                             $status = Clean (Get-Prop $info "status" "")
                             $effectiveUsecs = Get-RunEffectiveUsecs $run
+
                             if (Is-SuccessStatus $status) {
                                 [void]$cleared.Add($runLevelKey)
                                 Add-SuccessIndex $successIndex $runLevelKey $effectiveUsecs $status
                                 continue
                             }
+
                             if (!(Is-FailedStatus $status)) { continue }
                             if ($cleared.Contains($runLevelKey)) { continue }
+
                             $startUsecs = To-Int64 (Get-Prop $info "startTimeUsecs" 0)
                             $endUsecs = To-Int64 (Get-Prop $info "endTimeUsecs" 0)
                             $msg = Clean (Get-Prop $info "messages" "")
                             if (!$msg) { $msg = "RemoteAdapter run marked Failed" }
+
                             $rowStatus = "NewlyFailedThisCheck"
                             if ((Is-RunningStatus $latestRunStatus) -and $latestRunUsecs -gt $effectiveUsecs) { $rowStatus = "RunningAtLatestCheck" }
                             elseif ((Is-CancelledStatus $latestRunStatus) -and $latestRunUsecs -gt $effectiveUsecs) { $rowStatus = "CancelledAfterFailure" }
+
                             $objectName = Clean $ra.Object
                             if (!$objectName) { $objectName = "RemoteAdapter" }
+
                             $runKey = "$clusterId|$pgId|$runLevelKey|$runType|$effectiveUsecs"
                             Add-FailureRunKey $failedKeysByKey $runLevelKey $runKey
+
                             if (!$latestByKey.ContainsKey($runLevelKey)) {
                                 $latestByKey[$runLevelKey] = New-TrackingRow -IncidentNumber $Incident -Window $Window -ClusterName $clusterName -ClusterId $clusterId -Env $env -ProtectionGroup $pg -ObjectKey $runLevelKey -HostName (Clean $ra.Host) -ObjectName $objectName -ObjectType "kRemoteAdapter" -RunType $runType -StartUsecs $startUsecs -EndUsecs $endUsecs -Message $msg -Status $rowStatus -LatestRunStatus $latestRunStatus -LatestRunUsecs $latestRunUsecs -FailedRunKeys @($runKey)
                             }
                         }
+
                         foreach ($k in $latestByKey.Keys) {
                             if ($failedKeysByKey.ContainsKey($k)) { Update-RowFailureFields $latestByKey[$k] @($failedKeysByKey[$k]) }
                             $rows += $latestByKey[$k]
@@ -575,17 +615,22 @@ function Collect-CurrentObjectFailures($Incident, $Window, $Clusters, [string]$A
                     foreach ($run in $runsForType) {
                         $info = Get-FirstLocalBackupInfo $run
                         if (!$info) { continue }
+
                         $status = Clean (Get-Prop $info "status" "")
                         $startUsecs = To-Int64 (Get-Prop $info "startTimeUsecs" 0)
                         $endUsecs = To-Int64 (Get-Prop $info "endTimeUsecs" 0)
                         $effectiveUsecs = if ($endUsecs -gt 0) { $endUsecs } else { $startUsecs }
-                        $objectsAll = @(As-Array (Get-Prop $run "objects" @()) | Where-Object { $_ -and (Get-Prop $_ "object" $null) -and (Get-Prop $_ "localSnapshotInfo" $null) })
+
+                        $objectsAll = @(As-Array (Get-Prop $run "objects" @()) | Where-Object {
+                            $_ -and (Get-Prop $_ "object" $null)
+                        })
 
                         if (Is-SuccessStatus $status) {
                             if ($objectsAll.Count -eq 0) {
                                 [void]$cleared.Add($runLevelKey)
                                 Add-SuccessIndex $successIndex $runLevelKey $effectiveUsecs $status
                             }
+
                             foreach ($ob in $objectsAll) {
                                 if (Is-SuccessObject $ob) {
                                     $ck = Get-ObjectKey $ob $clusterId $env.Label $pgId $pgName
@@ -600,48 +645,38 @@ function Collect-CurrentObjectFailures($Incident, $Window, $Clusters, [string]$A
 
                         if (!(Is-FailedStatus $status)) { continue }
 
-                        $candidateObjects = @()
-                        if ($isNas) {
-                            $candidateObjects = @($objectsAll | Where-Object { (Get-FailedAttempts $_).Count -gt 0 })
-                        } else {
-                            $candidateObjects = @($objectsAll | Where-Object {
-                                $obj = Get-Prop $_ "object" $null
-                                $objType = Clean (Get-Prop $obj "objectType" "")
-                                $objEnv = Clean (Get-Prop $obj "environment" "")
-                                $objType -eq $env.TargetObjectType -and (!$objEnv -or ($filterSet -contains $objEnv))
-                            })
-                            if ($env.ParentHostNeeded) {
-                                $hostObjects = @($objectsAll | Where-Object {
-                                    $obj = Get-Prop $_ "object" $null
-                                    ((Clean (Get-Prop $obj "objectType" "")) -eq "kHost" -or (Clean (Get-Prop $obj "environment" "")) -eq "kPhysical") -and (Get-FailedAttempts $_).Count -gt 0
-                                })
-                                $candidateObjects += $hostObjects
-                            }
-                        }
+                        $candidateObjects = @($objectsAll | Where-Object {
+                            $evidence = Get-ObjectFailureEvidence $_
+                            $evidence.HasFailure
+                        })
 
                         $foundObjectFailure = $false
+
                         foreach ($ob in $candidateObjects) {
                             $obj = Get-Prop $ob "object" $null
                             $ok = Get-ObjectKey $ob $clusterId $env.Label $pgId $pgName
                             if (!$ok -or $cleared.Contains($ok)) { continue }
-                            $attempts = Get-FailedAttempts $ob
-                            $hasAttempts = $attempts.Count -gt 0
-                            if (!$hasAttempts -and $env.Label -ne "Physical") { continue }
-                            $msg = Get-FailureMessage $attempts
+
+                            $evidence = Get-ObjectFailureEvidence $ob
+                            if (!$evidence.HasFailure) { continue }
+
+                            $msg = Clean $evidence.Message
                             if (!$msg) { $msg = "Run marked Failed; object returned without failedAttempts details" }
 
                             $objType = Clean (Get-Prop $obj "objectType" "")
                             $objName = Clean (Get-Prop $obj "name" "")
                             $hostName = ""
+
                             if ($env.ParentHostNeeded) {
                                 $sourceId = Clean (Get-Prop $obj "sourceId" "")
-                                if ($sourceId -and $objectNameById.ContainsKey($sourceId)) { $hostName = $objectNameById[$sourceId] }
+                                if ($sourceId -and $objectNameById.ContainsKey($sourceId)) {
+                                    $hostName = $objectNameById[$sourceId]
+                                }
+
                                 if ($objType -eq "kHost" -or (Clean (Get-Prop $obj "environment" "")) -eq "kPhysical") {
                                     $hostName = $objName
-                                    $objName = "No DBs Found (Host-Level Failure)"
                                 }
                             }
-                            if (!$objName) { continue }
 
                             $rowStatus = "NewlyFailedThisCheck"
                             if ((Is-RunningStatus $latestRunStatus) -and $latestRunUsecs -gt $effectiveUsecs) { $rowStatus = "RunningAtLatestCheck" }
@@ -649,20 +684,31 @@ function Collect-CurrentObjectFailures($Incident, $Window, $Clusters, [string]$A
 
                             $runKey = "$clusterId|$pgId|$ok|$runType|$effectiveUsecs"
                             Add-FailureRunKey $failedKeysByKey $ok $runKey
+
                             if (!$latestByKey.ContainsKey($ok)) {
                                 $latestByKey[$ok] = New-TrackingRow -IncidentNumber $Incident -Window $Window -ClusterName $clusterName -ClusterId $clusterId -Env $env -ProtectionGroup $pg -ObjectKey $ok -HostName $hostName -ObjectName $objName -ObjectType $objType -RunType $runType -StartUsecs $startUsecs -EndUsecs $endUsecs -Message $msg -Status $rowStatus -LatestRunStatus $latestRunStatus -LatestRunUsecs $latestRunUsecs -FailedRunKeys @($runKey)
                             }
+
                             $foundObjectFailure = $true
                         }
 
-                        if (!$foundObjectFailure -and $objectsAll.Count -eq 0 -and !$cleared.Contains($runLevelKey)) {
+                        if (!$foundObjectFailure -and !$cleared.Contains($runLevelKey)) {
                             $msg = Clean (Get-Prop $info "messages" "")
-                            if (!$msg) { $msg = "Run marked failed; no object-level details returned" }
+                            if (!$msg) {
+                                if ($objectsAll.Count -eq 0) {
+                                    $msg = "Run marked failed; no object-level details returned"
+                                } else {
+                                    $msg = "Run marked failed; object details returned without failed object evidence"
+                                }
+                            }
+
                             $rowStatus = "UnknownNeedsReview"
                             if ((Is-RunningStatus $latestRunStatus) -and $latestRunUsecs -gt $effectiveUsecs) { $rowStatus = "RunningAtLatestCheck" }
                             elseif ((Is-CancelledStatus $latestRunStatus) -and $latestRunUsecs -gt $effectiveUsecs) { $rowStatus = "CancelledAfterFailure" }
+
                             $runKey = "$clusterId|$pgId|$runLevelKey|$runType|$effectiveUsecs"
                             Add-FailureRunKey $failedKeysByKey $runLevelKey $runKey
+
                             if (!$latestByKey.ContainsKey($runLevelKey)) {
                                 $latestByKey[$runLevelKey] = New-TrackingRow -IncidentNumber $Incident -Window $Window -ClusterName $clusterName -ClusterId $clusterId -Env $env -ProtectionGroup $pg -ObjectKey $runLevelKey -HostName "" -ObjectName "" -ObjectType "" -RunType $runType -StartUsecs $startUsecs -EndUsecs $endUsecs -Message $msg -Status $rowStatus -LatestRunStatus $latestRunStatus -LatestRunUsecs $latestRunUsecs -FailedRunKeys @($runKey)
                             }
@@ -670,11 +716,14 @@ function Collect-CurrentObjectFailures($Incident, $Window, $Clusters, [string]$A
                     }
 
                     foreach ($k in $latestByKey.Keys) {
-                        if ($failedKeysByKey.ContainsKey($k)) { Update-RowFailureFields $latestByKey[$k] @($failedKeysByKey[$k]) }
+                        if ($failedKeysByKey.ContainsKey($k)) {
+                            Update-RowFailureFields $latestByKey[$k] @($failedKeysByKey[$k])
+                        }
                         $rows += $latestByKey[$k]
                     }
                 }
             }
+
             $envFailures = $rows.Count - $before
             Write-Host ("  {0,-13}: PGs checked: {1} | failures: {2}" -f $env.Label, $pgsChecked, $envFailures)
         }
