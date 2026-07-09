@@ -139,6 +139,17 @@ export default async function () {
     return false;
   }
 
+  function getSlaValue(row) {
+    return firstNonBlank(
+      getField(row, "u_sla"),
+      getField(row, "u_sla_due"),
+      getField(row, "sla"),
+      getField(row, "sla_due"),
+      getField(row, "due_date"),
+      getField(row, "made_sla")
+    ) || "N/A";
+  }
+
   const dtskRows = extractRows(snowResult);
   const workItems = [];
 
@@ -176,6 +187,8 @@ export default async function () {
       getField(row, "assigned_to_name")
     ) || "N/A";
 
+    const sla = getSlaValue(row);
+
     const decomRequest = firstNonBlank(
       getField(row, "decom_request.number"),
       getField(row, "decom_request_number")
@@ -201,6 +214,7 @@ export default async function () {
       assignedTo,
       assignmentGroup,
       assignmentAction: assignedTo === "N/A" ? "Please assign" : "Assigned",
+      sla,
       createdOn,
       state,
       shortDescription
@@ -212,7 +226,9 @@ export default async function () {
     validCiCount: workItems.filter(x => x.ciValid).length,
     invalidCiCount: workItems.filter(x => !x.ciValid).length,
     assignedCount: workItems.filter(x => x.assignmentAction === "Assigned").length,
-    unassignedCount: workItems.filter(x => x.assignmentAction === "Please assign").length
+    unassignedCount: workItems.filter(x => x.assignmentAction === "Please assign").length,
+    slaPopulatedCount: workItems.filter(x => x.sla && x.sla !== "N/A").length,
+    slaMissingCount: workItems.filter(x => !x.sla || x.sla === "N/A").length
   };
 
   console.log("==== DTSK PREPARE WORK ITEMS SUMMARY ====");
