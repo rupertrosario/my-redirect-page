@@ -1,11 +1,42 @@
-# Cohesity Backup Failures - Untested Validation Instructions
+# Cohesity Backup Failures - Current Validation Instructions
 
-## Important status
+## Status
 
-This code was pushed but has not been validated against Helios from ChatGPT.
-Validation must be performed on the PowerShell host.
+This code was pushed to GitHub, but it has not been validated against Helios from ChatGPT. Validation must be done on the PowerShell host.
 
-Do not treat the report as production-ready until these checks pass.
+Do not treat the report as production-ready until the checks below pass.
+
+## Current latest position
+
+Use the wrapper for normal operation and for the main test path.
+
+```text
+Normal script to run:
+backup_failures/Cohesity_Backup_Failure_INC_Status_Update.ps1
+```
+
+The wrapper now does this:
+
+```text
+1. Calls Get-CohesityBackupFailureWindowConsolidator.ps1
+2. Collector performs Cohesity GET-only collection
+3. New window / new INC uses Baseline scan with 30 runs
+4. Same window / same INC uses Incremental scan with 15 runs
+5. Calls Format-CohesityBackupFailureReport.ps1
+6. Formatter rewrites operator-facing CSVs and worknotes_summary.txt
+```
+
+The formatter is post-processing only:
+
+```text
+- Does not call Cohesity
+- Does not change state.json
+- Keeps raw CSV copies as *_raw.csv
+- Renames Change to StatusChange in operator-facing CSVs
+- Removes technical columns from operator-facing incident_lifecycle.csv
+- Adds Running / In-progress PGs count in worknotes_summary.txt
+- Adds Cancelled Backup PGs count in worknotes_summary.txt
+```
 
 ## Repository context
 
@@ -15,94 +46,32 @@ Branch: Cohesity_Automations
 Folder: backup_failures/
 ```
 
-## Files changed
-
-### Main collector
-
-```text
-backup_failures/Get-CohesityBackupFailureWindowConsolidator.ps1
-```
-
-Commit:
-
-```text
-1f70fba67e63ca8143d1f54efb1b209ca4067557
-```
-
-Purpose:
-
-```text
-Implemented daily baseline + incremental object-level backup failure tracking.
-Baseline = 30 runs.
-Incremental = 15 runs.
-Object-level is source of truth.
-RemoteAdapter excluded.
-State backup / lock / atomic state write added.
-Incomplete API collection marked as rerun required.
-```
-
-### Wrapper
+## Current files
 
 ```text
 backup_failures/Cohesity_Backup_Failure_INC_Status_Update.ps1
-```
-
-Commits:
-
-```text
-15ebce303819998d8e6f2a0946eb5d6c66f0c539
-8ac82207fbb8b401caa6fa9b01e981be4aefe3b7
-```
-
-Purpose:
-
-```text
-Default NumRuns changed from 20 to 15.
-Wrapper text updated to say baseline 30 happens in collector.
-Wrapper now runs the formatter after collector completes.
-No collection logic belongs in the wrapper.
-```
-
-### Formatter
-
-```text
+backup_failures/Get-CohesityBackupFailureWindowConsolidator.ps1
 backup_failures/Format-CohesityBackupFailureReport.ps1
+backup_failures/UNTESTED_VALIDATION_INSTRUCTIONS.md
 ```
 
-Commit:
+## Latest relevant commits
 
 ```text
+1f70fba67e63ca8143d1f54efb1b209ca4067557
+Implement daily baseline and incremental object failure tracking
+
+15ebce303819998d8e6f2a0946eb5d6c66f0c539
+Align backup failure wrapper with baseline incremental collector
+
 7336fd59dddc53d0225523d9b85ebd8ac3c7369a
-```
+Add backup failure report formatter
 
-Purpose:
+8ac82207fbb8b401caa6fa9b01e981be4aefe3b7
+Run backup failure report formatter from wrapper
 
-```text
-Post-processing only.
-Does not call Cohesity.
-Does not change state.json.
-Keeps raw collector CSVs as *_raw.csv.
-Rewrites operator-facing CSVs with cleaner columns.
-Renames Change to StatusChange.
-Removes technical columns from operator-facing lifecycle CSV.
-Rewrites worknotes_summary.txt with failures, recovered objects, and concise running/cancelled counts.
-```
-
-## Validation principle
-
-Use a test output root first.
-Do not start with the production output folder.
-
-Test root:
-
-```text
-X:\PowerShell\Data\Cohesity\BackupFailureWindow_Test
-```
-
-Production root:
-
-```text
-X:\PowerShell\Data\Cohesity\BackupFailureWindow
+15e28ccb358ef073fa34aba511dc41a6972b017a
+Update validation instructions for formatter flow
 ```
 
 ## 1. Pull latest code
@@ -115,7 +84,7 @@ git checkout Cohesity_Automations
 git pull --ff-only origin Cohesity_Automations
 ```
 
-## 2. Confirm latest code is present
+## 2. Confirm latest files are present
 
 ```powershell
 cd X:\PowerShell\Cohesity_API_Scripts\backup_failures
@@ -130,13 +99,7 @@ Select-String .\Format-CohesityBackupFailureReport.ps1 -Pattern `
 "StatusChange","Running / In-progress PGs","Cancelled Backup PGs","incident_lifecycle_raw.csv"
 ```
 
-Expected:
-
-```text
-Matches should appear from all three files.
-```
-
-If no matches appear, stop. You are not testing the latest pushed code.
+Expected: matches from all three files.
 
 ## 3. Syntax check
 
@@ -156,49 +119,42 @@ $formatter = ".\backup_failures\Format-CohesityBackupFailureReport.ps1"
 "Formatter syntax OK"
 ```
 
-If this fails, stop and fix syntax first.
+If this fails, stop.
 
-## 4. Safe baseline test with direct collector plus formatter
+## 4. Safe test command
 
-Do not use the production folder yet.
+Use the wrapper with a test output root. This is the preferred test because it exercises the collector and formatter together.
 
 ```powershell
 cd X:\PowerShell\Cohesity_API_Scripts\backup_failures
 
-.\Get-CohesityBackupFailureWindowConsolidator.ps1 `
-  -IncidentNumber "INC999999" `
-  -OutputRoot "X:\PowerShell\Data\Cohesity\BackupFailureWindow_Test" `
+.\Cohesity_Backup_Failure_INC_Status_Update.ps1 `
+  -IncidentNumber "INC999998" `
+  -OutputRoot "X:\PowerShell\Data\Cohesity\BackupFailureWindow_WrapperTest" `
   -RequestTimeoutSec 120
 ```
 
-Expected first test behavior:
+Expected on first run for this test INC/window:
 
 ```text
 RunMode = Baseline
 Scan NumRuns = 30
+Formatter runs after collector
 ```
 
-Because this is a new test incident/state folder.
-
-Now run the formatter manually for the direct collector test:
+## 5. Locate test output
 
 ```powershell
-$latest = Get-ChildItem "X:\PowerShell\Data\Cohesity\BackupFailureWindow_Test" -Directory |
+$latest = Get-ChildItem "X:\PowerShell\Data\Cohesity\BackupFailureWindow_WrapperTest" -Directory |
   Where-Object { $_.Name -ne "Archive" } |
   Sort-Object LastWriteTime -Descending |
   Select-Object -First 1
 
-.\Format-CohesityBackupFailureReport.ps1 -ReportFolder $latest.FullName
-```
-
-## 5. Locate latest test output
-
-```powershell
 "Latest folder: $($latest.FullName)"
 Get-ChildItem $latest.FullName
 ```
 
-Expected files should include most of these:
+Expected files:
 
 ```text
 current_failures.csv
@@ -214,9 +170,43 @@ state.previous.json
 no_object_evidence_review.csv
 ```
 
-Empty CSVs with headers are acceptable if there are no matching rows.
+## 6. Validate worknotes
 
-## 6. Validate operator-facing lifecycle CSV columns
+```powershell
+Get-Content (Join-Path $latest.FullName "worknotes_summary.txt")
+```
+
+Expected content:
+
+```text
+Summary:
+Active Failures: <count>
+Recovered Today: <count>
+Running / In-progress PGs: <count>
+Cancelled Backup PGs: <count>
+
+Failure Section:
+...
+
+Success Section:
+...
+```
+
+If running or cancelled count is greater than zero, expected note:
+
+```text
+Please check incident_lifecycle.csv and continue monitoring running/cancelled backups.
+```
+
+Do not expect the sentence:
+
+```text
+These are not counted as failures or success.
+```
+
+That sentence was intentionally removed.
+
+## 7. Validate operator-facing lifecycle columns
 
 ```powershell
 Import-Csv (Join-Path $latest.FullName "incident_lifecycle.csv") |
@@ -225,7 +215,7 @@ Import-Csv (Join-Path $latest.FullName "incident_lifecycle.csv") |
   Select -ExpandProperty Name
 ```
 
-Expected operator-facing lifecycle columns:
+Expected columns:
 
 ```text
 IncidentNumber
@@ -248,7 +238,7 @@ FailedRunCount
 Message
 ```
 
-These should not be present in operator-facing `incident_lifecycle.csv`:
+These technical columns should not be in operator-facing incident_lifecycle.csv:
 
 ```text
 WindowKey
@@ -259,14 +249,14 @@ EnvironmentFilter
 FailedRunKeys
 ```
 
-Those technical fields should be preserved in:
+They should remain available in:
 
 ```text
 incident_lifecycle_raw.csv
 state.json
 ```
 
-## 7. Validate current failures are object-level
+## 8. Validate active failures
 
 ```powershell
 Import-Csv (Join-Path $latest.FullName "current_failures.csv") |
@@ -279,20 +269,12 @@ Pass condition:
 ```text
 ObjectName is populated for real object failures.
 ProtectionGroup is context only.
-No fake PG-as-object row exists.
+No fake PG-as-object failure row exists.
 RemoteAdapter does not appear.
 Same object failed multiple times in one day appears once with latest failure details.
 ```
 
-Fail condition:
-
-```text
-PG-only rows are shown as object failures.
-ObjectName is blank for real object failures.
-RemoteAdapter appears.
-```
-
-## 8. Validate cleared objects
+## 9. Validate recovered objects
 
 ```powershell
 Import-Csv (Join-Path $latest.FullName "cleared_by_success.csv") |
@@ -303,42 +285,10 @@ Import-Csv (Join-Path $latest.FullName "cleared_by_success.csv") |
 Pass condition:
 
 ```text
-Only previously failed objects with newer same ObjectKey success are shown here.
+Only previously failed objects with newer same-object success are shown here.
 ```
 
-Fail condition:
-
-```text
-Objects are cleared because PG succeeded but same ObjectKey did not succeed.
-```
-
-## 9. Validate worknotes summary
-
-```powershell
-Get-Content (Join-Path $latest.FullName "worknotes_summary.txt")
-```
-
-Pass condition:
-
-```text
-Contains Summary.
-Contains Active Failures count.
-Contains Recovered Today count.
-Contains Running / In-progress PGs count.
-Contains Cancelled Backup PGs count.
-Contains Failure Section.
-Contains Success Section.
-Does not list running/cancelled details in the failure table unless they are actual Failure status rows.
-Does not contain the sentence: These are not counted as failures or success.
-```
-
-Expected running/cancelled note if count is greater than zero:
-
-```text
-Please check incident_lifecycle.csv and continue monitoring running/cancelled backups.
-```
-
-## 10. Validate collection warnings
+## 10. Validate warnings
 
 ```powershell
 Get-Content (Join-Path $latest.FullName "collection_warnings.txt")
@@ -347,73 +297,13 @@ Get-Content (Join-Path $latest.FullName "collection_warnings.txt")
 Pass condition:
 
 ```text
-Warnings are empty/clean, or API errors are explicit.
-If API errors occurred, report status must indicate Incomplete - RERUN REQUIRED.
-```
-
-Fail condition:
-
-```text
-API errors occurred but report looks clean.
+Warnings are clean, or API errors are explicit.
+If API errors occurred, worknotes/closing status must not look clean.
 ```
 
 ## 11. Incremental rerun test
 
-Run the same test command again with the same test INC and same test output root.
-
-```powershell
-cd X:\PowerShell\Cohesity_API_Scripts\backup_failures
-
-.\Get-CohesityBackupFailureWindowConsolidator.ps1 `
-  -IncidentNumber "INC999999" `
-  -OutputRoot "X:\PowerShell\Data\Cohesity\BackupFailureWindow_Test" `
-  -RequestTimeoutSec 120
-```
-
-Expected second test behavior:
-
-```text
-RunMode = Incremental
-Scan NumRuns = 15
-Same INC/state reused.
-Known failed objects are carried forward if not seen.
-Objects clear only with same ObjectKey newer success.
-```
-
-Run formatter again:
-
-```powershell
-$latest = Get-ChildItem "X:\PowerShell\Data\Cohesity\BackupFailureWindow_Test" -Directory |
-  Where-Object { $_.Name -ne "Archive" } |
-  Sort-Object LastWriteTime -Descending |
-  Select-Object -First 1
-
-.\Format-CohesityBackupFailureReport.ps1 -ReportFolder $latest.FullName
-```
-
-## 12. Recheck output after incremental rerun
-
-```powershell
-foreach ($file in @("current_failures.csv","cleared_by_success.csv","incident_lifecycle.csv","collection_warnings.txt","worknotes_summary.txt")) {
-    "`n===== $file ====="
-    $path = Join-Path $latest.FullName $file
-    if (Test-Path $path) {
-        if ($file -like "*.csv") {
-            Import-Csv $path | Format-Table -AutoSize -Wrap
-        } else {
-            Get-Content $path
-        }
-    } else {
-        "Missing: $path"
-    }
-}
-```
-
-## 13. Wrapper test after safe direct test passes
-
-The wrapper now runs the formatter automatically.
-
-Use a test output root first:
+Run the same wrapper test command again with the same test INC and same test output root.
 
 ```powershell
 cd X:\PowerShell\Cohesity_API_Scripts\backup_failures
@@ -424,16 +314,29 @@ cd X:\PowerShell\Cohesity_API_Scripts\backup_failures
   -RequestTimeoutSec 120
 ```
 
-Expected:
+Expected second run:
 
 ```text
-Collector runs.
-Formatter runs.
-Final operator-facing files are listed.
-Raw CSV copies are listed for troubleshooting.
+RunMode = Incremental
+Scan NumRuns = 15
+Formatter runs after collector
 ```
 
-## 14. Only after safe tests pass, run normal production wrapper
+Recheck files:
+
+```powershell
+$latest = Get-ChildItem "X:\PowerShell\Data\Cohesity\BackupFailureWindow_WrapperTest" -Directory |
+  Where-Object { $_.Name -ne "Archive" } |
+  Sort-Object LastWriteTime -Descending |
+  Select-Object -First 1
+
+Get-Content (Join-Path $latest.FullName "worknotes_summary.txt")
+Import-Csv (Join-Path $latest.FullName "incident_lifecycle.csv") | Format-Table -AutoSize -Wrap
+```
+
+## 12. Normal production command
+
+Only after test passes, use this as the normal daily command:
 
 ```powershell
 cd X:\PowerShell\Cohesity_API_Scripts\backup_failures
@@ -441,53 +344,28 @@ cd X:\PowerShell\Cohesity_API_Scripts\backup_failures
 .\Cohesity_Backup_Failure_INC_Status_Update.ps1
 ```
 
-Then validate production output:
+## Do not normally run direct collector
+
+Do not use this for daily operation:
 
 ```powershell
-$latest = Get-ChildItem "X:\PowerShell\Data\Cohesity\BackupFailureWindow" -Directory |
-  Where-Object { $_.Name -ne "Archive" } |
-  Sort-Object LastWriteTime -Descending |
-  Select-Object -First 1
-
-"Latest folder: $($latest.FullName)"
-Get-ChildItem $latest.FullName
-Get-Content (Join-Path $latest.FullName "worknotes_summary.txt")
+.\Get-CohesityBackupFailureWindowConsolidator.ps1
 ```
 
-## Final pass / fail rule
+Direct collector is only for debugging. If direct collector is used, the formatter must be run separately.
 
-PASS:
-
-```text
-Baseline first test uses 30.
-Same INC rerun uses 15.
-current_failures.csv is object-level.
-cleared_by_success.csv only has same-object newer success.
-incident_lifecycle.csv uses StatusChange and hides technical IDs.
-incident_lifecycle_raw.csv preserves technical IDs.
-worknotes_summary.txt shows only summary, failures, success/recovered, running count, cancelled count, and collection status.
-RemoteAdapter is excluded.
-Warnings are explicit.
-Incomplete collection is not presented as clean.
-```
-
-FAIL:
+## Latest update - use this bottom section as the source of truth
 
 ```text
-Syntax error.
-PG-only rows shown as object failures.
-Object failures missing while diagnostic sees them and they are not cleared.
-API errors happen but report still looks clean.
-RemoteAdapter appears.
-Same-object success is not required for clearing.
-Work notes contain unnecessary lifecycle/debug columns.
-Work notes include running/cancelled rows as normal failure details.
-```
+Normal daily use:
+Run Cohesity_Backup_Failure_INC_Status_Update.ps1 only.
 
-## Do not do this until validation passes
+Safe test:
+Run Cohesity_Backup_Failure_INC_Status_Update.ps1 with -IncidentNumber and -OutputRoot pointing to a test folder.
 
-```text
-Do not mark production-ready.
-Do not rely on worknotes_summary.txt for live incident updates.
-Do not push further functional changes unless a failed validation case is understood.
+Do not follow older instructions that say to test direct collector first.
+The wrapper is now the correct primary entry point because it runs both collector and formatter.
+
+The main collector is still untested here against Helios.
+The formatter is post-processing only and does not change collection/state logic.
 ```
