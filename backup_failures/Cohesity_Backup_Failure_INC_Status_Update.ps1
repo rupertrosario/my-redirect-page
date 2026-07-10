@@ -33,6 +33,8 @@ param(
     [switch]$ShowGrid
 )
 
+$ErrorActionPreference = "Stop"
+
 function Get-ReportFolder([string]$Root, [string]$Inc) {
     if ($Inc) {
         $candidate = Join-Path $Root $Inc.Trim().ToUpper()
@@ -93,8 +95,12 @@ if ($ClusterName) { Write-Host ("ClusterName             : {0}" -f $ClusterName)
 if ($IncidentNumber) { Write-Host ("IncidentNumber          : {0}" -f $IncidentNumber) } else { Write-Host "IncidentNumber          : prompt/reuse current window" }
 Write-Host ""
 
-& $target @targetParams
-$mainExitCode = $LASTEXITCODE
+try {
+    & $target @targetParams
+} catch {
+    Write-Error ("Main collector failed. Formatter was not run. Error: {0}" -f $_.Exception.Message)
+    exit 1
+}
 
 $folder = Get-ReportFolder -Root $OutputRoot -Inc $IncidentNumber
 if ($folder) {
@@ -127,4 +133,4 @@ if ($folder) {
     Write-Warning "Unable to locate incident output folder."
 }
 
-exit $mainExitCode
+exit 0
