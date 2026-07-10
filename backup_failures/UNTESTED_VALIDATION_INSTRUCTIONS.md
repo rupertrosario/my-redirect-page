@@ -2,7 +2,8 @@
 
 ## Important status
 
-This code was pushed but has not been validated against Helios from ChatGPT. Validation must be performed on the PowerShell host.
+This code is pushed but has not been validated against Helios from ChatGPT.
+Validation must be performed on the PowerShell host.
 
 Do not treat the report as production-ready until these checks pass.
 
@@ -23,24 +24,28 @@ Production output root:
 X:\PowerShell\Data\Cohesity\BackupFailureWindow
 ```
 
-## Files in scope
+## Current behavior
 
 ```text
-backup_failures/Cohesity_Backup_Failure_INC_Status_Update.ps1
-backup_failures/Get-CohesityBackupFailureWindowConsolidator.ps1
-backup_failures/Format-CohesityBackupFailureReport.ps1
-backup_failures/UNTESTED_VALIDATION_INSTRUCTIONS.md
+1. Wrapper runs the backup failure collector.
+2. Wrapper applies retry-aware object state handling.
+3. New INC/window uses Baseline scan with 30 runs.
+4. Same INC/window rerun uses Incremental scan with 15 runs.
+5. Formatter runs after collection.
+6. Clean operator-facing CSVs remove technical/debug columns.
+7. Raw CSV copies are kept as *_raw.csv for troubleshooting.
 ```
 
-## What the wrapper does
+## Retry-aware rule
 
 ```text
-1. Runs the main collector.
-2. New INC/window uses Baseline scan with 30 runs.
-3. Same INC/window rerun uses Incremental scan with 15 runs.
-4. Runs the formatter after collection.
-5. Produces cleaned worknotes_summary.txt and incident_lifecycle.csv.
-6. Keeps raw CSV copies as *_raw.csv for troubleshooting.
+failedAttempts inside the same object/run are not final failure by themselves.
+
+Final object/snapshot status wins first.
+
+If object/snapshot status says Success, the object is treated as Success even if failedAttempts exist from earlier retries in the same run.
+
+failedAttempts are used as failure evidence only when no final object/run status is available.
 ```
 
 ## 1. Pull latest code
@@ -59,16 +64,13 @@ git pull --ff-only origin Cohesity_Automations
 cd X:\PowerShell\Cohesity_API_Scripts\backup_failures
 
 Select-String .\Cohesity_Backup_Failure_INC_Status_Update.ps1 -Pattern `
-"Incremental NumRuns","Baseline NumRuns","Format-CohesityBackupFailureReport"
-
-Select-String .\Get-CohesityBackupFailureWindowConsolidator.ps1 -Pattern `
-"BaselineNumRuns","RemoteAdapter","Clear only when the same ObjectKey"
+"Retry-aware state rule","final object/snapshot status wins","Get-RetryAwareCollectorPath"
 
 Select-String .\Format-CohesityBackupFailureReport.ps1 -Pattern `
 "StatusChange","Running / In-progress PGs","Cancelled Backup PGs","incident_lifecycle_raw.csv"
 ```
 
-Expected: matches appear from all three scripts.
+Expected: matches appear from both scripts.
 
 ## 3. Syntax check
 
@@ -92,7 +94,7 @@ If this fails, stop.
 
 ## 4. Safe test run
 
-Use only the existing test folder path below.
+Use only this test folder path.
 
 ```powershell
 cd X:\PowerShell\Cohesity_API_Scripts\backup_failures
@@ -103,11 +105,11 @@ cd X:\PowerShell\Cohesity_API_Scripts\backup_failures
   -RequestTimeoutSec 120
 ```
 
-Expected first test run if this test INC/state is new:
+Expected console output includes:
 
 ```text
-RunMode = Baseline
-Scan NumRuns = 30
+Retry-aware state rule : final object/snapshot status wins over same-run failedAttempts
+RunMode = Baseline or Incremental
 Formatter runs after collector
 ```
 
@@ -156,19 +158,13 @@ Failure Section:
 Success Section:
 ```
 
-Expected note when running or cancelled count is greater than zero:
-
-```text
-Please check incident_lifecycle.csv and continue monitoring running/cancelled backups.
-```
-
 This sentence should not appear:
 
 ```text
 These are not counted as failures or success.
 ```
 
-## 7. Validate lifecycle columns
+## 7. Validate cleaned lifecycle columns
 
 ```powershell
 Import-Csv (Join-Path $latest.FullName "incident_lifecycle.csv") |
@@ -196,11 +192,10 @@ LatestSuccessET
 LastSeenET
 FailureDates
 ConsecutiveFailureDays
-FailedRunCount
 Message
 ```
 
-These technical columns should not be in the cleaned lifecycle CSV:
+These should not be in cleaned incident_lifecycle.csv:
 
 ```text
 WindowKey
@@ -209,20 +204,16 @@ ClusterId
 ProtectionGroupId
 EnvironmentFilter
 FailedRunKeys
+FailedRunCount
 ```
 
-They should remain in:
-
-```text
-incident_lifecycle_raw.csv
-state.json
-```
+They should remain only in raw/state troubleshooting data.
 
 ## 8. Validate current failures
 
 ```powershell
 Import-Csv (Join-Path $latest.FullName "current_failures.csv") |
-  Select Status,StatusChange,Cluster,ProtectionGroup,Environment,Host,ObjectName,ObjectType,RunType,LastFailedET,FailureDates,ConsecutiveFailureDays,FailedRunCount,Message |
+  Select Status,StatusChange,Cluster,ProtectionGroup,Environment,Host,ObjectName,ObjectType,RunType,LastFailedET,FailureDates,ConsecutiveFailureDays,Message |
   Format-Table -AutoSize -Wrap
 ```
 
@@ -233,6 +224,7 @@ ObjectName is populated for real object failures.
 ProtectionGroup is context only.
 RemoteAdapter does not appear.
 Same-day duplicate failures are consolidated.
+Objects with final same-run success are not active failures just because failedAttempts existed earlier in that same run.
 ```
 
 ## 9. Validate success/recovered rows
@@ -260,47 +252,4 @@ Pass condition:
 ```text
 Warnings are clean, or API errors are explicit.
 If API errors occurred, Collection Status must show Incomplete - RERUN REQUIRED.
-```
-
-## 11. Incremental rerun test
-
-Run the exact same wrapper command again with the same test INC and same test output root.
-
-```powershell
-cd X:\PowerShell\Cohesity_API_Scripts\backup_failures
-
-.\Cohesity_Backup_Failure_INC_Status_Update.ps1 `
-  -IncidentNumber "INC999998" `
-  -OutputRoot "X:\PowerShell\Data\Cohesity\BackupFailureWindow_Test" `
-  -RequestTimeoutSec 120
-```
-
-Expected:
-
-```text
-RunMode = Incremental
-Scan NumRuns = 15
-Formatter runs after collector
-```
-
-## 12. Production run only after test passes
-
-```powershell
-cd X:\PowerShell\Cohesity_API_Scripts\backup_failures
-
-.\Cohesity_Backup_Failure_INC_Status_Update.ps1
-```
-
-## Final pass rule
-
-```text
-Baseline test uses 30.
-Incremental rerun uses 15.
-worknotes_summary.txt has only summary, failures, success, and running/cancelled count note.
-incident_lifecycle.csv has cleaned user-facing columns.
-*_raw.csv files retain technical troubleshooting fields.
-current_failures.csv is object-level.
-cleared_by_success.csv only shows same-object newer success.
-RemoteAdapter is excluded.
-Collection warnings are explicit.
 ```
