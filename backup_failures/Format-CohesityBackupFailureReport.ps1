@@ -26,6 +26,10 @@ function Clean($Value) {
 
 function Get-Prop($ObjectValue, [string]$Name, $DefaultValue = '') {
     if ($null -eq $ObjectValue) { return $DefaultValue }
+    if ($ObjectValue -is [hashtable]) {
+        if ($ObjectValue.ContainsKey($Name)) { return $ObjectValue[$Name] }
+        return $DefaultValue
+    }
     $Property = $ObjectValue.PSObject.Properties[$Name]
     if ($Property) { return $Property.Value }
     return $DefaultValue
@@ -55,7 +59,9 @@ function Backup-RawCsv([string]$Path) {
         [System.IO.Path]::GetDirectoryName($Path),
         ('{0}_raw{1}' -f [System.IO.Path]::GetFileNameWithoutExtension($Path), [System.IO.Path]::GetExtension($Path))
     )
-    Copy-Item -Path $Path -Destination $RawPath -Force
+    if (!(Test-Path $RawPath)) {
+        Copy-Item -Path $Path -Destination $RawPath -Force
+    }
 }
 
 function New-CleanRow($Row) {
@@ -71,11 +77,11 @@ function New-CleanRow($Row) {
         ObjectType = Clean (Get-Prop $Row 'ObjectType' '')
         RunType = Clean (Get-Prop $Row 'RunType' '')
         FirstFailedET = Clean (Get-Prop $Row 'FirstFailedET' '')
-        LastFailedET = Clean (Get-Prop $Row 'LastFailedET' '')
+        LastFailedET = Clean (Get-Prop $Row 'LastFailedET' (Get-Prop $Row 'NewestFailedET' ''))
         LatestSuccessET = Clean (Get-Prop $Row 'LatestSuccessET' '')
         LastSeenET = Clean (Get-Prop $Row 'LastSeenET' '')
         FailureDates = Clean (Get-Prop $Row 'FailureDates' '')
-        ConsecutiveFailureDays = Clean (Get-Prop $Row 'ConsecutiveFailureDays' '')
+        ConsecutiveFailureDays = Clean (Get-Prop $Row 'ConsecutiveFailureDays' (Get-Prop $Row 'FailureRuns' ''))
         Message = Clean (Get-Prop $Row 'Message' '')
     }
 }
@@ -103,6 +109,11 @@ function Get-UniqueProtectionGroupCount($Rows) {
     return $Keys.Count
 }
 
+function Test-StatusIn([object]$Row, [string[]]$StatusSet) {
+    $StatusValue = Clean (Get-Prop $Row 'Status' '')
+    return ($StatusSet -contains $StatusValue)
+}
+
 function Get-TableText($Rows, [string[]]$Columns, [string]$EmptyText) {
     $List = @($Rows)
     if ($List.Count -eq 0) { return $EmptyText }
@@ -127,10 +138,15 @@ $ScanRunCount = Clean (Get-Prop $State 'ScanRunCount' '')
 $CollectionStatus = Clean (Get-Prop $State 'CollectionStatus' '')
 if (!$CollectionStatus) { $CollectionStatus = 'Unknown' }
 
-$FailureRows = @($CurrentRows | Where-Object { (Clean (Get-Prop $_ 'Status' '')) -eq 'Failure' })
-$SuccessRows = @($ClearedRows | Where-Object { (Clean (Get-Prop $_ 'Status' '')) -eq 'Success' })
-$RunningRows = @($LifecycleRows | Where-Object { (Clean (Get-Prop $_ 'Status' '')) -eq 'Running' })
-$CancelledRows = @($LifecycleRows | Where-Object { (Clean (Get-Prop $_ 'Status' '')) -eq 'Cancelled' })
+$FailureStatusSet = @('Failure','NewlyFailedThisCheck','OlderStillFailing','CurrentStillFailing','CarriedForwardStillFailing','ReFailedAfterClear','UnknownNeedsReview')
+$SuccessStatusSet = @('Success','NewlyClearedThisCheck','ClearedByLaterSuccess')
+$RunningStatusSet = @('Running','RunningAtLatestCheck')
+$CancelledStatusSet = @('Cancelled','CancelledAfterFailure')
+
+$FailureRows = @($CurrentRows | Where-Object { Test-StatusIn $_ $FailureStatusSet })
+$SuccessRows = @($ClearedRows | Where-Object { Test-StatusIn $_ $SuccessStatusSet })
+$RunningRows = @($LifecycleRows | Where-Object { Test-StatusIn $_ $RunningStatusSet })
+$CancelledRows = @($LifecycleRows | Where-Object { Test-StatusIn $_ $CancelledStatusSet })
 
 $RunningProtectionGroups = Get-UniqueProtectionGroupCount $RunningRows
 $CancelledProtectionGroups = Get-UniqueProtectionGroupCount $CancelledRows
