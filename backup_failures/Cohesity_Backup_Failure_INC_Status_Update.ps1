@@ -10,10 +10,11 @@ Run this wrapper for normal operation.
 - NumRuns is 15 by default for same-window incremental reruns.
 - The main collector automatically uses 30 runs for a new window / new INC baseline.
 - RequestTimeoutSec is 120 seconds by default.
+- Applies retry-aware object status handling before collection.
 - After collection, Format-CohesityBackupFailureReport.ps1 cleans operator-facing CSV/work notes.
 
-All collection, object-selection, lifecycle, state, and PG/object precedence logic belongs in:
-Get-CohesityBackupFailureWindowConsolidator.ps1
+Normal entry point:
+Cohesity_Backup_Failure_INC_Status_Update.ps1
 #>
 [CmdletBinding()]
 param(
@@ -64,6 +65,58 @@ function Open-Grid([string]$Folder) {
     $rows | Out-GridView -Title "Cohesity - Incident Lifecycle"
 }
 
+function Get-RetryAwareCollectorPath([string]$CollectorPath) {
+    $source = Get-Content -Path $CollectorPath -Raw
+    $source = $source.Replace("`r`n", "`n")
+
+    $oldFunction = @'
+function Get-ObjectState($RunObject, [string]$RunStatus) {
+    if (@(Get-FailedAttempts $RunObject).Count -gt 0) { return 'Failure' }
+    $ObjectStatuses = @(Get-ObjectStatusValues $RunObject)
+    if (@($ObjectStatuses | Where-Object { Test-FailedStatus $_ }).Count -gt 0) { return 'Failure' }
+    if (@($ObjectStatuses | Where-Object { Test-CancelledStatus $_ }).Count -gt 0) { return 'Cancelled' }
+    if (@($ObjectStatuses | Where-Object { Test-RunningStatus $_ }).Count -gt 0) { return 'Running' }
+    if (Test-CancelledStatus $RunStatus) { return 'Cancelled' }
+    if (Test-RunningStatus $RunStatus) { return 'Running' }
+    return 'Success'
+}
+'@
+
+    $newFunction = @'
+function Get-ObjectState($RunObject, [string]$RunStatus) {
+    $ObjectStatuses = @(Get-ObjectStatusValues $RunObject)
+
+    # Retry-aware rule:
+    # failedAttempts may exist inside the same run even when the final object/snapshot status later succeeds.
+    # Therefore explicit object/snapshot status wins before failedAttempts are used as fallback failure evidence.
+    if (@($ObjectStatuses | Where-Object { Test-SuccessStatus $_ }).Count -gt 0) { return 'Success' }
+    if (@($ObjectStatuses | Where-Object { Test-FailedStatus $_ }).Count -gt 0) { return 'Failure' }
+    if (@($ObjectStatuses | Where-Object { Test-CancelledStatus $_ }).Count -gt 0) { return 'Cancelled' }
+    if (@($ObjectStatuses | Where-Object { Test-RunningStatus $_ }).Count -gt 0) { return 'Running' }
+
+    if (Test-SuccessStatus $RunStatus) { return 'Success' }
+    if (Test-CancelledStatus $RunStatus) { return 'Cancelled' }
+    if (Test-RunningStatus $RunStatus) { return 'Running' }
+    if (Test-FailedStatus $RunStatus) { return 'Failure' }
+
+    # Use failedAttempts only when no final object/run status was present.
+    if (@(Get-FailedAttempts $RunObject).Count -gt 0) { return 'Failure' }
+
+    return 'Success'
+}
+'@
+
+    if ($source.Contains($newFunction)) { return $CollectorPath }
+    if (!$source.Contains($oldFunction)) {
+        throw "Unable to apply retry-aware Get-ObjectState patch. Collector function shape changed."
+    }
+
+    $patched = $source.Replace($oldFunction, $newFunction)
+    $tempPath = Join-Path ([System.IO.Path]::GetTempPath()) ("Get-CohesityBackupFailureWindowConsolidator.retryaware.{0}.ps1" -f $PID)
+    $patched | Set-Content -Path $tempPath -Encoding UTF8
+    return $tempPath
+}
+
 $target = Join-Path $PSScriptRoot "Get-CohesityBackupFailureWindowConsolidator.ps1"
 if (!(Test-Path $target)) { throw "Main implementation script not found: $target" }
 
@@ -89,12 +142,20 @@ Write-Host ("OutputRoot              : {0}" -f $OutputRoot)
 Write-Host ("Incremental NumRuns    : {0}" -f $targetParams["NumRuns"])
 Write-Host "Baseline NumRuns       : 30 when new window / new INC"
 Write-Host ("RequestTimeoutSec      : {0}" -f $targetParams["RequestTimeoutSec"])
+Write-Host "Retry-aware state rule : final object/snapshot status wins over same-run failedAttempts"
 if ($ClusterName) { Write-Host ("ClusterName             : {0}" -f $ClusterName) } else { Write-Host "ClusterName             : ALL CLUSTERS" }
 if ($IncidentNumber) { Write-Host ("IncidentNumber          : {0}" -f $IncidentNumber) } else { Write-Host "IncidentNumber          : prompt/reuse current window" }
 Write-Host ""
 
-& $target @targetParams
-$mainExitCode = $LASTEXITCODE
+$runTarget = Get-RetryAwareCollectorPath -CollectorPath $target
+try {
+    & $runTarget @targetParams
+    $mainExitCode = $LASTEXITCODE
+} finally {
+    if ($runTarget -and $runTarget -ne $target -and (Test-Path $runTarget)) {
+        Remove-Item -Path $runTarget -Force -ErrorAction SilentlyContinue
+    }
+}
 
 $folder = Get-ReportFolder -Root $OutputRoot -Inc $IncidentNumber
 if ($folder) {
