@@ -10,6 +10,7 @@ Run this wrapper for normal operation.
 - NumRuns is 15 by default for same-window incremental reruns.
 - The main collector automatically uses 30 runs for a new window / new INC baseline.
 - RequestTimeoutSec is 120 seconds by default.
+- After collection, Format-CohesityBackupFailureReport.ps1 cleans operator-facing CSV/work notes.
 
 All collection, object-selection, lifecycle, state, and PG/object precedence logic belongs in:
 Get-CohesityBackupFailureWindowConsolidator.ps1
@@ -66,6 +67,8 @@ function Open-Grid([string]$Folder) {
 $target = Join-Path $PSScriptRoot "Get-CohesityBackupFailureWindowConsolidator.ps1"
 if (!(Test-Path $target)) { throw "Main implementation script not found: $target" }
 
+$formatter = Join-Path $PSScriptRoot "Format-CohesityBackupFailureReport.ps1"
+
 $targetParams = @{}
 foreach ($k in $PSBoundParameters.Keys) {
     if ($k -ne "ShowGrid") { $targetParams[$k] = $PSBoundParameters[$k] }
@@ -95,6 +98,16 @@ $mainExitCode = $LASTEXITCODE
 
 $folder = Get-ReportFolder -Root $OutputRoot -Inc $IncidentNumber
 if ($folder) {
+    if (Test-Path $formatter) {
+        try {
+            & $formatter -ReportFolder $folder
+        } catch {
+            Write-Warning ("Report formatting failed. Collector output is still available. Error: {0}" -f $_.Exception.Message)
+        }
+    } else {
+        Write-Warning ("Report formatter not found: {0}" -f $formatter)
+    }
+
     Write-Host ""
     Write-Host "Final operator-facing files:"
     Write-Host (Join-Path $folder "worknotes_summary.txt")
@@ -104,6 +117,11 @@ if ($folder) {
     if (Test-Path $clearedPath) { Write-Host $clearedPath }
     Write-Host "Script memory retained, do not edit:"
     Write-Host (Join-Path $folder "state.json")
+    Write-Host "Raw collector CSV copies, for troubleshooting only:"
+    foreach ($rawName in @("current_failures_raw.csv","cleared_by_success_raw.csv","incident_lifecycle_raw.csv")) {
+        $rawPath = Join-Path $folder $rawName
+        if (Test-Path $rawPath) { Write-Host $rawPath }
+    }
     if ($ShowGrid) { Open-Grid $folder }
 } else {
     Write-Warning "Unable to locate incident output folder."
