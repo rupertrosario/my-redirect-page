@@ -6,6 +6,7 @@ Formats Cohesity backup failure collector outputs for operator-facing review.
 Post-processing only. Does not call Cohesity and does not change state.json.
 Keeps raw collector CSVs as *_raw.csv, then rewrites operator-facing CSVs with cleaner columns.
 Rewrites worknotes_summary.txt so ServiceNow work notes show failures, recovered objects, and concise running/cancelled counts only.
+Attempt/run-count details such as FailedRunCount stay in *_raw.csv/state.json and are intentionally not shown in operator-facing CSVs or work notes.
 #>
 [CmdletBinding()]
 param(
@@ -75,7 +76,6 @@ function New-CleanRow($Row) {
         LastSeenET = Clean (Get-Prop $Row 'LastSeenET' '')
         FailureDates = Clean (Get-Prop $Row 'FailureDates' '')
         ConsecutiveFailureDays = Clean (Get-Prop $Row 'ConsecutiveFailureDays' '')
-        FailedRunCount = Clean (Get-Prop $Row 'FailedRunCount' '')
         Message = Clean (Get-Prop $Row 'Message' '')
     }
 }
@@ -85,7 +85,7 @@ function Write-CleanCsv([string]$Path) {
     Backup-RawCsv -Path $Path
     $Rows = Import-CsvSafe -Path $Path
     $CleanRows = @($Rows | ForEach-Object { New-CleanRow $_ })
-    $Columns = @('IncidentNumber','Status','StatusChange','Cluster','ProtectionGroup','Environment','Host','ObjectName','ObjectType','RunType','FirstFailedET','LastFailedET','LatestSuccessET','LastSeenET','FailureDates','ConsecutiveFailureDays','FailedRunCount','Message')
+    $Columns = @('IncidentNumber','Status','StatusChange','Cluster','ProtectionGroup','Environment','Host','ObjectName','ObjectType','RunType','FirstFailedET','LastFailedET','LatestSuccessET','LastSeenET','FailureDates','ConsecutiveFailureDays','Message')
     if ($CleanRows.Count -eq 0) {
         ($Columns -join ',') | Set-Content -Path $Path -Encoding UTF8
     } else {
