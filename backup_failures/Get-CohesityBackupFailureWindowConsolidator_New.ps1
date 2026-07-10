@@ -300,7 +300,7 @@ function Get-EnvironmentMap {
 }
 
 function Test-FailedStatus([string]$Status) { (Clean $Status) -in @('Failed','kFailed','Failure','kFailure','Error','kError') }
-function Test-SuccessStatus([string]$Status) { (Clean $Status) -in @('Succeeded','kSucceeded') }
+function Test-SuccessStatus([string]$Status) { (Clean $Status) -in @('Succeeded','kSucceeded','SucceededWithWarning','kSucceededWithWarning','Success','kSuccess','Successful','Completed','kCompleted') }
 function Test-WarningStatus([string]$Status) { (Clean $Status) -in @('SucceededWithWarning','kSucceededWithWarning','Warning','kWarning') }
 function Test-RunningStatus([string]$Status) { (Clean $Status) -in @('Running','kRunning','Accepted','kAccepted','Queued','kQueued') }
 function Test-CancelledStatus([string]$Status) { (Clean $Status) -in @('Canceled','Cancelled','kCanceled','kCancelled','Canceling','kCanceling') }
@@ -439,6 +439,7 @@ function Get-ObjectState($RunObject, [string]$RunStatus) {
     # Cohesity can record failedAttempts inside the same run/object even when
     # the final object/snapshot status is success, running, or cancelled.
     # Therefore final object/snapshot status must be evaluated before failedAttempts.
+    # A cancelled/run-level state must not override an explicit object/snapshot success.
     if (@($ObjectStatuses | Where-Object { Test-SuccessStatus $_ }).Count -gt 0) {
         return 'Success'
     }
@@ -746,8 +747,16 @@ function Process-DetailedRuns(
         $MergedFailureDates = Merge-DateStrings -OldDates $OldFailureDates -NewDateSet $Entry.FailureDates
 
         if ($Entry.LatestState -eq 'Success') {
-            if ($PreviousRow) {
-                $ClearedRows += New-StatusRow -Incident $Incident -WindowKey $WindowKey -Status 'Success' -Change 'Cleared' -ClusterDisplayName $ClusterDisplayName -ClusterId $ClusterId -EnvironmentSpec $EnvironmentSpec -ProtectionGroupName $ProtectionGroupName -ProtectionGroupId $ProtectionGroupId -ParentHostName $Entry.ParentHostName -ObjectName $Entry.ObjectName -ObjectType $Entry.ObjectType -RunType $Entry.RunType -FirstFailedUsecs 0 -LastFailedUsecs 0 -LatestSuccessUsecs $Entry.LatestSuccessUsecs -LastSeenUsecs $Entry.LatestUsecs -FailureDates $MergedFailureDates -FailedRunCount $Entry.FailedRunCount -Message 'Previously failed object has newer successful backup.' -ObjectKey $ObjectKey -EnvironmentFilter $EnvironmentSpec.Filter -FailedRunKeys (($Entry.FailedRunKeys | Select-Object -Unique) -join ' | ')
+            # Recovery-aware rule:
+            # If the latest object/snapshot state is Success, any older Failure/Running/Cancelled
+            # evidence in the same scan is cleared by that newer success. This covers cases such as
+            # a cancelled backup followed by a later successful backup before the next saved state exists.
+            if ($PreviousRow -or [int]$Entry.FailedRunCount -gt 0) {
+                $ClearMessage = 'Previously failed/running/cancelled object has newer successful backup.'
+                if (!$PreviousRow -and [int]$Entry.FailedRunCount -gt 0) {
+                    $ClearMessage = 'Earlier failed/running/cancelled object state in this scan has newer successful backup.'
+                }
+                $ClearedRows += New-StatusRow -Incident $Incident -WindowKey $WindowKey -Status 'Success' -Change 'Cleared' -ClusterDisplayName $ClusterDisplayName -ClusterId $ClusterId -EnvironmentSpec $EnvironmentSpec -ProtectionGroupName $ProtectionGroupName -ProtectionGroupId $ProtectionGroupId -ParentHostName $Entry.ParentHostName -ObjectName $Entry.ObjectName -ObjectType $Entry.ObjectType -RunType $Entry.RunType -FirstFailedUsecs 0 -LastFailedUsecs 0 -LatestSuccessUsecs $Entry.LatestSuccessUsecs -LastSeenUsecs $Entry.LatestUsecs -FailureDates $MergedFailureDates -FailedRunCount $Entry.FailedRunCount -Message $ClearMessage -ObjectKey $ObjectKey -EnvironmentFilter $EnvironmentSpec.Filter -FailedRunKeys (($Entry.FailedRunKeys | Select-Object -Unique) -join ' | ')
             }
             continue
         }
