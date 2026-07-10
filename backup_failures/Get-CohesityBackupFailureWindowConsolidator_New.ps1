@@ -11,7 +11,7 @@ Architectural rules:
 - Previous active object failures are always rechecked, even during incremental runs.
 - New failures are discovered from run-level Failed / Warning / Cancelled / Running / message signals, then confirmed at object level.
 - Final reporting is object-level only. Protection Group is context.
-- Clear only when the same ObjectKey has a newer successful object backup.
+- Clear when the same object identity has a newer successful object backup, even if run type changed.
 - If a known failed object is not visible in the current lookback, carry it forward.
 - Same-day repeated object failures are consolidated to the latest failure row.
 - Consecutive failures are tracked date-wise for clarity.
@@ -380,7 +380,12 @@ function Get-ObjectIdentityKey($RunObject, [string]$ClusterId, [string]$Protecti
     $SourceId = Clean (Get-Prop $ObjectMeta 'sourceId' '')
     $IdentityPart = $ObjectId
     if (!$IdentityPart) { $IdentityPart = ('{0}|{1}|{2}|{3}' -f $ObjectEnvironment,$ObjectType,$ObjectName,$SourceId) }
-    return ('{0}|{1}|{2}|{3}|{4}' -f $ClusterId,$ProtectionGroupId,$EnvironmentLabel,$RunType,$IdentityPart)
+
+    # Recovery identity rule:
+    # ObjectKey must not include RunType. A cancelled/failed incremental run can be
+    # cleared by a later successful full/synthetic/incremental run for the same object.
+    # RunType is still retained in the report row and FailedRunKeys for audit context.
+    return ('{0}|{1}|{2}|{3}' -f $ClusterId,$ProtectionGroupId,$EnvironmentLabel,$IdentityPart)
 }
 
 function Get-FailedAttempts($RunObject) {
