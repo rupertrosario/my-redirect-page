@@ -14,9 +14,7 @@ The operator cannot run Git commands on the target machine.
 
 Do not instruct the operator to run Git commands such as `git fetch`, `git pull`, `git clean`, `git status`, `git diff`, `git add`, `git commit`, or `git push`.
 
-The assistant must push repository changes directly through GitHub when needed.
-
-For the operator, provide only:
+The assistant must push repository changes directly through GitHub when needed. For the operator, provide only:
 
 ```text
 1. Downloadable file links from chat.
@@ -42,62 +40,41 @@ backup_failures/
   Format-CohesityBackupFailureReport.ps1
 ```
 
-Any local files such as older downloaded V2/V3/V4 copies, old numbered instruction files, text exports, or temporary patch notes should not be used as source of truth.
-
-## Local cleanup command - PowerShell only
-
-Do not delete first. Move clutter to a local archive folder.
-
-Run from PowerShell:
-
-```powershell
-$folder = "X:\PowerShell\Cohesity_API_Scripts\backup_failures"
-$archive = Join-Path $folder ("_local_clutter_" + (Get-Date -Format "yyyyMMdd_HHmmss"))
-New-Item -ItemType Directory -Path $archive -Force | Out-Null
-
-$keep = @(
-  "00_CURRENT_INSTRUCTIONS.md",
-  "Cohesity_Backup_Failure_INC_Status_Update.ps1",
-  "Get-CohesityBackupFailureWindowConsolidator.ps1",
-  "Format-CohesityBackupFailureReport.ps1"
-)
-
-Get-ChildItem $folder -File |
-  Where-Object { $keep -notcontains $_.Name } |
-  Move-Item -Destination $archive -Force
-
-"Moved local clutter to: $archive"
-Get-ChildItem $folder | Select Name | Sort-Object Name
-```
+Any local files such as older downloaded V2/V3/V4/V5 copies, old numbered instruction files, text exports, or temporary patch notes should not be used as source of truth.
 
 ## Current state
 
 We are correcting the consolidator based on observed output.
 
-The screenshot showed the bug clearly:
+Observed issue:
 
 ```text
-CancelledAfterFailure | CarriedForward | older date
-Success               | Cleared        | newer date
+Success exists for the same protected object, but the output still shows Running.
 ```
 
-That means the script created a cleared success row but still carried forward the old cancelled row.
+Correct rule:
 
-The active problem is the consolidator final reconciliation/state merge, not the wrapper and not the formatter.
+```text
+Running is not a terminal failure.
+A same-object successful completed backup must suppress Running unless there is a later terminal Failure or Cancelled.
+```
+
+The active problem is the consolidator object-state reconciliation, not the wrapper and not the formatter.
 
 ## Required consolidator fix level
 
-Use the V5 consolidator file from chat:
+Use the V6 consolidator file from chat:
 
 ```text
-Get-CohesityBackupFailureWindowConsolidator_ENV_FIRST_FIXED_V5.ps1
+Get-CohesityBackupFailureWindowConsolidator_ENV_FIRST_FIXED_V6.ps1
 ```
 
-V5 adds these two required rules:
+V6 includes all prior V5 rules and adds these required rules:
 
 ```text
-V5 state-reconciliation identity rule
-V5 final reconciliation rule
+V6 latest-success-over-running rule
+V6 success-suppresses-running rule
+V6 final active suppression rule
 ```
 
 ## Files and ownership
@@ -133,6 +110,7 @@ Rules:
 - Consolidator owns state comparison.
 - Consolidator must report object-level backup state, not only protection-group-level failure.
 - Consolidator must not carry forward an old cancelled/failed/running row when the same protected object has newer success.
+- Consolidator must not report Running as active when the same protected object has a successful completed backup and no later terminal Failure/Cancelled.
 
 ## Verification before test - positive checks only
 
@@ -146,10 +124,10 @@ cd X:\PowerShell\Cohesity_API_Scripts\backup_failures
 Get-FileHash .\Get-CohesityBackupFailureWindowConsolidator.ps1 -Algorithm SHA256
 
 Select-String .\Get-CohesityBackupFailureWindowConsolidator.ps1 -Pattern `
-"Recovery identity rule","ObjectKey must not include RunType","Recovery-aware rule","V5 state-reconciliation identity rule","V5 final reconciliation rule"
+"Recovery identity rule","ObjectKey must not include RunType","Recovery-aware rule","V5 state-reconciliation identity rule","V5 final reconciliation rule","V6 latest-success-over-running rule","V6 success-suppresses-running rule","V6 final active suppression rule"
 ```
 
-Expected for the intended V5 file:
+Expected for the intended V6 file:
 
 ```text
 Recovery identity rule                  = match
@@ -157,23 +135,12 @@ ObjectKey must not include RunType      = match
 Recovery-aware rule                     = match
 V5 state-reconciliation identity rule   = match
 V5 final reconciliation rule            = match
+V6 latest-success-over-running rule     = match
+V6 success-suppresses-running rule      = match
+V6 final active suppression rule        = match
 ```
 
 If these markers are missing, the operator is not using the intended latest consolidator file.
-
-## Back-to-basics lifecycle goal
-
-The script must answer this question for each protected object:
-
-```text
-Is this object still in a bad backup state after checking the latest backup runs?
-```
-
-It must not answer only:
-
-```text
-Did this object ever have a failed/cancelled/running run?
-```
 
 ## Correct lifecycle rules
 
@@ -181,10 +148,11 @@ Did this object ever have a failed/cancelled/running run?
 |---|---|
 | Failed backup, no later success | Active/current problem |
 | Cancelled backup, no later success | Active/current problem |
-| Running backup, no later final result | Active/current problem |
+| Running backup, no same-object success in lookback/state | Active/pending review |
+| Running backup, same-object success exists and no later terminal Failure/Cancelled | Not active |
 | Failed backup, later success | Cleared / recovered |
 | Cancelled backup, later success | Cleared / recovered |
-| Running backup, later success | Cleared / recovered |
+| Running backup, later success | Cleared / recovered if it was previously open |
 | Success only | Not reported as problem |
 | Previously open in state, now success | Cleared / recovered |
 | Previously open in old state format, same object now success | Do not carry old row forward |
@@ -199,19 +167,30 @@ Cluster + ProtectionGroup + Environment + ObjectIdentity
 
 Object lifecycle matching should not depend on `RunType`.
 
-For state reconciliation, old saved rows may have old `ObjectKey` values that included `RunType`. V5 must suppress those stale old rows by comparing protected-object identity from row fields, not by trusting only the saved `ObjectKey` string.
+For state reconciliation, old saved rows may have old `ObjectKey` values that included `RunType`. V5/V6 must suppress those stale old rows by comparing protected-object identity from row fields, not by trusting only the saved `ObjectKey` string.
+
+## Running vs success rule
+
+Use this precedence:
+
+```text
+Later terminal Failure/Cancelled after success = active problem.
+Success with no later terminal Failure/Cancelled = healthy / cleared.
+Running after success = do not reopen or keep active.
+Running with no success and no final result = active/pending review.
+```
+
+Reason:
+
+```text
+Running is not final evidence of failure. The last completed successful backup should not be overridden by a currently running attempt.
+```
 
 ## Testing rule
 
 Do not test lifecycle logic with all clusters and 15/30 runs.
 
-Use one known cluster and one known protection group/object where the problem is visible:
-
-```text
-Cancelled first
-Successful later
-Same protected object
-```
+Use one known cluster and one known protection group/object where the problem is visible.
 
 Run the consolidator directly for a small test:
 
@@ -240,7 +219,7 @@ $latest = Get-ChildItem "X:\PowerShell\Data\Cohesity\BackupFailureWindow_Test" -
 
 ## Inspect one known object
 
-Replace `<OBJECT_NAME>` with the object that had cancelled first and later success:
+Replace `<OBJECT_NAME>` with the object that had success but still appeared as Running:
 
 ```powershell
 $latest = Get-ChildItem "X:\PowerShell\Data\Cohesity\BackupFailureWindow_Test" -Directory |
@@ -271,22 +250,9 @@ Import-Csv (Join-Path $latest.FullName "current_failures.csv") |
   Format-Table -AutoSize
 ```
 
-## Expected result for cancelled-then-success
+## Expected result for success plus running
 
-The object should appear in:
-
-```text
-cleared_by_success.csv
-```
-
-with:
-
-```text
-Status = Success
-StatusChange = Cleared
-```
-
-It should not remain active in:
+The object should not remain active in:
 
 ```text
 current_failures.csv
@@ -295,11 +261,12 @@ current_failures.csv
 as:
 
 ```text
-Cancelled
-CancelledAfterFailure
-Failure
+Running
+Existing
 CarriedForward
 ```
+
+unless there is a later terminal Failure or Cancelled after the successful backup.
 
 ## Performance rule
 
@@ -324,7 +291,7 @@ BaselineNumRuns = 10 or 15
 
 Do not claim the full consolidator is pushed unless it has been explicitly fetched from GitHub after update and verified.
 
-For now, the downloadable V5 consolidator from chat is the file the operator should copy over the local consolidator.
+For now, the downloadable V6 consolidator from chat is the file the operator should copy over the local consolidator.
 
 ## Operating rule going forward
 
