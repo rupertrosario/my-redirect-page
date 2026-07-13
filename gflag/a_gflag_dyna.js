@@ -1,19 +1,12 @@
 import { credentialVaultClient } from "@dynatrace-sdk/client-classic-environment-v2";
 
 /**
- * Cohesity Cluster GFlag Report — split common/specific emails (ET)
+ * Cohesity Cluster GFlag Report — common and cluster-specific outputs (ET)
  *
- * Outputs:
- * - commonMarkdownEmail: GFlags with the same Service + GFlag + Value on every
- *   successfully queried cluster.
- * - specificMarkdownEmail: GFlags that are missing from one or more clusters,
- *   or have different values between clusters, grouped by cluster.
- *
- * Characteristics:
- * - GET-only
- * - Markdown-only
- * - 502-safe: continues per cluster
- * - Comparison excludes Reason and AppliedAtET
+ * GET-only. Produces two Markdown email bodies:
+ * - commonMarkdownEmail: identical Service + GFlag + Value across all
+ *   successfully queried clusters.
+ * - specificMarkdownEmail: missing or differing GFlags, grouped by cluster.
  */
 export default async function () {
   const baseUrl = "https://helios.cohesity.com";
@@ -21,7 +14,7 @@ export default async function () {
   const MAX_SPECIFIC_ROWS = 3000;
 
   // ======================
-  // AUTH (READ-ONLY)
+  // AUTHENTICATION
   // ======================
   const vaultName = "Cohesity_API_Key";
   const vaultId = "credentials_vault-312312";
@@ -29,8 +22,8 @@ export default async function () {
 
   async function getKeyByName(name) {
     const all = await credentialVaultClient.getCredentials();
-    const creds = all?.credentials || [];
-    const found = creds.find((c) => c?.name === name);
+    const credentials = all?.credentials || [];
+    const found = credentials.find((credential) => credential?.name === name);
     if (!found) return null;
 
     const detail = await credentialVaultClient.getCredentialsDetails({
@@ -59,25 +52,31 @@ export default async function () {
   // ======================
   // HELPERS
   // ======================
-  const norm = (v) =>
-    v === null || v === undefined ? "" : String(v).trim();
+  const norm = (value) =>
+    value === null || value === undefined ? "" : String(value).trim();
 
-  const toArray = (v) =>
-    !v ? [] : Array.isArray(v) ? v : [v];
+  const toArray = (value) =>
+    !value ? [] : Array.isArray(value) ? value : [value];
 
-  const safeCell = (v) =>
-    v === null || v === undefined
+  const safeCell = (value) =>
+    value === null || value === undefined
       ? ""
-      : String(v).replace(/\|/g, " ").replace(/\r?\n/g, " ");
+      : String(value).replace(/\|/g, " ").replace(/\r?\n/g, " ");
 
   function mdTable(headers, rows) {
-    const head = "| " + headers.join(" | ") + " |";
-    const sep = "| " + headers.map(() => "---").join(" | ") + " |";
+    const header = `| ${headers.join(" | ")} |`;
+    const separator = `| ${headers.map(() => "---").join(" | ")} |`;
     const body = rows.map(
-      (row) =>
-        "| " + headers.map((h) => safeCell(row[h])).join(" | ") + " |"
+      (row) => `| ${headers.map((key) => safeCell(row[key])).join(" | ")} |`
     );
-    return [head, sep, ...body].join("\n");
+    return [header, separator, ...body].join("\n");
+  }
+
+  // Preserve intentional blank lines while excluding optional null sections.
+  function joinReport(parts) {
+    return parts
+      .filter((part) => part !== null && part !== undefined)
+      .join("\n");
   }
 
   function normalizeReason(reason) {
@@ -94,8 +93,8 @@ export default async function () {
     }
     if (lower.includes("default")) return "Default";
 
-    const match = raw.match(/case#\s*\d+/i);
-    if (match) return match[0].replace(/\s+/g, "");
+    const caseMatch = raw.match(/case#\s*\d+/i);
+    if (caseMatch) return caseMatch[0].replace(/\s+/g, "");
 
     return raw.split(/[.;]/)[0].trim();
   }
@@ -215,7 +214,7 @@ export default async function () {
       })
   );
 
-  // clusterName -> Map(Service+GFlag -> row)
+  // clusterName -> Map(Service + GFlag -> row)
   const clusterMaps = new Map();
   const errors = [];
   let fetchedRowCount = 0;
@@ -288,6 +287,7 @@ export default async function () {
     return {
       clusterCount: clusters.length,
       successfulClusterCount: 0,
+      failedClusterCount: errors.length,
       fetchedRowCount,
       commonRowCount: 0,
       specificRowCount: 0,
@@ -310,23 +310,24 @@ export default async function () {
 
   for (const key of allKeys) {
     let expectedValue = null;
-    let common = true;
+    let isCommon = true;
 
     for (const clusterName of successfulClusters) {
       const row = clusterMaps.get(clusterName)?.get(key);
       if (!row) {
-        common = false;
+        isCommon = false;
         break;
       }
 
-      if (expectedValue === null) expectedValue = row.RawValue;
-      else if (row.RawValue !== expectedValue) {
-        common = false;
+      if (expectedValue === null) {
+        expectedValue = row.RawValue;
+      } else if (row.RawValue !== expectedValue) {
+        isCommon = false;
         break;
       }
     }
 
-    if (common) commonKeys.add(key);
+    if (isCommon) commonKeys.add(key);
   }
 
   const commonRows = [];
@@ -377,14 +378,14 @@ export default async function () {
   });
 
   const errorNote = errors.length
-    ? `_Warning: ${errors.length} cluster query error(s). Common classification uses only ${successfulClusters.length} successfully queried cluster(s)._`
-    : "";
+    ? `_Warning: ${errors.length} cluster query error(s). Classification is based on ${successfulClusters.length} successfully queried cluster(s)._`
+    : null;
 
   const renderedCommonRows = commonRows.slice(0, MAX_COMMON_ROWS);
-  const commonMarkdownEmail = [
+  const commonMarkdownEmail = joinReport([
     `### Cohesity Common GFlag Report — ${reportDate}`,
     "",
-    `Common means the same Service, GFlag and Value exist on all ${successfulClusters.length} successfully queried clusters.`,
+    `This report contains GFlags for which the Service, GFlag, and Value are identical across all ${successfulClusters.length} successfully queried clusters.`,
     "",
     renderedCommonRows.length
       ? mdTable(
@@ -393,12 +394,10 @@ export default async function () {
         )
       : "_No common GFlags found._",
     commonRows.length > MAX_COMMON_ROWS
-      ? `_Note: Common email capped at ${MAX_COMMON_ROWS} of ${commonRows.length} rows._`
-      : "",
+      ? `_Note: The common report is limited to ${MAX_COMMON_ROWS} of ${commonRows.length} rows._`
+      : null,
     errorNote
-  ]
-    .filter(Boolean)
-    .join("\n");
+  ]);
 
   const specificSections = [];
   let renderedSpecificCount = 0;
@@ -419,27 +418,27 @@ export default async function () {
         renderedRows
       )
     );
-    specificSections.push("\n---\n");
+    specificSections.push("");
+    specificSections.push("---");
+    specificSections.push("");
 
     renderedSpecificCount += renderedRows.length;
     clusterIndex++;
   }
 
-  const specificMarkdownEmail = [
+  const specificMarkdownEmail = joinReport([
     `### Cohesity Cluster-Specific GFlag Report — ${reportDate}`,
     "",
-    "This report contains only GFlags that are missing from one or more clusters or have different values between clusters.",
+    "This report contains GFlags that are absent from one or more clusters or have different values across the successfully queried clusters.",
     "",
     specificSections.length
       ? specificSections.join("\n")
       : "_No cluster-specific GFlags found._",
     specificRowCount > MAX_SPECIFIC_ROWS
-      ? `_Note: Specific email capped at ${MAX_SPECIFIC_ROWS} of ${specificRowCount} rows._`
-      : "",
+      ? `_Note: The cluster-specific report is limited to ${MAX_SPECIFIC_ROWS} of ${specificRowCount} rows._`
+      : null,
     errorNote
-  ]
-    .filter(Boolean)
-    .join("\n");
+  ]);
 
   return {
     clusterCount: clusters.length,
