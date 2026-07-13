@@ -637,10 +637,60 @@ function Merge-RowsByObjectKey($Rows) {
         $ObjectKey = Clean (Get-Prop $Row 'ObjectKey' '')
         if (!$ObjectKey) { continue }
         if (!$Index.ContainsKey($ObjectKey)) { $Index[$ObjectKey] = $Row; continue }
-        $OldSortValue = Get-DateSortValue (Get-Prop $Index[$ObjectKey] 'LastSeenET' '')
-        $NewSortValue = Get-DateSortValue (Get-Prop $Row 'LastSeenET' '')
+        $OldSortValue = Get-RowSortValue $Index[$ObjectKey]
+        $NewSortValue = Get-RowSortValue $Row
         if ($NewSortValue -ge $OldSortValue) { $Index[$ObjectKey] = $Row }
     }
+    return @($Index.Values)
+}
+
+function Get-RowSortValue($Row) {
+    $LastSeenValue = Get-DateSortValue (Get-Prop $Row 'LastSeenET' '')
+    $LatestSuccessValue = Get-DateSortValue (Get-Prop $Row 'LatestSuccessET' '')
+    if ($LatestSuccessValue -gt $LastSeenValue) { return $LatestSuccessValue }
+    return $LastSeenValue
+}
+
+function Get-RecoveryIdentityKeyForRow($Row) {
+    $ClusterId = Clean (Get-Prop $Row 'ClusterId' '')
+    $ProtectionGroupId = Clean (Get-Prop $Row 'ProtectionGroupId' '')
+    $EnvironmentLabel = Clean (Get-Prop $Row 'Environment' '')
+    $ObjectType = Clean (Get-Prop $Row 'ObjectType' '')
+    $HostName = Clean (Get-Prop $Row 'Host' '')
+    $ObjectName = Clean (Get-Prop $Row 'ObjectName' '')
+
+    if ($ClusterId -and $ProtectionGroupId -and $EnvironmentLabel -and $ObjectName) {
+        # V5 state-reconciliation identity rule:
+        # Previous state may contain old ObjectKey values that included RunType.
+        # Active/carry-forward suppression must compare the protected object itself,
+        # not the saved ObjectKey format. This prevents an old CancelledAfterFailure
+        # row from being carried forward after the same object has newer success.
+        return (('{0}|{1}|{2}|{3}|{4}|{5}' -f $ClusterId,$ProtectionGroupId,$EnvironmentLabel,$ObjectType,$HostName,$ObjectName).ToLowerInvariant())
+    }
+
+    $ObjectKey = Clean (Get-Prop $Row 'ObjectKey' '')
+    if ($ObjectKey) { return $ObjectKey.ToLowerInvariant() }
+    return ''
+}
+
+function Index-RowsByRecoveryIdentity($Rows) {
+    $Index = @{}
+    foreach ($Row in @($Rows)) {
+        $RecoveryKey = Get-RecoveryIdentityKeyForRow $Row
+        if (!$RecoveryKey) { continue }
+        if (!$Index.ContainsKey($RecoveryKey)) {
+            $Index[$RecoveryKey] = $Row
+            continue
+        }
+        $OldSortValue = Get-RowSortValue $Index[$RecoveryKey]
+        $NewSortValue = Get-RowSortValue $Row
+        if ($NewSortValue -ge $OldSortValue) { $Index[$RecoveryKey] = $Row }
+    }
+    return $Index
+}
+
+function Merge-RowsByRecoveryIdentity($Rows) {
+    $Index = Index-RowsByRecoveryIdentity $Rows
     return @($Index.Values)
 }
 
@@ -656,6 +706,7 @@ function Process-DetailedRuns(
     $PreviousRowsForProtectionGroup
 ) {
     $PreviousByKey = Index-RowsByObjectKey $PreviousRowsForProtectionGroup
+    $PreviousByRecoveryKey = Index-RowsByRecoveryIdentity $PreviousRowsForProtectionGroup
     $EvidenceByKey = @{}
     $ObjectIdToName = @{}
     $PhysicalHostById = @{}
@@ -705,6 +756,7 @@ function Process-DetailedRuns(
                     FailureDates = @{}
                     FailedRunCount = 0
                     FailedRunKeys = New-Object System.Collections.Generic.List[string]
+                    RecoveryIdentityKey = ''
                 }
             }
             $Entry = $EvidenceByKey[$ObjectKey]
@@ -713,6 +765,9 @@ function Process-DetailedRuns(
             $ObjectType = Clean (Get-Prop $ObjectMeta 'objectType' '')
             $ParentHostName = ''
             if ($EnvironmentSpec.ParentHostNeeded) { $ParentHostName = Get-ObjectParentHostName -RunObject $RunObject -ObjectIdToName $ObjectIdToName -PhysicalHostById $PhysicalHostById }
+            if (!$Entry.RecoveryIdentityKey) {
+                $Entry.RecoveryIdentityKey = (('{0}|{1}|{2}|{3}|{4}|{5}' -f $ClusterId,$ProtectionGroupId,$EnvironmentSpec.Label,$ObjectType,$ParentHostName,$ObjectName).ToLowerInvariant())
+            }
             $ObjectMessage = Get-ObjectMessage -RunObject $RunObject -RunInfo $RunInfo
             if (!$ObjectMessage -and $ObjectState -eq 'Failure') { $ObjectMessage = 'Object-level failure detected.' }
             if (!$ObjectMessage -and $ObjectState -eq 'Running') { $ObjectMessage = 'Latest object or run state is running.' }
@@ -747,6 +802,7 @@ function Process-DetailedRuns(
         $Entry = $EvidenceByKey[$ObjectKey]
         $PreviousRow = $null
         if ($PreviousByKey.ContainsKey($ObjectKey)) { $PreviousRow = $PreviousByKey[$ObjectKey] }
+        elseif ($Entry.RecoveryIdentityKey -and $PreviousByRecoveryKey.ContainsKey($Entry.RecoveryIdentityKey)) { $PreviousRow = $PreviousByRecoveryKey[$Entry.RecoveryIdentityKey] }
         $OldFailureDates = ''
         if ($PreviousRow) { $OldFailureDates = Clean (Get-Prop $PreviousRow 'FailureDates' '') }
         $MergedFailureDates = Merge-DateStrings -OldDates $OldFailureDates -NewDateSet $Entry.FailureDates
@@ -853,7 +909,7 @@ try {
     Write-Host ('RunMode         : {0}' -f $RunMode)
     Write-Host ('Scan NumRuns    : {0}' -f $ScanRunCount)
     Write-Host 'RemoteAdapter   : excluded'
-    Write-Host 'Decision model  : object-level only; same ObjectKey success clears failure'
+    Write-Host 'Decision model  : object-level only; recovery identity success clears stale state'
     Write-Host ''
 
     foreach ($EnvironmentSpec in Get-EnvironmentMap) {
@@ -921,23 +977,27 @@ try {
         }
     }
 
-    $ActiveRows = @(Merge-RowsByObjectKey $ActiveRows)
-    $ClearedRows = @(Merge-RowsByObjectKey $ClearedRows)
-    $ActiveByKey = Index-RowsByObjectKey $ActiveRows
-    $ClearedByKey = Index-RowsByObjectKey $ClearedRows
+    $ActiveRows = @(Merge-RowsByRecoveryIdentity $ActiveRows)
+    $ClearedRows = @(Merge-RowsByRecoveryIdentity $ClearedRows)
+    $ActiveByRecoveryKey = Index-RowsByRecoveryIdentity $ActiveRows
+    $ClearedByRecoveryKey = Index-RowsByRecoveryIdentity $ClearedRows
 
     foreach ($PreviousRow in @($PreviousOpenRows)) {
-        $PreviousObjectKey = Clean (Get-Prop $PreviousRow 'ObjectKey' '')
-        if (!$PreviousObjectKey) { continue }
-        if ($ActiveByKey.ContainsKey($PreviousObjectKey)) { continue }
-        if ($ClearedByKey.ContainsKey($PreviousObjectKey)) { continue }
+        $PreviousRecoveryKey = Get-RecoveryIdentityKeyForRow $PreviousRow
+        if (!$PreviousRecoveryKey) { continue }
+        if ($ActiveByRecoveryKey.ContainsKey($PreviousRecoveryKey)) { continue }
+        if ($ClearedByRecoveryKey.ContainsKey($PreviousRecoveryKey)) { continue }
         $ActiveRows += New-CarryForwardRow -PreviousRow $PreviousRow -Reason 'Known failed object not seen in current lookback; carried forward until same-object success is observed.'
     }
 
-    $ActiveRows = @(Merge-RowsByObjectKey $ActiveRows | Sort-Object Cluster,Environment,ProtectionGroup,ObjectName)
-    $ClearedRows = @(Merge-RowsByObjectKey $ClearedRows | Sort-Object Cluster,Environment,ProtectionGroup,ObjectName)
-    $AllClearedRows = @(Merge-RowsByObjectKey @($PreviousClearedRows + $ClearedRows) | Sort-Object Cluster,Environment,ProtectionGroup,ObjectName)
-    $LifecycleRows = @(Merge-RowsByObjectKey @($ActiveRows + $AllClearedRows) | Sort-Object Cluster,Environment,ProtectionGroup,ObjectName)
+    # V5 final reconciliation rule:
+    # Do not allow stale active rows from old state/ObjectKey formats to coexist with
+    # newer same-object success. Recovery matching is done by protected-object identity,
+    # not by the saved ObjectKey string.
+    $ActiveRows = @(Merge-RowsByRecoveryIdentity $ActiveRows | Sort-Object Cluster,Environment,ProtectionGroup,ObjectName)
+    $ClearedRows = @(Merge-RowsByRecoveryIdentity $ClearedRows | Sort-Object Cluster,Environment,ProtectionGroup,ObjectName)
+    $AllClearedRows = @(Merge-RowsByRecoveryIdentity @($PreviousClearedRows + $ClearedRows) | Sort-Object Cluster,Environment,ProtectionGroup,ObjectName)
+    $LifecycleRows = @(Merge-RowsByRecoveryIdentity @($ActiveRows + $AllClearedRows) | Sort-Object Cluster,Environment,ProtectionGroup,ObjectName)
 
     Write-CsvRows -Rows $ActiveRows -Path (Join-Path $OutputFolder 'current_failures.csv') -Columns $script:CsvColumns
     Write-CsvRows -Rows $ClearedRows -Path (Join-Path $OutputFolder 'cleared_by_success.csv') -Columns $script:CsvColumns
