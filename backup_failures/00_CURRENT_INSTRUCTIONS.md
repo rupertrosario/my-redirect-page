@@ -2,7 +2,33 @@
 
 This is the only active instruction file for `backup_failures/`.
 
-Going forward, overwrite this file whenever instructions change. Do not create numbered instruction files such as `02_...`, `03_...`, or `04_...` for normal guidance. Old instruction files are obsolete and must not be used as the source of truth.
+Going forward, overwrite this file whenever instructions change. Do not create numbered instruction files such as `02_...`, `03_...`, or `04_...` for normal guidance.
+
+## Hard operating rule
+
+The operator cannot run Git commands on the target machine.
+
+Do not instruct the operator to run:
+
+```text
+git fetch
+git checkout
+git pull
+git clean
+git status
+git diff
+git add
+git commit
+git push
+```
+
+The assistant must push repository changes directly through GitHub when needed. For the operator, provide only:
+
+```text
+1. Downloadable file links from chat.
+2. PowerShell copy-paste commands.
+3. PowerShell validation commands.
+```
 
 ## Repository scope
 
@@ -10,13 +36,62 @@ Going forward, overwrite this file whenever instructions change. Do not create n
 - Branch: `Cohesity_Automations`
 - Folder: `backup_failures/`
 
+## Folder should stay simple
+
+Target working set:
+
+```text
+backup_failures/
+  00_CURRENT_INSTRUCTIONS.md
+  Cohesity_Backup_Failure_INC_Status_Update.ps1
+  Get-CohesityBackupFailureWindowConsolidator.ps1
+  Format-CohesityBackupFailureReport.ps1
+```
+
+Any local files such as older downloaded V2/V3/V4 copies, old numbered instruction files, text exports, or temporary patch notes should not be used as source of truth.
+
+## Local cleanup command - PowerShell only
+
+Do not delete first. Move clutter to a local archive folder.
+
+Run from PowerShell:
+
+```powershell
+$folder = "X:\PowerShell\Cohesity_API_Scripts\backup_failures"
+$archive = Join-Path $folder ("_local_clutter_" + (Get-Date -Format "yyyyMMdd_HHmmss"))
+New-Item -ItemType Directory -Path $archive -Force | Out-Null
+
+$keep = @(
+  "00_CURRENT_INSTRUCTIONS.md",
+  "Cohesity_Backup_Failure_INC_Status_Update.ps1",
+  "Get-CohesityBackupFailureWindowConsolidator.ps1",
+  "Format-CohesityBackupFailureReport.ps1"
+)
+
+Get-ChildItem $folder -File |
+  Where-Object { $keep -notcontains $_.Name } |
+  Move-Item -Destination $archive -Force
+
+"Moved local clutter to: $archive"
+Get-ChildItem $folder | Select Name | Sort-Object Name
+```
+
+Expected visible working files after cleanup:
+
+```text
+00_CURRENT_INSTRUCTIONS.md
+Cohesity_Backup_Failure_INC_Status_Update.ps1
+Format-CohesityBackupFailureReport.ps1
+Get-CohesityBackupFailureWindowConsolidator.ps1
+```
+
 ## Current state
 
 We are going back to basics.
 
 Do not continue broad all-cluster testing until the core lifecycle logic is proven on one known object.
 
-The current active problem is the consolidator logic and validation, not the wrapper and not the formatter.
+The active problem is the consolidator logic and validation, not the wrapper and not the formatter.
 
 ## Files and ownership
 
@@ -51,9 +126,11 @@ Rules:
 - Consolidator owns state comparison.
 - Consolidator must report object-level backup state, not only protection-group-level failure.
 
-## First verification before any test
+## Verification before test - no obsolete text checks
 
-On the machine running the workflow, verify the actual local consolidator file before testing:
+Do not ask the operator to search for old strings such as `Processing clusters alphabetically`.
+
+Use only positive checks for the intended current logic:
 
 ```powershell
 cd X:\PowerShell\Cohesity_API_Scripts\backup_failures
@@ -61,7 +138,7 @@ cd X:\PowerShell\Cohesity_API_Scripts\backup_failures
 Get-FileHash .\Get-CohesityBackupFailureWindowConsolidator.ps1 -Algorithm SHA256
 
 Select-String .\Get-CohesityBackupFailureWindowConsolidator.ps1 -Pattern `
-"Recovery identity rule","ObjectKey must not include RunType","Recovery-aware rule","Processing clusters alphabetically"
+"Recovery identity rule","ObjectKey must not include RunType","Recovery-aware rule"
 ```
 
 Expected for the latest intended local V4 file:
@@ -70,10 +147,9 @@ Expected for the latest intended local V4 file:
 Recovery identity rule             = match
 ObjectKey must not include RunType = match
 Recovery-aware rule                = match
-Processing clusters alphabetically = no match
 ```
 
-If `Processing clusters alphabetically` appears, the machine is running an old consolidator.
+If these markers are missing, the operator is not using the intended latest consolidator file.
 
 ## Back-to-basics lifecycle goal
 
