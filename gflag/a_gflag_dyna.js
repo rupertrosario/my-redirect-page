@@ -385,7 +385,7 @@ export default async function () {
   const commonMarkdownEmail = joinReport([
     `### Cohesity Common GFlag Report — ${reportDate}`,
     "",
-    `This report contains GFlags for which the Service, GFlag, and Value are identical across all ${successfulClusters.length} successfully queried clusters.`,
+    `The following table provides a consolidated view of GFlag configurations shared across all ${successfulClusters.length} successfully queried clusters.`,
     "",
     renderedCommonRows.length
       ? mdTable(
@@ -429,7 +429,7 @@ export default async function () {
   const specificMarkdownEmail = joinReport([
     `### Cohesity Cluster-Specific GFlag Report — ${reportDate}`,
     "",
-    "This report contains GFlags that are absent from one or more clusters or have different values across the successfully queried clusters.",
+    "The following tables provide a consolidated view of cluster-specific GFlag configurations across the successfully queried clusters.",
     "",
     specificSections.length
       ? specificSections.join("\n")
