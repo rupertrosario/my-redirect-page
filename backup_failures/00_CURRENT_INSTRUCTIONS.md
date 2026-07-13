@@ -2,25 +2,13 @@
 
 This is the only active instruction file for `backup_failures/`.
 
-Going forward, overwrite this file whenever instructions change. Do not create numbered instruction files such as `02_...`, `03_...`, or `04_...` for normal guidance.
+Going forward, overwrite this file whenever instructions change. Do not create numbered instruction files for normal guidance.
 
 ## Hard operating rule
 
 The operator cannot run Git commands on the target machine.
 
-Do not instruct the operator to run:
-
-```text
-git fetch
-git checkout
-git pull
-git clean
-git status
-git diff
-git add
-git commit
-git push
-```
+Do not instruct the operator to run Git commands such as `git fetch`, `git pull`, `git clean`, `git status`, `git diff`, `git add`, `git commit`, or `git push`.
 
 The assistant must push repository changes directly through GitHub when needed. For the operator, provide only:
 
@@ -76,22 +64,35 @@ Get-ChildItem $folder -File |
 Get-ChildItem $folder | Select Name | Sort-Object Name
 ```
 
-Expected visible working files after cleanup:
-
-```text
-00_CURRENT_INSTRUCTIONS.md
-Cohesity_Backup_Failure_INC_Status_Update.ps1
-Format-CohesityBackupFailureReport.ps1
-Get-CohesityBackupFailureWindowConsolidator.ps1
-```
-
 ## Current state
 
-We are going back to basics.
+We are correcting the consolidator based on observed output.
 
-Do not continue broad all-cluster testing until the core lifecycle logic is proven on one known object.
+The screenshot showed the bug clearly:
 
-The active problem is the consolidator logic and validation, not the wrapper and not the formatter.
+```text
+CancelledAfterFailure | CarriedForward | older date
+Success               | Cleared        | newer date
+```
+
+That means the script created a cleared success row but still carried forward the old cancelled row.
+
+The active problem is the consolidator final reconciliation/state merge, not the wrapper and not the formatter.
+
+## Required consolidator fix level
+
+Use the V5 consolidator file from chat:
+
+```text
+Get-CohesityBackupFailureWindowConsolidator_ENV_FIRST_FIXED_V5.ps1
+```
+
+V5 adds these two required rules:
+
+```text
+V5 state-reconciliation identity rule
+V5 final reconciliation rule
+```
 
 ## Files and ownership
 
@@ -125,10 +126,11 @@ Rules:
 - Consolidator owns failure/running/cancelled/success lifecycle logic.
 - Consolidator owns state comparison.
 - Consolidator must report object-level backup state, not only protection-group-level failure.
+- Consolidator must not carry forward an old cancelled/failed/running row when the same protected object has newer success.
 
-## Verification before test - no obsolete text checks
+## Verification before test - positive checks only
 
-Do not ask the operator to search for old strings such as `Processing clusters alphabetically`.
+Do not ask the operator to search for old strings.
 
 Use only positive checks for the intended current logic:
 
@@ -138,15 +140,17 @@ cd X:\PowerShell\Cohesity_API_Scripts\backup_failures
 Get-FileHash .\Get-CohesityBackupFailureWindowConsolidator.ps1 -Algorithm SHA256
 
 Select-String .\Get-CohesityBackupFailureWindowConsolidator.ps1 -Pattern `
-"Recovery identity rule","ObjectKey must not include RunType","Recovery-aware rule"
+"Recovery identity rule","ObjectKey must not include RunType","Recovery-aware rule","V5 state-reconciliation identity rule","V5 final reconciliation rule"
 ```
 
-Expected for the latest intended local V4 file:
+Expected for the intended V5 file:
 
 ```text
-Recovery identity rule             = match
-ObjectKey must not include RunType = match
-Recovery-aware rule                = match
+Recovery identity rule                  = match
+ObjectKey must not include RunType      = match
+Recovery-aware rule                     = match
+V5 state-reconciliation identity rule   = match
+V5 final reconciliation rule            = match
 ```
 
 If these markers are missing, the operator is not using the intended latest consolidator file.
@@ -177,6 +181,7 @@ Did this object ever have a failed/cancelled/running run?
 | Running backup, later success | Cleared / recovered |
 | Success only | Not reported as problem |
 | Previously open in state, now success | Cleared / recovered |
+| Previously open in old state format, same object now success | Do not carry old row forward |
 
 ## Correct object identity rule
 
@@ -188,16 +193,7 @@ Cluster + ProtectionGroup + Environment + ObjectIdentity
 
 Object lifecycle matching should not depend on `RunType`.
 
-Reason:
-
-```text
-Same object cancelled in Incremental
-Same object later successful in Full/Synthetic/Incremental
-```
-
-The later success should clear the object because the object recovered.
-
-`RunType` should still remain in report rows for audit context, but it should not prevent recovery matching.
+For state reconciliation, old saved rows may have old `ObjectKey` values that included `RunType`. V5 must suppress those stale old rows by comparing protected-object identity from row fields, not by trusting only the saved `ObjectKey` string.
 
 ## Testing rule
 
@@ -296,6 +292,7 @@ as:
 Cancelled
 CancelledAfterFailure
 Failure
+CarriedForward
 ```
 
 ## Performance rule
@@ -321,7 +318,7 @@ BaselineNumRuns = 10 or 15
 
 Do not claim the full consolidator is pushed unless it has been explicitly fetched from GitHub after update and verified.
 
-For now, this instruction file is the source of truth for what to test and how to reason about the lifecycle.
+For now, the downloadable V5 consolidator from chat is the file the operator should copy over the local consolidator.
 
 ## Operating rule going forward
 
@@ -329,5 +326,4 @@ When instructions change:
 
 1. Overwrite `backup_failures/00_CURRENT_INSTRUCTIONS.md`.
 2. Do not create a new numbered instruction file.
-3. If old instruction files exist, treat them as obsolete.
-4. Keep chat instructions and this file aligned.
+3. Keep chat instructions and this file aligned.
