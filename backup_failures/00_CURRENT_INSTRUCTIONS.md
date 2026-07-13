@@ -1,8 +1,12 @@
+# THIS FILE MUST ALWAYS BE OVERWRITTEN. DO NOT CREATE NEW INSTRUCTION FILES.
+
 # CURRENT INSTRUCTIONS - Backup Failure workflow
 
 This is the only active instruction file for `backup_failures/`.
 
-Going forward, overwrite this file whenever instructions change. Do not create numbered instruction files for normal guidance.
+Whenever instructions change, overwrite this same file: `backup_failures/00_CURRENT_INSTRUCTIONS.md`.
+
+Do not create numbered instruction files for normal guidance. Do not use old notes, patch files, TXT exports, or downloaded V2/V3/V4/V5 copies as instruction source of truth.
 
 ## Hard operating rule
 
@@ -10,7 +14,9 @@ The operator cannot run Git commands on the target machine.
 
 Do not instruct the operator to run Git commands such as `git fetch`, `git pull`, `git clean`, `git status`, `git diff`, `git add`, `git commit`, or `git push`.
 
-The assistant must push repository changes directly through GitHub when needed. For the operator, provide only:
+The assistant must push repository changes directly through GitHub when needed.
+
+For the operator, provide only:
 
 ```text
 1. Downloadable file links from chat.
