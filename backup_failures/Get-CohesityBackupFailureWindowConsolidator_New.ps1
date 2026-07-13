@@ -10,6 +10,7 @@ Architectural rules:
 - Existing window / same INC uses incremental scan with a smaller run count.
 - Previous active object failures are always rechecked, even during incremental runs.
 - New failures are discovered from run-level Failed / Warning / Cancelled / Running / message signals, then confirmed at object level.
+- V6: Running must not override a same-object successful completed backup unless a later terminal Failure/Cancelled exists.
 - Final reporting is object-level only. Protection Group is context.
 - Clear when the same object identity has a newer successful object backup, even if run type changed.
 - If a known failed object is not visible in the current lookback, carry it forward.
@@ -746,6 +747,10 @@ function Process-DetailedRuns(
                     LatestState = ''
                     LatestUsecs = [int64]0
                     LatestSuccessUsecs = [int64]0
+                    LatestSuccessRunType = ''
+                    LatestRunningUsecs = [int64]0
+                    LastTerminalProblemUsecs = [int64]0
+                    LatestTerminalProblemState = ''
                     FirstFailedUsecs = [int64]0
                     LastFailedUsecs = [int64]0
                     ObjectName = ''
@@ -773,7 +778,7 @@ function Process-DetailedRuns(
             if (!$ObjectMessage -and $ObjectState -eq 'Running') { $ObjectMessage = 'Latest object or run state is running.' }
             if (!$ObjectMessage -and $ObjectState -eq 'Cancelled') { $ObjectMessage = 'Latest object or run state is cancelled.' }
 
-            if (!$Entry.LatestState) {
+            if (!$Entry.LatestState -or $RunUsecs -gt [int64]$Entry.LatestUsecs) {
                 $Entry.LatestState = $ObjectState
                 $Entry.LatestUsecs = $RunUsecs
                 $Entry.ObjectName = $ObjectName
@@ -781,7 +786,24 @@ function Process-DetailedRuns(
                 $Entry.ParentHostName = $ParentHostName
                 $Entry.RunType = $RunType
                 $Entry.Message = $ObjectMessage
-                if ($ObjectState -eq 'Success') { $Entry.LatestSuccessUsecs = $RunUsecs }
+            }
+
+            if ($ObjectState -eq 'Success' -and $RunUsecs -gt [int64]$Entry.LatestSuccessUsecs) {
+                # V6 latest-success-over-running rule:
+                # A newer/current Running row must not reopen or keep an incident active
+                # when the same protected object already has a successful backup and
+                # no later terminal Failure/Cancelled exists.
+                $Entry.LatestSuccessUsecs = $RunUsecs
+                $Entry.LatestSuccessRunType = $RunType
+            }
+
+            if ($ObjectState -eq 'Running' -and $RunUsecs -gt [int64]$Entry.LatestRunningUsecs) {
+                $Entry.LatestRunningUsecs = $RunUsecs
+            }
+
+            if ($ObjectState -in @('Failure','Cancelled') -and $RunUsecs -gt [int64]$Entry.LastTerminalProblemUsecs) {
+                $Entry.LastTerminalProblemUsecs = $RunUsecs
+                $Entry.LatestTerminalProblemState = $ObjectState
             }
 
             if ($ObjectState -in @('Failure','Running','Cancelled')) {
@@ -807,6 +829,29 @@ function Process-DetailedRuns(
         if ($PreviousRow) { $OldFailureDates = Clean (Get-Prop $PreviousRow 'FailureDates' '') }
         $MergedFailureDates = Merge-DateStrings -OldDates $OldFailureDates -NewDateSet $Entry.FailureDates
 
+        $HasSuccessForObject = ([int64]$Entry.LatestSuccessUsecs -gt 0)
+        $HasTerminalProblemAfterSuccess = ([int64]$Entry.LastTerminalProblemUsecs -gt [int64]$Entry.LatestSuccessUsecs)
+
+        if ($HasSuccessForObject -and !$HasTerminalProblemAfterSuccess) {
+            # V6 success-suppresses-running rule:
+            # Running is not a terminal failure. If the same protected object has a success
+            # and no later terminal Failure/Cancelled exists, do not report Running as active.
+            # This also clears older Failure/Cancelled/Running evidence for the same object.
+            if ($PreviousRow -or [int64]$Entry.LastTerminalProblemUsecs -gt 0) {
+                $ClearMessage = 'Previously failed/running/cancelled object has newer successful backup.'
+                if (!$PreviousRow -and [int64]$Entry.LastTerminalProblemUsecs -gt 0) {
+                    $ClearMessage = 'Earlier failed/cancelled object state in this scan has newer successful backup.'
+                }
+                if ([int64]$Entry.LatestRunningUsecs -gt [int64]$Entry.LatestSuccessUsecs) {
+                    $ClearMessage = ($ClearMessage + ' Newer running attempt is ignored until it finishes because the last completed backup is successful.')
+                }
+                $ClearRunType = Clean $Entry.LatestSuccessRunType
+                if (!$ClearRunType) { $ClearRunType = $Entry.RunType }
+                $ClearedRows += New-StatusRow -Incident $Incident -WindowKey $WindowKey -Status 'Success' -Change 'Cleared' -ClusterDisplayName $ClusterDisplayName -ClusterId $ClusterId -EnvironmentSpec $EnvironmentSpec -ProtectionGroupName $ProtectionGroupName -ProtectionGroupId $ProtectionGroupId -ParentHostName $Entry.ParentHostName -ObjectName $Entry.ObjectName -ObjectType $Entry.ObjectType -RunType $ClearRunType -FirstFailedUsecs 0 -LastFailedUsecs 0 -LatestSuccessUsecs $Entry.LatestSuccessUsecs -LastSeenUsecs $Entry.LatestSuccessUsecs -FailureDates $MergedFailureDates -FailedRunCount $Entry.FailedRunCount -Message $ClearMessage -ObjectKey $ObjectKey -EnvironmentFilter $EnvironmentSpec.Filter -FailedRunKeys (($Entry.FailedRunKeys | Select-Object -Unique) -join ' | ')
+            }
+            continue
+        }
+
         if ($Entry.LatestState -eq 'Success') {
             # Recovery-aware rule:
             # If the latest object/snapshot state is Success, any older Failure/Running/Cancelled
@@ -817,7 +862,9 @@ function Process-DetailedRuns(
                 if (!$PreviousRow -and [int]$Entry.FailedRunCount -gt 0) {
                     $ClearMessage = 'Earlier failed/running/cancelled object state in this scan has newer successful backup.'
                 }
-                $ClearedRows += New-StatusRow -Incident $Incident -WindowKey $WindowKey -Status 'Success' -Change 'Cleared' -ClusterDisplayName $ClusterDisplayName -ClusterId $ClusterId -EnvironmentSpec $EnvironmentSpec -ProtectionGroupName $ProtectionGroupName -ProtectionGroupId $ProtectionGroupId -ParentHostName $Entry.ParentHostName -ObjectName $Entry.ObjectName -ObjectType $Entry.ObjectType -RunType $Entry.RunType -FirstFailedUsecs 0 -LastFailedUsecs 0 -LatestSuccessUsecs $Entry.LatestSuccessUsecs -LastSeenUsecs $Entry.LatestUsecs -FailureDates $MergedFailureDates -FailedRunCount $Entry.FailedRunCount -Message $ClearMessage -ObjectKey $ObjectKey -EnvironmentFilter $EnvironmentSpec.Filter -FailedRunKeys (($Entry.FailedRunKeys | Select-Object -Unique) -join ' | ')
+                $ClearRunType = Clean $Entry.LatestSuccessRunType
+                if (!$ClearRunType) { $ClearRunType = $Entry.RunType }
+                $ClearedRows += New-StatusRow -Incident $Incident -WindowKey $WindowKey -Status 'Success' -Change 'Cleared' -ClusterDisplayName $ClusterDisplayName -ClusterId $ClusterId -EnvironmentSpec $EnvironmentSpec -ProtectionGroupName $ProtectionGroupName -ProtectionGroupId $ProtectionGroupId -ParentHostName $Entry.ParentHostName -ObjectName $Entry.ObjectName -ObjectType $Entry.ObjectType -RunType $ClearRunType -FirstFailedUsecs 0 -LastFailedUsecs 0 -LatestSuccessUsecs $Entry.LatestSuccessUsecs -LastSeenUsecs $Entry.LatestSuccessUsecs -FailureDates $MergedFailureDates -FailedRunCount $Entry.FailedRunCount -Message $ClearMessage -ObjectKey $ObjectKey -EnvironmentFilter $EnvironmentSpec.Filter -FailedRunKeys (($Entry.FailedRunKeys | Select-Object -Unique) -join ' | ')
             }
             continue
         }
@@ -994,9 +1041,26 @@ try {
     # Do not allow stale active rows from old state/ObjectKey formats to coexist with
     # newer same-object success. Recovery matching is done by protected-object identity,
     # not by the saved ObjectKey string.
-    $ActiveRows = @(Merge-RowsByRecoveryIdentity $ActiveRows | Sort-Object Cluster,Environment,ProtectionGroup,ObjectName)
     $ClearedRows = @(Merge-RowsByRecoveryIdentity $ClearedRows | Sort-Object Cluster,Environment,ProtectionGroup,ObjectName)
     $AllClearedRows = @(Merge-RowsByRecoveryIdentity @($PreviousClearedRows + $ClearedRows) | Sort-Object Cluster,Environment,ProtectionGroup,ObjectName)
+    $AllClearedByRecoveryKey = Index-RowsByRecoveryIdentity $AllClearedRows
+
+    # V6 final active suppression rule:
+    # A Running row must not stay active when the same protected object has a successful
+    # backup and no later terminal Failure/Cancelled. Running is pending evidence only;
+    # it should not override the last completed successful backup.
+    $ActiveRows = @(Merge-RowsByRecoveryIdentity $ActiveRows | Where-Object {
+        $ActiveRecoveryKey = Get-RecoveryIdentityKeyForRow $_
+        if (!$ActiveRecoveryKey -or !$AllClearedByRecoveryKey.ContainsKey($ActiveRecoveryKey)) { return $true }
+
+        $ActiveStatus = Clean (Get-Prop $_ 'Status' '')
+        $ActiveSortValue = Get-RowSortValue $_
+        $ClearedSortValue = Get-RowSortValue $AllClearedByRecoveryKey[$ActiveRecoveryKey]
+
+        if ($ActiveStatus -eq 'Running') { return $false }
+        return ($ActiveSortValue -gt $ClearedSortValue)
+    } | Sort-Object Cluster,Environment,ProtectionGroup,ObjectName)
+
     $LifecycleRows = @(Merge-RowsByRecoveryIdentity @($ActiveRows + $AllClearedRows) | Sort-Object Cluster,Environment,ProtectionGroup,ObjectName)
 
     Write-CsvRows -Rows $ActiveRows -Path (Join-Path $OutputFolder 'current_failures.csv') -Columns $script:CsvColumns
