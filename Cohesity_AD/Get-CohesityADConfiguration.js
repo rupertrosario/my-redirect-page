@@ -1,15 +1,34 @@
 import { credentialVaultClient } from "@dynatrace-sdk/client-classic-environment-v2";
 
 /**
- * Cohesity Active Directory Configuration Report
- * Multi-cluster | Cohesity Helios | GET-only | Dynatrace JavaScript
+ * Cohesity Active Directory Configuration Inventory
+ *
+ * Purpose:
+ * - Discover every Cohesity cluster visible through Helios.
+ * - Query each cluster's Active Directory configuration.
+ * - Return structured rows using the same ten columns as the PowerShell CSV.
+ * - Generate one Markdown table for a Dynatrace email action.
+ * - Return per-cluster query failures separately in the errors array.
+ *
+ * GET-only API flow:
+ * 1. GET /v2/mcm/cluster-mgmt/info
+ *    Discovers all clusters visible to the Helios API key.
+ * 2. GET /v2/active-directories?includeTenants=true
+ *    Runs once per cluster with accessClusterId in the request headers.
+ *
+ * The script does not use POST, PUT, PATCH, or DELETE.
+ * The API key is read only from Dynatrace Credential Vault.
  */
 export default async function () {
+  // ------------------------------------------------------------------
+  // Configuration
+  // ------------------------------------------------------------------
   const baseUrl = "https://helios.cohesity.com";
   const vaultName = "Cohesity_API_Key";
   const vaultId = "credentials_vault-312312";
   const maxMarkdownRows = 1000;
 
+  // Keep this order identical to the PowerShell CSV output.
   const columns = [
     "Cluster",
     "ADConfigured",
@@ -23,6 +42,9 @@ export default async function () {
     "ADConfigurationId"
   ];
 
+  // ------------------------------------------------------------------
+  // Generic value and array helpers
+  // ------------------------------------------------------------------
   const normalize = (value) =>
     value === null || value === undefined ? "" : String(value).trim();
 
@@ -31,6 +53,7 @@ export default async function () {
     return Array.isArray(value) ? value : [value];
   };
 
+  // Convert empty or missing API values to N/A for consistent reporting.
   const valueOrNA = (value) => {
     if (value === null || value === undefined) return "N/A";
 
@@ -42,6 +65,7 @@ export default async function () {
     return normalize(value) || "N/A";
   };
 
+  // Return the first populated property from a list of possible API names.
   const firstValue = (object, propertyNames) => {
     if (!object) return "N/A";
 
@@ -53,12 +77,14 @@ export default async function () {
     return "N/A";
   };
 
+  // Escape characters that would otherwise break a Markdown table cell.
   const escapeMarkdownCell = (value) =>
     String(value ?? "")
       .replace(/\\/g, "\\\\")
       .replace(/\|/g, "\\|")
       .replace(/\r?\n/g, " ");
 
+  // Build one Markdown table from the structured result rows.
   function markdownTable(headers, rows) {
     const headerRow = `| ${headers.map(escapeMarkdownCell).join(" | ")} |`;
     const separatorRow = `| ${headers.map(() => "---").join(" | ")} |`;
@@ -72,6 +98,12 @@ export default async function () {
     return [headerRow, separatorRow, ...dataRows].join("\n");
   }
 
+  // ------------------------------------------------------------------
+  // Cohesity AD field-formatting helpers
+  // ------------------------------------------------------------------
+
+  // Format preferred domain controllers as:
+  // controller-name [status]; controller-name [status]
   function formatNameStatusList(items) {
     const values = [];
 
@@ -93,6 +125,8 @@ export default async function () {
     return values.length ? values.join("; ") : "N/A";
   }
 
+  // Format machine accounts as:
+  // account-name; DNS=dns-name | second-account
   function formatMachineAccounts(machineAccounts) {
     const values = [];
 
@@ -114,6 +148,7 @@ export default async function () {
     return values.length ? values.join(" | ") : "N/A";
   }
 
+  // Combine trustedDomains and whitelistedDomains into one report column.
   function formatTrustedDomains(trustedDomainParams) {
     if (!trustedDomainParams) return "N/A";
 
@@ -138,6 +173,8 @@ export default async function () {
     return values.length ? values.join(", ") : "N/A";
   }
 
+  // Create a complete ten-column row for clusters with no AD configuration
+  // or clusters whose AD query could not be completed.
   function emptyRow(clusterName, adConfigured) {
     return {
       Cluster: clusterName,
@@ -153,6 +190,12 @@ export default async function () {
     };
   }
 
+  // ------------------------------------------------------------------
+  // Dynatrace Credential Vault
+  // ------------------------------------------------------------------
+
+  // First find the API key credential by name. If the vault list lookup is
+  // unavailable or no key is found, use the configured credential ID.
   async function getApiKey() {
     try {
       const credentialList = await credentialVaultClient.getCredentials();
@@ -169,7 +212,7 @@ export default async function () {
         if (apiKey) return apiKey;
       }
     } catch {
-      // Fall through to the configured credential ID.
+      // Continue to the configured vault ID fallback.
     }
 
     try {
@@ -183,6 +226,12 @@ export default async function () {
     }
   }
 
+  // ------------------------------------------------------------------
+  // GET-only HTTP wrapper
+  // ------------------------------------------------------------------
+
+  // Every Cohesity API request passes through this function. The HTTP method
+  // is fixed to GET so the workflow cannot modify Cohesity configuration.
   async function getJson(url, headers) {
     try {
       const response = await fetch(url, {
@@ -225,6 +274,9 @@ export default async function () {
     }
   }
 
+  // ------------------------------------------------------------------
+  // Authentication
+  // ------------------------------------------------------------------
   const apiKey = await getApiKey();
 
   if (!apiKey) {
@@ -241,6 +293,10 @@ export default async function () {
     apiKey
   };
 
+  // ------------------------------------------------------------------
+  // GET 1: Discover all clusters visible through Cohesity Helios
+  // Endpoint: GET /v2/mcm/cluster-mgmt/info
+  // ------------------------------------------------------------------
   const clusterResponse = await getJson(
     `${baseUrl}/v2/mcm/cluster-mgmt/info`,
     commonHeaders
@@ -259,6 +315,7 @@ export default async function () {
 
   const clusterData = clusterResponse.data || {};
 
+  // Support the possible cluster-list response wrappers returned by Helios.
   const clusters = toArray(
     clusterData.cohesityClusters ||
       clusterData.clusters ||
@@ -306,6 +363,11 @@ export default async function () {
   let configuredClusterCount = 0;
   let notConfiguredClusterCount = 0;
 
+  // ------------------------------------------------------------------
+  // GET 2: Query AD configuration separately for every discovered cluster
+  // Endpoint: GET /v2/active-directories?includeTenants=true
+  // Header: accessClusterId=<current cluster ID>
+  // ------------------------------------------------------------------
   for (const cluster of clusters) {
     const clusterNameValue = firstValue(cluster, [
       "name",
@@ -325,6 +387,8 @@ export default async function () {
     const clusterName =
       clusterNameValue === "N/A" ? "Unknown" : clusterNameValue;
 
+    // A missing cluster ID prevents a targeted query. Keep the cluster in the
+    // main table as Unknown and record the reason in the separate errors array.
     if (clusterIdValue === "N/A") {
       rows.push(emptyRow(clusterName, "Unknown"));
       errors.push({
@@ -345,6 +409,8 @@ export default async function () {
       clusterHeaders
     );
 
+    // Keep one Unknown row in the inventory and store the actual HTTP failure
+    // separately so a failed query is not treated as AD not configured.
     if (!adResponse.ok) {
       rows.push(emptyRow(clusterName, "Unknown"));
       errors.push({
@@ -358,6 +424,7 @@ export default async function () {
     const adData = adResponse.data;
     let activeDirectories = [];
 
+    // Normalize array, wrapped-array, and single-object API responses.
     if (Array.isArray(adData)) {
       activeDirectories = adData.filter(Boolean);
     } else if (Array.isArray(adData?.activeDirectories)) {
@@ -366,6 +433,7 @@ export default async function () {
       activeDirectories = [adData];
     }
 
+    // An empty successful response means AD is not configured on the cluster.
     if (!activeDirectories.length) {
       rows.push(emptyRow(clusterName, "No"));
       notConfiguredClusterCount++;
@@ -374,6 +442,7 @@ export default async function () {
 
     configuredClusterCount++;
 
+    // Create one report row per returned AD configuration.
     for (const activeDirectory of activeDirectories) {
       rows.push({
         Cluster: clusterName,
@@ -400,6 +469,7 @@ export default async function () {
     }
   }
 
+  // Match PowerShell ordering: Cluster first, then DomainName.
   rows.sort(
     (left, right) =>
       left.Cluster.localeCompare(right.Cluster, undefined, {
@@ -410,6 +480,9 @@ export default async function () {
       })
   );
 
+  // ------------------------------------------------------------------
+  // Build the single Markdown table used by the email action
+  // ------------------------------------------------------------------
   const reportDate = new Date().toLocaleDateString("en-GB", {
     timeZone: "Asia/Kolkata",
     year: "numeric",
@@ -432,6 +505,12 @@ export default async function () {
     .filter((item) => item !== null && item !== undefined)
     .join("\n");
 
+  // ------------------------------------------------------------------
+  // Dynatrace workflow outputs
+  // rows          : structured ten-column inventory
+  // markdownEmail : one Markdown table for the email body
+  // errors        : separate per-cluster query failures
+  // ------------------------------------------------------------------
   return {
     clusterCount: clusters.length,
     configuredClusterCount,
