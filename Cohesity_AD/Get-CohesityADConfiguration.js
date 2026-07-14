@@ -4,30 +4,22 @@ import { credentialVaultClient } from "@dynatrace-sdk/client-classic-environment
  * Cohesity Active Directory Configuration Inventory
  *
  * Purpose:
- * - Discover all Cohesity clusters visible through Helios.
+ * - Discover every Cohesity cluster visible through Helios.
  * - Query each cluster's Active Directory configuration.
- * - Return structured rows using the same ten fields as PowerShell.
- * - Generate one narrow vertical Markdown table for Dynatrace email.
- * - Return cluster-specific query failures separately in errors.
+ * - Return complete structured rows.
+ * - Generate one horizontal Markdown table containing the nine agreed fields.
  *
  * GET-only API flow:
  * 1. GET /v2/mcm/cluster-mgmt/info
  * 2. GET /v2/active-directories?includeTenants=true
- *    The second GET runs once per cluster with accessClusterId.
+ *    The second request runs once per cluster with accessClusterId.
  *
  * No POST, PUT, PATCH, or DELETE request is used.
- * The Helios API key is read only from Dynatrace Credential Vault.
  */
 export default async function () {
-  // ------------------------------------------------------------------
-  // Configuration
-  // ------------------------------------------------------------------
   const baseUrl = "https://helios.cohesity.com";
   const vaultName = "Cohesity_API_Key";
   const vaultId = "credentials_vault-312312";
-  const maxMarkdownRows = 1000;
-
-  // Structured rows retain the same ten columns as PowerShell.
   const columns = [
     "Cluster",
     "ADConfigured",
@@ -41,22 +33,19 @@ export default async function () {
     "ADConfigurationId"
   ];
 
-  // The email uses Field/Value rows instead of one excessively wide row.
-  // ADConfigured=Yes is intentionally omitted from the email.
-  const markdownFields = [
+  // Email table: only the nine agreed fields. ADConfigured remains in rows.
+  const markdownColumns = [
+    ["Cluster", "Cluster"],
     ["Domain", "DomainName"],
-    ["Organizational Unit", "OrganizationalUnit"],
+    ["OU", "OrganizationalUnit"],
     ["Workgroup", "WorkGroupName"],
     ["Machine Accounts", "MachineAccounts"],
-    ["Preferred Domain Controllers", "PreferredDomainControllers"],
-    ["Denied Domain Controllers", "DomainControllersDenyList"],
+    ["Preferred DCs", "PreferredDomainControllers"],
+    ["Denied DCs", "DomainControllersDenyList"],
     ["Trusted Domains", "TrustedDomains"],
-    ["AD Configuration ID", "ADConfigurationId"]
+    ["AD Config ID", "ADConfigurationId"]
   ];
 
-  // ------------------------------------------------------------------
-  // Generic normalization helpers
-  // ------------------------------------------------------------------
   const normalize = (value) =>
     value === null || value === undefined ? "" : String(value).trim();
 
@@ -88,53 +77,37 @@ export default async function () {
   };
 
   /**
-   * Dynatrace email Markdown treats every pipe as a column separator.
-   * Replace embedded pipes before constructing each row.
+   * Preserve every value while making long tokens wrap inside email tables.
+   *
+   * - Embedded pipes are replaced because Dynatrace treats them as columns.
+   * - Zero-width break points are inserted after normal separators such as
+   *   dots, commas, semicolons, equals signs, slashes, underscores and hyphens.
+   * - No text is truncated.
    */
   const safeMarkdownCell = (value) =>
     String(value ?? "")
       .replace(/\|/g, " / ")
       .replace(/\r?\n/g, " ")
       .replace(/\s+/g, " ")
+      .replace(/([.,;=\\/_-])/g, "$1\u200B")
       .trim();
 
-  /**
-   * Build one narrow table:
-   * Cluster | Field | Value
-   *
-   * This avoids email-client clipping caused by the previous nine-column
-   * layout while preserving every reported value.
-   */
-  function markdownTable(rows) {
-    const lines = [
-      "| Cluster | Field | Value |",
-      "|---|---|---|"
-    ];
+  function markdownTable(columnDefinitions, rows) {
+    const labels = columnDefinitions.map(([label]) => label);
+    const keys = columnDefinitions.map(([, key]) => key);
 
-    for (const row of rows) {
-      const cluster = safeMarkdownCell(row.Cluster);
+    const headerRow = `| ${labels.join(" | ")} |`;
+    const separatorRow = `| ${labels.map(() => "---").join(" | ")} |`;
+    const dataRows = rows.map(
+      (row) =>
+        `| ${keys
+          .map((key) => safeMarkdownCell(row[key]))
+          .join(" | ")} |`
+    );
 
-      // Do not display the repetitive Yes value. Preserve only exceptional
-      // No/Unknown states so failed or unconfigured clusters remain visible.
-      if (row.ADConfigured !== "Yes") {
-        lines.push(
-          `| ${cluster} | AD Status | ${safeMarkdownCell(row.ADConfigured)} |`
-        );
-      }
-
-      for (const [label, key] of markdownFields) {
-        lines.push(
-          `| ${cluster} | ${label} | ${safeMarkdownCell(row[key])} |`
-        );
-      }
-    }
-
-    return lines.join("\n");
+    return [headerRow, separatorRow, ...dataRows].join("\n");
   }
 
-  // ------------------------------------------------------------------
-  // Cohesity AD field formatting
-  // ------------------------------------------------------------------
   function formatNameStatusList(items) {
     const values = [];
 
@@ -216,9 +189,6 @@ export default async function () {
     };
   }
 
-  // ------------------------------------------------------------------
-  // Dynatrace Credential Vault
-  // ------------------------------------------------------------------
   async function getApiKey() {
     try {
       const credentialList = await credentialVaultClient.getCredentials();
@@ -235,7 +205,7 @@ export default async function () {
         if (apiKey) return apiKey;
       }
     } catch {
-      // Continue to the configured credential ID fallback.
+      // Fall through to the configured credential ID.
     }
 
     try {
@@ -249,9 +219,6 @@ export default async function () {
     }
   }
 
-  // ------------------------------------------------------------------
-  // GET-only HTTP wrapper
-  // ------------------------------------------------------------------
   async function getJson(url, headers) {
     try {
       const response = await fetch(url, {
@@ -294,9 +261,6 @@ export default async function () {
     }
   }
 
-  // ------------------------------------------------------------------
-  // Authentication
-  // ------------------------------------------------------------------
   const apiKey = await getApiKey();
 
   if (!apiKey) {
@@ -313,9 +277,6 @@ export default async function () {
     apiKey
   };
 
-  // ------------------------------------------------------------------
-  // GET 1: Discover clusters through Helios
-  // ------------------------------------------------------------------
   const clusterResponse = await getJson(
     `${baseUrl}/v2/mcm/cluster-mgmt/info`,
     commonHeaders
@@ -380,10 +341,6 @@ export default async function () {
   let configuredClusterCount = 0;
   let notConfiguredClusterCount = 0;
 
-  // ------------------------------------------------------------------
-  // GET 2: Query AD configuration once for every cluster
-  // Header: accessClusterId=<current cluster ID>
-  // ------------------------------------------------------------------
   for (const cluster of clusters) {
     const clusterNameValue = firstValue(cluster, [
       "name",
@@ -488,9 +445,6 @@ export default async function () {
       })
   );
 
-  // ------------------------------------------------------------------
-  // Build one narrow vertical Markdown table for the email body
-  // ------------------------------------------------------------------
   const reportDate = new Date().toLocaleDateString("en-GB", {
     timeZone: "Asia/Kolkata",
     year: "numeric",
@@ -498,14 +452,10 @@ export default async function () {
     day: "2-digit"
   });
 
-  const markdownRows = rows.slice(0, maxMarkdownRows);
   const markdownEmail = [
     `### Cohesity Active Directory Configuration — ${reportDate}`,
     "",
-    markdownTable(markdownRows),
-    rows.length > maxMarkdownRows
-      ? `_Note: Markdown output limited to ${maxMarkdownRows} of ${rows.length} inventory rows._`
-      : null,
+    markdownTable(markdownColumns, rows),
     errors.length
       ? `_Warning: ${errors.length} cluster query error(s). See the separate errors output._`
       : null
