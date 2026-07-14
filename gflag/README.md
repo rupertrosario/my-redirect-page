@@ -90,15 +90,17 @@ Important:
    |---|---|
    | Left **Choose a value** | Select **Subject** from Dynamic content |
    | Operator | Select **contains** |
-   | Right **Choose a value** | `Cluster-Specific GFlag Report` |
+   | Right **Choose a value** | `Cluster Specific GFlag Report` |
 
 The completed condition must be:
 
 ```text
 Subject contains Common GFlag Report
 OR
-Subject contains Cluster-Specific GFlag Report
+Subject contains Cluster Specific GFlag Report
 ```
+
+Do not use `Cluster-Specific GFlag Report`; the actual subject uses a space, not a hyphen.
 
 Do not use the longer value `Cohesity Common GFlag Report`. The observed Common report subject is:
 
@@ -130,7 +132,7 @@ Configure the **Create file** action:
 4. Open **Cohesity GFlag Reports**.
 5. Select that folder.
 
-Both Common and Cluster-Specific reports are stored in this same folder.
+Both Common and Cluster Specific reports are stored in this same folder.
 
 ### 6. Configure File Name
 
@@ -180,7 +182,7 @@ The condition's **False** branch requires no action. Emails that do not match ei
 ```text
 When a new email arrives in the selected Outlook folder
                     ↓
-Subject contains Common OR Cluster-Specific GFlag Report?
+Subject contains Common OR Cluster Specific GFlag Report?
           ┌─────────┴─────────┐
          True                False
           ↓                    ↓
@@ -203,7 +205,7 @@ Documents/Cohesity GFlag Reports
    ```
 
 7. Open the HTML file and verify that the complete email body and tables are present.
-8. Repeat with a new Cluster-Specific GFlag report email.
+8. Repeat with a new Cluster Specific GFlag report email.
 9. Confirm the second file uses the `Cohesity_Cluster_Specific_GFlags_` filename prefix.
 
 Existing emails already present before the flow is enabled should not be used as the primary trigger test. Use a newly delivered or forwarded report email.
