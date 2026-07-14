@@ -14,9 +14,17 @@ This page defines the Identity and Access Management (IAM) control requirements 
 
 ## IAM Control Requirements
 
-The corporate IAM control baseline applies to all in-scope platforms. The approved control baseline may be inserted below as an image or linked to the authoritative IAM standard.
+The applicable IAM control requirements are extracted from the Corporate IAM Confluence documentation and retained here as the governing reference for the in-scope Data Protection platforms.
 
-**IAM Control Baseline:** [Insert image or authoritative standard link]
+**Corporate IAM Source Page:** [Insert link to the Corporate Confluence page]
+
+**Referenced Section:** IAM
+
+**Corporate IAM Requirements:** [Insert link to the pasted IAM requirements / first image or section anchor]
+
+The Corporate IAM requirements are maintained by the owning enterprise team. This document records how Cohesity, Dell EMC Data Domain, and Dell EMC NetWorker align with those requirements and provides the supporting compliance evidence.
+
+> Paste or retain the extracted Corporate IAM requirements below this note.
 
 ## Platform Compliance Matrix
 
@@ -106,7 +114,7 @@ Record only controls that are not compliant, partially compliant, or not applica
 | Field | Value |
 |---|---|
 | Document Owner | [Name / Team] |
-| Version | 0.2 |
+| Version | 0.3 |
 | Effective Date | [Date] |
 | Last Updated | [Date] |
 | Review Frequency | Annually or upon material control change |
