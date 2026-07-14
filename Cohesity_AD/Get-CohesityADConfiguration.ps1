@@ -14,6 +14,10 @@
 # - GET /v2/mcm/cluster-mgmt/info
 # - GET /v2/active-directories?includeTenants=true
 #
+# One-time API key encryption (run as the same Windows account):
+# Read-Host "Enter Cohesity API key" -AsSecureString | ConvertFrom-SecureString |
+#     Set-Content "X:\PowerShell\Cohesity_API_Scripts\DO_NOT_Delete\apikey.enc"
+#
 # CSV Columns:
 # Cluster, ADConfigured, DomainName, OrganizationalUnit, WorkGroupName,
 # MachineAccounts, PreferredDomainControllers, DomainControllersDenyList,
@@ -26,7 +30,7 @@ $ErrorActionPreference = "Stop"
 # Config
 # -------------------------------
 $baseUrl      = "https://helios.cohesity.com"
-$apikeypath   = "X:\PowerShell\Cohesity_API_Scripts\DO_NOT_Delete\apikey.txt"
+$apikeypath   = "X:\PowerShell\Cohesity_API_Scripts\DO_NOT_Delete\apikey.enc"
 $logDirectory = "X:\PowerShell\Data\Cohesity\ADInventory"
 
 if (-not (Test-Path -Path $logDirectory -PathType Container)) {
@@ -34,13 +38,28 @@ if (-not (Test-Path -Path $logDirectory -PathType Container)) {
 }
 
 if (-not (Test-Path -Path $apikeypath -PathType Leaf)) {
-    throw "API key file not found at $apikeypath"
+    throw "Encrypted API key file not found at $apikeypath"
 }
 
-$apiKey = (Get-Content -Path $apikeypath -Raw).Trim()
+try {
+    $secureApiKey = Get-Content -Path $apikeypath -Raw | ConvertTo-SecureString -ErrorAction Stop
+    $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secureApiKey)
+
+    try {
+        $apiKey = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr)
+    }
+    finally {
+        if ($bstr -ne [IntPtr]::Zero) {
+            [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
+        }
+    }
+}
+catch {
+    throw "Failed to decrypt API key file '$apikeypath'. Create it with the same Windows account on the same computer. $($_.Exception.Message)"
+}
 
 if ([string]::IsNullOrWhiteSpace($apiKey)) {
-    throw "API key file is empty: $apikeypath"
+    throw "Decrypted API key is empty: $apikeypath"
 }
 
 $commonHeaders = @{
