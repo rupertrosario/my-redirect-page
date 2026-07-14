@@ -52,14 +52,12 @@ This flow copies the email body. It does not move or delete the original Outlook
    - Personal mailbox: **When a new email arrives (V3)**
    - Shared mailbox: **When a new email arrives in a shared mailbox (V2)**
 
-An Automated cloud flow is used because the process must start automatically when a new email arrives.
-
 ### 2. Configure the Outlook trigger
 
 | Field | Value |
 |---|---|
 | Mailbox Address | Enter the shared mailbox address only when using the shared-mailbox trigger |
-| Folder | Use the folder picker and select the Inbox subfolder where the GFlag emails arrive |
+| Folder | Select the Inbox subfolder where the GFlag emails arrive |
 | Subject Filter | `GFlag Report` |
 | Only with Attachments | `No` |
 | Include Attachments | `No` |
@@ -81,7 +79,7 @@ Important:
    |---|---|
    | Left **Choose a value** | Select **Subject** from Dynamic content |
    | Operator | Select **contains** |
-   | Right **Choose a value** | `Common GFlag Report` |
+   | Right **Choose a value** | `Cluster Common GFlag Report` |
 
 5. Select **Add row**.
 6. Configure the second row:
@@ -95,22 +93,14 @@ Important:
 The completed condition must be:
 
 ```text
-Subject contains Common GFlag Report
+Subject contains Cluster Common GFlag Report
 OR
 Subject contains Cluster Specific GFlag Report
 ```
 
-Do not use `Cluster-Specific GFlag Report`; the actual subject uses a space, not a hyphen.
+Do not use **AND**. Each report email contains only one report type.
 
-Do not use the longer value `Cohesity Common GFlag Report`. The observed Common report subject is:
-
-```text
-105142 - Cohesity Custer Common GFlag Report
-```
-
-Because `Custer` appears between `Cohesity` and `Common`, the longer text does not exist as one continuous substring and makes the condition False.
-
-Do not use **AND**. A report email normally contains only one report type.
+Do not use a hyphen in `Cluster Specific GFlag Report` unless the actual email subject contains one.
 
 ### 4. Add SharePoint Create file
 
@@ -132,32 +122,30 @@ Configure the **Create file** action:
 4. Open **Cohesity GFlag Reports**.
 5. Select that folder.
 
-Both Common and Cluster Specific reports are stored in this same folder.
+Both report types are stored in this same folder.
 
 ### 6. Configure File Name
 
 Click inside **File Name**, open **fx / Expression**, and paste this exact expression:
 
 ```text
-concat(if(contains(toLower(triggerOutputs()?['body/subject']),'common gflag report'),'Cohesity_Common_GFlags_','Cohesity_Cluster_Specific_GFlags_'),formatDateTime(utcNow(),'yyyy-MM-dd_HHmmssfff'),'.html')
+concat(if(contains(toLower(triggerOutputs()?['body/subject']),'cluster common gflag report'),'Cohesity_Common_GFlags_','Cohesity_Cluster_Specific_GFlags_'),formatDateTime(utcNow(),'yyyy-MM-dd_HHmmssfff'),'.html')
 ```
 
-This expression is case-insensitive because it converts the subject to lowercase before matching.
-
-It produces filenames such as:
+Example filenames:
 
 ```text
 Cohesity_Common_GFlags_2026-07-14_103015245.html
 Cohesity_Cluster_Specific_GFlags_2026-07-14_103020671.html
 ```
 
-The timestamp is UTC. Milliseconds are included to reduce filename collisions.
+The expression is case-insensitive because it converts the subject to lowercase before matching. The timestamp is UTC and includes milliseconds.
 
 ### 7. Configure File Content
 
 1. Click inside **File Content**.
 2. Open **Dynamic content**.
-3. Select **Body** from the Outlook trigger: **When a new email arrives**.
+3. Select **Body** from **When a new email arrives**.
 
 Use:
 
@@ -182,7 +170,7 @@ The condition's **False** branch requires no action. Emails that do not match ei
 ```text
 When a new email arrives in the selected Outlook folder
                     ↓
-Subject contains Common OR Cluster Specific GFlag Report?
+Subject contains Cluster Common OR Cluster Specific GFlag Report?
           ┌─────────┴─────────┐
          True                False
           ↓                    ↓
@@ -195,20 +183,14 @@ Documents/Cohesity GFlag Reports
 
 1. Select **Save**.
 2. Select **Test → Manually**.
-3. Send, receive, or forward a new Common GFlag report into the monitored Outlook folder.
-4. Open the flow's **Run history**.
-5. Confirm the condition followed the **True** branch.
-6. Confirm the Common HTML file was created in:
+3. Send, receive, or forward a new Cluster Common GFlag report into the monitored Outlook folder.
+4. Open **Run history** and confirm the condition followed the **True** branch.
+5. Confirm the Common HTML file was created in `Documents/Cohesity GFlag Reports`.
+6. Open the file and verify that the complete email body and tables are present.
+7. Repeat with a new Cluster Specific GFlag report email.
+8. Confirm the second file uses the `Cohesity_Cluster_Specific_GFlags_` prefix.
 
-   ```text
-   Documents/Cohesity GFlag Reports
-   ```
-
-7. Open the HTML file and verify that the complete email body and tables are present.
-8. Repeat with a new Cluster Specific GFlag report email.
-9. Confirm the second file uses the `Cohesity_Cluster_Specific_GFlags_` filename prefix.
-
-Existing emails already present before the flow is enabled should not be used as the primary trigger test. Use a newly delivered or forwarded report email.
+Existing emails already present before the flow is enabled should not be used as the primary trigger test. Use a newly delivered or forwarded email.
 
 ## Operational notes
 
@@ -217,6 +199,6 @@ Existing emails already present before the flow is enabled should not be used as
 - Attachments are not saved.
 - Protected or encrypted messages may not expose their body to the connector.
 - Inline images using mail-specific `cid:` references may not display after the HTML file is opened from SharePoint.
-- Keep the expected report subject text consistent.
+- Keep the report subject text consistent.
 - If the Outlook folder is renamed or moved, update the trigger's Folder selection.
 - This file is the canonical instruction set. Future updates must replace this same file rather than create duplicate or dated instruction files.
