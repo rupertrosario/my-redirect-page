@@ -44,11 +44,23 @@ No `POST`, `PUT`, `PATCH`, or `DELETE` request is used.
 
 ```powershell
 $baseUrl      = "https://helios.cohesity.com"
-$apikeypath   = "X:\PowerShell\Cohesity_API_Scripts\DO_NOT_Delete\apikey.txt"
+$apikeypath   = "X:\PowerShell\Cohesity_API_Scripts\DO_NOT_Delete\apikey.enc"
 $logDirectory = "X:\PowerShell\Data\Cohesity\ADInventory"
 ```
 
-Run:
+### Create the encrypted API key file once
+
+Run this under the same Windows account and on the same computer that will execute the collector:
+
+```powershell
+Read-Host "Enter Cohesity API key" -AsSecureString |
+    ConvertFrom-SecureString |
+    Set-Content "X:\PowerShell\Cohesity_API_Scripts\DO_NOT_Delete\apikey.enc"
+```
+
+The file is protected with Windows DPAPI. It can only be decrypted by the same Windows user on the same computer.
+
+Run the collector:
 
 ```powershell
 .\Get-CohesityADConfiguration.ps1
