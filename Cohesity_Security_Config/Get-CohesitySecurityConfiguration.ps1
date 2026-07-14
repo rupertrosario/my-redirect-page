@@ -79,16 +79,6 @@ function Get-Json {
     return ($response.Content | ConvertFrom-Json)
 }
 
-function As-Array {
-    param($Value)
-
-    if ($null -eq $Value) {
-        return @()
-    }
-
-    return @($Value)
-}
-
 function Value-OrNA {
     param($Value)
 
@@ -161,12 +151,8 @@ function Convert-ToNullableBoolean {
     }
 
     $text = ([string]$Value).Trim()
-    if ($text -ieq "True") {
-        return $true
-    }
-    if ($text -ieq "False") {
-        return $false
-    }
+    if ($text -ieq "True") { return $true }
+    if ($text -ieq "False") { return $false }
 
     return $null
 }
@@ -178,13 +164,8 @@ function Get-MinimumStatus {
     )
 
     $number = Convert-ToNullableNumber $Value
-    if ($null -eq $number) {
-        return "Not Assessed"
-    }
-    if ($number -ge $Minimum) {
-        return "Compliant"
-    }
-
+    if ($null -eq $number) { return "Not Assessed" }
+    if ($number -ge $Minimum) { return "Compliant" }
     return "Non-Compliant"
 }
 
@@ -195,13 +176,8 @@ function Get-MaximumStatus {
     )
 
     $number = Convert-ToNullableNumber $Value
-    if ($null -eq $number) {
-        return "Not Assessed"
-    }
-    if ($number -gt 0 -and $number -le $Maximum) {
-        return "Compliant"
-    }
-
+    if ($null -eq $number) { return "Not Assessed" }
+    if ($number -gt 0 -and $number -le $Maximum) { return "Compliant" }
     return "Non-Compliant"
 }
 
@@ -209,9 +185,8 @@ function Get-PciValueStatus {
     param($Value)
 
     $number = Convert-ToNullableNumber $Value
-    if ($null -eq $number) {
-        return "Not Assessed"
-    }
+    if ($null -eq $number) { return "Not Assessed" }
+
     if (
         $number -gt 0 -and
         $number -le $script:PasswordStandard.PciPasswordMaxLifetimeDays
@@ -352,7 +327,7 @@ function Get-PasswordPolicyAssessment {
         $findingText = "None"
     }
 
-    [pscustomobject][ordered]@{
+    return [pscustomobject][ordered]@{
         PasswordComplexityEnabledCount = $complexityDisplay
         PasswordLengthStatus            = $passwordLengthStatus
         PasswordComplexityStatus        = $passwordComplexityStatus
@@ -368,7 +343,7 @@ function Get-PasswordPolicyAssessment {
 function New-EmptyRow {
     param([string]$Cluster)
 
-    [pscustomobject][ordered]@{
+    return [pscustomobject][ordered]@{
         Cluster                                 = $Cluster
         PasswordMinLength                       = "N/A"
         PasswordIncludeUpperLetter              = "N/A"
@@ -452,7 +427,8 @@ function New-SecurityRow {
         $rowData[$property.Name] = $property.Value
     }
 
-    return [pscustomobject][ordered]$rowData
+    # $rowData is already an ordered dictionary. Cast it directly.
+    return [pscustomobject]$rowData
 }
 
 Write-Host "====================================================" -ForegroundColor Cyan
