@@ -77,20 +77,27 @@ export default async function () {
   };
 
   /**
-   * Preserve every value while making long tokens wrap inside email tables.
+   * Preserve every value while allowing only genuinely long tokens to wrap.
    *
-   * - Embedded pipes are replaced because Dynatrace treats them as columns.
-   * - Zero-width break points are inserted after normal separators such as
-   *   dots, commas, semicolons, equals signs, slashes, underscores and hyphens.
-   * - No text is truncated.
+   * The previous version inserted an invisible break after almost every
+   * punctuation character. That made the table look compressed and cramped.
+   * This version keeps normal text untouched and adds a soft break only inside
+   * unbroken tokens longer than 28 characters, such as UUIDs, FQDNs and OUs.
    */
-  const safeMarkdownCell = (value) =>
-    String(value ?? "")
+  const addSoftBreaksToLongTokens = (text) =>
+    text.replace(/\S{29,}/g, (token) =>
+      token.match(/.{1,28}/g).join("\u200B")
+    );
+
+  const safeMarkdownCell = (value) => {
+    const cleaned = String(value ?? "")
       .replace(/\|/g, " / ")
       .replace(/\r?\n/g, " ")
       .replace(/\s+/g, " ")
-      .replace(/([.,;=\\/_-])/g, "$1\u200B")
       .trim();
+
+    return addSoftBreaksToLongTokens(cleaned);
+  };
 
   function markdownTable(columnDefinitions, rows) {
     const labels = columnDefinitions.map(([label]) => label);
