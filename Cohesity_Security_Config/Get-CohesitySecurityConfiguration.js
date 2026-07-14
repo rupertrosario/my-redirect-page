@@ -5,8 +5,7 @@ import { credentialVaultClient } from "@dynatrace-sdk/client-classic-environment
  *
  * GET-only API flow:
  * 1. GET /v2/mcm/cluster-mgmt/info
- * 2. GET /v2/security-config
- *    Runs once per cluster with accessClusterId.
+ * 2. GET /v2/security-config once per cluster with accessClusterId
  *
  * No POST, PUT, PATCH, or DELETE request is used.
  */
@@ -64,102 +63,15 @@ export default async function () {
     "ComplianceFindings"
   ];
 
-  const markdownSections = [
-    {
-      title: "Password Standard - Actual Values",
-      columns: [
-        ["Cluster", "Cluster"],
-        ["Min Length", "PasswordMinLength"],
-        ["Complexity", "PasswordComplexityEnabledCount"],
-        ["History", "NumDisallowedOldPasswords"],
-        ["Min Age Days", "PasswordMinLifetimeDays"],
-        ["Max Age Days", "PasswordMaxLifetimeDays"],
-        ["Overall", "OverallPasswordPolicyStatus"]
-      ]
-    },
-    {
-      title: "Password Standard - Compliance",
-      columns: [
-        ["Cluster", "Cluster"],
-        ["Length", "PasswordLengthStatus"],
-        ["Complexity", "PasswordComplexityStatus"],
-        ["History", "PasswordHistoryStatus"],
-        ["Min Age", "PasswordMinLifetimeStatus"],
-        ["Max Age 365", "PasswordMaxLifetime365Status"],
-        ["PCI 90 Value", "MeetsPCI90DayValue"]
-      ]
-    },
-    {
-      title: "Password Compliance Findings",
-      columns: [
-        ["Cluster", "Cluster"],
-        ["Overall", "OverallPasswordPolicyStatus"],
-        ["Findings", "ComplianceFindings"]
-      ]
-    },
-    {
-      title: "Password Strength",
-      columns: [
-        ["Cluster", "Cluster"],
-        ["Min Length", "PasswordMinLength"],
-        ["Upper", "PasswordIncludeUpperLetter"],
-        ["Lower", "PasswordIncludeLowerLetter"],
-        ["Number", "PasswordIncludeNumber"],
-        ["Special", "PasswordIncludeSpecialChar"]
-      ]
-    },
-    {
-      title: "Password Reuse and Lifetime",
-      columns: [
-        ["Cluster", "Cluster"],
-        ["Old Passwords", "NumDisallowedOldPasswords"],
-        ["Different Chars", "NumDifferentChars"],
-        ["Min Life Days", "PasswordMinLifetimeDays"],
-        ["Max Life Days", "PasswordMaxLifetimeDays"]
-      ]
-    },
-    {
-      title: "Account Lockout and General Timeouts",
-      columns: [
-        ["Cluster", "Cluster"],
-        ["Max Failed", "MaxFailedLoginAttempts"],
-        ["Lock Mins", "FailedLoginLockTimeDurationMins"],
-        ["Inactive Days", "AccountInactivityTimeDays"],
-        ["Token Mins", "AuthTokenTimeoutMinutes"],
-        ["UI Timeout ms", "UIInactivityTimeoutMSecs"],
-        ["SSH Mins", "SSHTimeoutInMins"]
-      ]
-    },
-    {
-      title: "Session Management",
-      columns: [
-        ["Cluster", "Cluster"],
-        ["Enabled", "SessionManagementEnabled"],
-        ["Absolute sec", "SessionAbsoluteTimeoutSeconds"],
-        ["Inactive sec", "SessionInactivityTimeoutSeconds"],
-        ["Limit Sessions", "LimitSessions"],
-        ["Per User", "SessionLimitPerUser"],
-        ["System Wide", "SessionLimitSystemWide"]
-      ]
-    },
-    {
-      title: "Certificate Authentication",
-      columns: [
-        ["Cluster", "Cluster"],
-        ["Mapping Auth", "CertificateMappingAuthenticationEnabled"],
-        ["Certificate Mapping", "CertificateMapping"],
-        ["AD Mapping", "CertificateADMapping"]
-      ]
-    },
-    {
-      title: "Data Classification",
-      columns: [
-        ["Cluster", "Cluster"],
-        ["Classified", "IsDataClassified"],
-        ["Classified Message", "ClassifiedDataMessage"],
-        ["Unclassified Message", "UnclassifiedDataMessage"]
-      ]
-    }
+  const complianceTableColumns = [
+    ["Cluster", "Cluster"],
+    ["Min Length<br>Expected >= 15", "PasswordMinLength"],
+    ["Complexity<br>Expected >= 3/4", "PasswordComplexityEnabledCount"],
+    ["History<br>Expected >= 6", "NumDisallowedOldPasswords"],
+    ["Min Age<br>Expected >= 2", "PasswordMinLifetimeDays"],
+    ["Max Age<br>Expected <= 365", "PasswordMaxLifetimeDays"],
+    ["Overall Status", "OverallPasswordPolicyStatus"],
+    ["Findings", "ComplianceFindings"]
   ];
 
   const toArray = (value) => {
@@ -305,39 +217,28 @@ export default async function () {
 
     const findings = [];
 
-    const minLength = toFiniteNumber(row.PasswordMinLength);
     if (passwordLengthStatus === "Not Assessed") {
       findings.push("Password minimum length was not returned");
     } else if (passwordLengthStatus === "Non-Compliant") {
-      findings.push(
-        `Minimum length ${minLength} is below ${standard.passwordMinLength}`
-      );
+      findings.push(`Length below ${standard.passwordMinLength}`);
     }
 
     if (passwordComplexityStatus === "Not Assessed") {
       findings.push("One or more complexity flags were not returned");
     } else if (passwordComplexityStatus === "Non-Compliant") {
-      findings.push(
-        `Complexity ${complexityEnabledCount} of 4 is below ${standard.complexityRequired} of 4`
-      );
+      findings.push(`Complexity below ${standard.complexityRequired} of 4`);
     }
 
-    const history = toFiniteNumber(row.NumDisallowedOldPasswords);
     if (passwordHistoryStatus === "Not Assessed") {
       findings.push("Password history was not returned");
     } else if (passwordHistoryStatus === "Non-Compliant") {
-      findings.push(
-        `Password history ${history} is below ${standard.disallowedOldPasswords}`
-      );
+      findings.push(`History below ${standard.disallowedOldPasswords}`);
     }
 
-    const minAge = toFiniteNumber(row.PasswordMinLifetimeDays);
     if (passwordMinLifetimeStatus === "Not Assessed") {
       findings.push("Minimum password age was not returned");
     } else if (passwordMinLifetimeStatus === "Non-Compliant") {
-      findings.push(
-        `Minimum password age ${minAge} days is below ${standard.passwordMinLifetimeDays}`
-      );
+      findings.push(`Minimum age below ${standard.passwordMinLifetimeDays}`);
     }
 
     const maxAge = toFiniteNumber(row.PasswordMaxLifetimeDays);
@@ -346,8 +247,8 @@ export default async function () {
     } else if (passwordMaxLifetime365Status === "Non-Compliant") {
       findings.push(
         maxAge <= 0
-          ? "Maximum password age is not enabled"
-          : `Maximum password age ${maxAge} days exceeds ${standard.passwordMaxLifetimeDays}`
+          ? "Maximum age is not enabled"
+          : `Maximum age exceeds ${standard.passwordMaxLifetimeDays}`
       );
     }
 
@@ -373,7 +274,6 @@ export default async function () {
       row[column] = "N/A";
     }
 
-    row.PasswordComplexityEnabledCount = "N/A";
     row.PasswordLengthStatus = "Not Assessed";
     row.PasswordComplexityStatus = "Not Assessed";
     row.PasswordHistoryStatus = "Not Assessed";
@@ -617,13 +517,12 @@ export default async function () {
       compliantClusterCount: 0,
       nonCompliantClusterCount: 0,
       notAssessedClusterCount: 0,
-      pci90ValueMetClusterCount: 0,
       rowCount: 0,
       standard,
       columns,
       rows: [],
       markdownEmail:
-        "### Cohesity Cluster Security Configuration\n\n_No clusters returned from Cohesity Helios._",
+        "### Cohesity Password Policy Compliance\n\n_No clusters returned from Cohesity Helios._",
       errors: []
     };
   }
@@ -700,9 +599,6 @@ export default async function () {
   const notAssessedClusterCount = rows.filter(
     (row) => row.OverallPasswordPolicyStatus === "Not Assessed"
   ).length;
-  const pci90ValueMetClusterCount = rows.filter(
-    (row) => row.MeetsPCI90DayValue === "Yes"
-  ).length;
 
   const reportDate = new Date().toLocaleDateString("en-GB", {
     timeZone: "Asia/Kolkata",
@@ -712,27 +608,20 @@ export default async function () {
   });
 
   const markdownParts = [
-    `### Cohesity Cluster Security Configuration — ${reportDate}`,
+    `### Cohesity Password Policy Compliance — ${reportDate}`,
     "",
-    `Password standard: minimum length ${standard.passwordMinLength}; complexity ${standard.complexityRequired} of 4; history ${standard.disallowedOldPasswords}; minimum age ${standard.passwordMinLifetimeDays} days; maximum age ${standard.passwordMaxLifetimeDays} days.`,
+    markdownTable(complianceTableColumns, rows),
     "",
-    "_PCI note: MeetsPCI90DayValue checks the configured numeric value only. PCI applicability and MFA usage are not exposed by /v2/security-config._"
+    "_PCI note: The 90-day rule is not assessed because /v2/security-config does not expose PCI scope or MFA usage._",
+    "",
+    "#### Summary",
+    `- Clusters discovered: ${clusters.length}`,
+    `- Clusters successfully read: ${successfulClusterCount}`,
+    `- Password policy compliant: ${compliantClusterCount}`,
+    `- Password policy non-compliant: ${nonCompliantClusterCount}`,
+    `- Password policy not assessed: ${notAssessedClusterCount}`,
+    `- Cluster query errors: ${errors.length}`
   ];
-
-  for (const section of markdownSections) {
-    markdownParts.push(
-      "",
-      `#### ${section.title}`,
-      markdownTable(section.columns, rows)
-    );
-  }
-
-  if (errors.length) {
-    markdownParts.push(
-      "",
-      `_Warning: ${errors.length} cluster query error(s). See the separate errors output._`
-    );
-  }
 
   const markdownEmail = markdownParts.join("\n");
 
@@ -743,7 +632,6 @@ export default async function () {
     compliantClusterCount,
     nonCompliantClusterCount,
     notAssessedClusterCount,
-    pci90ValueMetClusterCount,
     rowCount: rows.length,
     standard,
     columns,
