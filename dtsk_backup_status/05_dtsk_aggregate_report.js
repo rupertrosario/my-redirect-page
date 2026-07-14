@@ -290,12 +290,10 @@ export default async function () {
   function makeNoteMarkdown() {
     return [
       "- NAS backups are excluded from this server decommission validation.",
-      "- **SLA Status** is calculated in Dynatrace as 2 days from `sys_created_on`, which is treated as the time the DTSK came to the Backup group for this report.",
-      "- **No Backup Found** means no in-scope Cohesity backup object was found for the CI.",
-      "- **DB Only / No Server Backup** means a SQL/Oracle backup was found, but no FS, VM, Hyper-V, or Nutanix/AHV backup was found for the server.",
-      "- **Server Backup / No DB Backup** means the CI name indicates a DB/CN server and server-level backup was found, but no SQL/Oracle backup was found after the validator's all-cluster DB fallback search.",
-      "- **Assignment Action** is derived from ServiceNow: `Assigned` when Assigned To is populated, otherwise `Please assign`.",
-      "- Cluster search diagnostics are retained in task JSON but are not shown in the email Cluster column."
+      "- **SLA Status** is calculated as 2 days from `sys_created_on`.",
+      "- **No Backup Found** means no supported Cohesity backup was found for the CI.",
+      "- **DB Only / No Server Backup** means SQL/Oracle backup was found, but no server-level backup was found.",
+      "- **Server Backup / No DB Backup** means the DB/CN server has server-level backup, but no SQL/Oracle backup was found after checking all Cohesity clusters."
     ].join("\n");
   }
 
