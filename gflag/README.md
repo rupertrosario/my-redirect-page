@@ -81,7 +81,7 @@ Important:
    |---|---|
    | Left **Choose a value** | Select **Subject** from Dynamic content |
    | Operator | Select **contains** |
-   | Right **Choose a value** | `Cohesity Common GFlag Report` |
+   | Right **Choose a value** | `Common GFlag Report` |
 
 5. Select **Add row**.
 6. Configure the second row:
@@ -90,17 +90,25 @@ Important:
    |---|---|
    | Left **Choose a value** | Select **Subject** from Dynamic content |
    | Operator | Select **contains** |
-   | Right **Choose a value** | `Cohesity Cluster-Specific GFlag Report` |
+   | Right **Choose a value** | `Cluster-Specific GFlag Report` |
 
 The completed condition must be:
 
 ```text
-Subject contains Cohesity Common GFlag Report
+Subject contains Common GFlag Report
 OR
-Subject contains Cohesity Cluster-Specific GFlag Report
+Subject contains Cluster-Specific GFlag Report
 ```
 
-Do not use **AND**. A report email normally contains only one of the two full report names.
+Do not use the longer value `Cohesity Common GFlag Report`. The observed Common report subject is:
+
+```text
+105142 - Cohesity Custer Common GFlag Report
+```
+
+Because `Custer` appears between `Cohesity` and `Common`, the longer text does not exist as one continuous substring and makes the condition False.
+
+Do not use **AND**. A report email normally contains only one report type.
 
 ### 4. Add SharePoint Create file
 
@@ -129,10 +137,12 @@ Both Common and Cluster-Specific reports are stored in this same folder.
 Click inside **File Name**, open **fx / Expression**, and paste this exact expression:
 
 ```text
-concat(if(contains(triggerOutputs()?['body/subject'],'Cohesity Common GFlag Report'),'Cohesity_Common_GFlags_','Cohesity_Cluster_Specific_GFlags_'),formatDateTime(utcNow(),'yyyy-MM-dd_HHmmssfff'),'.html')
+concat(if(contains(toLower(triggerOutputs()?['body/subject']),'common gflag report'),'Cohesity_Common_GFlags_','Cohesity_Cluster_Specific_GFlags_'),formatDateTime(utcNow(),'yyyy-MM-dd_HHmmssfff'),'.html')
 ```
 
-This produces filenames such as:
+This expression is case-insensitive because it converts the subject to lowercase before matching.
+
+It produces filenames such as:
 
 ```text
 Cohesity_Common_GFlags_2026-07-14_103015245.html
@@ -183,7 +193,7 @@ Documents/Cohesity GFlag Reports
 
 1. Select **Save**.
 2. Select **Test → Manually**.
-3. Send or receive a new **Cohesity Common GFlag Report** email in the monitored Outlook folder.
+3. Send, receive, or forward a new Common GFlag report into the monitored Outlook folder.
 4. Open the flow's **Run history**.
 5. Confirm the condition followed the **True** branch.
 6. Confirm the Common HTML file was created in:
@@ -193,7 +203,7 @@ Documents/Cohesity GFlag Reports
    ```
 
 7. Open the HTML file and verify that the complete email body and tables are present.
-8. Repeat with a new **Cohesity Cluster-Specific GFlag Report** email.
+8. Repeat with a new Cluster-Specific GFlag report email.
 9. Confirm the second file uses the `Cohesity_Cluster_Specific_GFlags_` filename prefix.
 
 Existing emails already present before the flow is enabled should not be used as the primary trigger test. Use a newly delivered or forwarded report email.
