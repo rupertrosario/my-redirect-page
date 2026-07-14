@@ -7,7 +7,7 @@ import { credentialVaultClient } from "@dynatrace-sdk/client-classic-environment
  * - Discover all Cohesity clusters visible through Helios.
  * - Query each cluster's Active Directory configuration.
  * - Return structured rows using the same ten fields as PowerShell.
- * - Generate one compact Markdown table for Dynatrace email.
+ * - Generate one narrow vertical Markdown table for Dynatrace email.
  * - Return cluster-specific query failures separately in errors.
  *
  * GET-only API flow:
@@ -41,17 +41,17 @@ export default async function () {
     "ADConfigurationId"
   ];
 
-  // Email omits ADConfigured and uses shorter labels to reduce width.
-  const markdownColumns = [
-    ["Cluster", "Cluster"],
+  // The email uses Field/Value rows instead of one excessively wide row.
+  // ADConfigured=Yes is intentionally omitted from the email.
+  const markdownFields = [
     ["Domain", "DomainName"],
-    ["OU", "OrganizationalUnit"],
+    ["Organizational Unit", "OrganizationalUnit"],
     ["Workgroup", "WorkGroupName"],
     ["Machine Accounts", "MachineAccounts"],
-    ["Preferred DCs", "PreferredDomainControllers"],
-    ["Denied DCs", "DomainControllersDenyList"],
+    ["Preferred Domain Controllers", "PreferredDomainControllers"],
+    ["Denied Domain Controllers", "DomainControllersDenyList"],
     ["Trusted Domains", "TrustedDomains"],
-    ["AD Config ID", "ADConfigurationId"]
+    ["AD Configuration ID", "ADConfigurationId"]
   ];
 
   // ------------------------------------------------------------------
@@ -89,8 +89,7 @@ export default async function () {
 
   /**
    * Dynatrace email Markdown treats every pipe as a column separator.
-   * Backslash-escaping is not reliable in that renderer. Replace embedded
-   * pipes before constructing each row so the final column is not displaced.
+   * Replace embedded pipes before constructing each row.
    */
   const safeMarkdownCell = (value) =>
     String(value ?? "")
@@ -99,20 +98,38 @@ export default async function () {
       .replace(/\s+/g, " ")
       .trim();
 
-  function markdownTable(columnDefinitions, rows) {
-    const labels = columnDefinitions.map(([label]) => label);
-    const keys = columnDefinitions.map(([, key]) => key);
+  /**
+   * Build one narrow table:
+   * Cluster | Field | Value
+   *
+   * This avoids email-client clipping caused by the previous nine-column
+   * layout while preserving every reported value.
+   */
+  function markdownTable(rows) {
+    const lines = [
+      "| Cluster | Field | Value |",
+      "|---|---|---|"
+    ];
 
-    const headerRow = `| ${labels.join(" | ")} |`;
-    const separatorRow = `| ${labels.map(() => "---").join(" | ")} |`;
-    const dataRows = rows.map(
-      (row) =>
-        `| ${keys
-          .map((key) => safeMarkdownCell(row[key]))
-          .join(" | ")} |`
-    );
+    for (const row of rows) {
+      const cluster = safeMarkdownCell(row.Cluster);
 
-    return [headerRow, separatorRow, ...dataRows].join("\n");
+      // Do not display the repetitive Yes value. Preserve only exceptional
+      // No/Unknown states so failed or unconfigured clusters remain visible.
+      if (row.ADConfigured !== "Yes") {
+        lines.push(
+          `| ${cluster} | AD Status | ${safeMarkdownCell(row.ADConfigured)} |`
+        );
+      }
+
+      for (const [label, key] of markdownFields) {
+        lines.push(
+          `| ${cluster} | ${label} | ${safeMarkdownCell(row[key])} |`
+        );
+      }
+    }
+
+    return lines.join("\n");
   }
 
   // ------------------------------------------------------------------
@@ -157,7 +174,6 @@ export default async function () {
       if (parts.length) values.push(parts.join("; "));
     }
 
-    // Semicolon is deliberate. A pipe inside a Markdown cell breaks the table.
     return values.length ? values.join("; ") : "N/A";
   }
 
@@ -473,7 +489,7 @@ export default async function () {
   );
 
   // ------------------------------------------------------------------
-  // Build one compact Markdown table for the email body
+  // Build one narrow vertical Markdown table for the email body
   // ------------------------------------------------------------------
   const reportDate = new Date().toLocaleDateString("en-GB", {
     timeZone: "Asia/Kolkata",
@@ -486,9 +502,9 @@ export default async function () {
   const markdownEmail = [
     `### Cohesity Active Directory Configuration — ${reportDate}`,
     "",
-    markdownTable(markdownColumns, markdownRows),
+    markdownTable(markdownRows),
     rows.length > maxMarkdownRows
-      ? `_Note: Markdown output limited to ${maxMarkdownRows} of ${rows.length} rows._`
+      ? `_Note: Markdown output limited to ${maxMarkdownRows} of ${rows.length} inventory rows._`
       : null,
     errors.length
       ? `_Warning: ${errors.length} cluster query error(s). See the separate errors output._`
