@@ -1,53 +1,46 @@
-# Cohesity Active Directory Configuration CSV
+# Cohesity Active Directory Configuration
 
 ## Purpose
 
-`Get-CohesityADConfiguration.ps1` retrieves Active Directory integration details from every Cohesity cluster visible through Cohesity Helios and exports a timestamped CSV.
+Collect Active Directory integration details from every Cohesity cluster visible through Cohesity Helios.
 
-The implementation follows the same operating pattern as the Cohesity policy inventory collector:
-
-- fixed configuration paths at the top of the script
-- one shared GET wrapper
-- Helios cluster discovery
-- per-cluster `accessClusterId` processing
-- per-cluster error isolation
-- timestamped CSV output
-- final console summary
-
-Password-policy or password-standard checks are not included.
+Both collectors are strictly read-only and use only HTTP `GET` requests.
 
 ## Files
 
 | File | Purpose |
 |---|---|
-| `Get-CohesityADConfiguration.ps1` | PowerShell 5.1/7-compatible GET-only collector |
-| `README.md` | Configuration, API flow, execution, fields, status logic, and sample output |
+| `Get-CohesityADConfiguration.ps1` | PowerShell 5.1/7 multi-cluster CSV collector |
+| `Get-CohesityADConfiguration.js` | Dynatrace JavaScript action with Markdown output |
+| `Sample_Cohesity_AD_Configuration.csv` | Illustrative output only |
 
-## Read-Only API Flow
+## API Flow
 
 1. `GET /v2/mcm/cluster-mgmt/info`
-   - Retrieves all Cohesity clusters visible to the Helios API key.
 2. `GET /v2/active-directories?includeTenants=true`
-   - Executed once per cluster.
-   - The target cluster is selected using the `accessClusterId` header.
+   - Called once per cluster.
+   - Uses the `accessClusterId` request header.
 
-The script contains no `POST`, `PUT`, `PATCH`, or `DELETE` request.
+No `POST`, `PUT`, `PATCH`, or `DELETE` request is used.
 
-## Requirements
+## Final Output Columns
 
-- Windows PowerShell 5.1 or PowerShell 7+
-- Outbound HTTPS access to `https://helios.cohesity.com`
-- Helios API key with:
-  - visibility to the required clusters
-  - read permission for Active Directory/LDAP configuration
-- Read access to the API-key file
-- Write access to the output directory
+| Column | Source |
+|---|---|
+| `Cluster` | Helios cluster inventory |
+| `ADConfigured` | Derived by the script |
+| `DomainName` | AD configuration API |
+| `OrganizationalUnit` | `organizationalUnitName` |
+| `WorkGroupName` | `workGroupName` |
+| `MachineAccounts` | `machineAccounts` |
+| `PreferredDomainControllers` | `preferredDomainControllers` |
+| `DomainControllersDenyList` | `domainControllersDenyList` |
+| `TrustedDomains` | trusted and whitelisted domains |
+| `ADConfigurationId` | AD configuration `id` |
 
-The API key is read from disk and is never written to the console or CSV.
+`N/A` means the API did not return a configured value for that optional field. It does not automatically mean that the cluster is misconfigured.
 
-## Configuration
-
-Edit the configuration section at the top of the script:
+## PowerShell Configuration
 
 ```powershell
 $baseUrl      = "https://helios.cohesity.com"
@@ -55,99 +48,41 @@ $apikeypath   = "X:\PowerShell\Cohesity_API_Scripts\DO_NOT_Delete\apikey.txt"
 $logDirectory = "X:\PowerShell\Data\Cohesity\ADInventory"
 ```
 
-The output directory is created automatically when it does not exist.
-
-The API-key file must contain only the Helios API key.
-
-## Run
+Run:
 
 ```powershell
-Set-Location X:\PowerShell\Cohesity_API_Scripts\Cohesity_AD
-
 .\Get-CohesityADConfiguration.ps1
 ```
 
-## Output File
-
-The script writes one timestamped CSV:
+Output:
 
 ```text
-X:\PowerShell\Data\Cohesity\ADInventory\Cohesity_AD_Configuration_YYYYMMDD_HHMM.csv
+X:\PowerShell\Data\Cohesity\ADInventory\Cohesity_AD_Configuration_YYYYMMDD_HHmm.csv
 ```
 
-The CSV contains one row per Active Directory connection.
+## Dynatrace Configuration
 
-A cluster with no returned AD configuration receives one explicit `NOT_CONFIGURED` row. A failed cluster query receives one explicit `COLLECTION_ERROR` row, allowing the report to remain complete even when one cluster cannot be queried.
+The JavaScript action uses the credential vault:
 
-## CSV Columns
-
-| Column | Description |
-|---|---|
-| `Cluster` | Cohesity cluster name |
-| `ADConfigured` | `Yes`, `No`, or `Unknown` |
-| `DomainName` | Joined Active Directory domain |
-| `OrganizationalUnit` | Configured organizational unit |
-| `WorkGroupName` | Configured workgroup, when returned |
-| `MachineAccounts` | AD machine-account name and DNS hostname |
-| `PreferredDomainControllers` | Preferred controllers and reported reachability |
-| `DomainControllers` | All returned controllers grouped by domain |
-| `DomainControllersDenyList` | Controllers explicitly denied |
-| `TrustedDomains` | Returned trusted and allow-listed domains |
-| `IdMappingType` | User ID mapping type, such as `Rfc2307` or `Rid` |
-| `LdapProviderId` | LDAP provider identifier |
-| `NisProviderDomainName` | NIS provider domain, when configured |
-| `ConnectionId` | AD connection identifier |
-| `ADConfigurationId` | Cohesity AD configuration identifier |
-| `ErrorCode` | Cohesity-reported AD configuration error code |
-| `ErrorMessage` | Cohesity-reported error or collection failure message |
-| `CollectionStatus` | Normalized collection result |
-
-## Collection Status
-
-| Status | Meaning |
-|---|---|
-| `CONFIGURED` | AD configuration was returned with no reported error or unreachable controller |
-| `REVIEW` | AD is configured, but one or more returned controllers are not `Reachable` |
-| `ERROR` | Cohesity returned an AD configuration error code or error message |
-| `NOT_CONFIGURED` | The cluster returned no Active Directory configuration |
-| `COLLECTION_ERROR` | The cluster-specific GET failed or the cluster ID was unavailable |
-
-## Sample CSV Output
-
-| Cluster | ADConfigured | DomainName | OrganizationalUnit | MachineAccounts | PreferredDomainControllers | TrustedDomains | IdMappingType | CollectionStatus |
-|---|---|---|---|---|---|---|---|---|
-| CHS-PROD-01 | Yes | `corp.example.com` | `OU=Cohesity,OU=Servers,DC=corp,DC=example,DC=com` | `CHS-PROD-01$; DNS=chs-prod-01.corp.example.com` | `dc01.corp.example.com [Reachable]; dc02.corp.example.com [Reachable]` | `emea.example.com` | `Rfc2307` | `CONFIGURED` |
-| CHS-DR-01 | Yes | `corp.example.com` | `OU=DR,DC=corp,DC=example,DC=com` | `CHS-DR-01$` | `dc03.corp.example.com [Unreachable]` | `N/A` | `Rid` | `REVIEW` |
-| CHS-TEST-01 | No | `N/A` | `N/A` | `N/A` | `N/A` | `N/A` | `N/A` | `NOT_CONFIGURED` |
-| CHS-LAB-01 | Unknown | `N/A` | `N/A` | `N/A` | `N/A` | `N/A` | `N/A` | `COLLECTION_ERROR` |
-
-## Console Summary
-
-The script prints:
-
-- clusters discovered
-- clusters with AD
-- clusters without AD
-- rows requiring review
-- error rows
-- total CSV rows
-- CSV output path
-- per-cluster fetch issues
-
-## Validation
-
-Run the script and confirm:
-
-```powershell
-Import-Csv "X:\PowerShell\Data\Cohesity\ADInventory\Cohesity_AD_Configuration_*.csv" |
-    Select-Object -First 10 |
-    Format-Table Cluster, ADConfigured, DomainName, PreferredDomainControllers, CollectionStatus -AutoSize
+```javascript
+const vaultName = "Cohesity_API_Key";
+const vaultId = "credentials_vault-312312";
 ```
 
-Confirm that:
+Update `vaultId` if the credential ID differs in the target Dynatrace environment.
 
-1. Every expected cluster appears.
-2. `NOT_CONFIGURED` is present only for clusters without AD integration.
-3. Any non-`Reachable` controller is marked `REVIEW`.
-4. `COLLECTION_ERROR` rows are investigated rather than treated as not configured.
-5. No API key or password information appears in the CSV.
+The JavaScript action returns:
+
+- `rows`
+- `markdownEmail`
+- cluster and row counts
+- a separate `errors` array
+
+## Sample Output
+
+| Cluster | ADConfigured | DomainName | OrganizationalUnit | WorkGroupName | MachineAccounts | PreferredDomainControllers | DomainControllersDenyList | TrustedDomains | ADConfigurationId |
+|---|---|---|---|---|---|---|---|---|---|
+| CHS-PROD-01 | Yes | `corp.example.com` | `OU=Cohesity,OU=Servers` | `N/A` | `CHS-PROD-01$` | `dc01 [Reachable]; dc02 [Reachable]` | `N/A` | `emea.example.com` | `101` |
+| CHS-TEST-01 | No | `N/A` | `N/A` | `N/A` | `N/A` | `N/A` | `N/A` | `N/A` | `N/A` |
+
+The values above are illustrative and are not values retrieved from the production environment.
