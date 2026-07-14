@@ -23,6 +23,22 @@ This flow copies the email body. It does not move or delete the original Outlook
 - Report type identified in the filename
 - Attachments are not copied
 
+## Observed email subjects
+
+The actual report subjects follow these patterns:
+
+```text
+105142 - Cohesity Custer Common GFlag Report - Jul 14, 2026
+105142 - Cohesity Custer Specific GFlag Report - Jul 14, 2026
+```
+
+The leading number and trailing date can change. The condition therefore matches only the stable middle text:
+
+```text
+Custer Common GFlag Report
+Custer Specific GFlag Report
+```
+
 ## Prerequisites
 
 1. The SharePoint folder already exists:
@@ -79,7 +95,7 @@ Important:
    |---|---|
    | Left **Choose a value** | Select **Subject** from Dynamic content |
    | Operator | Select **contains** |
-   | Right **Choose a value** | `Cluster Common GFlag Report` |
+   | Right **Choose a value** | `Custer Common GFlag Report` |
 
 5. Select **Add row**.
 6. Configure the second row:
@@ -88,19 +104,19 @@ Important:
    |---|---|
    | Left **Choose a value** | Select **Subject** from Dynamic content |
    | Operator | Select **contains** |
-   | Right **Choose a value** | `Cluster Specific GFlag Report` |
+   | Right **Choose a value** | `Custer Specific GFlag Report` |
 
 The completed condition must be:
 
 ```text
-Subject contains Cluster Common GFlag Report
+Subject contains Custer Common GFlag Report
 OR
-Subject contains Cluster Specific GFlag Report
+Subject contains Custer Specific GFlag Report
 ```
 
 Do not use **AND**. Each report email contains only one report type.
 
-Do not use a hyphen in `Cluster Specific GFlag Report` unless the actual email subject contains one.
+Do not use `Cluster`, `Cluster-Specific`, or a hyphen. The observed subjects use the exact word `Custer` and a space between `Custer` and `Specific`.
 
 ### 4. Add SharePoint Create file
 
@@ -129,14 +145,14 @@ Both report types are stored in this same folder.
 Click inside **File Name**, open **fx / Expression**, and paste this exact expression:
 
 ```text
-concat(if(contains(toLower(triggerOutputs()?['body/subject']),'cluster common gflag report'),'Cohesity_Common_GFlags_','Cohesity_Cluster_Specific_GFlags_'),formatDateTime(utcNow(),'yyyy-MM-dd_HHmmssfff'),'.html')
+concat(if(contains(toLower(triggerOutputs()?['body/subject']),'custer common gflag report'),'Cohesity_Common_GFlags_','Cohesity_Custer_Specific_GFlags_'),formatDateTime(utcNow(),'yyyy-MM-dd_HHmmssfff'),'.html')
 ```
 
 Example filenames:
 
 ```text
 Cohesity_Common_GFlags_2026-07-14_103015245.html
-Cohesity_Cluster_Specific_GFlags_2026-07-14_103020671.html
+Cohesity_Custer_Specific_GFlags_2026-07-14_103020671.html
 ```
 
 The expression is case-insensitive because it converts the subject to lowercase before matching. The timestamp is UTC and includes milliseconds.
@@ -170,7 +186,7 @@ The condition's **False** branch requires no action. Emails that do not match ei
 ```text
 When a new email arrives in the selected Outlook folder
                     ↓
-Subject contains Cluster Common OR Cluster Specific GFlag Report?
+Subject contains Custer Common OR Custer Specific GFlag Report?
           ┌─────────┴─────────┐
          True                False
           ↓                    ↓
@@ -183,12 +199,12 @@ Documents/Cohesity GFlag Reports
 
 1. Select **Save**.
 2. Select **Test → Manually**.
-3. Send, receive, or forward a new Cluster Common GFlag report into the monitored Outlook folder.
+3. Send, receive, or forward a new Custer Common GFlag report into the monitored Outlook folder.
 4. Open **Run history** and confirm the condition followed the **True** branch.
 5. Confirm the Common HTML file was created in `Documents/Cohesity GFlag Reports`.
 6. Open the file and verify that the complete email body and tables are present.
-7. Repeat with a new Cluster Specific GFlag report email.
-8. Confirm the second file uses the `Cohesity_Cluster_Specific_GFlags_` prefix.
+7. Repeat with a new Custer Specific GFlag report email.
+8. Confirm the second file uses the `Cohesity_Custer_Specific_GFlags_` prefix.
 
 Existing emails already present before the flow is enabled should not be used as the primary trigger test. Use a newly delivered or forwarded email.
 
