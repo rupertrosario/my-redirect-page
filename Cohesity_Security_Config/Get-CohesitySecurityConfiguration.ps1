@@ -1,4 +1,4 @@
-# Cohesity Cluster Security Configuration Inventory
+# Cohesity Cluster Security Configuration and Password Compliance Inventory
 # Multi-cluster | Helios | GET-only | PowerShell 5.1 compatible
 
 $ErrorActionPreference = "Stop"
@@ -9,6 +9,15 @@ $baseUrl             = "https://helios.cohesity.com"
 $logDirectory        = "X:\PowerShell\Data\Cohesity\SecurityConfiguration"
 $helperPath          = "X:\PowerShell\Cohesity_API_Scripts\Common\ApiKeyAesHelper.ps1"
 $encryptedApiKeyPath = "X:\PowerShell\Cohesity_API_Scripts\Common\Secure\cohesity_apikey.enc"
+
+$script:PasswordStandard = [ordered]@{
+    PasswordMinLength           = 15
+    ComplexityRequired         = 3
+    DisallowedOldPasswords     = 6
+    PasswordMinLifetimeDays    = 2
+    PasswordMaxLifetimeDays    = 365
+    PciPasswordMaxLifetimeDays = 90
+}
 
 if (-not (Test-Path $logDirectory -PathType Container)) {
     New-Item -Path $logDirectory -ItemType Directory -Force | Out-Null
@@ -124,6 +133,238 @@ function First-Property {
     return "N/A"
 }
 
+function Convert-ToNullableNumber {
+    param($Value)
+
+    if ($null -eq $Value -or ([string]$Value).Trim() -eq "N/A") {
+        return $null
+    }
+
+    [double]$number = 0
+    if ([double]::TryParse(
+        ([string]$Value),
+        [Globalization.NumberStyles]::Any,
+        [Globalization.CultureInfo]::InvariantCulture,
+        [ref]$number
+    )) {
+        return $number
+    }
+
+    return $null
+}
+
+function Convert-ToNullableBoolean {
+    param($Value)
+
+    if ($Value -is [bool]) {
+        return [bool]$Value
+    }
+
+    $text = ([string]$Value).Trim()
+    if ($text -ieq "True") {
+        return $true
+    }
+    if ($text -ieq "False") {
+        return $false
+    }
+
+    return $null
+}
+
+function Get-MinimumStatus {
+    param(
+        $Value,
+        [double]$Minimum
+    )
+
+    $number = Convert-ToNullableNumber $Value
+    if ($null -eq $number) {
+        return "Not Assessed"
+    }
+    if ($number -ge $Minimum) {
+        return "Compliant"
+    }
+
+    return "Non-Compliant"
+}
+
+function Get-MaximumStatus {
+    param(
+        $Value,
+        [double]$Maximum
+    )
+
+    $number = Convert-ToNullableNumber $Value
+    if ($null -eq $number) {
+        return "Not Assessed"
+    }
+    if ($number -gt 0 -and $number -le $Maximum) {
+        return "Compliant"
+    }
+
+    return "Non-Compliant"
+}
+
+function Get-PciValueStatus {
+    param($Value)
+
+    $number = Convert-ToNullableNumber $Value
+    if ($null -eq $number) {
+        return "Not Assessed"
+    }
+    if (
+        $number -gt 0 -and
+        $number -le $script:PasswordStandard.PciPasswordMaxLifetimeDays
+    ) {
+        return "Yes"
+    }
+
+    return "No"
+}
+
+function Get-PasswordPolicyAssessment {
+    param($Row)
+
+    $complexityValues = @(
+        Convert-ToNullableBoolean $Row.PasswordIncludeUpperLetter
+        Convert-ToNullableBoolean $Row.PasswordIncludeLowerLetter
+        Convert-ToNullableBoolean $Row.PasswordIncludeNumber
+        Convert-ToNullableBoolean $Row.PasswordIncludeSpecialChar
+    )
+
+    $complexityKnown = @(
+        $complexityValues | Where-Object { $null -ne $_ }
+    ).Count -eq 4
+
+    $complexityEnabledCount = $null
+    if ($complexityKnown) {
+        $complexityEnabledCount = @(
+            $complexityValues | Where-Object { $_ -eq $true }
+        ).Count
+    }
+
+    $passwordLengthStatus = Get-MinimumStatus `
+        $Row.PasswordMinLength `
+        $script:PasswordStandard.PasswordMinLength
+
+    if (-not $complexityKnown) {
+        $passwordComplexityStatus = "Not Assessed"
+    }
+    elseif (
+        $complexityEnabledCount -ge
+        $script:PasswordStandard.ComplexityRequired
+    ) {
+        $passwordComplexityStatus = "Compliant"
+    }
+    else {
+        $passwordComplexityStatus = "Non-Compliant"
+    }
+
+    $passwordHistoryStatus = Get-MinimumStatus `
+        $Row.NumDisallowedOldPasswords `
+        $script:PasswordStandard.DisallowedOldPasswords
+
+    $passwordMinLifetimeStatus = Get-MinimumStatus `
+        $Row.PasswordMinLifetimeDays `
+        $script:PasswordStandard.PasswordMinLifetimeDays
+
+    $passwordMaxLifetime365Status = Get-MaximumStatus `
+        $Row.PasswordMaxLifetimeDays `
+        $script:PasswordStandard.PasswordMaxLifetimeDays
+
+    $requiredStatuses = @(
+        $passwordLengthStatus
+        $passwordComplexityStatus
+        $passwordHistoryStatus
+        $passwordMinLifetimeStatus
+        $passwordMaxLifetime365Status
+    )
+
+    if ($requiredStatuses -contains "Not Assessed") {
+        $overallStatus = "Not Assessed"
+    }
+    elseif (@(
+        $requiredStatuses | Where-Object { $_ -ne "Compliant" }
+    ).Count -eq 0) {
+        $overallStatus = "Compliant"
+    }
+    else {
+        $overallStatus = "Non-Compliant"
+    }
+
+    $findings = @()
+
+    $minLength = Convert-ToNullableNumber $Row.PasswordMinLength
+    if ($passwordLengthStatus -eq "Not Assessed") {
+        $findings += "Password minimum length was not returned"
+    }
+    elseif ($passwordLengthStatus -eq "Non-Compliant") {
+        $findings += "Minimum length $minLength is below $($script:PasswordStandard.PasswordMinLength)"
+    }
+
+    if ($passwordComplexityStatus -eq "Not Assessed") {
+        $findings += "One or more complexity flags were not returned"
+    }
+    elseif ($passwordComplexityStatus -eq "Non-Compliant") {
+        $findings += "Complexity $complexityEnabledCount of 4 is below $($script:PasswordStandard.ComplexityRequired) of 4"
+    }
+
+    $history = Convert-ToNullableNumber $Row.NumDisallowedOldPasswords
+    if ($passwordHistoryStatus -eq "Not Assessed") {
+        $findings += "Password history was not returned"
+    }
+    elseif ($passwordHistoryStatus -eq "Non-Compliant") {
+        $findings += "Password history $history is below $($script:PasswordStandard.DisallowedOldPasswords)"
+    }
+
+    $minAge = Convert-ToNullableNumber $Row.PasswordMinLifetimeDays
+    if ($passwordMinLifetimeStatus -eq "Not Assessed") {
+        $findings += "Minimum password age was not returned"
+    }
+    elseif ($passwordMinLifetimeStatus -eq "Non-Compliant") {
+        $findings += "Minimum password age $minAge days is below $($script:PasswordStandard.PasswordMinLifetimeDays)"
+    }
+
+    $maxAge = Convert-ToNullableNumber $Row.PasswordMaxLifetimeDays
+    if ($passwordMaxLifetime365Status -eq "Not Assessed") {
+        $findings += "Maximum password age was not returned"
+    }
+    elseif ($passwordMaxLifetime365Status -eq "Non-Compliant") {
+        if ($maxAge -le 0) {
+            $findings += "Maximum password age is not enabled"
+        }
+        else {
+            $findings += "Maximum password age $maxAge days exceeds $($script:PasswordStandard.PasswordMaxLifetimeDays)"
+        }
+    }
+
+    if ($null -eq $complexityEnabledCount) {
+        $complexityDisplay = "N/A"
+    }
+    else {
+        $complexityDisplay = "$complexityEnabledCount of 4"
+    }
+
+    if ($findings.Count -gt 0) {
+        $findingText = $findings -join "; "
+    }
+    else {
+        $findingText = "None"
+    }
+
+    [pscustomobject][ordered]@{
+        PasswordComplexityEnabledCount = $complexityDisplay
+        PasswordLengthStatus            = $passwordLengthStatus
+        PasswordComplexityStatus        = $passwordComplexityStatus
+        PasswordHistoryStatus           = $passwordHistoryStatus
+        PasswordMinLifetimeStatus       = $passwordMinLifetimeStatus
+        PasswordMaxLifetime365Status    = $passwordMaxLifetime365Status
+        MeetsPCI90DayValue              = Get-PciValueStatus $Row.PasswordMaxLifetimeDays
+        OverallPasswordPolicyStatus     = $overallStatus
+        ComplianceFindings              = $findingText
+    }
+}
+
 function New-EmptyRow {
     param([string]$Cluster)
 
@@ -156,6 +397,15 @@ function New-EmptyRow {
         ClassifiedDataMessage                  = "N/A"
         UnclassifiedDataMessage                = "N/A"
         SSHTimeoutInMins                        = "N/A"
+        PasswordComplexityEnabledCount          = "N/A"
+        PasswordLengthStatus                    = "Not Assessed"
+        PasswordComplexityStatus                = "Not Assessed"
+        PasswordHistoryStatus                   = "Not Assessed"
+        PasswordMinLifetimeStatus               = "Not Assessed"
+        PasswordMaxLifetime365Status            = "Not Assessed"
+        MeetsPCI90DayValue                      = "Not Assessed"
+        OverallPasswordPolicyStatus             = "Not Assessed"
+        ComplianceFindings                      = "Cluster security configuration was not returned"
     }
 }
 
@@ -165,7 +415,7 @@ function New-SecurityRow {
         $SecurityConfig
     )
 
-    [pscustomobject][ordered]@{
+    $rowData = [ordered]@{
         Cluster                                 = $Cluster
         PasswordMinLength                       = Value-OrNA $SecurityConfig.passwordStrength.minLength
         PasswordIncludeUpperLetter              = Value-OrNA $SecurityConfig.passwordStrength.includeUpperLetter
@@ -195,6 +445,14 @@ function New-SecurityRow {
         UnclassifiedDataMessage                = Value-OrNA $SecurityConfig.dataClassification.unclassifiedDataMessage
         SSHTimeoutInMins                        = Value-OrNA $SecurityConfig.sshConfiguration.sshTimeoutInMins
     }
+
+    $assessment = Get-PasswordPolicyAssessment ([pscustomobject]$rowData)
+
+    foreach ($property in @($assessment.PSObject.Properties)) {
+        $rowData[$property.Name] = $property.Value
+    }
+
+    return [pscustomobject][ordered]$rowData
 }
 
 Write-Host "====================================================" -ForegroundColor Cyan
@@ -282,6 +540,41 @@ foreach ($cluster in $clusters) {
 
 $rows = @($rows | Sort-Object Cluster)
 
+Write-Host "`nPASSWORD STANDARD - ACTUAL VALUES" -ForegroundColor Cyan
+$rows |
+    Select-Object `
+        Cluster,
+        PasswordMinLength,
+        PasswordComplexityEnabledCount,
+        NumDisallowedOldPasswords,
+        PasswordMinLifetimeDays,
+        PasswordMaxLifetimeDays,
+        OverallPasswordPolicyStatus |
+    Format-Table -AutoSize -Wrap |
+    Out-Host
+
+Write-Host "`nPASSWORD STANDARD - COMPLIANCE" -ForegroundColor Cyan
+$rows |
+    Select-Object `
+        Cluster,
+        PasswordLengthStatus,
+        PasswordComplexityStatus,
+        PasswordHistoryStatus,
+        PasswordMinLifetimeStatus,
+        PasswordMaxLifetime365Status,
+        MeetsPCI90DayValue |
+    Format-Table -AutoSize -Wrap |
+    Out-Host
+
+Write-Host "`nPASSWORD COMPLIANCE FINDINGS" -ForegroundColor Cyan
+$rows |
+    Select-Object `
+        Cluster,
+        OverallPasswordPolicyStatus,
+        ComplianceFindings |
+    Format-Table -AutoSize -Wrap |
+    Out-Host
+
 Write-Host "`nPASSWORD STRENGTH" -ForegroundColor Cyan
 $rows |
     Select-Object `
@@ -361,14 +654,43 @@ $rows | Export-Csv `
     -NoTypeInformation `
     -Encoding UTF8
 
+$compliantClusters = @(
+    $rows | Where-Object {
+        $_.OverallPasswordPolicyStatus -eq "Compliant"
+    }
+).Count
+$nonCompliantClusters = @(
+    $rows | Where-Object {
+        $_.OverallPasswordPolicyStatus -eq "Non-Compliant"
+    }
+).Count
+$notAssessedClusters = @(
+    $rows | Where-Object {
+        $_.OverallPasswordPolicyStatus -eq "Not Assessed"
+    }
+).Count
+$pci90ValueMetClusters = @(
+    $rows | Where-Object {
+        $_.MeetsPCI90DayValue -eq "Yes"
+    }
+).Count
+
 Write-Host "`n====================================" -ForegroundColor Cyan
 Write-Host "SECURITY CONFIGURATION SUMMARY" -ForegroundColor White
 Write-Host "====================================" -ForegroundColor Cyan
-Write-Host "Clusters discovered       : $($clusters.Count)"
-Write-Host "Clusters successfully read: $successfulClusters"
-Write-Host "Cluster fetch issues      : $($issues.Count)"
-Write-Host "Rows displayed/exported   : $($rows.Count)"
-Write-Host "CSV output                : $csvPath"
+Write-Host "Clusters discovered          : $($clusters.Count)"
+Write-Host "Clusters successfully read   : $successfulClusters"
+Write-Host "Password policy compliant    : $compliantClusters"
+Write-Host "Password policy non-compliant: $nonCompliantClusters"
+Write-Host "Password policy not assessed : $notAssessedClusters"
+Write-Host "Meets PCI 90-day value       : $pci90ValueMetClusters"
+Write-Host "Cluster fetch issues         : $($issues.Count)"
+Write-Host "Rows displayed/exported      : $($rows.Count)"
+Write-Host "CSV output                   : $csvPath"
+
+Write-Host `
+    "PCI note: MeetsPCI90DayValue checks only whether maxLifetimeDays is 1-90. PCI scope and MFA usage are not exposed by /v2/security-config." `
+    -ForegroundColor Yellow
 
 if ($issues.Count -gt 0) {
     $issues | Format-Table -AutoSize -Wrap | Out-Host
