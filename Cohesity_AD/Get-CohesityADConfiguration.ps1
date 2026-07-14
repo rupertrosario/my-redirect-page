@@ -14,10 +14,6 @@
 # - GET /v2/mcm/cluster-mgmt/info
 # - GET /v2/active-directories?includeTenants=true
 #
-# One-time API key encryption (run as the same Windows account):
-# Read-Host "Enter Cohesity API key" -AsSecureString | ConvertFrom-SecureString |
-#     Set-Content "X:\PowerShell\Cohesity_API_Scripts\DO_NOT_Delete\apikey.enc"
-#
 # CSV Columns:
 # Cluster, ADConfigured, DomainName, OrganizationalUnit, WorkGroupName,
 # MachineAccounts, PreferredDomainControllers, DomainControllersDenyList,
@@ -25,41 +21,35 @@
 # =====================================================================
 
 $ErrorActionPreference = "Stop"
+$FormatEnumerationLimit = -1
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
 # -------------------------------
 # Config
 # -------------------------------
-$baseUrl      = "https://helios.cohesity.com"
-$apikeypath   = "X:\PowerShell\Cohesity_API_Scripts\DO_NOT_Delete\apikey.enc"
-$logDirectory = "X:\PowerShell\Data\Cohesity\ADInventory"
+$baseUrl            = "https://helios.cohesity.com"
+$logDirectory        = "X:\PowerShell\Data\Cohesity\ADInventory"
+$helperPath          = "X:\PowerShell\Cohesity_API_Scripts\Common\ApiKeyAesHelper.ps1"
+$encryptedApiKeyPath = "X:\PowerShell\Cohesity_API_Scripts\Common\Secure\cohesity_apikey.enc"
 
 if (-not (Test-Path -Path $logDirectory -PathType Container)) {
     New-Item -Path $logDirectory -ItemType Directory -Force | Out-Null
 }
 
-if (-not (Test-Path -Path $apikeypath -PathType Leaf)) {
-    throw "Encrypted API key file not found at $apikeypath"
+if (-not (Test-Path -Path $helperPath -PathType Leaf)) {
+    throw "API key helper not found at $helperPath"
 }
 
-try {
-    $secureApiKey = Get-Content -Path $apikeypath -Raw | ConvertTo-SecureString -ErrorAction Stop
-    $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secureApiKey)
+if (-not (Test-Path -Path $encryptedApiKeyPath -PathType Leaf)) {
+    throw "Encrypted API key file not found at $encryptedApiKeyPath"
+}
 
-    try {
-        $apiKey = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr)
-    }
-    finally {
-        if ($bstr -ne [IntPtr]::Zero) {
-            [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
-        }
-    }
-}
-catch {
-    throw "Failed to decrypt API key file '$apikeypath'. Create it with the same Windows account on the same computer. $($_.Exception.Message)"
-}
+. $helperPath
+
+$apiKey = Get-CohesityApiKeyFromAes -EncryptedFile $encryptedApiKeyPath
 
 if ([string]::IsNullOrWhiteSpace($apiKey)) {
-    throw "Decrypted API key is empty: $apikeypath"
+    throw "AES API key helper returned an empty API key."
 }
 
 $commonHeaders = @{
