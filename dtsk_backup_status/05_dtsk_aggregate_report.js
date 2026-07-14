@@ -11,6 +11,7 @@
 // - Shows DTSK assignment ownership and calculated SLA status in the email output
 // - Keeps cluster diagnostics out of the Cluster column
 // - Clearly reports when there are no active decommission DTSKs
+// - Explicitly reports DB-named servers that have server backup but no DB backup
 //
 // Strictly read/aggregate only. No HTTP calls. No writes.
 // ==========================================================
@@ -85,6 +86,7 @@ export default async function () {
     const displayMap = {
       NoObject: "No Backup Found",
       NoFSBackupFound: "DB Only / No Server Backup",
+      NoDBBackupFound: "Server Backup / No DB Backup",
       HyperV: "Hyper-V",
       Nutanix: "Nutanix/AHV"
     };
@@ -147,6 +149,7 @@ export default async function () {
       SQL: 50,
       Oracle: 60,
       NoFSBackupFound: 900,
+      NoDBBackupFound: 910,
       NoObject: 950,
       Unknown: 999
     };
@@ -262,6 +265,7 @@ export default async function () {
       `| **DB-protected CIs** | **${summary.dbProtectedCiCount}** |`,
       `| **No backup found** | **${summary.noObjectRowCount}** |`,
       `| **DB backup found but no server-level backup** | **${summary.noFsBackupFoundRowCount}** |`,
+      `| **DB-named server backup found but no DB backup** | **${summary.noDbBackupFoundRowCount}** |`,
       `| **Warnings** | **${summary.warningCount}** |`
     ].join("\n");
   }
@@ -278,6 +282,7 @@ export default async function () {
       `| Oracle | ${summary.oracleRowCount} |`,
       `| **No Backup Found** | **${summary.noObjectRowCount}** |`,
       `| **DB Only / No Server Backup** | **${summary.noFsBackupFoundRowCount}** |`,
+      `| **Server Backup / No DB Backup** | **${summary.noDbBackupFoundRowCount}** |`,
       `| Unknown | ${summary.unknownRowCount} |`
     ].join("\n");
   }
@@ -288,6 +293,7 @@ export default async function () {
       "- **SLA Status** is calculated in Dynatrace as 2 days from `sys_created_on`, which is treated as the time the DTSK came to the Backup group for this report.",
       "- **No Backup Found** means no in-scope Cohesity backup object was found for the CI.",
       "- **DB Only / No Server Backup** means a SQL/Oracle backup was found, but no FS, VM, Hyper-V, or Nutanix/AHV backup was found for the server.",
+      "- **Server Backup / No DB Backup** means the CI name indicates a DB/CN server and server-level backup was found, but no SQL/Oracle backup was found after the validator's all-cluster DB fallback search.",
       "- **Assignment Action** is derived from ServiceNow: `Assigned` when Assigned To is populated, otherwise `Please assign`.",
       "- Cluster search diagnostics are retained in task JSON but are not shown in the email Cluster column."
     ].join("\n");
@@ -308,12 +314,36 @@ export default async function () {
   let dbCnFallbackRowsFound = 0;
 
   for (const output of validationOutputs) {
-    for (const row of asArray(output?.rows)) rows.push(normalizeRow(row, workItemLookup));
+    const outputRows = asArray(output?.rows);
+    for (const row of outputRows) rows.push(normalizeRow(row, workItemLookup));
 
     const s = output?.summary || {};
     if (s.dbNamedServer === true) dbNamedServerCount += 1;
     if (s.dbCnFallbackApplied === true) dbCnFallbackAppliedCount += 1;
     dbCnFallbackRowsFound += Number(s.dbCnFallbackRowsFound || 0);
+
+    const alreadyHasNoDbStatus = outputRows.some(row => safeText(row?.BackupType) === "NoDBBackupFound");
+    if (
+      s.dbNamedServer === true &&
+      s.serverLevelBackupFound === true &&
+      s.dbBackupFound !== true &&
+      !alreadyHasNoDbStatus
+    ) {
+      rows.push(normalizeRow({
+        DTSK: s.dtsk,
+        AssignedTo: s.assignedTo,
+        AssignmentGroup: s.assignmentGroup,
+        AssignmentAction: s.assignmentAction,
+        ServerName: s.ciName,
+        BackupType: "NoDBBackupFound",
+        ObjectName: s.ciName,
+        SourceName: s.ciName,
+        ClusterName: "N/A",
+        ProtectionGroup: "-",
+        LastBackupTime: "NoDBBackupFound",
+        ClustersChecked: "N/A"
+      }, workItemLookup));
+    }
 
     for (const warning of asArray(output?.warnings)) {
       const text = safeText(warning);
@@ -342,6 +372,7 @@ export default async function () {
     sqlRowCount: countRows(finalRows, "SQL"),
     oracleRowCount: countRows(finalRows, "Oracle"),
     noFsBackupFoundRowCount: countRows(finalRows, "NoFSBackupFound"),
+    noDbBackupFoundRowCount: countRows(finalRows, "NoDBBackupFound"),
     noObjectRowCount: countRows(finalRows, "NoObject"),
     unknownRowCount: countRows(finalRows, "Unknown"),
 
