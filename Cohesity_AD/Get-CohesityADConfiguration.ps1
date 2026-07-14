@@ -1,445 +1,521 @@
-<#
-.SYNOPSIS
-    Collects Active Directory integration configuration from all Cohesity clusters managed by Helios.
+# =====================================================================
+# Cohesity Active Directory Configuration CSV
+# Multi-Cluster | Helios | GET-only | PowerShell 5.1 compatible
+#
+# Purpose:
+# - Export Active Directory integration details from all Helios clusters
+# - One CSV row per AD connection
+# - Include NOT_CONFIGURED and COLLECTION_ERROR rows
+# - No password-policy collection
+# - No JSON columns
+# - No POST / PUT / PATCH / DELETE
+#
+# Uses:
+# - GET /v2/mcm/cluster-mgmt/info
+# - GET /v2/active-directories?includeTenants=true
+#
+# CSV Columns:
+# Cluster, ADConfigured, DomainName, OrganizationalUnit, WorkGroupName,
+# MachineAccounts, PreferredDomainControllers, DomainControllers,
+# DomainControllersDenyList, TrustedDomains, IdMappingType,
+# LdapProviderId, NisProviderDomainName, ConnectionId, ADConfigurationId,
+# ErrorCode, ErrorMessage, CollectionStatus
+# =====================================================================
 
-.DESCRIPTION
-    GET-only collector. The script first retrieves the cluster inventory from Helios, then queries
-    each cluster's Active Directory configuration using the accessClusterId header.
+$ErrorActionPreference = "Stop"
 
-    No POST, PUT, PATCH, or DELETE requests are used.
+# -------------------------------
+# Config
+# -------------------------------
+$baseUrl      = "https://helios.cohesity.com"
+$apikeypath   = "X:\PowerShell\Cohesity_API_Scripts\DO_NOT_Delete\apikey.txt"
+$logDirectory = "X:\PowerShell\Data\Cohesity\ADInventory"
 
-.PARAMETER ApiKey
-    Cohesity Helios API key. If omitted, the script reads COHESITY_API_KEY from the environment.
-
-.PARAMETER HeliosUrl
-    Cohesity Helios base URL. Default: https://helios.cohesity.com
-
-.PARAMETER OutputCsvPath
-    CSV output path. If omitted, a timestamped file is created in the current directory.
-
-.PARAMETER TimeoutSec
-    HTTP timeout for each GET request. Default: 120 seconds.
-
-.EXAMPLE
-    $env:COHESITY_API_KEY = '<api-key>'
-    .\Get-CohesityADConfiguration.ps1
-
-.EXAMPLE
-    .\Get-CohesityADConfiguration.ps1 `
-        -ApiKey $env:COHESITY_API_KEY `
-        -OutputCsvPath .\Cohesity_AD_Configuration.csv
-#>
-
-[CmdletBinding()]
-param(
-    [Parameter(Mandatory = $false)]
-    [string]$ApiKey = $env:COHESITY_API_KEY,
-
-    [Parameter(Mandatory = $false)]
-    [ValidateNotNullOrEmpty()]
-    [string]$HeliosUrl = 'https://helios.cohesity.com',
-
-    [Parameter(Mandatory = $false)]
-    [string]$OutputCsvPath,
-
-    [Parameter(Mandatory = $false)]
-    [ValidateRange(10, 600)]
-    [int]$TimeoutSec = 120
-)
-
-Set-StrictMode -Version 2.0
-$ErrorActionPreference = 'Stop'
-
-# Required for Windows PowerShell 5.1 when the host has not already enabled TLS 1.2.
-if ($PSVersionTable.PSVersion.Major -lt 6) {
-    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+if (-not (Test-Path -Path $logDirectory -PathType Container)) {
+    New-Item -Path $logDirectory -ItemType Directory -Force | Out-Null
 }
 
-if ([string]::IsNullOrWhiteSpace($ApiKey)) {
-    throw 'Helios API key is required. Pass -ApiKey or set the COHESITY_API_KEY environment variable.'
+if (-not (Test-Path -Path $apikeypath -PathType Leaf)) {
+    throw "API key file not found at $apikeypath"
 }
 
-$HeliosUrl = $HeliosUrl.TrimEnd('/')
+$apiKey = (Get-Content -Path $apikeypath -Raw).Trim()
 
-if ([string]::IsNullOrWhiteSpace($OutputCsvPath)) {
-    $fileName = 'Cohesity_AD_Configuration_{0}.csv' -f (Get-Date -Format 'yyyyMMdd_HHmmss')
-    $OutputCsvPath = Join-Path -Path (Get-Location) -ChildPath $fileName
+if ([string]::IsNullOrWhiteSpace($apiKey)) {
+    throw "API key file is empty: $apikeypath"
 }
 
-function Invoke-CohesityGet {
-    [CmdletBinding()]
+$commonHeaders = @{
+    "apiKey" = $apiKey
+    "accept" = "application/json"
+}
+
+# -------------------------------
+# GET wrapper
+# -------------------------------
+function Invoke-HeliosGetJson {
     param(
-        [Parameter(Mandatory = $true)]
-        [string]$Uri,
-
-        [Parameter(Mandatory = $true)]
-        [hashtable]$Headers
+        [Parameter(Mandatory)][string]$Uri,
+        [Parameter(Mandatory)][hashtable]$Headers
     )
 
-    Invoke-RestMethod `
-        -Method Get `
-        -Uri $Uri `
-        -Headers $Headers `
-        -ContentType 'application/json' `
-        -TimeoutSec $TimeoutSec
-}
-
-function ConvertTo-Array {
-    param([object]$Value)
-
-    if ($null -eq $Value) {
-        return @()
+    if ($PSVersionTable.PSVersion.Major -lt 6) {
+        $response = Invoke-WebRequest -Uri $Uri -Headers $Headers -Method Get -UseBasicParsing -ErrorAction Stop
+    }
+    else {
+        $response = Invoke-WebRequest -Uri $Uri -Headers $Headers -Method Get -ErrorAction Stop
     }
 
-    return @($Value)
+    if (-not $response -or [string]::IsNullOrWhiteSpace($response.Content)) {
+        return $null
+    }
+
+    return ($response.Content | ConvertFrom-Json)
 }
 
-function Get-ObjectPropertyValue {
+# -------------------------------
+# Basic helpers
+# -------------------------------
+function ValueOrNA {
+    param($Value)
+
+    if ($null -eq $Value) {
+        return "N/A"
+    }
+
+    if ($Value -is [array]) {
+        $items = @(
+            $Value | ForEach-Object {
+                if ($null -ne $_ -and -not [string]::IsNullOrWhiteSpace([string]$_)) {
+                    ([string]$_).Trim()
+                }
+            }
+        )
+
+        if ($items.Count -eq 0) {
+            return "N/A"
+        }
+
+        return ($items -join ", ")
+    }
+
+    $text = [string]$Value
+
+    if ([string]::IsNullOrWhiteSpace($text)) {
+        return "N/A"
+    }
+
+    return $text.Trim()
+}
+
+function Get-FirstValue {
     param(
-        [object]$Object,
-        [Parameter(Mandatory = $true)]
-        [string]$Name
+        $Object,
+        [string[]]$Names
     )
 
     if ($null -eq $Object) {
-        return $null
+        return "N/A"
     }
 
-    $property = $Object.PSObject.Properties[$Name]
-    if ($null -eq $property) {
-        return $null
+    foreach ($name in $Names) {
+        if ($null -ne $Object.PSObject.Properties[$name]) {
+            $value = ValueOrNA $Object.$name
+
+            if ($value -ne "N/A") {
+                return $value
+            }
+        }
     }
 
-    return $property.Value
+    return "N/A"
 }
 
-function Join-NonEmpty {
-    param(
-        [object[]]$Values,
-        [string]$Separator = '; '
-    )
+function Format-NameStatusList {
+    param($Items)
 
-    $items = @(
-        $Values |
-            ForEach-Object {
-                if ($null -ne $_) {
-                    ([string]$_).Trim()
-                }
-            } |
-            Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
-            Select-Object -Unique
-    )
+    $values = @()
 
-    return ($items -join $Separator)
-}
-
-function Get-ControllerDisplay {
-    param([object]$Controllers)
-
-    $values = foreach ($controller in (ConvertTo-Array $Controllers)) {
-        if ($null -eq $controller) {
+    foreach ($item in @($Items)) {
+        if ($null -eq $item) {
             continue
         }
 
-        $name = [string](Get-ObjectPropertyValue -Object $controller -Name 'name')
-        $status = [string](Get-ObjectPropertyValue -Object $controller -Name 'status')
+        $name   = Get-FirstValue $item @("name", "dnsHostName", "hostName")
+        $status = Get-FirstValue $item @("status", "state")
 
-        if (-not [string]::IsNullOrWhiteSpace($name) -and -not [string]::IsNullOrWhiteSpace($status)) {
-            '{0} [{1}]' -f $name, $status
+        if ($name -ne "N/A" -and $status -ne "N/A") {
+            $values += "$name [$status]"
         }
-        elseif (-not [string]::IsNullOrWhiteSpace($name)) {
-            $name
+        elseif ($name -ne "N/A") {
+            $values += $name
         }
-    }
-
-    return (Join-NonEmpty -Values $values)
-}
-
-function Get-DomainControllerDisplay {
-    param([object]$DomainControllerGroups)
-
-    $values = foreach ($group in (ConvertTo-Array $DomainControllerGroups)) {
-        if ($null -eq $group) {
-            continue
-        }
-
-        $domain = [string](Get-ObjectPropertyValue -Object $group -Name 'domainName')
-        $controllers = Get-ControllerDisplay -Controllers (Get-ObjectPropertyValue -Object $group -Name 'controllers')
-
-        if (-not [string]::IsNullOrWhiteSpace($domain) -and -not [string]::IsNullOrWhiteSpace($controllers)) {
-            '{0}: {1}' -f $domain, $controllers
-        }
-        elseif (-not [string]::IsNullOrWhiteSpace($controllers)) {
-            $controllers
+        elseif ($status -ne "N/A") {
+            $values += "Status=$status"
         }
     }
 
-    return (Join-NonEmpty -Values $values)
+    if ($values.Count -eq 0) {
+        return "N/A"
+    }
+
+    return ($values -join "; ")
 }
 
-function Get-MachineAccountDisplay {
-    param([object]$MachineAccounts)
+function Format-MachineAccounts {
+    param($MachineAccounts)
 
-    $values = foreach ($account in (ConvertTo-Array $MachineAccounts)) {
+    $values = @()
+
+    foreach ($account in @($MachineAccounts)) {
         if ($null -eq $account) {
             continue
         }
 
-        $name = [string](Get-ObjectPropertyValue -Object $account -Name 'name')
-        $dnsHostName = [string](Get-ObjectPropertyValue -Object $account -Name 'dnsHostName')
+        $name    = Get-FirstValue $account @("name")
+        $dnsName = Get-FirstValue $account @("dnsHostName")
+        $parts   = @()
 
-        if (-not [string]::IsNullOrWhiteSpace($name) -and -not [string]::IsNullOrWhiteSpace($dnsHostName)) {
-            '{0} ({1})' -f $name, $dnsHostName
+        if ($name -ne "N/A") {
+            $parts += $name
         }
-        elseif (-not [string]::IsNullOrWhiteSpace($name)) {
-            $name
+
+        if ($dnsName -ne "N/A" -and $dnsName -ne $name) {
+            $parts += "DNS=$dnsName"
         }
-        elseif (-not [string]::IsNullOrWhiteSpace($dnsHostName)) {
-            $dnsHostName
-        }
-    }
 
-    return (Join-NonEmpty -Values $values)
-}
-
-function Get-TrustedDomainNames {
-    param([object]$TrustedDomainParams)
-
-    if ($null -eq $TrustedDomainParams) {
-        return ''
-    }
-
-    $trustedDomains = Get-ObjectPropertyValue -Object $TrustedDomainParams -Name 'trustedDomains'
-
-    $values = foreach ($domain in (ConvertTo-Array $trustedDomains)) {
-        $domainName = [string](Get-ObjectPropertyValue -Object $domain -Name 'domainName')
-        if (-not [string]::IsNullOrWhiteSpace($domainName)) {
-            $domainName
+        if ($parts.Count -gt 0) {
+            $values += ($parts -join "; ")
         }
     }
 
-    return (Join-NonEmpty -Values $values)
-}
-
-function Get-ActiveDirectoriesFromResponse {
-    param([object]$Response)
-
-    if ($null -eq $Response) {
-        return @()
+    if ($values.Count -eq 0) {
+        return "N/A"
     }
 
-    $propertyNames = @($Response.PSObject.Properties.Name)
-
-    if ($propertyNames -contains 'activeDirectories') {
-        return @(ConvertTo-Array (Get-ObjectPropertyValue -Object $Response -Name 'activeDirectories'))
-    }
-
-    return @(ConvertTo-Array $Response)
+    return ($values -join " | ")
 }
 
-function Test-UnreachableController {
-    param([object]$ActiveDirectory)
+function Format-AllDomainControllers {
+    param($DomainControllerGroups)
 
-    $statuses = @()
+    $values = @()
 
-    foreach ($controller in (ConvertTo-Array (Get-ObjectPropertyValue -Object $ActiveDirectory -Name 'preferredDomainControllers'))) {
-        $status = [string](Get-ObjectPropertyValue -Object $controller -Name 'status')
-        if (-not [string]::IsNullOrWhiteSpace($status)) {
-            $statuses += $status
-        }
-    }
-
-    foreach ($group in (ConvertTo-Array (Get-ObjectPropertyValue -Object $ActiveDirectory -Name 'domainControllers'))) {
-        foreach ($controller in (ConvertTo-Array (Get-ObjectPropertyValue -Object $group -Name 'controllers'))) {
-            $status = [string](Get-ObjectPropertyValue -Object $controller -Name 'status')
-            if (-not [string]::IsNullOrWhiteSpace($status)) {
-                $statuses += $status
-            }
-        }
-    }
-
-    return [bool]($statuses | Where-Object { $_ -ne 'Reachable' } | Select-Object -First 1)
-}
-
-$commonHeaders = @{
-    Accept = 'application/json'
-    apiKey = $ApiKey
-}
-
-$clusterUri = '{0}/v2/mcm/cluster-mgmt/info' -f $HeliosUrl
-Write-Host ('Retrieving Cohesity cluster inventory from {0} ...' -f $HeliosUrl)
-
-$clusterResponse = Invoke-CohesityGet -Uri $clusterUri -Headers $commonHeaders
-$clusters = @()
-
-if ($null -ne $clusterResponse -and @($clusterResponse.PSObject.Properties.Name) -contains 'cohesityClusters') {
-    $clusters = @(ConvertTo-Array (Get-ObjectPropertyValue -Object $clusterResponse -Name 'cohesityClusters'))
-}
-else {
-    $clusters = @(ConvertTo-Array $clusterResponse)
-}
-
-$clusters = @(
-    $clusters |
-        Where-Object { $null -ne $_ -and -not [string]::IsNullOrWhiteSpace([string](Get-ObjectPropertyValue -Object $_ -Name 'clusterId')) } |
-        Sort-Object -Property clusterName
-)
-
-if ($clusters.Count -eq 0) {
-    throw 'No clusters were returned by Helios.'
-}
-
-$rows = New-Object System.Collections.Generic.List[object]
-$adUri = '{0}/v2/active-directories?includeTenants=true' -f $HeliosUrl
-
-foreach ($cluster in $clusters) {
-    $clusterId = [string](Get-ObjectPropertyValue -Object $cluster -Name 'clusterId')
-    $clusterName = [string](Get-ObjectPropertyValue -Object $cluster -Name 'clusterName')
-
-    if ([string]::IsNullOrWhiteSpace($clusterName)) {
-        $clusterName = $clusterId
-    }
-
-    Write-Host ('[{0}] Retrieving Active Directory configuration ...' -f $clusterName)
-
-    $clusterHeaders = @{
-        Accept = 'application/json'
-        apiKey = $ApiKey
-        accessClusterId = $clusterId
-    }
-
-    try {
-        $adResponse = Invoke-CohesityGet -Uri $adUri -Headers $clusterHeaders
-        $activeDirectories = @(Get-ActiveDirectoriesFromResponse -Response $adResponse)
-
-        if ($activeDirectories.Count -eq 0) {
-            $rows.Add([pscustomobject]@{
-                ClusterName                 = $clusterName
-                ClusterId                   = $clusterId
-                ADConfigured                = 'No'
-                DomainName                 = ''
-                OrganizationalUnit          = ''
-                WorkGroupName               = ''
-                ConnectionId                = ''
-                MachineAccounts             = ''
-                PreferredDomainControllers  = ''
-                DomainControllers           = ''
-                DomainControllersDenyList   = ''
-                IdMappingType               = ''
-                TrustedDomains              = ''
-                WhitelistedDomains          = ''
-                BlacklistedDomains          = ''
-                OnlyUseWhitelistedDomains   = ''
-                TrustDiscoveryStatus        = ''
-                TrustEnabled                = ''
-                ErrorCode                   = ''
-                ErrorMessage                = ''
-                CollectionStatus            = 'NOT_CONFIGURED'
-                CollectionError             = ''
-            })
-
+    foreach ($group in @($DomainControllerGroups)) {
+        if ($null -eq $group) {
             continue
         }
 
-        foreach ($ad in $activeDirectories) {
-            $errorCode = ''
-            $errorMessage = ''
+        $domainName = Get-FirstValue $group @("domainName")
+        $controllers = Format-NameStatusList $group.controllers
 
-            $adError = Get-ObjectPropertyValue -Object $ad -Name 'error'
-            $idMappingParams = Get-ObjectPropertyValue -Object $ad -Name 'idMappingParams'
-            $userIdMappingParams = Get-ObjectPropertyValue -Object $idMappingParams -Name 'userIdMappingParams'
-            $trustedDomainParams = Get-ObjectPropertyValue -Object $ad -Name 'trustedDomainParams'
-
-            if ($null -ne $adError) {
-                $errorCode = [string](Get-ObjectPropertyValue -Object $adError -Name 'errorCode')
-                $errorMessage = [string](Get-ObjectPropertyValue -Object $adError -Name 'errorMessage')
-            }
-
-            $collectionStatus = 'CONFIGURED'
-
-            if (-not [string]::IsNullOrWhiteSpace($errorCode) -or -not [string]::IsNullOrWhiteSpace($errorMessage)) {
-                $collectionStatus = 'ERROR'
-            }
-            elseif (Test-UnreachableController -ActiveDirectory $ad) {
-                $collectionStatus = 'REVIEW'
-            }
-
-            $rows.Add([pscustomobject]@{
-                ClusterName                 = $clusterName
-                ClusterId                   = $clusterId
-                ADConfigured                = 'Yes'
-                DomainName                 = [string](Get-ObjectPropertyValue -Object $ad -Name 'domainName')
-                OrganizationalUnit          = [string](Get-ObjectPropertyValue -Object $ad -Name 'organizationalUnitName')
-                WorkGroupName               = [string](Get-ObjectPropertyValue -Object $ad -Name 'workGroupName')
-                ConnectionId                = [string](Get-ObjectPropertyValue -Object $ad -Name 'connectionId')
-                MachineAccounts             = Get-MachineAccountDisplay -MachineAccounts (Get-ObjectPropertyValue -Object $ad -Name 'machineAccounts')
-                PreferredDomainControllers  = Get-ControllerDisplay -Controllers (Get-ObjectPropertyValue -Object $ad -Name 'preferredDomainControllers')
-                DomainControllers           = Get-DomainControllerDisplay -DomainControllerGroups (Get-ObjectPropertyValue -Object $ad -Name 'domainControllers')
-                DomainControllersDenyList   = Join-NonEmpty -Values (ConvertTo-Array (Get-ObjectPropertyValue -Object $ad -Name 'domainControllersDenyList'))
-                IdMappingType               = [string](Get-ObjectPropertyValue -Object $userIdMappingParams -Name 'type')
-                TrustedDomains              = Get-TrustedDomainNames -TrustedDomainParams $trustedDomainParams
-                WhitelistedDomains          = Join-NonEmpty -Values (ConvertTo-Array (Get-ObjectPropertyValue -Object $trustedDomainParams -Name 'whitelistedDomains'))
-                BlacklistedDomains          = Join-NonEmpty -Values (ConvertTo-Array (Get-ObjectPropertyValue -Object $trustedDomainParams -Name 'blacklistedDomains'))
-                OnlyUseWhitelistedDomains   = [string](Get-ObjectPropertyValue -Object $trustedDomainParams -Name 'onlyUseWhitelistedDomains')
-                TrustDiscoveryStatus        = [string](Get-ObjectPropertyValue -Object $trustedDomainParams -Name 'discoveryStatus')
-                TrustEnabled                = [string](Get-ObjectPropertyValue -Object $trustedDomainParams -Name 'enabled')
-                ErrorCode                   = $errorCode
-                ErrorMessage                = $errorMessage
-                CollectionStatus            = $collectionStatus
-                CollectionError             = ''
-            })
+        if ($domainName -ne "N/A" -and $controllers -ne "N/A") {
+            $values += "${domainName}: $controllers"
         }
+        elseif ($controllers -ne "N/A") {
+            $values += $controllers
+        }
+    }
+
+    if ($values.Count -eq 0) {
+        return "N/A"
+    }
+
+    return ($values -join " | ")
+}
+
+function Format-TrustedDomains {
+    param($TrustedDomainParams)
+
+    if ($null -eq $TrustedDomainParams) {
+        return "N/A"
+    }
+
+    $values = @()
+
+    foreach ($trusted in @($TrustedDomainParams.trustedDomains)) {
+        if ($null -eq $trusted) {
+            continue
+        }
+
+        $domainName = Get-FirstValue $trusted @("domainName")
+
+        if ($domainName -ne "N/A") {
+            $values += $domainName
+        }
+    }
+
+    foreach ($domain in @($TrustedDomainParams.whitelistedDomains)) {
+        $domainName = ValueOrNA $domain
+
+        if ($domainName -ne "N/A" -and $domainName -notin $values) {
+            $values += $domainName
+        }
+    }
+
+    if ($values.Count -eq 0) {
+        return "N/A"
+    }
+
+    return ($values -join ", ")
+}
+
+function Get-IdMappingType {
+    param($ActiveDirectory)
+
+    if ($null -eq $ActiveDirectory.idMappingParams.userIdMappingParams) {
+        return "N/A"
+    }
+
+    return (Get-FirstValue $ActiveDirectory.idMappingParams.userIdMappingParams @("type"))
+}
+
+function Get-CollectionStatus {
+    param($ActiveDirectory)
+
+    $errorCode    = Get-FirstValue $ActiveDirectory.error @("errorCode")
+    $errorMessage = Get-FirstValue $ActiveDirectory.error @("errorMessage")
+
+    if ($errorCode -ne "N/A" -or $errorMessage -ne "N/A") {
+        return "ERROR"
+    }
+
+    $controllerStatuses = @()
+
+    foreach ($controller in @($ActiveDirectory.preferredDomainControllers)) {
+        if ($null -ne $controller -and $null -ne $controller.PSObject.Properties["status"]) {
+            $controllerStatuses += [string]$controller.status
+        }
+    }
+
+    foreach ($group in @($ActiveDirectory.domainControllers)) {
+        foreach ($controller in @($group.controllers)) {
+            if ($null -ne $controller -and $null -ne $controller.PSObject.Properties["status"]) {
+                $controllerStatuses += [string]$controller.status
+            }
+        }
+    }
+
+    $unhealthy = @(
+        $controllerStatuses | Where-Object {
+            -not [string]::IsNullOrWhiteSpace($_) -and $_ -ne "Reachable"
+        }
+    )
+
+    if ($unhealthy.Count -gt 0) {
+        return "REVIEW"
+    }
+
+    return "CONFIGURED"
+}
+
+function New-EmptyADRow {
+    param(
+        [string]$Cluster,
+        [string]$ADConfigured,
+        [string]$Status,
+        [string]$ErrorMessage = "N/A"
+    )
+
+    return [pscustomobject][ordered]@{
+        Cluster                    = $Cluster
+        ADConfigured               = $ADConfigured
+        DomainName                 = "N/A"
+        OrganizationalUnit         = "N/A"
+        WorkGroupName              = "N/A"
+        MachineAccounts            = "N/A"
+        PreferredDomainControllers = "N/A"
+        DomainControllers          = "N/A"
+        DomainControllersDenyList  = "N/A"
+        TrustedDomains             = "N/A"
+        IdMappingType              = "N/A"
+        LdapProviderId             = "N/A"
+        NisProviderDomainName      = "N/A"
+        ConnectionId               = "N/A"
+        ADConfigurationId          = "N/A"
+        ErrorCode                  = "N/A"
+        ErrorMessage               = $ErrorMessage
+        CollectionStatus           = $Status
+    }
+}
+
+# -------------------------------
+# Get clusters
+# -------------------------------
+Write-Host "=============================================" -ForegroundColor Cyan
+Write-Host "   COHESITY AD CONFIGURATION CSV" -ForegroundColor White
+Write-Host "=============================================" -ForegroundColor Cyan
+Write-Host "Output: CSV only" -ForegroundColor Gray
+
+try {
+    $clusterJson = Invoke-HeliosGetJson -Uri "$baseUrl/v2/mcm/cluster-mgmt/info" -Headers $commonHeaders
+}
+catch {
+    throw "Failed to query Helios clusters: $($_.Exception.Message)"
+}
+
+$clusters = @()
+
+if ($clusterJson.cohesityClusters) {
+    $clusters = @($clusterJson.cohesityClusters)
+}
+elseif ($clusterJson.clusters) {
+    $clusters = @($clusterJson.clusters)
+}
+elseif ($clusterJson.clusterInfos) {
+    $clusters = @($clusterJson.clusterInfos)
+}
+elseif ($clusterJson.mcmInfo.clusterInfos) {
+    $clusters = @($clusterJson.mcmInfo.clusterInfos)
+}
+
+if (-not $clusters -or $clusters.Count -eq 0) {
+    throw "No clusters returned from Helios."
+}
+
+$clusters = @(
+    $clusters | Sort-Object {
+        Get-FirstValue $_ @("name", "clusterName", "displayName", "ClusterName", "Name")
+    }
+)
+
+# -------------------------------
+# Main collection
+# -------------------------------
+$rows = @()
+$clusterIssues = @()
+$configuredClusterCount = 0
+$notConfiguredClusterCount = 0
+$reviewRowCount = 0
+$errorRowCount = 0
+
+foreach ($cluster in $clusters) {
+    $clusterName = Get-FirstValue $cluster @("name", "clusterName", "displayName", "ClusterName", "Name")
+    $clusterId   = Get-FirstValue $cluster @("clusterId", "id", "ClusterId", "Id")
+
+    if ($clusterName -eq "N/A") {
+        $clusterName = "Unknown"
+    }
+
+    if ($clusterId -eq "N/A") {
+        $clusterIssues += [pscustomobject]@{
+            Cluster = $clusterName
+            Issue   = "Cluster ID missing"
+        }
+
+        $rows += New-EmptyADRow -Cluster $clusterName -ADConfigured "Unknown" -Status "COLLECTION_ERROR" -ErrorMessage "Cluster ID missing"
+        $errorRowCount++
+        continue
+    }
+
+    Write-Host "Processing cluster: $clusterName" -ForegroundColor Cyan
+
+    $headers = @{
+        "apiKey"          = $apiKey
+        "accessClusterId" = [string]$clusterId
+        "accept"          = "application/json"
+    }
+
+    try {
+        $adJson = Invoke-HeliosGetJson -Uri "$baseUrl/v2/active-directories?includeTenants=true" -Headers $headers
     }
     catch {
         $message = $_.Exception.Message
-        Write-Warning ('[{0}] Active Directory collection failed: {1}' -f $clusterName, $message)
 
-        $rows.Add([pscustomobject]@{
-            ClusterName                 = $clusterName
-            ClusterId                   = $clusterId
-            ADConfigured                = 'Unknown'
-            DomainName                 = ''
-            OrganizationalUnit          = ''
-            WorkGroupName               = ''
-            ConnectionId                = ''
-            MachineAccounts             = ''
-            PreferredDomainControllers  = ''
-            DomainControllers           = ''
-            DomainControllersDenyList   = ''
-            IdMappingType               = ''
-            TrustedDomains              = ''
-            WhitelistedDomains          = ''
-            BlacklistedDomains          = ''
-            OnlyUseWhitelistedDomains   = ''
-            TrustDiscoveryStatus        = ''
-            TrustEnabled                = ''
-            ErrorCode                   = ''
-            ErrorMessage                = ''
-            CollectionStatus            = 'COLLECTION_ERROR'
-            CollectionError             = $message
-        })
+        $clusterIssues += [pscustomobject]@{
+            Cluster = $clusterName
+            Issue   = "AD configuration fetch failed: $message"
+        }
+
+        $rows += New-EmptyADRow -Cluster $clusterName -ADConfigured "Unknown" -Status "COLLECTION_ERROR" -ErrorMessage $message
+        $errorRowCount++
+        continue
+    }
+
+    $activeDirectories = @()
+
+    if ($adJson.activeDirectories) {
+        $activeDirectories = @($adJson.activeDirectories | Where-Object { $null -ne $_ })
+    }
+    elseif ($adJson -is [array]) {
+        $activeDirectories = @($adJson | Where-Object { $null -ne $_ })
+    }
+    elseif ($adJson.domainName -or $adJson.connectionId -or $adJson.id) {
+        $activeDirectories = @($adJson)
+    }
+
+    if ($activeDirectories.Count -eq 0) {
+        $rows += New-EmptyADRow -Cluster $clusterName -ADConfigured "No" -Status "NOT_CONFIGURED"
+        $notConfiguredClusterCount++
+        continue
+    }
+
+    $configuredClusterCount++
+
+    foreach ($activeDirectory in $activeDirectories) {
+        $status = Get-CollectionStatus $activeDirectory
+
+        if ($status -eq "REVIEW") {
+            $reviewRowCount++
+        }
+        elseif ($status -eq "ERROR") {
+            $errorRowCount++
+        }
+
+        $rows += [pscustomobject][ordered]@{
+            Cluster                    = $clusterName
+            ADConfigured               = "Yes"
+            DomainName                 = Get-FirstValue $activeDirectory @("domainName")
+            OrganizationalUnit         = Get-FirstValue $activeDirectory @("organizationalUnitName")
+            WorkGroupName              = Get-FirstValue $activeDirectory @("workGroupName")
+            MachineAccounts            = Format-MachineAccounts $activeDirectory.machineAccounts
+            PreferredDomainControllers = Format-NameStatusList $activeDirectory.preferredDomainControllers
+            DomainControllers          = Format-AllDomainControllers $activeDirectory.domainControllers
+            DomainControllersDenyList  = ValueOrNA $activeDirectory.domainControllersDenyList
+            TrustedDomains             = Format-TrustedDomains $activeDirectory.trustedDomainParams
+            IdMappingType              = Get-IdMappingType $activeDirectory
+            LdapProviderId             = Get-FirstValue $activeDirectory @("ldapProviderId")
+            NisProviderDomainName      = Get-FirstValue $activeDirectory @("nisProviderDomainName")
+            ConnectionId               = Get-FirstValue $activeDirectory @("connectionId")
+            ADConfigurationId          = Get-FirstValue $activeDirectory @("id")
+            ErrorCode                  = Get-FirstValue $activeDirectory.error @("errorCode")
+            ErrorMessage               = Get-FirstValue $activeDirectory.error @("errorMessage")
+            CollectionStatus           = $status
+        }
     }
 }
 
-$outputDirectory = Split-Path -Path $OutputCsvPath -Parent
-if (-not [string]::IsNullOrWhiteSpace($outputDirectory) -and -not (Test-Path -LiteralPath $outputDirectory)) {
-    New-Item -ItemType Directory -Path $outputDirectory -Force | Out-Null
+# -------------------------------
+# Export CSV
+# -------------------------------
+$timestamp = Get-Date -Format "yyyyMMdd_HHmm"
+$csvPath = Join-Path $logDirectory "Cohesity_AD_Configuration_$timestamp.csv"
+
+$rows |
+    Sort-Object Cluster, DomainName |
+    Export-Csv -Path $csvPath -NoTypeInformation -Encoding UTF8
+
+# -------------------------------
+# Console summary
+# -------------------------------
+Write-Host "`n==============================" -ForegroundColor Cyan
+Write-Host "AD CONFIGURATION SUMMARY" -ForegroundColor White
+Write-Host "==============================" -ForegroundColor Cyan
+Write-Host "Clusters discovered       : $($clusters.Count)"
+Write-Host "Clusters with AD          : $configuredClusterCount"
+Write-Host "Clusters without AD       : $notConfiguredClusterCount"
+Write-Host "Rows requiring review     : $reviewRowCount"
+Write-Host "Error rows                : $errorRowCount"
+Write-Host "CSV rows                  : $($rows.Count)"
+Write-Host "CSV output                : $csvPath"
+
+if ($clusterIssues.Count -gt 0) {
+    Write-Host "Cluster fetch issues      : $($clusterIssues.Count)" -ForegroundColor Yellow
+
+    foreach ($issue in $clusterIssues) {
+        Write-Host (" - {0}: {1}" -f $issue.Cluster, $issue.Issue) -ForegroundColor Yellow
+    }
 }
 
-$sortedRows = @($rows | Sort-Object -Property ClusterName, DomainName)
-$sortedRows | Export-Csv -Path $OutputCsvPath -NoTypeInformation -Encoding UTF8
-
-Write-Host ''
-Write-Host 'Cohesity Active Directory Configuration Summary'
-Write-Host '------------------------------------------------'
-$sortedRows |
-    Select-Object ClusterName, ADConfigured, DomainName, PreferredDomainControllers, IdMappingType, CollectionStatus |
-    Format-Table -AutoSize |
-    Out-Host
-
-Write-Host ('Clusters queried : {0}' -f $clusters.Count)
-Write-Host ('Rows produced    : {0}' -f $sortedRows.Count)
-Write-Host ('CSV output       : {0}' -f (Resolve-Path -LiteralPath $OutputCsvPath))
-
-# Return structured objects to support downstream PowerShell processing.
-$sortedRows
+Write-Host "=============================="
+Write-Host "Processing complete."
