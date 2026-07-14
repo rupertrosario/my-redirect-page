@@ -17,7 +17,7 @@ This flow copies the email body. It does not move or delete the original Outlook
 ## Current design
 
 - One Outlook trigger
-- One subject-validation condition
+- One condition containing two subject checks joined with **OR**
 - One SharePoint folder
 - One SharePoint **Create file** action
 - Report type retained in the generated filename
@@ -70,31 +70,41 @@ Important:
 - If an Outlook rule moves messages into a subfolder, the trigger must monitor that subfolder, not Inbox.
 - Do not use **Body Preview** later in the flow.
 
-### 3. Add the subject-validation condition
+### 3. Add the report-subject condition
 
 1. Select **+ New step**.
 2. Add **Control → Condition**.
-3. In the condition, select the **Expression** tab and enter:
+3. At the top of the condition parameters, change **AND** to **OR**.
+4. Configure the first row:
 
-   ```text
-   or(
-     contains(triggerOutputs()?['body/subject'],'Cohesity Common GFlag Report'),
-     contains(triggerOutputs()?['body/subject'],'Cohesity Cluster-Specific GFlag Report')
-   )
-   ```
+   | Field | Selection |
+   |---|---|
+   | Left **Choose a value** | Select **Subject** from Dynamic content |
+   | Operator | Select **contains** |
+   | Right **Choose a value** | Enter `Cohesity Common GFlag Report` |
 
-4. Set the comparison to:
+5. Select **Add row**.
+6. Configure the second row:
 
-   ```text
-   is equal to
-   true
-   ```
+   | Field | Selection |
+   |---|---|
+   | Left **Choose a value** | Select **Subject** from Dynamic content |
+   | Operator | Select **contains** |
+   | Right **Choose a value** | Enter `Cohesity Cluster-Specific GFlag Report` |
 
-This prevents another email containing only the generic text `GFlag Report` from being saved under the wrong report type.
+The finished condition must read:
+
+```text
+Subject contains Cohesity Common GFlag Report
+OR
+Subject contains Cohesity Cluster-Specific GFlag Report
+```
+
+Do not use **AND**. A single email subject cannot normally contain both complete report names, so an AND condition would send valid report emails to the False branch.
 
 ### 4. Add SharePoint Create file
 
-Inside the condition's **If yes** branch:
+Inside the condition's **True** branch:
 
 1. Select **Add an action**.
 2. Add **SharePoint → Create file**.
@@ -148,18 +158,18 @@ Body Preview
 
 `Body Preview` can be truncated and may omit report tables or other HTML content.
 
-### 5. Leave the If no branch empty
+### 5. Leave the False branch empty
 
-The condition's **If no** branch requires no action. Non-matching messages are ignored.
+The condition's **False** branch requires no action. Non-matching messages are ignored.
 
 ## Final flow structure
 
 ```text
 When a new email arrives in the selected Outlook folder
                     ↓
-Subject is Common OR Cluster-Specific GFlag Report?
+Subject contains Common OR Cluster-Specific GFlag Report?
           ┌─────────┴─────────┐
-         Yes                  No
+         True                False
           ↓                    ↓
 SharePoint — Create file    No action
           ↓
@@ -170,7 +180,7 @@ Documents/Cohesity GFlag Reports
 
 1. Save and enable the flow.
 2. Send or receive a new **Cohesity Common GFlag Report** email in the monitored Outlook folder.
-3. Open **Run history** and confirm the condition selected **If yes**.
+3. Open **Run history** and confirm the condition selected **True**.
 4. Confirm the HTML file was created in:
 
    ```text
