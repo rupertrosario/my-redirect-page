@@ -274,14 +274,14 @@ function Get-PasswordPolicyAssessment {
         $findings += "Password minimum length was not returned"
     }
     elseif ($passwordLengthStatus -eq "Non-Compliant") {
-        $findings += "Minimum length $minLength is below $($script:PasswordStandard.PasswordMinLength)"
+        $findings += "Length below $($script:PasswordStandard.PasswordMinLength)"
     }
 
     if ($passwordComplexityStatus -eq "Not Assessed") {
         $findings += "One or more complexity flags were not returned"
     }
     elseif ($passwordComplexityStatus -eq "Non-Compliant") {
-        $findings += "Complexity $complexityEnabledCount of 4 is below $($script:PasswordStandard.ComplexityRequired) of 4"
+        $findings += "Complexity below $($script:PasswordStandard.ComplexityRequired) of 4"
     }
 
     $history = Convert-ToNullableNumber $Row.NumDisallowedOldPasswords
@@ -289,7 +289,7 @@ function Get-PasswordPolicyAssessment {
         $findings += "Password history was not returned"
     }
     elseif ($passwordHistoryStatus -eq "Non-Compliant") {
-        $findings += "Password history $history is below $($script:PasswordStandard.DisallowedOldPasswords)"
+        $findings += "History below $($script:PasswordStandard.DisallowedOldPasswords)"
     }
 
     $minAge = Convert-ToNullableNumber $Row.PasswordMinLifetimeDays
@@ -297,7 +297,7 @@ function Get-PasswordPolicyAssessment {
         $findings += "Minimum password age was not returned"
     }
     elseif ($passwordMinLifetimeStatus -eq "Non-Compliant") {
-        $findings += "Minimum password age $minAge days is below $($script:PasswordStandard.PasswordMinLifetimeDays)"
+        $findings += "Minimum age below $($script:PasswordStandard.PasswordMinLifetimeDays)"
     }
 
     $maxAge = Convert-ToNullableNumber $Row.PasswordMaxLifetimeDays
@@ -306,10 +306,10 @@ function Get-PasswordPolicyAssessment {
     }
     elseif ($passwordMaxLifetime365Status -eq "Non-Compliant") {
         if ($maxAge -le 0) {
-            $findings += "Maximum password age is not enabled"
+            $findings += "Maximum age is not enabled"
         }
         else {
-            $findings += "Maximum password age $maxAge days exceeds $($script:PasswordStandard.PasswordMaxLifetimeDays)"
+            $findings += "Maximum age exceeds $($script:PasswordStandard.PasswordMaxLifetimeDays)"
         }
     }
 
@@ -516,109 +516,24 @@ foreach ($cluster in $clusters) {
 
 $rows = @($rows | Sort-Object Cluster)
 
-Write-Host "`nPASSWORD STANDARD - ACTUAL VALUES" -ForegroundColor Cyan
+Write-Host "`nPASSWORD POLICY COMPLIANCE" -ForegroundColor Cyan
+
 $rows |
     Select-Object `
-        Cluster,
-        PasswordMinLength,
-        PasswordComplexityEnabledCount,
-        NumDisallowedOldPasswords,
-        PasswordMinLifetimeDays,
-        PasswordMaxLifetimeDays,
-        OverallPasswordPolicyStatus |
+        @{ Name = "Cluster"; Expression = { $_.Cluster } },
+        @{ Name = "Min Length`nExpected >= 15"; Expression = { $_.PasswordMinLength } },
+        @{ Name = "Complexity`nExpected >= 3/4"; Expression = { $_.PasswordComplexityEnabledCount } },
+        @{ Name = "History`nExpected >= 6"; Expression = { $_.NumDisallowedOldPasswords } },
+        @{ Name = "Min Age`nExpected >= 2"; Expression = { $_.PasswordMinLifetimeDays } },
+        @{ Name = "Max Age`nExpected <= 365"; Expression = { $_.PasswordMaxLifetimeDays } },
+        @{ Name = "Overall Status"; Expression = { $_.OverallPasswordPolicyStatus } },
+        @{ Name = "Findings"; Expression = { $_.ComplianceFindings } } |
     Format-Table -AutoSize -Wrap |
     Out-Host
 
-Write-Host "`nPASSWORD STANDARD - COMPLIANCE" -ForegroundColor Cyan
-$rows |
-    Select-Object `
-        Cluster,
-        PasswordLengthStatus,
-        PasswordComplexityStatus,
-        PasswordHistoryStatus,
-        PasswordMinLifetimeStatus,
-        PasswordMaxLifetime365Status,
-        MeetsPCI90DayValue |
-    Format-Table -AutoSize -Wrap |
-    Out-Host
-
-Write-Host "`nPASSWORD COMPLIANCE FINDINGS" -ForegroundColor Cyan
-$rows |
-    Select-Object `
-        Cluster,
-        OverallPasswordPolicyStatus,
-        ComplianceFindings |
-    Format-Table -AutoSize -Wrap |
-    Out-Host
-
-Write-Host "`nPASSWORD STRENGTH" -ForegroundColor Cyan
-$rows |
-    Select-Object `
-        Cluster,
-        PasswordMinLength,
-        PasswordIncludeUpperLetter,
-        PasswordIncludeLowerLetter,
-        PasswordIncludeNumber,
-        PasswordIncludeSpecialChar |
-    Format-Table -AutoSize -Wrap |
-    Out-Host
-
-Write-Host "`nPASSWORD REUSE AND LIFETIME" -ForegroundColor Cyan
-$rows |
-    Select-Object `
-        Cluster,
-        NumDisallowedOldPasswords,
-        NumDifferentChars,
-        PasswordMinLifetimeDays,
-        PasswordMaxLifetimeDays |
-    Format-Table -AutoSize -Wrap |
-    Out-Host
-
-Write-Host "`nACCOUNT LOCKOUT AND GENERAL TIMEOUTS" -ForegroundColor Cyan
-$rows |
-    Select-Object `
-        Cluster,
-        MaxFailedLoginAttempts,
-        FailedLoginLockTimeDurationMins,
-        AccountInactivityTimeDays,
-        AuthTokenTimeoutMinutes,
-        UIInactivityTimeoutMSecs,
-        SSHTimeoutInMins |
-    Format-Table -AutoSize -Wrap |
-    Out-Host
-
-Write-Host "`nSESSION MANAGEMENT" -ForegroundColor Cyan
-$rows |
-    Select-Object `
-        Cluster,
-        SessionManagementEnabled,
-        SessionAbsoluteTimeoutSeconds,
-        SessionInactivityTimeoutSeconds,
-        LimitSessions,
-        SessionLimitPerUser,
-        SessionLimitSystemWide |
-    Format-Table -AutoSize -Wrap |
-    Out-Host
-
-Write-Host "`nCERTIFICATE AUTHENTICATION" -ForegroundColor Cyan
-$rows |
-    Select-Object `
-        Cluster,
-        CertificateMappingAuthenticationEnabled,
-        CertificateMapping,
-        CertificateADMapping |
-    Format-Table -AutoSize -Wrap |
-    Out-Host
-
-Write-Host "`nDATA CLASSIFICATION" -ForegroundColor Cyan
-$rows |
-    Select-Object `
-        Cluster,
-        IsDataClassified,
-        ClassifiedDataMessage,
-        UnclassifiedDataMessage |
-    Format-Table -AutoSize -Wrap |
-    Out-Host
+Write-Host `
+    "PCI note: The 90-day rule is not assessed because /v2/security-config does not expose PCI scope or MFA usage." `
+    -ForegroundColor Yellow
 
 $timestamp = Get-Date -Format "yyyyMMdd_HHmm"
 $csvPath = Join-Path `
@@ -645,11 +560,6 @@ $notAssessedClusters = @(
         $_.OverallPasswordPolicyStatus -eq "Not Assessed"
     }
 ).Count
-$pci90ValueMetClusters = @(
-    $rows | Where-Object {
-        $_.MeetsPCI90DayValue -eq "Yes"
-    }
-).Count
 
 Write-Host "`n====================================" -ForegroundColor Cyan
 Write-Host "SECURITY CONFIGURATION SUMMARY" -ForegroundColor White
@@ -659,14 +569,9 @@ Write-Host "Clusters successfully read   : $successfulClusters"
 Write-Host "Password policy compliant    : $compliantClusters"
 Write-Host "Password policy non-compliant: $nonCompliantClusters"
 Write-Host "Password policy not assessed : $notAssessedClusters"
-Write-Host "Meets PCI 90-day value       : $pci90ValueMetClusters"
 Write-Host "Cluster fetch issues         : $($issues.Count)"
 Write-Host "Rows displayed/exported      : $($rows.Count)"
 Write-Host "CSV output                   : $csvPath"
-
-Write-Host `
-    "PCI note: MeetsPCI90DayValue checks only whether maxLifetimeDays is 1-90. PCI scope and MFA usage are not exposed by /v2/security-config." `
-    -ForegroundColor Yellow
 
 if ($issues.Count -gt 0) {
     $issues | Format-Table -AutoSize -Wrap | Out-Host
