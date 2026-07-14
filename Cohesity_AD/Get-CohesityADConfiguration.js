@@ -2,130 +2,90 @@ import { credentialVaultClient } from "@dynatrace-sdk/client-classic-environment
 
 /**
  * Cohesity Active Directory Configuration Report
- *
- * Multi-cluster | Helios | GET-only | Dynatrace JavaScript action
- *
- * Output columns:
- * Cluster, ADConfigured, DomainName, OrganizationalUnit, WorkGroupName,
- * MachineAccounts, PreferredDomainControllers, DomainControllersDenyList,
- * TrustedDomains, ADConfigurationId
+ * Multi-cluster | Cohesity Helios | GET-only | Dynatrace JavaScript
  */
 export default async function () {
   const baseUrl = "https://helios.cohesity.com";
-  const MAX_ROWS = 1000;
-
   const vaultName = "Cohesity_API_Key";
   const vaultId = "credentials_vault-312312";
-  let apiKey = null;
+  const maxMarkdownRows = 1000;
 
-  async function getKeyByName(name) {
-    const all = await credentialVaultClient.getCredentials();
-    const credentials = all?.credentials || [];
-    const found = credentials.find(
-      (credential) => credential?.name === name
-    );
+  const columns = [
+    "Cluster",
+    "ADConfigured",
+    "DomainName",
+    "OrganizationalUnit",
+    "WorkGroupName",
+    "MachineAccounts",
+    "PreferredDomainControllers",
+    "DomainControllersDenyList",
+    "TrustedDomains",
+    "ADConfigurationId"
+  ];
 
-    if (!found) return null;
+  const normalize = (value) =>
+    value === null || value === undefined ? "" : String(value).trim();
 
-    const detail =
-      await credentialVaultClient.getCredentialsDetails({
-        id: found.id
-      });
-
-    return detail?.token || detail?.password || null;
-  }
-
-  try {
-    apiKey = await getKeyByName(vaultName);
-
-    if (!apiKey) {
-      throw new Error("Vault name lookup returned no key");
-    }
-  } catch {
-    const detail =
-      await credentialVaultClient.getCredentialsDetails({
-        id: vaultId
-      });
-
-    apiKey = detail?.token || detail?.password || null;
-  }
-
-  if (!apiKey) {
-    return {
-      error: "No Cohesity API key available"
-    };
-  }
-
-  const commonHeaders = {
-    accept: "application/json",
-    apiKey
+  const toArray = (value) => {
+    if (value === null || value === undefined) return [];
+    return Array.isArray(value) ? value : [value];
   };
-
-  const norm = (value) =>
-    value === null || value === undefined
-      ? ""
-      : String(value).trim();
 
   const valueOrNA = (value) => {
-    if (value === null || value === undefined) {
-      return "N/A";
-    }
+    if (value === null || value === undefined) return "N/A";
 
     if (Array.isArray(value)) {
-      const items = value
-        .map((item) => norm(item))
-        .filter(Boolean);
-
-      return items.length ? items.join(", ") : "N/A";
+      const values = value.map(normalize).filter(Boolean);
+      return values.length ? values.join(", ") : "N/A";
     }
 
-    const text = norm(value);
-    return text || "N/A";
+    return normalize(value) || "N/A";
   };
 
-  const toArray = (value) =>
-    !value ? [] : Array.isArray(value) ? value : [value];
+  const firstValue = (object, propertyNames) => {
+    if (!object) return "N/A";
 
-  const safeCell = (value) =>
-    value === null || value === undefined
-      ? ""
-      : String(value)
-          .replace(/\|/g, " ")
-          .replace(/\r?\n/g, " ");
+    for (const propertyName of propertyNames) {
+      const value = valueOrNA(object[propertyName]);
+      if (value !== "N/A") return value;
+    }
 
-  function mdTable(headers, rows) {
-    const header = `| ${headers.join(" | ")} |`;
-    const separator =
-      `| ${headers.map(() => "---").join(" | ")} |`;
+    return "N/A";
+  };
 
-    const body = rows.map(
+  const escapeMarkdownCell = (value) =>
+    String(value ?? "")
+      .replace(/\\/g, "\\\\")
+      .replace(/\|/g, "\\|")
+      .replace(/\r?\n/g, " ");
+
+  function markdownTable(headers, rows) {
+    const headerRow = `| ${headers.map(escapeMarkdownCell).join(" | ")} |`;
+    const separatorRow = `| ${headers.map(() => "---").join(" | ")} |`;
+    const dataRows = rows.map(
       (row) =>
         `| ${headers
-          .map((key) => safeCell(row[key]))
+          .map((header) => escapeMarkdownCell(row[header]))
           .join(" | ")} |`
     );
 
-    return [header, separator, ...body].join("\n");
+    return [headerRow, separatorRow, ...dataRows].join("\n");
   }
 
   function formatNameStatusList(items) {
     const values = [];
 
     for (const item of toArray(items)) {
-      const name =
-        norm(item?.name) ||
-        norm(item?.dnsHostName) ||
-        norm(item?.hostName);
+      if (!item) continue;
 
-      const status =
-        norm(item?.status) ||
-        norm(item?.state);
+      const name = firstValue(item, ["name", "dnsHostName", "hostName"]);
+      const status = firstValue(item, ["status", "state"]);
 
-      if (name && status) {
+      if (name !== "N/A" && status !== "N/A") {
         values.push(`${name} [${status}]`);
-      } else if (name) {
+      } else if (name !== "N/A") {
         values.push(name);
-      } else if (status) {
+      } else if (status !== "N/A") {
         values.push(`Status=${status}`);
       }
     }
@@ -137,19 +97,18 @@ export default async function () {
     const values = [];
 
     for (const account of toArray(machineAccounts)) {
-      const name = norm(account?.name);
-      const dnsName = norm(account?.dnsHostName);
+      if (!account) continue;
+
+      const name = firstValue(account, ["name"]);
+      const dnsName = firstValue(account, ["dnsHostName"]);
       const parts = [];
 
-      if (name) parts.push(name);
-
-      if (dnsName && dnsName !== name) {
+      if (name !== "N/A") parts.push(name);
+      if (dnsName !== "N/A" && dnsName !== name) {
         parts.push(`DNS=${dnsName}`);
       }
 
-      if (parts.length) {
-        values.push(parts.join("; "));
-      }
+      if (parts.length) values.push(parts.join("; "));
     }
 
     return values.length ? values.join(" | ") : "N/A";
@@ -160,24 +119,18 @@ export default async function () {
 
     const values = [];
 
-    for (
-      const trustedDomain of
-      toArray(trustedDomainParams?.trustedDomains)
-    ) {
-      const domainName = norm(trustedDomain?.domainName);
+    for (const trustedDomain of toArray(trustedDomainParams.trustedDomains)) {
+      if (!trustedDomain) continue;
 
-      if (domainName && !values.includes(domainName)) {
+      const domainName = firstValue(trustedDomain, ["domainName"]);
+      if (domainName !== "N/A" && !values.includes(domainName)) {
         values.push(domainName);
       }
     }
 
-    for (
-      const domain of
-      toArray(trustedDomainParams?.whitelistedDomains)
-    ) {
-      const domainName = norm(domain);
-
-      if (domainName && !values.includes(domainName)) {
+    for (const domain of toArray(trustedDomainParams.whitelistedDomains)) {
+      const domainName = valueOrNA(domain);
+      if (domainName !== "N/A" && !values.includes(domainName)) {
         values.push(domainName);
       }
     }
@@ -185,9 +138,9 @@ export default async function () {
     return values.length ? values.join(", ") : "N/A";
   }
 
-  function emptyRow(cluster, adConfigured) {
+  function emptyRow(clusterName, adConfigured) {
     return {
-      Cluster: cluster,
+      Cluster: clusterName,
       ADConfigured: adConfigured,
       DomainName: "N/A",
       OrganizationalUnit: "N/A",
@@ -200,7 +153,37 @@ export default async function () {
     };
   }
 
-  async function getJsonSafe(url, headers) {
+  async function getApiKey() {
+    try {
+      const credentialList = await credentialVaultClient.getCredentials();
+      const credential = toArray(credentialList?.credentials).find(
+        (item) => item?.name === vaultName
+      );
+
+      if (credential?.id) {
+        const detail = await credentialVaultClient.getCredentialsDetails({
+          id: credential.id
+        });
+
+        const apiKey = detail?.token || detail?.password || null;
+        if (apiKey) return apiKey;
+      }
+    } catch {
+      // Fall through to the configured credential ID.
+    }
+
+    try {
+      const detail = await credentialVaultClient.getCredentialsDetails({
+        id: vaultId
+      });
+
+      return detail?.token || detail?.password || null;
+    } catch {
+      return null;
+    }
+  }
+
+  async function getJson(url, headers) {
     try {
       const response = await fetch(url, {
         method: "GET",
@@ -208,16 +191,20 @@ export default async function () {
       });
 
       if (!response.ok) {
-        let text = "";
+        let responseText = "";
 
         try {
-          text = await response.text();
-        } catch {}
+          responseText = await response.text();
+        } catch {
+          responseText = "";
+        }
 
         return {
           ok: false,
           status: response.status,
-          error: text,
+          error:
+            responseText ||
+            `HTTP ${response.status} ${response.statusText}`,
           data: null
         };
       }
@@ -232,22 +219,41 @@ export default async function () {
       return {
         ok: false,
         status: 0,
-        error: String(error),
+        error: error instanceof Error ? error.message : String(error),
         data: null
       };
     }
   }
 
-  const clusterResponse = await getJsonSafe(
+  const apiKey = await getApiKey();
+
+  if (!apiKey) {
+    return {
+      error: "No Cohesity API key available in Credential Vault",
+      rows: [],
+      markdownEmail: "",
+      errors: []
+    };
+  }
+
+  const commonHeaders = {
+    accept: "application/json",
+    apiKey
+  };
+
+  const clusterResponse = await getJson(
     `${baseUrl}/v2/mcm/cluster-mgmt/info`,
     commonHeaders
   );
 
   if (!clusterResponse.ok) {
     return {
-      error: "Failed to fetch clusters",
+      error: "Failed to query Cohesity Helios clusters",
       status: clusterResponse.status,
-      details: clusterResponse.error
+      details: clusterResponse.error,
+      rows: [],
+      markdownEmail: "",
+      errors: []
     };
   }
 
@@ -258,23 +264,42 @@ export default async function () {
       clusterData.clusters ||
       clusterData.clusterInfos ||
       clusterData?.mcmInfo?.clusterInfos
-  ).sort((a, b) => {
-    const aName =
-      norm(a?.clusterName) ||
-      norm(a?.name) ||
-      norm(a?.displayName);
+  ).sort((left, right) => {
+    const leftName = firstValue(left, [
+      "name",
+      "clusterName",
+      "displayName",
+      "ClusterName",
+      "Name"
+    ]);
 
-    const bName =
-      norm(b?.clusterName) ||
-      norm(b?.name) ||
-      norm(b?.displayName);
+    const rightName = firstValue(right, [
+      "name",
+      "clusterName",
+      "displayName",
+      "ClusterName",
+      "Name"
+    ]);
 
-    return aName.localeCompare(
-      bName,
-      undefined,
-      { sensitivity: "base" }
-    );
+    return leftName.localeCompare(rightName, undefined, {
+      sensitivity: "base"
+    });
   });
+
+  if (!clusters.length) {
+    return {
+      clusterCount: 0,
+      configuredClusterCount: 0,
+      notConfiguredClusterCount: 0,
+      failedClusterCount: 0,
+      rowCount: 0,
+      columns,
+      rows: [],
+      markdownEmail:
+        "### Cohesity Active Directory Configuration\n\n_No clusters returned from Cohesity Helios._",
+      errors: []
+    };
+  }
 
   const rows = [];
   const errors = [];
@@ -282,47 +307,51 @@ export default async function () {
   let notConfiguredClusterCount = 0;
 
   for (const cluster of clusters) {
-    const clusterId =
-      norm(cluster?.clusterId) ||
-      norm(cluster?.id);
+    const clusterNameValue = firstValue(cluster, [
+      "name",
+      "clusterName",
+      "displayName",
+      "ClusterName",
+      "Name"
+    ]);
+
+    const clusterIdValue = firstValue(cluster, [
+      "clusterId",
+      "id",
+      "ClusterId",
+      "Id"
+    ]);
 
     const clusterName =
-      norm(cluster?.clusterName) ||
-      norm(cluster?.name) ||
-      norm(cluster?.displayName) ||
-      (clusterId ? `Cluster-${clusterId}` : "Unknown");
+      clusterNameValue === "N/A" ? "Unknown" : clusterNameValue;
 
-    if (!clusterId) {
+    if (clusterIdValue === "N/A") {
       rows.push(emptyRow(clusterName, "Unknown"));
-
       errors.push({
         cluster: clusterName,
         status: 0,
         error: "Cluster ID missing"
       });
-
       continue;
     }
 
-    const headers = {
+    const clusterHeaders = {
       ...commonHeaders,
-      accessClusterId: clusterId
+      accessClusterId: String(clusterIdValue)
     };
 
-    const adResponse = await getJsonSafe(
+    const adResponse = await getJson(
       `${baseUrl}/v2/active-directories?includeTenants=true`,
-      headers
+      clusterHeaders
     );
 
     if (!adResponse.ok) {
       rows.push(emptyRow(clusterName, "Unknown"));
-
       errors.push({
         cluster: clusterName,
         status: adResponse.status,
         error: adResponse.error
       });
-
       continue;
     }
 
@@ -332,16 +361,8 @@ export default async function () {
     if (Array.isArray(adData)) {
       activeDirectories = adData.filter(Boolean);
     } else if (Array.isArray(adData?.activeDirectories)) {
-      activeDirectories =
-        adData.activeDirectories.filter(Boolean);
-    } else if (
-      adData &&
-      (
-        adData.domainName ||
-        adData.connectionId ||
-        adData.id
-      )
-    ) {
+      activeDirectories = adData.activeDirectories.filter(Boolean);
+    } else if (adData && (adData.domainName || adData.id)) {
       activeDirectories = [adData];
     }
 
@@ -357,89 +378,58 @@ export default async function () {
       rows.push({
         Cluster: clusterName,
         ADConfigured: "Yes",
-        DomainName:
-          valueOrNA(activeDirectory?.domainName),
-        OrganizationalUnit:
-          valueOrNA(
-            activeDirectory?.organizationalUnitName
-          ),
-        WorkGroupName:
-          valueOrNA(activeDirectory?.workGroupName),
-        MachineAccounts:
-          formatMachineAccounts(
-            activeDirectory?.machineAccounts
-          ),
-        PreferredDomainControllers:
-          formatNameStatusList(
-            activeDirectory?.preferredDomainControllers
-          ),
-        DomainControllersDenyList:
-          valueOrNA(
-            activeDirectory?.domainControllersDenyList
-          ),
-        TrustedDomains:
-          formatTrustedDomains(
-            activeDirectory?.trustedDomainParams
-          ),
-        ADConfigurationId:
-          valueOrNA(activeDirectory?.id)
+        DomainName: firstValue(activeDirectory, ["domainName"]),
+        OrganizationalUnit: firstValue(activeDirectory, [
+          "organizationalUnitName"
+        ]),
+        WorkGroupName: firstValue(activeDirectory, ["workGroupName"]),
+        MachineAccounts: formatMachineAccounts(
+          activeDirectory.machineAccounts
+        ),
+        PreferredDomainControllers: formatNameStatusList(
+          activeDirectory.preferredDomainControllers
+        ),
+        DomainControllersDenyList: valueOrNA(
+          activeDirectory.domainControllersDenyList
+        ),
+        TrustedDomains: formatTrustedDomains(
+          activeDirectory.trustedDomainParams
+        ),
+        ADConfigurationId: firstValue(activeDirectory, ["id"])
       });
     }
   }
 
   rows.sort(
-    (a, b) =>
-      a.Cluster.localeCompare(
-        b.Cluster,
-        undefined,
-        { sensitivity: "base" }
-      ) ||
-      a.DomainName.localeCompare(
-        b.DomainName,
-        undefined,
-        { sensitivity: "base" }
-      )
+    (left, right) =>
+      left.Cluster.localeCompare(right.Cluster, undefined, {
+        sensitivity: "base"
+      }) ||
+      left.DomainName.localeCompare(right.DomainName, undefined, {
+        sensitivity: "base"
+      })
   );
 
-  const reportDate = new Date().toLocaleDateString(
-    "en-US",
-    {
-      timeZone: "America/New_York",
-      year: "numeric",
-      month: "short",
-      day: "2-digit"
-    }
-  );
+  const reportDate = new Date().toLocaleDateString("en-GB", {
+    timeZone: "Asia/Kolkata",
+    year: "numeric",
+    month: "short",
+    day: "2-digit"
+  });
 
-  const headers = [
-    "Cluster",
-    "ADConfigured",
-    "DomainName",
-    "OrganizationalUnit",
-    "WorkGroupName",
-    "MachineAccounts",
-    "PreferredDomainControllers",
-    "DomainControllersDenyList",
-    "TrustedDomains",
-    "ADConfigurationId"
-  ];
-
-  const renderedRows = rows.slice(0, MAX_ROWS);
-
+  const markdownRows = rows.slice(0, maxMarkdownRows);
   const markdownEmail = [
     `### Cohesity Active Directory Configuration — ${reportDate}`,
     "",
-    mdTable(headers, renderedRows),
-    rows.length > MAX_ROWS
-      ? `_Note: Report limited to ${MAX_ROWS} of ${rows.length} rows._`
+    markdownTable(columns, markdownRows),
+    rows.length > maxMarkdownRows
+      ? `_Note: Markdown output limited to ${maxMarkdownRows} of ${rows.length} rows._`
       : null,
     errors.length
-      ? `_Warning: ${errors.length} cluster query error(s). See the errors output._`
+      ? `_Warning: ${errors.length} cluster query error(s). See the separate errors output._`
       : null
   ]
-    .filter(
-      (part) => part !== null && part !== undefined
-    )
+    .filter((item) => item !== null && item !== undefined)
     .join("\n");
 
   return {
@@ -448,6 +438,7 @@ export default async function () {
     notConfiguredClusterCount,
     failedClusterCount: errors.length,
     rowCount: rows.length,
+    columns,
     rows,
     markdownEmail,
     errors
