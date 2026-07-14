@@ -1,176 +1,98 @@
-# Cohesity GFlag Reports — Power Automate
+# Cohesity GFlag Settings Collection, Reporting, and SharePoint Storage
 
-## Objective
+## Overview
 
-Copy the HTML body of either Cohesity GFlag report email from an Outlook mailbox folder into one SharePoint folder.
+GFlags are configurable Cohesity settings used to control system behaviour, enable features, tune performance, and apply support-recommended workarounds.
 
-```text
-Outlook mailbox folder
-        ↓
-Power Automate
-        ↓
-SharePoint: Documents/Cohesity GFlag Reports
-```
+This read-only process collects the current GFlag settings from the managed Cohesity clusters, compares the settings across clusters, generates two email reports, and stores the received reports in SharePoint through Power Automate.
 
-This flow copies the email body. It does not move or delete the original Outlook email.
+## GFlag Settings Collected
 
-## Observed email subjects
-
-The actual report subjects follow these patterns:
-
-```text
-105142 - Cohesity Custer Common GFlag Report - Jul 14, 2026
-105142 - Cohesity Custer Specific GFlag Report - Jul 14, 2026
-```
-
-The leading number and trailing date can change. The stable subject fragments are:
-
-```text
-Custer Common GFlag Report
-Custer Specific GFlag Report
-```
-
-## Current design
-
-- One Outlook trigger
-- No Condition action
-- One SharePoint folder
-- One SharePoint **Create file** action
-- File Name expression identifies Common or Specific
-- Attachments are not copied
-
-## Build the flow
-
-### 1. Create the flow
-
-1. Open **Power Automate**.
-2. Select **Create → Automated cloud flow**.
-3. Flow name:
-
-   ```text
-   Copy Cohesity GFlag Emails to SharePoint
-   ```
-
-4. Select the correct Outlook trigger:
-   - Personal mailbox: **When a new email arrives (V3)**
-   - Shared mailbox: **When a new email arrives in a shared mailbox (V2)**
-
-### 2. Configure the Outlook trigger
-
-| Field | Value |
+| Setting | Description |
 |---|---|
-| Mailbox Address | Enter the shared mailbox address only when using the shared-mailbox trigger |
-| Folder | Select the Inbox subfolder where the GFlag emails arrive |
+| Cluster | Cohesity cluster from which the setting was retrieved |
+| Service | Cohesity service associated with the GFlag |
+| GFlag | Name of the configuration setting |
+| Value | Current configured value |
+| Reason | Available reason or source for the setting |
+| Applied Time | Available timestamp displayed in Eastern Time |
+
+The process does not create, modify, or remove any GFlag setting.
+
+## Reports Generated
+
+| Report | Description |
+|---|---|
+| Common GFlag Report | Settings where the Service, GFlag, and Value are identical across all successfully queried clusters |
+| Cluster-Specific GFlag Report | Settings that are specific to individual clusters or have different values across the successfully queried clusters |
+
+## Schedule
+
+| Frequency | Day | Time | Time Zone |
+|---|---|---|---|
+| Every two weeks | Monday | 9:00 AM | Eastern Time (ET) |
+
+## End-to-End Process
+
+| Step | Process | Result |
+|---|---|---|
+| 1 | The scheduled workflow starts every two weeks on Monday at 9:00 AM ET | GFlag collection begins |
+| 2 | Current GFlag settings are retrieved from the managed Cohesity clusters | Cluster, Service, GFlag, Value, Reason, and Applied Time are collected |
+| 3 | Service, GFlag, and Value are compared across successfully queried clusters | Settings are classified as Common or Cluster-Specific |
+| 4 | The Common and Cluster-Specific reports are generated | Two report outputs are produced |
+| 5 | Both reports are sent to the designated Outlook mailbox | The reports are available by email |
+| 6 | Power Automate detects each email with `GFlag Report` in the subject | The SharePoint file process starts automatically |
+| 7 | Power Automate copies the complete email Body into an HTML file | The report content and tables are preserved |
+| 8 | The HTML file is created in the configured SharePoint folder | The report is available for future reference |
+
+## Power Automate and SharePoint Storage
+
+Power Automate starts only after a GFlag report email reaches the configured Outlook mailbox folder.
+
+| Power Automate Setting | Configuration |
+|---|---|
+| Trigger | When a new email arrives in the selected Outlook folder |
 | Subject Filter | `GFlag Report` |
-| Only with Attachments | `No` |
-| Include Attachments | `No` |
+| Attachments | Not required and not copied |
+| SharePoint Action | Create file |
+| File Content | Full Outlook email `Body` |
+| Destination | `Documents/Cohesity GFlag Reports` |
+| Source Email | Remains unchanged in Outlook |
 
-Important:
-
-- Select the exact Outlook subfolder containing the reports.
-- The folder must be visible in Outlook on the web.
-- Local PST folders cannot be used.
-
-### 3. Remove the Condition
-
-Do not add a **Condition** action.
-
-If a Condition already exists:
-
-1. Select the Condition card.
-2. Select **... → Delete**.
-3. Add the SharePoint action directly below the Outlook trigger.
-
-The trigger already limits the flow to subjects containing `GFlag Report`. The File Name expression below identifies whether the report is Common or Specific.
-
-### 4. Add SharePoint Create file
-
-1. Select **+ → Add an action** directly below the Outlook trigger.
-2. Search for **SharePoint**.
-3. Select **Create file**.
-
-Do not select **Create item**. Create item writes to a SharePoint List and does not create an HTML file.
-
-### 5. Select the SharePoint folder
-
-Configure **Create file**:
-
-1. **Site Address** → select the required SharePoint site.
-2. **Folder Path** → click the folder icon.
-3. Open **Documents**.
-4. Open **Cohesity GFlag Reports**.
-5. Select that folder.
-
-Both report types are stored in this same folder.
-
-### 6. Configure File Name
-
-Click **File Name → fx / Expression** and paste:
-
-```text
-concat(if(contains(toLower(coalesce(triggerOutputs()?['body/subject'],'')),'custer common gflag report'),'Cohesity_Custer_Common_GFlags_',if(contains(toLower(coalesce(triggerOutputs()?['body/subject'],'')),'custer specific gflag report'),'Cohesity_Custer_Specific_GFlags_','Cohesity_Unknown_GFlag_')),formatDateTime(utcNow(),'yyyy-MM-dd_HHmmssfff'),'.html')
-```
+Both report types are stored in the same SharePoint folder as HTML files. The filename identifies whether the report is Common or Cluster-Specific and includes a timestamp to prevent duplicate filenames.
 
 Example filenames:
 
 ```text
-Cohesity_Custer_Common_GFlags_2026-07-14_103015245.html
-Cohesity_Custer_Specific_GFlags_2026-07-14_103020671.html
+Cohesity_Custer_Common_GFlags_YYYY-MM-DD_HHmmssfff.html
+Cohesity_Custer_Specific_GFlags_YYYY-MM-DD_HHmmssfff.html
 ```
 
-If the subject contains `GFlag Report` but matches neither observed type, the file uses the prefix:
+## Links
 
-```text
-Cohesity_Unknown_GFlag_
-```
+| Resource | Link |
+|---|---|
+| SharePoint GFlag Report Location | [Add SharePoint link here](ADD_SHAREPOINT_URL_HERE) |
+| Outlook GFlag Report Folder | [Add Outlook folder link here](ADD_OUTLOOK_FOLDER_URL_HERE) |
 
-### 7. Configure File Content
+## Images
 
-1. Click **File Content**.
-2. Open **Dynamic content**.
-3. Select **Body** from **When a new email arrives**.
+### Example GFlag Report Email
 
-Use:
+Replace the placeholder below with a screenshot of the Common or Cluster-Specific report email.
 
-```text
-Body
-```
+![Example GFlag report email](ADD_EMAIL_REPORT_IMAGE_HERE)
 
-Do not use:
+### SharePoint Report Location
 
-```text
-Body Preview
-```
+Replace the placeholder below with a screenshot showing the SharePoint folder and saved HTML reports.
 
-Body Preview can be truncated and may omit tables or other HTML content.
+![SharePoint GFlag report location](ADD_SHAREPOINT_LOCATION_IMAGE_HERE)
 
-## Final flow structure
+## Operational Notes
 
-```text
-When a new email arrives in the selected Outlook folder
-                    ↓
-SharePoint — Create file
-                    ↓
-Documents/Cohesity GFlag Reports
-```
-
-## Save and test
-
-1. Select **Save**.
-2. Select **Test → Manually**.
-3. Send, receive, or forward a new Custer Common GFlag report into the monitored Outlook folder.
-4. Open **Run history**.
-5. Confirm **Create file** succeeded.
-6. Confirm the filename starts with `Cohesity_Custer_Common_GFlags_`.
-7. Repeat with a Custer Specific GFlag report.
-8. Confirm the second filename starts with `Cohesity_Custer_Specific_GFlags_`.
-9. Open both HTML files and verify the complete email body and tables are present.
-
-## Operational notes
-
-- The original email remains in Outlook.
-- The flow copies only the HTML email body.
-- Attachments are not saved.
-- Inline images using mail-specific `cid:` references may not render from SharePoint.
-- If the Outlook folder is renamed or moved, update the trigger's Folder selection.
-- This file is the canonical instruction set. Future updates must overwrite this same file.
+- The GFlag collection is read-only.
+- Power Automate runs whenever a matching report email arrives.
+- The full email `Body` must be used; `Body Preview` can be truncated.
+- The original report emails remain in Outlook.
+- Changes to the Outlook folder, email subject, or SharePoint location must also be updated in Power Automate.
