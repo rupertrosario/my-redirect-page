@@ -7,7 +7,8 @@ import { credentialVaultClient } from "@dynatrace-sdk/client-classic-environment
  * - Discover every Cohesity cluster visible through Helios.
  * - Query each cluster's Active Directory configuration.
  * - Return structured rows using the same ten columns as the PowerShell CSV.
- * - Generate one Markdown table for a Dynatrace email action.
+ * - Generate one narrower Markdown table for a Dynatrace email action.
+ * - Omit ADConfigured from the Markdown email table to reduce clipping.
  * - Return per-cluster query failures separately in the errors array.
  *
  * GET-only API flow:
@@ -28,7 +29,7 @@ export default async function () {
   const vaultId = "credentials_vault-312312";
   const maxMarkdownRows = 1000;
 
-  // Keep this order identical to the PowerShell CSV output.
+  // Keep this order identical to the PowerShell CSV and structured rows.
   const columns = [
     "Cluster",
     "ADConfigured",
@@ -41,6 +42,12 @@ export default async function () {
     "TrustedDomains",
     "ADConfigurationId"
   ];
+
+  // The email table intentionally omits ADConfigured to reduce table width.
+  // Structured rows still retain all ten columns.
+  const markdownColumns = columns.filter(
+    (column) => column !== "ADConfigured"
+  );
 
   // ------------------------------------------------------------------
   // Generic value and array helpers
@@ -314,7 +321,6 @@ export default async function () {
   }
 
   const clusterData = clusterResponse.data || {};
-
   // Support the possible cluster-list response wrappers returned by Helios.
   const clusters = toArray(
     clusterData.cohesityClusters ||
@@ -388,7 +394,7 @@ export default async function () {
       clusterNameValue === "N/A" ? "Unknown" : clusterNameValue;
 
     // A missing cluster ID prevents a targeted query. Keep the cluster in the
-    // main table as Unknown and record the reason in the separate errors array.
+    // structured rows as Unknown and record the reason in the errors array.
     if (clusterIdValue === "N/A") {
       rows.push(emptyRow(clusterName, "Unknown"));
       errors.push({
@@ -442,7 +448,7 @@ export default async function () {
 
     configuredClusterCount++;
 
-    // Create one report row per returned AD configuration.
+    // Create one structured report row per returned AD configuration.
     for (const activeDirectory of activeDirectories) {
       rows.push({
         Cluster: clusterName,
@@ -482,6 +488,7 @@ export default async function () {
 
   // ------------------------------------------------------------------
   // Build the single Markdown table used by the email action
+  // ADConfigured is omitted only from this table to reduce width.
   // ------------------------------------------------------------------
   const reportDate = new Date().toLocaleDateString("en-GB", {
     timeZone: "Asia/Kolkata",
@@ -494,7 +501,7 @@ export default async function () {
   const markdownEmail = [
     `### Cohesity Active Directory Configuration — ${reportDate}`,
     "",
-    markdownTable(columns, markdownRows),
+    markdownTable(markdownColumns, markdownRows),
     rows.length > maxMarkdownRows
       ? `_Note: Markdown output limited to ${maxMarkdownRows} of ${rows.length} rows._`
       : null,
@@ -507,8 +514,8 @@ export default async function () {
 
   // ------------------------------------------------------------------
   // Dynatrace workflow outputs
-  // rows          : structured ten-column inventory
-  // markdownEmail : one Markdown table for the email body
+  // rows          : structured ten-column inventory, including ADConfigured
+  // markdownEmail : one nine-column Markdown table without ADConfigured
   // errors        : separate per-cluster query failures
   // ------------------------------------------------------------------
   return {
