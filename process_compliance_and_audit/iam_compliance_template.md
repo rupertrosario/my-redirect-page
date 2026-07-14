@@ -14,13 +14,15 @@ This page defines the Identity and Access Management (IAM) control requirements 
 
 ## IAM Control Requirements
 
-The corporate IAM control baseline applies to all in-scope platforms. The detailed control requirements may be inserted here as the approved source image or linked to the authoritative IAM standard.
+The corporate IAM control baseline applies to all in-scope platforms. The approved control baseline may be inserted below as an image or linked to the authoritative IAM standard.
 
 **IAM Control Baseline:** [Insert image or authoritative standard link]
 
 ## Platform Compliance Matrix
 
-| Platform | Directory Integration | Account Inventory | Privileged Access | Access Review & Certification | Credential & Secret Management | Audit Logging | Overall Status | Evidence Repository |
+The matrix below records the current IAM compliance status of the in-scope platforms. Detailed user, group, role, privilege, SSO, MFA, and access-alignment information is maintained in the corresponding platform account inventory.
+
+| Platform | Directory Integration | Password Policy Compliance | Account Inventory & Access Alignment | PAM Review | Access Review & Certification | Credential Management | Overall Status | Evidence Repository |
 |---|---|---|---|---|---|---|---|---|
 | Cohesity | [Status] | [Status] | [Status] | [Status] | [Status] | [Status] | [Status] | [Link] |
 | Dell EMC Data Domain | [Status] | [Status] | [Status] | [Status] | [Status] | [Status] | [Status] | [Link] |
@@ -28,45 +30,58 @@ The corporate IAM control baseline applies to all in-scope platforms. The detail
 
 Use **Compliant**, **Partially Compliant**, **Not Compliant**, or **Not Applicable**.
 
-## Common Control Evidence
+## Compliance Evidence Mapping
 
-Use this section where the same enterprise process or evidence applies to all platforms. Do not repeat the same evidence under each platform.
+Evidence links are maintained within this document. Account inventory evidence is platform-specific. Enterprise processes are referenced once where they apply consistently across all platforms.
 
 | IAM Control | Control Implementation | Evidence Reference |
 |---|---|---|
-| Account Inventory | Platform user, privileged-account, and service-account inventories are maintained and reviewed. | [Account Inventory Link] |
-| Privileged Access Management | Privileged access is governed through the PAM process, including privileged-account inventory, approval, and periodic review. | [PAM Review Link] |
-| Access Review & Certification | Periodic access certification is performed. Orphaned and terminated-user access is removed, and service-account ownership is maintained. | [Access Certification Link] / [Service Account Register Link] |
-| Credential & Secret Management | Passwords, privileged credentials, service-account secrets, and applicable certificates are managed through approved enterprise processes. Credentials are vaulted in Delinea where applicable, and annual password rotation is completed through approved Change Requests. | [Delinea Link] / [Password Rotation CR Link] / [Certificate Evidence Link] |
-| Audit Logging | Administrative access and security-relevant activity are logged and retained according to the applicable enterprise logging standard. | [Audit Log Evidence Link] |
+| Directory Integration | Centralized authentication is implemented through the approved directory or identity provider, where supported. | [Platform evidence links below] |
+| Password Policy Compliance | Platform password settings are reviewed against the approved corporate password baseline. Any platform limitation or deviation is documented. | [Password Policy Compliance Evidence Link] |
+| Privileged Access Management | Privileged-account review, approval, access validation, and applicable audit evidence are maintained through the PAM review process. | [PAM Review Link] |
+| Access Review & Certification | Periodic access certification is performed. Orphaned and terminated-user access is removed, and service-account ownership and certification evidence are maintained. | [Access Certification Link] / [Service Account & Certificate SharePoint Link] |
+| Credential Management | Privileged credentials, service-account passwords, secrets, and applicable certificates are managed through approved processes. Delinea is used where applicable, and annual password rotation is completed through approved Change Requests. | [Delinea Link] / [Annual Password Rotation CR Link] / [Certificate Evidence Link] |
 
-## Platform-Specific Evidence
+## Platform Account Inventory & Compliance Evidence
 
-Only document controls here when the implementation or evidence differs by platform.
+The account inventory is the primary evidence for platform access controls. Each platform inventory should include users and groups, assigned roles, privileged or non-privileged classification, account or group owner, access alignment, review status, and evidence notes.
 
 ### Cohesity
 
-| IAM Control | Implementation / Configuration | Evidence Reference | Status / Notes |
-|---|---|---|---|
-| Directory Integration | Integrated with Active Directory for centralized authentication. | [Cohesity AD Integration Link] | [Status] |
-| Platform-Specific Access Controls | [Describe Cohesity-specific roles, local-account restrictions, MFA, or exceptions.] | [Link] | [Status] |
-| Platform-Specific Audit Evidence | [Describe Cohesity audit-log evidence, if not covered by the common control.] | [Link] | [Status] |
+**Account Inventory:** [Cohesity Account Inventory Link]
+
+| User / Group / Account | Account Type | Assigned Role(s) | Privileged? | Owner | Access Aligned? | SSO | MFA | Review Status / Notes |
+|---|---|---|---|---|---|---|---|---|
+| [User / Group] | [Named / Group / Service / Local / Helios] | [Role] | [Yes / No] | [Owner] | [Yes / No] | [Enabled / Not Applicable / Exception] | [Enabled / Not Applicable / Exception] | [Notes] |
+| Helios users | [Named / Group] | [Role(s)] | [Yes / No] | [Owner] | [Yes / No] | [Add SSO configuration] | [Add MFA configuration] | [Compliance notes] |
+
+**Directory Integration Evidence:** [Cohesity AD / SSO Evidence Link]
+
+**Password Policy Compliance Evidence:** [Cohesity Password Policy Evidence Link]
 
 ### Dell EMC Data Domain
 
-| IAM Control | Implementation / Configuration | Evidence Reference | Status / Notes |
-|---|---|---|---|
-| Directory Integration | [Describe Data Domain directory integration.] | [Data Domain AD/LDAP Link] | [Status] |
-| Platform-Specific Access Controls | [Describe Data Domain-specific roles, local-account restrictions, MFA, or exceptions.] | [Link] | [Status] |
-| Platform-Specific Audit Evidence | [Describe Data Domain audit-log evidence, if not covered by the common control.] | [Link] | [Status] |
+**Account Inventory:** [Data Domain Account Inventory Link]
+
+| User / Group / Account | Account Type | Assigned Role(s) | Privileged? | Owner | Access Aligned? | Review Status / Notes |
+|---|---|---|---|---|---|---|
+| [User / Group] | [Named / Group / Service / Local] | [Role] | [Yes / No] | [Owner] | [Yes / No] | [Notes] |
+
+**Directory Integration Evidence:** [Data Domain AD / LDAP Evidence Link]
+
+**Password Policy Compliance Evidence:** [Data Domain Password Policy Evidence Link]
 
 ### Dell EMC NetWorker
 
-| IAM Control | Implementation / Configuration | Evidence Reference | Status / Notes |
-|---|---|---|---|
-| Directory Integration | [Describe NetWorker directory integration.] | [NetWorker AD/LDAP Link] | [Status] |
-| Platform-Specific Access Controls | [Describe NetWorker-specific roles, local-account restrictions, MFA, or exceptions.] | [Link] | [Status] |
-| Platform-Specific Audit Evidence | [Describe NetWorker audit-log evidence, if not covered by the common control.] | [Link] | [Status] |
+**Account Inventory:** [NetWorker Account Inventory Link]
+
+| User / Group / Account | Account Type | Assigned Role(s) | Privileged? | Owner | Access Aligned? | Review Status / Notes |
+|---|---|---|---|---|---|---|
+| [User / Group] | [Named / Group / Service / Local] | [Role] | [Yes / No] | [Owner] | [Yes / No] | [Notes] |
+
+**Directory Integration Evidence:** [NetWorker AD / LDAP Evidence Link]
+
+**Password Policy Compliance Evidence:** [NetWorker Password Policy Evidence Link]
 
 ## Exceptions, Gaps & Remediation
 
@@ -80,17 +95,18 @@ Record only controls that are not compliant, partially compliant, or not applica
 
 | Review Item | Owner | Frequency | Last Reviewed | Next Review | Evidence |
 |---|---|---|---|---|---|
-| IAM compliance status | [Owner] | Quarterly / Annually | [Date] | [Date] | [Link] |
-| PAM review | [Owner] | Quarterly | [Date] | [Date] | [Link] |
-| Access certification | [Owner] | [Frequency] | [Date] | [Date] | [Link] |
-| Credential rotation | [Owner] | Annually | [Date] | [Date] | [CR / Evidence Link] |
+| Platform account inventory and access alignment | [Owner] | Quarterly / Annually | [Date] | [Date] | [Platform Inventory Link] |
+| PAM review | [Owner] | Quarterly | [Date] | [Date] | [PAM Review Link] |
+| Access certification | [Owner] | [Frequency] | [Date] | [Date] | [Certification Link] |
+| Password policy compliance | [Owner] | Annually / upon change | [Date] | [Date] | [Evidence Link] |
+| Credential and password rotation | [Owner] | Annually | [Date] | [Date] | [CR / Evidence Link] |
 
 ## Document Control
 
 | Field | Value |
 |---|---|
 | Document Owner | [Name / Team] |
-| Version | 0.1 |
+| Version | 0.2 |
 | Effective Date | [Date] |
 | Last Updated | [Date] |
 | Review Frequency | Annually or upon material control change |
