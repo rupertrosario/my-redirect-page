@@ -2,7 +2,7 @@
 
 ## Purpose
 
-This document provides implementation details and supporting evidence demonstrating compliance with the Corporate Identity & Access Management (IAM) requirements for Cohesity, Dell EMC Data Domain, and Dell EMC NetWorker.
+This document provides implementation details and supporting evidence demonstrating compliance with the Enterprise Identity & Access Management (IAM) requirements for Cohesity, Dell EMC Data Domain, and Dell EMC NetWorker.
 
 ## Scope
 
@@ -12,23 +12,23 @@ This document provides implementation details and supporting evidence demonstrat
 | Dell EMC Data Domain | Yes |
 | Dell EMC NetWorker | Yes |
 
-## Corporate IAM Requirements (Reference)
+## Enterprise IAM Requirements (Reference)
 
-The applicable IAM requirements are extracted from the Corporate IAM Confluence documentation and retained here as the governing reference for the in-scope Data Protection platforms.
+The applicable IAM requirements are extracted from the Enterprise IAM Confluence documentation and retained here as the governing reference for the in-scope Data Protection platforms.
 
-**Corporate IAM Source Page:** [Insert Corporate Confluence link]
+**Enterprise IAM Source Page:** [Insert Enterprise Confluence link]
 
 **Referenced Section:** IAM
 
-**Corporate IAM Requirements:** [Insert section anchor/link]
+**Enterprise IAM Requirements:** [Insert section anchor/link]
 
-The Corporate IAM requirements are maintained by the owning enterprise team. This document records how Cohesity, Dell EMC Data Domain, and Dell EMC NetWorker comply with those requirements and provides supporting evidence.
+The Enterprise IAM requirements are maintained by the owning enterprise team. This document records how Cohesity, Dell EMC Data Domain, and Dell EMC NetWorker comply with those requirements and provides supporting evidence.
 
-> Paste or retain the extracted Corporate IAM requirements below this note.
+> Paste or retain the extracted Enterprise IAM requirements below this note.
 
 ## Platform Compliance Matrix
 
-The matrix below provides a high-level compliance summary for each in-scope Data Protection platform against the applicable Corporate IAM requirements. Detailed implementation, supporting evidence, and any approved deviations are documented in the sections that follow.
+The matrix below provides a high-level compliance summary for each in-scope Data Protection platform against the applicable Enterprise IAM requirements. Detailed implementation, supporting evidence, and any approved deviations are documented in the sections that follow.
 
 | Platform | Assets in Scope | Directory Integration | Password Policy Compliance | Account Inventory & Access Alignment | PAM Review | Access Review & Certification | Credential Management | Overall Status | Last Reviewed | Evidence Repository |
 |---|---|---|---|---|---|---|---|---|---|---|
@@ -42,7 +42,7 @@ Use **Compliant**, **Partially Compliant**, **Not Compliant**, or **Not Applicab
 
 ### Access Control
 
-| Corporate IAM Requirement | Implementation | Evidence Reference |
+| Enterprise IAM Requirement | Implementation | Evidence Reference |
 |---|---|---|
 | All user and service accounts are uniquely identifiable | Cohesity, Data Domain, and NetWorker user and group listings identify named AD users, AD groups, service accounts, DD Boost accounts, Helios users, and vendor local accounts, as applicable. | [Cohesity User & Group Listing] / [Data Domain User & Group Listing] / [NetWorker User & Group Listing] |
 | No generic, shared, or default production accounts | Shared accounts are not used. Vendor-required local accounts are documented, controlled through Delinea where applicable, and reviewed through the PAM process. | [Platform User & Group Listings] / [PAM Review] / [Delinea Evidence] |
@@ -51,7 +51,7 @@ Use **Compliant**, **Partially Compliant**, **Not Compliant**, or **Not Applicab
 
 ### Privileged Access
 
-| Corporate IAM Requirement | Implementation | Evidence Reference |
+| Enterprise IAM Requirement | Implementation | Evidence Reference |
 |---|---|---|
 | Privileged accounts are inventoried and approved | Privileged accounts and assignments are documented in the platform listings and reviewed through the manager-approved PAM process. | [Platform User & Group Listings] / [PAM Review] |
 | Privileged access is reviewed quarterly | Privileged access is reviewed monthly through the PAM review process, exceeding the quarterly requirement. | [Monthly PAM Review] |
@@ -60,7 +60,7 @@ Use **Compliant**, **Partially Compliant**, **Not Compliant**, or **Not Applicab
 
 ### Access Reviews
 
-| Corporate IAM Requirement | Implementation | Evidence Reference |
+| Enterprise IAM Requirement | Implementation | Evidence Reference |
 |---|---|---|
 | Periodic access certifications are completed on schedule | Enterprise access certification is performed through Zilla and reviewed by the responsible application manager. | [Zilla Access Certification Evidence] |
 | Orphaned accounts are removed promptly | Orphaned accounts are identified during platform, PAM, or access-certification reviews and removed as required. | [Platform Review Evidence] / [PAM Review] / [Zilla Evidence] |
@@ -71,13 +71,13 @@ Use **Compliant**, **Partially Compliant**, **Not Compliant**, or **Not Applicab
 
 | Platform | Implementation | Evidence Reference | Status / Notes |
 |---|---|---|---|
-| Cohesity | Password settings and authentication controls are reviewed against the applicable corporate requirements. Helios SSO and MFA are documented separately. | [Cohesity Password Policy Evidence] | [Status] |
-| Dell EMC Data Domain | Password settings and authentication controls are reviewed against the applicable corporate requirements. | [Data Domain Password Policy Evidence] | [Status] |
-| Dell EMC NetWorker | Password settings and authentication controls are reviewed against the applicable corporate requirements. | [NetWorker Password Policy Evidence] | [Status] |
+| Cohesity | Password settings and authentication controls are reviewed against the applicable Enterprise IAM requirements. Helios SSO and MFA are documented separately. | [Cohesity Password Policy Evidence] | [Status] |
+| Dell EMC Data Domain | Password settings and authentication controls are reviewed against the applicable Enterprise IAM requirements. | [Data Domain Password Policy Evidence] | [Status] |
+| Dell EMC NetWorker | Password settings and authentication controls are reviewed against the applicable Enterprise IAM requirements. | [NetWorker Password Policy Evidence] | [Status] |
 
 ### Credential Management
 
-| Corporate IAM Requirement | Implementation | Evidence Reference |
+| Enterprise IAM Requirement | Implementation | Evidence Reference |
 |---|---|---|
 | Passwords, secrets, certificates, and keys are rotated per policy | Applicable privileged, service, vendor-local, and application credentials are managed through Delinea and approved Change Requests. Password rotation is performed every 365 days. Certificates are tracked separately. | [Delinea Evidence] / [Annual Password Rotation CR] / [Certificate SharePoint Link] |
 | Service-account credentials are maintained in approved vaults | Service-account and applicable DD Boost credentials are maintained in Delinea and tracked through SharePoint. | [Delinea Evidence] / [Service Account Register] |
