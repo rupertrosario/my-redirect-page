@@ -28,11 +28,13 @@ The Corporate IAM requirements are maintained by the owning enterprise team. Thi
 
 ## Platform Compliance Matrix
 
-| Platform | Directory Integration | Password Policy Compliance | Account Inventory & Access Alignment | PAM Review | Access Review & Certification | Credential Management | Overall Status | Evidence Repository |
-|---|---|---|---|---|---|---|---|---|
-| Cohesity | [Status] | [Status] | [Status] | [Status] | [Status] | [Status] | [Status] | [Link] |
-| Dell EMC Data Domain | [Status] | [Status] | [Status] | [Status] | [Status] | [Status] | [Status] | [Link] |
-| Dell EMC NetWorker | [Status] | [Status] | [Status] | [Status] | [Status] | [Status] | [Status] | [Link] |
+The matrix below provides a high-level compliance summary for each in-scope Data Protection platform against the applicable Corporate IAM requirements. Detailed implementation, supporting evidence, and any approved deviations are documented in the sections that follow.
+
+| Platform | Assets in Scope | Directory Integration | Password Policy Compliance | Account Inventory & Access Alignment | PAM Review | Access Review & Certification | Credential Management | Overall Status | Last Reviewed | Evidence Repository |
+|---|---|---|---|---|---|---|---|---|---|---|
+| Cohesity | [No. of Clusters] | [Status] | [Status] | [Status] | [Status] | [Status] | [Status] | [Status] | [Date] | [Link] |
+| Dell EMC Data Domain | [No. of Appliances] | [Status] | [Status] | [Status] | [Status] | [Status] | [Status] | [Status] | [Date] | [Link] |
+| Dell EMC NetWorker | [No. of Servers] | [Status] | [Status] | [Status] | [Status] | [Status] | [Status] | [Status] | [Date] | [Link] |
 
 Use **Compliant**, **Partially Compliant**, **Not Compliant**, or **Not Applicable**.
 
@@ -133,13 +135,13 @@ Use the existing SharePoint evidence or linked register. A separate duplicate in
 |---|---|---|---|---|---|---|---|---|
 | [Account] | [Cohesity / Data Domain / NetWorker] | [Service / DD Boost / Vendor Local] | [Purpose] | [Owner] | [Delinea / Approved Location] | [Date] | [Status] | [Link] |
 
-## Exceptions, Gaps & Remediation
+## Non-Compliance, Exceptions & Deviations
 
-Record only controls that are partially compliant, not compliant, not applicable, or require a documented exception.
+The table below records approved exceptions, deviations, or non-compliant controls identified during the review. Fully compliant platforms or assets do not require an entry.
 
-| Platform | IAM Control | Gap / Exception | Risk | Owner | Remediation / Compensating Control | Target Date | Approval / Evidence |
-|---|---|---|---|---|---|---|---|
-| [Platform] | [Control] | [Description] | [Risk] | [Owner] | [Action] | [Date] | [Link] |
+| Platform | Asset / Device ID | IAM Control | Current Status | Reason for Deviation | Risk / Impact | Compensating Control | Target Remediation Date | Evidence |
+|---|---|---|---|---|---|---|---|---|
+| [Platform] | [Asset ID] | [IAM Control] | [Partially Compliant / Not Compliant / Not Applicable] | [Reason] | [Risk] | [Compensating Control] | [Date] | [Link] |
 
 ## Review & Approval
 
