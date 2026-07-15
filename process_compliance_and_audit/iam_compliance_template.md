@@ -36,7 +36,7 @@ The matrix below provides a high-level compliance summary for each in-scope Data
 | Dell EMC Data Domain | [No. of Appliances] | [Status] | [Status] | [Status] | [Status] | [Status] | [Status] | [Status] | [Date] | [Link] |
 | Dell EMC NetWorker | [No. of Servers] | [Status] | [Status] | [Status] | [Status] | [Status] | [Status] | [Status] | [Date] | [Link] |
 
-Use **Compliant**, **Partially Compliant**, **Not Compliant**, or **Not Applicable**.
+Use the Confluence Status macro for **Compliant**, **Partially Compliant**, **Not Compliant**, or **Not Applicable**.
 
 ## Non-Compliance, Exceptions & Deviations
 
@@ -70,10 +70,10 @@ Records users, groups, service accounts, DD Boost accounts, roles, ownership, an
 
 | Enterprise IAM Requirement | Implementation | Evidence Reference |
 |---|---|---|
-| All user and service accounts are uniquely identifiable | Cohesity, Data Domain, and NetWorker user and group listings identify named AD users, AD groups, service accounts, DD Boost accounts, Helios users, and vendor local accounts, as applicable. | [Platform User & Group Listings] |
-| No generic, shared, or default production accounts | Shared accounts are not used. Vendor-required local accounts are documented, controlled through Delinea where applicable, and reviewed through the PAM process. | [Platform User & Group Listings] / [PAM Review] / [Delinea Evidence] |
-| Least-privilege access is enforced | Roles and group memberships are reviewed against operational responsibilities and recorded as aligned or not aligned in the platform listings. | [Platform User & Group Listings] |
-| Privileged accounts are segregated from standard user accounts | Privileged access is identified separately from standard named-user access in the Cohesity, Data Domain, and NetWorker listings. | [Platform User & Group Listings] |
+| All user and service accounts are uniquely identifiable | The Platform User & Group Listing identifies named AD users, AD groups, service accounts, DD Boost accounts, Helios users, and vendor local accounts across Cohesity, Data Domain, and NetWorker, as applicable. | [Platform User & Group Listing] |
+| No generic, shared, or default production accounts | Shared accounts are not used. Vendor-required local accounts are documented, controlled through Delinea where applicable, and reviewed through the PAM process. | [Platform User & Group Listing] / [PAM Review] / [Delinea Evidence] |
+| Least-privilege access is enforced | Roles and group memberships are reviewed against operational responsibilities and recorded as aligned or not aligned in the Platform User & Group Listing. | [Platform User & Group Listing] |
+| Privileged accounts are segregated from standard user accounts | Privileged access is identified separately from standard named-user access in the Platform User & Group Listing. | [Platform User & Group Listing] |
 
 ### Privileged Access
 
@@ -81,10 +81,10 @@ Covers PAM review, monitoring, approval, and privileged access controls.
 
 | Enterprise IAM Requirement | Implementation | Evidence Reference |
 |---|---|---|
-| Privileged accounts are inventoried and approved | Privileged accounts and assignments are documented in the platform listings and reviewed through the manager-approved PAM process. | [Platform User & Group Listings] / [PAM Review] |
+| Privileged accounts are inventoried and approved | Privileged accounts and assignments are documented in the Platform User & Group Listing and reviewed through the manager-approved PAM process. | [Platform User & Group Listing] / [PAM Review] |
 | Privileged access is reviewed quarterly | Privileged access is reviewed monthly through the PAM review process, exceeding the quarterly requirement. | [Monthly PAM Review] |
 | Administrative access is monitored and logged | Administrative activity and applicable PAM use cases are reviewed monthly, with supporting security logs retained in Splunk. | [PAM Review] / [Splunk Evidence] |
-| MFA is enabled for privileged users wherever supported | MFA and SSO are enabled for Cohesity Helios where supported and documented in the Cohesity user and group listing. Data Domain and NetWorker applicability is recorded separately. | [Cohesity Helios SSO/MFA Evidence] / [Platform Listings] |
+| MFA is enabled for privileged users wherever supported | MFA and SSO are enabled for Cohesity Helios where supported and documented in the Platform User & Group Listing. Data Domain and NetWorker applicability is recorded separately. | [Cohesity Helios SSO/MFA Evidence] / [Platform User & Group Listing] |
 
 ### Access Reviews
 
@@ -95,7 +95,7 @@ Covers Zilla certification for Cohesity and manual certification for Data Domain
 | Periodic access certifications are completed on schedule | Cohesity access certification is performed through Zilla and reviewed by the responsible application manager. Data Domain and NetWorker access certifications are completed manually and documented. | [Cohesity Zilla Certification Evidence] / [Data Domain Manual Certification Evidence] / [NetWorker Manual Certification Evidence] |
 | Orphaned accounts are removed promptly | Orphaned accounts are identified during platform, PAM, or access-certification reviews and removed as required. | [Platform Review Evidence] / [PAM Review] / [Certification Evidence] |
 | Terminated users are removed within the defined SLA | AD-integrated user access is removed through the enterprise identity lifecycle process. | [Enterprise IAM Evidence] |
-| Service-account ownership is identified and documented | Service accounts and DD Boost accounts are documented within the applicable platform user and group listing with purpose, owner, credential location, rotation or expiry, and review status. | [Platform User & Group Listings] / [SharePoint Evidence] |
+| Service-account ownership is identified and documented | Service accounts and DD Boost accounts are listed in the Platform User & Group Listing. Ownership, credential location, rotation or expiry, and review status are maintained in SharePoint. | [Platform User & Group Listing] / [SharePoint Evidence] |
 
 ### Credential Management
 
@@ -105,45 +105,31 @@ Covers password policy, Delinea, rotation, secrets, and certificate tracking.
 
 | Platform | Implementation | Evidence Reference | Status / Notes |
 |---|---|---|---|
-| Cohesity | Password settings and authentication controls are reviewed against the applicable Enterprise IAM requirements. Helios SSO and MFA are documented separately. | [Cohesity Password Policy Evidence] | [Status] |
-| Dell EMC Data Domain | Password settings and authentication controls are reviewed against the applicable Enterprise IAM requirements. | [Data Domain Password Policy Evidence] | [Status] |
-| Dell EMC NetWorker | Password settings and authentication controls are reviewed against the applicable Enterprise IAM requirements. | [NetWorker Password Policy Evidence] | [Status] |
+| Cohesity | AD-integrated users inherit Enterprise AD password controls. Cohesity password and authentication settings are validated programmatically through the Cohesity API. Vendor-local and service-account credentials are managed through Delinea and rotated every 365 days through the approved Change Request process. Helios uses SSO and MFA. | [Cohesity Validation Script / Output] / [Delinea Evidence] / [Rotation CR] / [Helios SSO/MFA Evidence] | [Status] |
+| Dell EMC Data Domain | AD-integrated users inherit Enterprise AD password controls. Vendor-local, service, and DD Boost credentials are managed through Delinea and rotated every 365 days through the approved Change Request process. | [Data Domain Password Policy Evidence] / [Delinea Evidence] / [Rotation CR] | [Status] |
+| Dell EMC NetWorker | AD-integrated users inherit Enterprise AD password controls. Vendor-local and service-account credentials are managed through Delinea and rotated every 365 days through the approved Change Request process. | [NetWorker Password Policy Evidence] / [Delinea Evidence] / [Rotation CR] | [Status] |
 
 #### Credential Vaulting, Rotation & Certificate Management
 
 | Enterprise IAM Requirement | Implementation | Evidence Reference |
 |---|---|---|
-| Passwords, secrets, certificates, and keys are rotated per policy | Applicable privileged, service, vendor-local, and application credentials are managed through Delinea and approved Change Requests. Password rotation is performed every 365 days. Certificates are tracked separately. | [Delinea Evidence] / [Annual Password Rotation CR] / [Certificate SharePoint Link] |
-| Service-account credentials are maintained in approved vaults | Service-account and applicable DD Boost credentials are maintained in Delinea and tracked through SharePoint. | [Delinea Evidence] / [Platform User & Group Listings] |
-| Expiring credentials are monitored and remediated | SharePoint tracking provides 30-, 60-, and 90-day expiry notifications for applicable credentials and certificates, with remediation completed through the approved change process. | [SharePoint Tracking] / [Change Request Evidence] |
+| Passwords, secrets, certificates, and keys are rotated per policy | Applicable privileged, service, vendor-local, and application credentials are managed through Delinea and approved Change Requests. Password rotation is performed every 365 days. SSL/TLS certificates are tracked separately. | [Delinea Evidence] / [Annual Password Rotation CR] / [Certificate SharePoint Link] |
+| Service-account credentials are maintained in approved vaults | Service-account and applicable DD Boost credentials are maintained in Delinea. Ownership, credential location, rotation or expiry, and review status are maintained in SharePoint. | [Delinea Evidence] / [SharePoint Evidence] |
+| Expiring credentials are monitored and remediated | SharePoint tracking provides 30-, 60-, and 90-day expiry notifications for applicable credentials and SSL/TLS certificates, with remediation completed through the approved change process. | [SharePoint Tracking] / [Change Request Evidence] |
 
-## Platform User & Group Listings
+## Platform User & Group Listing
 
-The platform user and group listings are the authoritative account inventories. They should include named users, AD groups, service accounts, DD Boost accounts, Helios users, vendor local accounts, assigned roles, privileged classification, ownership, access alignment, credential location, rotation or expiry, review status, and evidence links.
+The Platform User & Group Listing is maintained as a separate Confluence page and serves as the authoritative account inventory for all Data Protection platforms.
 
-### Cohesity
+**Evidence:** [Platform User & Group Listing]
 
-**User & Group Listing:** [Cohesity Link]
-
-Include AD users and groups, Cohesity roles, privileged or standard classification, service accounts, vendor local accounts where applicable, Helios users, Helios SSO and MFA status, owner, purpose, access alignment, credential location, rotation or expiry, review status, and evidence.
-
-### Dell EMC Data Domain
-
-**User & Group Listing:** [Data Domain Link]
-
-Include AD users and groups, Data Domain roles, privileged or standard classification, service accounts, DD Boost application accounts, vendor local accounts where applicable, owner, purpose, access alignment, credential location, rotation or expiry, review status, and evidence.
-
-### Dell EMC NetWorker
-
-**User & Group Listing:** [NetWorker Link]
-
-Include AD users and groups, NetWorker roles, privileged or standard classification, service accounts, vendor local accounts where applicable, owner, purpose, access alignment, credential location, rotation or expiry, review status, and evidence.
+It includes named AD users, AD groups, platform roles, privileged or standard classification, service accounts, DD Boost accounts, vendor local accounts where applicable, Helios users, Helios SSO and MFA status, ownership, access alignment, and review status. Credential location, rotation, and expiry details are maintained separately in SharePoint and Delinea.
 
 ## Review & Approval
 
 | Review Item | Owner | Frequency | Last Reviewed | Next Review | Evidence |
 |---|---|---|---|---|---|
-| Platform user and group listings | [Owner] | [Frequency] | [Date] | [Date] | [Link] |
+| Platform User & Group Listing | [Owner] | [Frequency] | [Date] | [Date] | [Link] |
 | PAM review | [Owner] | Monthly | [Date] | [Date] | [PAM Review Link] |
 | Cohesity Zilla access certification | [Application Manager] | [Enterprise Schedule] | [Date] | [Date] | [Zilla Link] |
 | Data Domain manual access certification | [Application Manager] | [Schedule] | [Date] | [Date] | [Evidence Link] |
