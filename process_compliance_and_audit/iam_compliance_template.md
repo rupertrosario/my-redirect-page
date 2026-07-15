@@ -137,6 +137,12 @@ It includes named AD users, AD groups, platform roles, privileged or standard cl
 | Password policy compliance | [Owner] | Annually or upon change | [Date] | [Date] | [Evidence Link] |
 | Credential rotation | [Owner] | Every 365 days | [Date] | [Date] | [CR / Evidence Link] |
 
+## Revision History
+
+| Version | Date | Description |
+|---|---|---|
+| 1.0 Draft | 15-Jul-2026 | Updated the document to align with Enterprise IAM requirements and reorganized the compliance, evidence, access review, account inventory, PAM, password policy, credential management, and exception sections for Cohesity, Data Domain, and NetWorker. |
+
 ## Document Control
 
 | Field | Value |
