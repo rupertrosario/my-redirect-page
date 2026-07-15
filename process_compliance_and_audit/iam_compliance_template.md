@@ -48,9 +48,15 @@ The table below records approved exceptions, deviations, or non-compliant contro
 
 ## Compliance, Audit & Evidence
 
+Documents how the platforms meet Enterprise IAM requirements and links the supporting evidence.
+
 ### Access Control
 
+Covers authentication, authorization, account governance, and access alignment.
+
 #### Directory Integration
+
+Shows how Cohesity, Data Domain, and NetWorker use Enterprise AD.
 
 | Platform | Implementation | Evidence Reference |
 |---|---|---|
@@ -59,6 +65,8 @@ The table below records approved exceptions, deviations, or non-compliant contro
 | Dell EMC NetWorker | Centralized authentication is implemented through Active Directory or the approved directory integration. | [NetWorker AD Evidence] |
 
 #### Account Inventory & Access Alignment
+
+Records users, groups, service accounts, DD Boost accounts, roles, ownership, and privilege status.
 
 | Enterprise IAM Requirement | Implementation | Evidence Reference |
 |---|---|---|
@@ -69,6 +77,8 @@ The table below records approved exceptions, deviations, or non-compliant contro
 
 ### Privileged Access
 
+Covers PAM review, monitoring, approval, and privileged access controls.
+
 | Enterprise IAM Requirement | Implementation | Evidence Reference |
 |---|---|---|
 | Privileged accounts are inventoried and approved | Privileged accounts and assignments are documented in the platform listings and reviewed through the manager-approved PAM process. | [Platform User & Group Listings] / [PAM Review] |
@@ -78,14 +88,18 @@ The table below records approved exceptions, deviations, or non-compliant contro
 
 ### Access Reviews
 
+Covers Zilla certification for Cohesity and manual certification for Data Domain and NetWorker.
+
 | Enterprise IAM Requirement | Implementation | Evidence Reference |
 |---|---|---|
-| Periodic access certifications are completed on schedule | Enterprise access certification is performed through Zilla and reviewed by the responsible application manager. | [Zilla Access Certification Evidence] |
-| Orphaned accounts are removed promptly | Orphaned accounts are identified during platform, PAM, or access-certification reviews and removed as required. | [Platform Review Evidence] / [PAM Review] / [Zilla Evidence] |
-| Terminated users are removed within the defined SLA | AD-integrated user access is removed through the enterprise identity lifecycle process. | [Enterprise IAM / Zilla Evidence] |
+| Periodic access certifications are completed on schedule | Cohesity access certification is performed through Zilla and reviewed by the responsible application manager. Data Domain and NetWorker access certifications are completed manually and documented. | [Cohesity Zilla Certification Evidence] / [Data Domain Manual Certification Evidence] / [NetWorker Manual Certification Evidence] |
+| Orphaned accounts are removed promptly | Orphaned accounts are identified during platform, PAM, or access-certification reviews and removed as required. | [Platform Review Evidence] / [PAM Review] / [Certification Evidence] |
+| Terminated users are removed within the defined SLA | AD-integrated user access is removed through the enterprise identity lifecycle process. | [Enterprise IAM Evidence] |
 | Service-account ownership is identified and documented | Service accounts and DD Boost accounts are documented within the applicable platform user and group listing with purpose, owner, credential location, rotation or expiry, and review status. | [Platform User & Group Listings] / [SharePoint Evidence] |
 
 ### Credential Management
+
+Covers password policy, Delinea, rotation, secrets, and certificate tracking.
 
 #### Password Policy Compliance
 
@@ -131,7 +145,9 @@ Include AD users and groups, NetWorker roles, privileged or standard classificat
 |---|---|---|---|---|---|
 | Platform user and group listings | [Owner] | [Frequency] | [Date] | [Date] | [Link] |
 | PAM review | [Owner] | Monthly | [Date] | [Date] | [PAM Review Link] |
-| Zilla access certification | [Application Manager] | [Enterprise Schedule] | [Date] | [Date] | [Zilla Link] |
+| Cohesity Zilla access certification | [Application Manager] | [Enterprise Schedule] | [Date] | [Date] | [Zilla Link] |
+| Data Domain manual access certification | [Application Manager] | [Schedule] | [Date] | [Date] | [Evidence Link] |
+| NetWorker manual access certification | [Application Manager] | [Schedule] | [Date] | [Date] | [Evidence Link] |
 | Password policy compliance | [Owner] | Annually or upon change | [Date] | [Date] | [Evidence Link] |
 | Credential rotation | [Owner] | Every 365 days | [Date] | [Date] | [CR / Evidence Link] |
 
