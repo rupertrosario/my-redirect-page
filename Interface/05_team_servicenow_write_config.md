@@ -15,6 +15,8 @@ validate_interfaces
   ↓
 snow_search_team
   ↓
+snow_search_team_ci
+  ↓
 normalize_team_search
   ↓
 create_team_incident  [loop]
@@ -55,16 +57,33 @@ Expected routing:
 
 ## Team Configuration Item
 
-For Team incidents, use the generic ServiceNow CI:
+The cluster name must come from:
+
+```text
+result("validate_interfaces").teamIncidents[].cluster
+```
+
+`snow_search_team_ci` should search ServiceNow CMDB using that cluster name before `normalize_team_search` runs.
+
+`04_normalize_team_search.js` emits:
+
+```text
+cluster
+cmdb_ci
+cmdb_ci_source
+```
+
+CI selection logic:
+
+```text
+Cluster CI found by snow_search_team_ci -> cmdb_ci = matched cluster CI
+No cluster CI found                 -> cmdb_ci = Cohesity (PRODUCTION)
+```
+
+Fallback CI:
 
 ```text
 Cohesity (PRODUCTION)
-```
-
-`04_normalize_team_search.js` emits this value as:
-
-```text
-cmdb_ci
 ```
 
 Cluster-specific details remain in `short_description`, `description`, and `comments`.
@@ -119,10 +138,18 @@ If the ServiceNow connector labels this field as **Configuration item**, map tha
 {{ _.item.cmdb_ci }}
 ```
 
-Expected value:
+Validation fields available in the loop item:
 
 ```text
-Cohesity (PRODUCTION)
+cluster        = {{ _.item.cluster }}
+cmdb_ci_source = {{ _.item.cmdb_ci_source }}
+```
+
+Expected `cmdb_ci_source` values:
+
+```text
+cluster_ci_match -> cluster CI was found in ServiceNow CMDB
+fallback_ci      -> Cohesity (PRODUCTION) was used
 ```
 
 ## Recommended static fields
