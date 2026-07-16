@@ -76,6 +76,7 @@ export default async function ({ execution_id }) {
     if (x.correlation_id !== undefined || x.CorrelationId !== undefined) score += 10;
     if (x.short_description !== undefined) score += 4;
     if (x.description !== undefined || x.work_notes !== undefined || x.comment !== undefined) score += 3;
+    if (x.cluster !== undefined || x.clusterName !== undefined || x.ClusterName !== undefined) score += 3;
     if (x.clusterId !== undefined || x.cluster_id !== undefined || x.ClusterId !== undefined) score += 2;
     return score;
   }
@@ -199,6 +200,22 @@ export default async function ({ execution_id }) {
     return text(candidate.correlation_id || candidate.CorrelationId || candidate.correlationId);
   }
 
+  function getClusterName(candidate) {
+    return text(
+      candidate.cluster ||
+      candidate.clusterName ||
+      candidate.ClusterName ||
+      candidate.cluster_name ||
+      candidate.Cluster ||
+      candidate.cmdb_ci ||
+      candidate.configuration_item
+    );
+  }
+
+  function getConfigurationItem(candidate) {
+    return getClusterName(candidate);
+  }
+
   function getShortDescription(candidate) {
     return text(candidate.short_description || candidate.shortDescription || "Cohesity Interface DOWN - Team");
   }
@@ -211,7 +228,7 @@ export default async function ({ execution_id }) {
     const existing = text(candidate.comment || candidate.work_notes || candidate.description);
     if (existing) return existing;
 
-    const cluster = text(candidate.clusterName || candidate.ClusterName || candidate.cluster_name || candidate.Cluster);
+    const cluster = getClusterName(candidate);
     const correlation = getCorrelation(candidate);
 
     return [
@@ -276,6 +293,7 @@ export default async function ({ execution_id }) {
       const candidate = teamItems[i] || {};
       const records = extractRecords(searchItems[i]);
       const correlationId = getCorrelation(candidate);
+      const cmdbCi = getConfigurationItem(candidate);
       const comment = getComment(candidate);
 
       if (!correlationId) {
@@ -293,6 +311,7 @@ export default async function ({ execution_id }) {
           short_description: getShortDescription(candidate),
           description: getDescription(candidate),
           correlation_id: correlationId,
+          cmdb_ci: cmdbCi,
           comment: comment
         });
         continue;
@@ -315,7 +334,8 @@ export default async function ({ execution_id }) {
         updateTeamIncidents.push({
           number: number,
           comment: comment,
-          correlation_id: correlationId
+          correlation_id: correlationId,
+          cmdb_ci: cmdbCi
         });
         continue;
       }
