@@ -2,7 +2,8 @@
 //
 // Purpose:
 // - Read validate_interfaces.teamIncidents[]
-// - Read looped ServiceNow search results from snow_search_team
+// - Read looped ServiceNow Team incident search results from snow_search_team
+// - Optionally read looped ServiceNow CMDB CI search results from snow_search_team_ci
 // - Return flat, loop-safe arrays for ServiceNow Create/Update tasks
 //
 // Output arrays are intentionally simple. Do not spread the full candidate object
@@ -12,7 +13,8 @@ import { execution } from "@dynatrace-sdk/automation-utils";
 
 export default async function ({ execution_id }) {
   const validateTaskIds = ["validate_interfaces", "validate"];
-  const searchTaskIds = [
+
+  const incidentSearchTaskIds = [
     "snow_search_team",
     "snow_search",
     "snow_search_team_incident",
@@ -20,7 +22,14 @@ export default async function ({ execution_id }) {
     "servicenow_search_team"
   ];
 
-  const TEAM_CMDB_CI = "Cohesity (PRODUCTION)";
+  const ciSearchTaskIds = [
+    "snow_search_team_ci",
+    "snow_search_ci",
+    "snow_search_team_cmdb_ci",
+    "servicenow_search_team_ci"
+  ];
+
+  const FALLBACK_TEAM_CMDB_CI = "Cohesity (PRODUCTION)";
 
   function text(v) {
     if (v === null || v === undefined) return "";
@@ -114,7 +123,7 @@ export default async function ({ execution_id }) {
     return { path: bestScore > 0 ? "auto_detected" : "not_found", items: best };
   }
 
-  function isSnowRecordArray(v) {
+  function isRecordArray(v) {
     if (!Array.isArray(v)) return false;
     if (v.length === 0) return true;
     if (!isObj(v[0])) return false;
@@ -125,13 +134,15 @@ export default async function ({ execution_id }) {
       r.number !== undefined ||
       r.state !== undefined ||
       r.short_description !== undefined ||
-      r.correlation_id !== undefined
+      r.correlation_id !== undefined ||
+      r.name !== undefined ||
+      r.sys_class_name !== undefined
     );
   }
 
   function extractRecords(item) {
     if (!item) return [];
-    if (isSnowRecordArray(item)) return item;
+    if (isRecordArray(item)) return item;
     if (!isObj(item)) return [];
 
     const paths = [
@@ -153,13 +164,13 @@ export default async function ({ execution_id }) {
 
     for (const p of paths) {
       const value = getPath(item, p);
-      if (isSnowRecordArray(value)) return value;
+      if (isRecordArray(value)) return value;
     }
 
     return [];
   }
 
-  function getSearchLoopItems(searchResult, expectedCount) {
+  function getLoopItems(searchResult, expectedCount) {
     if (Array.isArray(searchResult)) return { path: "root", items: searchResult };
 
     const directPaths = [
@@ -179,7 +190,7 @@ export default async function ({ execution_id }) {
 
     for (const p of directPaths) {
       const value = getPath(searchResult, p);
-      if (Array.isArray(value) && !isSnowRecordArray(value)) {
+      if (Array.isArray(value) && !isRecordArray(value)) {
         return { path: p, items: value };
       }
     }
@@ -188,7 +199,7 @@ export default async function ({ execution_id }) {
     collectArrays(searchResult, arrays, 7);
 
     for (const arr of arrays) {
-      if (expectedCount > 0 && arr.length === expectedCount && !isSnowRecordArray(arr)) {
+      if (expectedCount > 0 && arr.length === expectedCount && !isRecordArray(arr)) {
         return { path: "auto_detected", items: arr };
       }
     }
@@ -212,8 +223,34 @@ export default async function ({ execution_id }) {
     );
   }
 
-  function getConfigurationItem() {
-    return TEAM_CMDB_CI;
+  function getCiDisplay(record) {
+    if (!record) return "";
+    return text(
+      record.name ||
+      record.display_value ||
+      record.cmdb_ci ||
+      record.configuration_item ||
+      record.sys_id
+    );
+  }
+
+  function getConfigurationItem(candidate, ciRecords) {
+    const clusterName = getClusterName(candidate);
+    const matchedCi = getCiDisplay((ciRecords || [])[0]);
+
+    if (matchedCi) {
+      return {
+        cmdb_ci: matchedCi,
+        cmdb_ci_source: "cluster_ci_match",
+        cluster: clusterName
+      };
+    }
+
+    return {
+      cmdb_ci: FALLBACK_TEAM_CMDB_CI,
+      cmdb_ci_source: "fallback_ci",
+      cluster: clusterName
+    };
   }
 
   function getShortDescription(candidate) {
@@ -245,6 +282,7 @@ export default async function ({ execution_id }) {
         error: "Missing execution_id",
         inputTeamCount: 0,
         searchLoopCount: 0,
+        ciSearchLoopCount: 0,
         createCount: 0,
         updateCount: 0,
         noWriteCount: 0,
@@ -256,14 +294,16 @@ export default async function ({ execution_id }) {
 
     const workflowExecution = await execution(execution_id);
     const validate = await readFirstTaskResult(workflowExecution, validateTaskIds);
-    const search = await readFirstTaskResult(workflowExecution, searchTaskIds);
+    const incidentSearch = await readFirstTaskResult(workflowExecution, incidentSearchTaskIds);
+    const ciSearch = await readFirstTaskResult(workflowExecution, ciSearchTaskIds);
 
-    if (!validate.found || !search.found) {
+    if (!validate.found || !incidentSearch.found) {
       return {
         ok: false,
         error: "Required previous task result not found",
         inputTeamCount: 0,
         searchLoopCount: 0,
+        ciSearchLoopCount: 0,
         createCount: 0,
         updateCount: 0,
         noWriteCount: 0,
@@ -272,9 +312,11 @@ export default async function ({ execution_id }) {
         noWriteTeamIncidents: [],
         debug: {
           validateTask: validate.taskId,
-          searchTask: search.taskId,
+          incidentSearchTask: incidentSearch.taskId,
+          ciSearchTask: ciSearch.taskId,
           validateErrors: validate.errors,
-          searchErrors: search.errors
+          incidentSearchErrors: incidentSearch.errors,
+          ciSearchErrors: ciSearch.errors
         }
       };
     }
@@ -282,8 +324,13 @@ export default async function ({ execution_id }) {
     const teamPick = getTeamIncidents(validate.result);
     const teamItems = teamPick.items;
 
-    const searchPick = getSearchLoopItems(search.result, teamItems.length);
-    const searchItems = searchPick.items;
+    const incidentSearchPick = getLoopItems(incidentSearch.result, teamItems.length);
+    const incidentSearchItems = incidentSearchPick.items;
+
+    const ciSearchPick = ciSearch.found
+      ? getLoopItems(ciSearch.result, teamItems.length)
+      : { path: "not_configured", items: [] };
+    const ciSearchItems = ciSearchPick.items;
 
     const createTeamIncidents = [];
     const updateTeamIncidents = [];
@@ -291,14 +338,16 @@ export default async function ({ execution_id }) {
 
     for (let i = 0; i < teamItems.length; i++) {
       const candidate = teamItems[i] || {};
-      const records = extractRecords(searchItems[i]);
+      const records = extractRecords(incidentSearchItems[i]);
+      const ciRecords = extractRecords(ciSearchItems[i]);
       const correlationId = getCorrelation(candidate);
-      const cmdbCi = getConfigurationItem(candidate);
+      const ci = getConfigurationItem(candidate, ciRecords);
       const comment = getComment(candidate);
 
       if (!correlationId) {
         noWriteTeamIncidents.push({
           correlation_id: "",
+          cluster: ci.cluster,
           reason: "missing_correlation_id",
           matchedCount: records.length,
           incident_numbers: ""
@@ -311,7 +360,9 @@ export default async function ({ execution_id }) {
           short_description: getShortDescription(candidate),
           description: getDescription(candidate),
           correlation_id: correlationId,
-          cmdb_ci: cmdbCi,
+          cluster: ci.cluster,
+          cmdb_ci: ci.cmdb_ci,
+          cmdb_ci_source: ci.cmdb_ci_source,
           comment: comment
         });
         continue;
@@ -324,6 +375,7 @@ export default async function ({ execution_id }) {
         if (!number) {
           noWriteTeamIncidents.push({
             correlation_id: correlationId,
+            cluster: ci.cluster,
             reason: "matched_incident_missing_number",
             matchedCount: 1,
             incident_numbers: ""
@@ -335,13 +387,16 @@ export default async function ({ execution_id }) {
           number: number,
           comment: comment,
           correlation_id: correlationId,
-          cmdb_ci: cmdbCi
+          cluster: ci.cluster,
+          cmdb_ci: ci.cmdb_ci,
+          cmdb_ci_source: ci.cmdb_ci_source
         });
         continue;
       }
 
       noWriteTeamIncidents.push({
         correlation_id: correlationId,
+        cluster: ci.cluster,
         reason: "duplicate_active_incidents_found",
         matchedCount: records.length,
         incident_numbers: records.map(function (r) { return text(r && r.number); }).filter(Boolean).join(", ")
@@ -351,11 +406,14 @@ export default async function ({ execution_id }) {
     return {
       ok: true,
       selectedValidateTask: validate.taskId,
-      selectedSearchTask: search.taskId,
+      selectedIncidentSearchTask: incidentSearch.taskId,
+      selectedCiSearchTask: ciSearch.taskId,
       selectedTeamPath: teamPick.path,
-      selectedSearchLoopPath: searchPick.path,
+      selectedIncidentSearchLoopPath: incidentSearchPick.path,
+      selectedCiSearchLoopPath: ciSearchPick.path,
       inputTeamCount: teamItems.length,
-      searchLoopCount: searchItems.length,
+      searchLoopCount: incidentSearchItems.length,
+      ciSearchLoopCount: ciSearchItems.length,
       createCount: createTeamIncidents.length,
       updateCount: updateTeamIncidents.length,
       noWriteCount: noWriteTeamIncidents.length,
@@ -369,6 +427,7 @@ export default async function ({ execution_id }) {
       error: text(e && e.message ? e.message : e),
       inputTeamCount: 0,
       searchLoopCount: 0,
+      ciSearchLoopCount: 0,
       createCount: 0,
       updateCount: 0,
       noWriteCount: 0,
