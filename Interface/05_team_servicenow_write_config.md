@@ -15,8 +15,6 @@ validate_interfaces
   ↓
 snow_search_team
   ↓
-snow_search_team_ci
-  ↓
 normalize_team_search
   ↓
 create_team_incident  [loop]
@@ -54,39 +52,6 @@ Expected routing:
 ```
 
 `noWriteTeamIncidents[]` is manual-review only. Do not create or update when duplicates are found.
-
-## Team Configuration Item
-
-The cluster name must come from:
-
-```text
-result("validate_interfaces").teamIncidents[].cluster
-```
-
-`snow_search_team_ci` should search ServiceNow CMDB using that cluster name before `normalize_team_search` runs.
-
-`04_normalize_team_search.js` emits:
-
-```text
-cluster
-cmdb_ci
-cmdb_ci_source
-```
-
-CI selection logic:
-
-```text
-Cluster CI found by snow_search_team_ci -> cmdb_ci = matched cluster CI
-No cluster CI found                 -> cmdb_ci = Cohesity (PRODUCTION)
-```
-
-Fallback CI:
-
-```text
-Cohesity (PRODUCTION)
-```
-
-Cluster-specific details remain in `short_description`, `description`, and `comments`.
 
 ---
 
@@ -128,28 +93,7 @@ Use the current loop item variable from Dynatrace:
 short_description = {{ _.item.short_description }}
 description       = {{ _.item.description }}
 correlation_id    = {{ _.item.correlation_id }}
-cmdb_ci           = {{ _.item.cmdb_ci }}
 comments          = {{ _.item.comment }}
-```
-
-If the ServiceNow connector labels this field as **Configuration item**, map that field to:
-
-```text
-{{ _.item.cmdb_ci }}
-```
-
-Validation fields available in the loop item:
-
-```text
-cluster        = {{ _.item.cluster }}
-cmdb_ci_source = {{ _.item.cmdb_ci_source }}
-```
-
-Expected `cmdb_ci_source` values:
-
-```text
-cluster_ci_match -> cluster CI was found in ServiceNow CMDB
-fallback_ci      -> Cohesity (PRODUCTION) was used
 ```
 
 ## Recommended static fields
@@ -218,7 +162,7 @@ comments       = {{ _.item.comment }}
 correlation_id = {{ _.item.correlation_id }}
 ```
 
-Do not overwrite short description or configuration item during update unless explicitly required.
+Do not overwrite short description during update unless explicitly required.
 
 ## Expected update behavior
 
