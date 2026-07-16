@@ -53,6 +53,22 @@ Expected routing:
 
 `noWriteTeamIncidents[]` is manual-review only. Do not create or update when duplicates are found.
 
+## Team Configuration Item
+
+For Team incidents, use the generic ServiceNow CI:
+
+```text
+Cohesity (PRODUCTION)
+```
+
+`04_normalize_team_search.js` emits this value as:
+
+```text
+cmdb_ci
+```
+
+Cluster-specific details remain in `short_description`, `description`, and `comments`.
+
 ---
 
 # Task: create_team_incident
@@ -93,7 +109,20 @@ Use the current loop item variable from Dynatrace:
 short_description = {{ _.item.short_description }}
 description       = {{ _.item.description }}
 correlation_id    = {{ _.item.correlation_id }}
+cmdb_ci           = {{ _.item.cmdb_ci }}
 comments          = {{ _.item.comment }}
+```
+
+If the ServiceNow connector labels this field as **Configuration item**, map that field to:
+
+```text
+{{ _.item.cmdb_ci }}
+```
+
+Expected value:
+
+```text
+Cohesity (PRODUCTION)
 ```
 
 ## Recommended static fields
@@ -162,7 +191,7 @@ comments       = {{ _.item.comment }}
 correlation_id = {{ _.item.correlation_id }}
 ```
 
-Do not overwrite short description during update unless explicitly required.
+Do not overwrite short description or configuration item during update unless explicitly required.
 
 ## Expected update behavior
 
