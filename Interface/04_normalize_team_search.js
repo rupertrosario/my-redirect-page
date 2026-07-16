@@ -20,6 +20,8 @@ export default async function ({ execution_id }) {
     "servicenow_search_team"
   ];
 
+  const TEAM_CMDB_CI = "Cohesity (PRODUCTION)";
+
   function text(v) {
     if (v === null || v === undefined) return "";
     return String(v).trim();
@@ -206,14 +208,12 @@ export default async function ({ execution_id }) {
       candidate.clusterName ||
       candidate.ClusterName ||
       candidate.cluster_name ||
-      candidate.Cluster ||
-      candidate.cmdb_ci ||
-      candidate.configuration_item
+      candidate.Cluster
     );
   }
 
-  function getConfigurationItem(candidate) {
-    return getClusterName(candidate);
+  function getConfigurationItem() {
+    return TEAM_CMDB_CI;
   }
 
   function getShortDescription(candidate) {
