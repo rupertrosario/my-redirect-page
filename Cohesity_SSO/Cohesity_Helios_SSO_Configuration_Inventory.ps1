@@ -179,7 +179,7 @@ foreach ($cluster in $clusters) {
             Enabled              = "N/A"
             AllowLocalUserLogin  = "N/A"
             Domain               = "N/A"
-            IssuerId             = "N/A"
+            ProviderIssuerId     = "N/A"
             SSOUrl               = "N/A"
             Roles                = "N/A"
             SamlAttributeName    = "N/A"
@@ -202,7 +202,7 @@ foreach ($cluster in $clusters) {
             Enabled              = "N/A"
             AllowLocalUserLogin  = "N/A"
             Domain               = "N/A"
-            IssuerId             = "N/A"
+            ProviderIssuerId     = "N/A"
             SSOUrl               = "N/A"
             Roles                = "N/A"
             SamlAttributeName    = "N/A"
@@ -252,7 +252,7 @@ foreach ($cluster in $clusters) {
             Enabled              = To-YesNo (Get-PropertyValue -Object $idp -Names @("isEnabled"))
             AllowLocalUserLogin  = To-YesNo (Get-PropertyValue -Object $idp -Names @("allowLocalUserLogin"))
             Domain               = To-Text (Get-PropertyValue -Object $idp -Names @("domain"))
-            IssuerId             = To-Text (Get-PropertyValue -Object $idp -Names @("issuerId"))
+            ProviderIssuerId     = To-Text (Get-PropertyValue -Object $idp -Names @("issuerId"))
             SSOUrl               = To-Text (Get-PropertyValue -Object $idp -Names @("ssoUrl"))
             Roles                = To-Text (Get-PropertyValue -Object $idp -Names @("roles"))
             SamlAttributeName    = To-Text (Get-PropertyValue -Object $idp -Names @("samlAttributeName"))
@@ -268,7 +268,7 @@ foreach ($cluster in $clusters) {
 $rows = @($rows | Sort-Object Cluster, IdentityProviderName)
 
 $rows |
-    Select-Object Cluster, QueryStatus, SSOConfigured, IdentityProviderName, Enabled, Domain, Roles, MissingFields |
+    Select-Object Cluster, QueryStatus, SSOConfigured, IdentityProviderName, Enabled, Domain, ProviderIssuerId, SSOUrl, Roles, MissingFields |
     Format-Table -AutoSize -Wrap |
     Out-Host
 
