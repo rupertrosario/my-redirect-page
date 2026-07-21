@@ -53,16 +53,39 @@ function Get-Json {
 }
 
 function Get-PropertyValue {
-    param($Object, [string[]]$Names)
+    param(
+        $Object,
+        [Parameter(Mandatory)][string[]]$Names
+    )
 
     if ($null -eq $Object) { return $null }
+
     foreach ($name in $Names) {
-        $property = @($Object.PSObject.Properties | Where-Object { $_.Name -ieq $name } | Select-Object -First 1)
-        if (@($property).Count -gt 0 -and $null -ne $property[0].Value) {
-            return $property[0].Value
+        $property = $Object.PSObject.Properties |
+            Where-Object { $_.Name -ieq $name } |
+            Select-Object -First 1
+
+        if ($null -ne $property) {
+            return $property.Value
         }
     }
+
     return $null
+}
+
+function Test-PropertyExists {
+    param(
+        $Object,
+        [Parameter(Mandatory)][string]$Name
+    )
+
+    if ($null -eq $Object) { return $false }
+
+    $property = $Object.PSObject.Properties |
+        Where-Object { $_.Name -ieq $Name } |
+        Select-Object -First 1
+
+    return ($null -ne $property)
 }
 
 function To-Text {
@@ -80,12 +103,22 @@ function To-Text {
     return (($items | Select-Object -Unique) -join "; ")
 }
 
+function To-YesNo {
+    param($Value)
+
+    if ($null -eq $Value) { return "N/A" }
+    if ([bool]$Value) { return "Yes" }
+    return "No"
+}
+
 function Get-IdpArray {
     param($Response)
 
     if ($null -eq $Response) { return @() }
+
     $idps = Get-PropertyValue -Object $Response -Names @("idps")
     if ($null -eq $idps) { return @() }
+
     return @(@($idps) | Where-Object { $null -ne $_ })
 }
 
@@ -136,6 +169,7 @@ foreach ($cluster in $clusters) {
     catch {
         $message = $_.Exception.Message
         $issues += [pscustomobject]@{ Cluster = $clusterName; Issue = $message }
+
         $rows += [pscustomobject][ordered]@{
             Cluster              = $clusterName
             ClusterId            = $clusterId
@@ -152,6 +186,7 @@ foreach ($cluster in $clusters) {
             SignRequest          = "N/A"
             TenantId             = "N/A"
             Id                   = "N/A"
+            MissingFields        = "N/A"
             Issue                = $message
         }
         continue
@@ -174,28 +209,57 @@ foreach ($cluster in $clusters) {
             SignRequest          = "N/A"
             TenantId             = "N/A"
             Id                   = "N/A"
+            MissingFields        = "N/A"
             Issue                = ""
         }
         continue
     }
 
     foreach ($idp in $idps) {
+        $expectedFields = @(
+            "name",
+            "isEnabled",
+            "allowLocalUserLogin",
+            "domain",
+            "issuerId",
+            "ssoUrl",
+            "roles",
+            "samlAttributeName",
+            "signRequest",
+            "tenantId",
+            "id"
+        )
+
+        $missingFields = @(
+            $expectedFields | Where-Object {
+                -not (Test-PropertyExists -Object $idp -Name $_)
+            }
+        )
+
+        $missingFieldsText = if (@($missingFields).Count -gt 0) {
+            $missingFields -join "; "
+        }
+        else {
+            "None"
+        }
+
         $rows += [pscustomobject][ordered]@{
             Cluster              = $clusterName
             ClusterId            = $clusterId
             QueryStatus          = "Success"
             SSOConfigured        = "Yes"
-            IdentityProviderName = (To-Text $idp.name)
-            Enabled              = if ($null -eq $idp.isEnabled) { "N/A" } elseif ([bool]$idp.isEnabled) { "Yes" } else { "No" }
-            AllowLocalUserLogin  = if ($null -eq $idp.allowLocalUserLogin) { "N/A" } elseif ([bool]$idp.allowLocalUserLogin) { "Yes" } else { "No" }
-            Domain               = (To-Text $idp.domain)
-            IssuerId             = (To-Text $idp.issuerId)
-            SSOUrl               = (To-Text $idp.ssoUrl)
-            Roles                = (To-Text $idp.roles)
-            SamlAttributeName    = (To-Text $idp.samlAttributeName)
-            SignRequest          = if ($null -eq $idp.signRequest) { "N/A" } elseif ([bool]$idp.signRequest) { "Yes" } else { "No" }
-            TenantId             = (To-Text $idp.tenantId)
-            Id                   = (To-Text $idp.id)
+            IdentityProviderName = To-Text (Get-PropertyValue -Object $idp -Names @("name"))
+            Enabled              = To-YesNo (Get-PropertyValue -Object $idp -Names @("isEnabled"))
+            AllowLocalUserLogin  = To-YesNo (Get-PropertyValue -Object $idp -Names @("allowLocalUserLogin"))
+            Domain               = To-Text (Get-PropertyValue -Object $idp -Names @("domain"))
+            IssuerId             = To-Text (Get-PropertyValue -Object $idp -Names @("issuerId"))
+            SSOUrl               = To-Text (Get-PropertyValue -Object $idp -Names @("ssoUrl"))
+            Roles                = To-Text (Get-PropertyValue -Object $idp -Names @("roles"))
+            SamlAttributeName    = To-Text (Get-PropertyValue -Object $idp -Names @("samlAttributeName"))
+            SignRequest          = To-YesNo (Get-PropertyValue -Object $idp -Names @("signRequest"))
+            TenantId             = To-Text (Get-PropertyValue -Object $idp -Names @("tenantId"))
+            Id                   = To-Text (Get-PropertyValue -Object $idp -Names @("id"))
+            MissingFields        = $missingFieldsText
             Issue                = ""
         }
     }
@@ -204,7 +268,7 @@ foreach ($cluster in $clusters) {
 $rows = @($rows | Sort-Object Cluster, IdentityProviderName)
 
 $rows |
-    Select-Object Cluster, QueryStatus, SSOConfigured, IdentityProviderName, Enabled, Domain, Roles |
+    Select-Object Cluster, QueryStatus, SSOConfigured, IdentityProviderName, Enabled, Domain, Roles, MissingFields |
     Format-Table -AutoSize -Wrap |
     Out-Host
 
