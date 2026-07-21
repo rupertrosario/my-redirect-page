@@ -185,17 +185,17 @@ foreach ($cluster in $clusters) {
             ClusterId            = $clusterId
             QueryStatus          = "Success"
             SSOConfigured        = "Yes"
-            IdentityProviderName = To-Text $idp.name
+            IdentityProviderName = (To-Text $idp.name)
             Enabled              = if ($null -eq $idp.isEnabled) { "N/A" } elseif ([bool]$idp.isEnabled) { "Yes" } else { "No" }
             AllowLocalUserLogin  = if ($null -eq $idp.allowLocalUserLogin) { "N/A" } elseif ([bool]$idp.allowLocalUserLogin) { "Yes" } else { "No" }
-            Domain               = To-Text $idp.domain
-            IssuerId             = To-Text $idp.issuerId
-            SSOUrl               = To-Text $idp.ssoUrl
-            Roles                = To-Text $idp.roles
-            SamlAttributeName    = To-Text $idp.samlAttributeName
+            Domain               = (To-Text $idp.domain)
+            IssuerId             = (To-Text $idp.issuerId)
+            SSOUrl               = (To-Text $idp.ssoUrl)
+            Roles                = (To-Text $idp.roles)
+            SamlAttributeName    = (To-Text $idp.samlAttributeName)
             SignRequest          = if ($null -eq $idp.signRequest) { "N/A" } elseif ([bool]$idp.signRequest) { "Yes" } else { "No" }
-            TenantId             = To-Text $idp.tenantId
-            Id                   = To-Text $idp.id
+            TenantId             = (To-Text $idp.tenantId)
+            Id                   = (To-Text $idp.id)
             Issue                = ""
         }
     }
