@@ -42,13 +42,16 @@ function Convert-ToDisplayValue {
         return "N/A"
     }
 
-    $items = @($Value) | ForEach-Object {
-        if ($null -ne $_ -and -not [string]::IsNullOrWhiteSpace([string]$_)) {
-            ([string]$_).Trim()
-        }
-    }
+    $items = @(
+        $Value |
+            ForEach-Object {
+                if ($null -ne $_ -and -not [string]::IsNullOrWhiteSpace([string]$_)) {
+                    ([string]$_).Trim()
+                }
+            }
+    )
 
-    if ($items.Count -eq 0) {
+    if (@($items).Count -eq 0) {
         return "N/A"
     }
 
@@ -66,30 +69,47 @@ catch {
     throw "Failed to query Helios identity providers: $($_.Exception.Message)"
 }
 
-$idps = if ($response.idps) {
-    @($response.idps)
-}
-else {
-    @($response)
+$idps = @()
+
+if ($null -ne $response) {
+    $idpsProperty = $response.PSObject.Properties["idps"]
+
+    if ($null -ne $idpsProperty -and $null -ne $idpsProperty.Value) {
+        $idps = @(
+            $idpsProperty.Value |
+                Where-Object { $null -ne $_ }
+        )
+    }
+    elseif ($response -is [System.Array]) {
+        $idps = @(
+            $response |
+                Where-Object { $null -ne $_ }
+        )
+    }
+    else {
+        $idps = @($response)
+    }
 }
 
-if ($idps.Count -eq 0) {
+if (@($idps).Count -eq 0) {
     Write-Warning "No Helios identity provider configurations were returned."
     return
 }
 
-$rows = foreach ($idp in $idps) {
-    [pscustomobject][ordered]@{
-        IdentityProviderName = Convert-ToDisplayValue $idp.name
-        Enabled              = if ($null -eq $idp.isEnabled) { "N/A" } elseif ($idp.isEnabled) { "Yes" } else { "No" }
-        Domain               = Convert-ToDisplayValue $idp.domain
-        IssuerId             = Convert-ToDisplayValue $idp.issuerId
-        SSOUrl               = Convert-ToDisplayValue $idp.ssoUrl
-        DefaultClusters      = Convert-ToDisplayValue $idp.defaultClusters
-        DefaultRoles         = Convert-ToDisplayValue $idp.defaultRoles
-        Id                   = Convert-ToDisplayValue $idp.id
+$rows = @(
+    foreach ($idp in $idps) {
+        [pscustomobject][ordered]@{
+            IdentityProviderName = Convert-ToDisplayValue $idp.name
+            Enabled              = if ($null -eq $idp.isEnabled) { "N/A" } elseif ($idp.isEnabled) { "Yes" } else { "No" }
+            Domain               = Convert-ToDisplayValue $idp.domain
+            IssuerId             = Convert-ToDisplayValue $idp.issuerId
+            SSOUrl               = Convert-ToDisplayValue $idp.ssoUrl
+            DefaultClusters      = Convert-ToDisplayValue $idp.defaultClusters
+            DefaultRoles         = Convert-ToDisplayValue $idp.defaultRoles
+            Id                   = Convert-ToDisplayValue $idp.id
+        }
     }
-}
+)
 
 $rows = @($rows | Sort-Object IdentityProviderName, Domain)
 
@@ -100,5 +120,5 @@ $csvPath = Join-Path $logDirectory "Cohesity_Helios_SSO_Configuration_$timestamp
 
 $rows | Export-Csv -Path $csvPath -NoTypeInformation -Encoding UTF8
 
-Write-Host "Identity provider configurations: $($rows.Count)"
+Write-Host "Identity provider configurations: $(@($rows).Count)"
 Write-Host "CSV output: $csvPath"
