@@ -43,7 +43,7 @@ function Convert-ToDisplayValue {
     }
 
     $items = @(
-        $Value |
+        @($Value) |
             ForEach-Object {
                 if ($null -ne $_ -and -not [string]::IsNullOrWhiteSpace([string]$_)) {
                     ([string]$_).Trim()
