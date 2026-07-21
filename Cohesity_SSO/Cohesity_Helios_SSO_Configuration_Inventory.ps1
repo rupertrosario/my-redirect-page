@@ -1,5 +1,5 @@
 # Cohesity Helios SSO / Identity Provider Inventory
-# Multi-cluster | Helios | GET-only | PowerShell 5.1 compatible
+# Multi-cluster assignment report | Helios | GET-only | PowerShell 5.1 compatible
 
 $ErrorActionPreference = "Stop"
 $FormatEnumerationLimit = -1
@@ -26,32 +26,19 @@ if ([string]::IsNullOrWhiteSpace($apiKey)) {
     throw "AES API key helper returned an empty API key."
 }
 
-function New-Headers {
-    param([string]$ClusterId)
-
-    $headers = @{
-        accept = "application/json"
-        apiKey = $apiKey
-    }
-
-    if (-not [string]::IsNullOrWhiteSpace($ClusterId)) {
-        $headers["accessClusterId"] = $ClusterId
-    }
-
-    return $headers
+$headers = @{
+    accept = "application/json"
+    apiKey = $apiKey
 }
 
 function Get-Json {
-    param(
-        [Parameter(Mandatory)] [string]$Uri,
-        [Parameter(Mandatory)] [hashtable]$Headers
-    )
+    param([Parameter(Mandatory)][string]$Uri)
 
     if ($PSVersionTable.PSVersion.Major -lt 6) {
-        $response = Invoke-WebRequest -Uri $Uri -Headers $Headers -Method Get -UseBasicParsing -ErrorAction Stop
+        $response = Invoke-WebRequest -Uri $Uri -Headers $headers -Method Get -UseBasicParsing -ErrorAction Stop
     }
     else {
-        $response = Invoke-WebRequest -Uri $Uri -Headers $Headers -Method Get -ErrorAction Stop
+        $response = Invoke-WebRequest -Uri $Uri -Headers $headers -Method Get -ErrorAction Stop
     }
 
     if ($null -eq $response -or [string]::IsNullOrWhiteSpace($response.Content)) {
@@ -63,15 +50,33 @@ function Get-Json {
 
 function As-Array {
     param($Value)
-    if ($null -eq $Value) { return @() }
-    return @($Value)
+    if ($null -eq $Value) { return ,@() }
+    return ,@($Value)
 }
 
-function Convert-ToDisplayValue {
+function Get-PropertyValue {
+    param($Object, [string[]]$Names)
+
+    if ($null -eq $Object) { return $null }
+
+    foreach ($name in $Names) {
+        $property = $Object.PSObject.Properties |
+            Where-Object { $_.Name -ieq $name } |
+            Select-Object -First 1
+
+        if ($null -ne $property -and $null -ne $property.Value) {
+            return $property.Value
+        }
+    }
+
+    return $null
+}
+
+function To-Text {
     param($Value)
 
-    $items = @(
-        As-Array $Value |
+    $values = @(
+        @(As-Array $Value) |
             ForEach-Object {
                 if ($null -ne $_ -and -not [string]::IsNullOrWhiteSpace([string]$_)) {
                     ([string]$_).Trim()
@@ -79,45 +84,66 @@ function Convert-ToDisplayValue {
             }
     )
 
-    if (@($items).Count -eq 0) { return "N/A" }
-    return (($items | Select-Object -Unique) -join "; ")
-}
-
-function First-Property {
-    param(
-        $Object,
-        [string[]]$Names
-    )
-
-    if ($null -eq $Object -or $Object -is [string]) { return "N/A" }
-
-    foreach ($name in $Names) {
-        foreach ($property in @($Object.PSObject.Properties)) {
-            if ($property.Name -ieq $name) {
-                $value = Convert-ToDisplayValue $property.Value
-                if ($value -ne "N/A") { return $value }
-            }
-        }
-    }
-
-    return "N/A"
+    if ($values.Length -eq 0) { return "N/A" }
+    return (($values | Select-Object -Unique) -join "; ")
 }
 
 function Get-IdpArray {
     param($Response)
 
-    if ($null -eq $Response) { return @() }
+    if ($null -eq $Response) { return ,@() }
 
-    $idpsProperty = $Response.PSObject.Properties["idps"]
-    if ($null -ne $idpsProperty -and $null -ne $idpsProperty.Value) {
-        return @($idpsProperty.Value | Where-Object { $null -ne $_ })
+    $value = Get-PropertyValue $Response @("idps", "identityProviders")
+    if ($null -ne $value) {
+        return ,@(@(As-Array $value) | Where-Object { $null -ne $_ })
     }
 
     if ($Response -is [System.Array]) {
-        return @($Response | Where-Object { $null -ne $_ })
+        return ,@($Response | Where-Object { $null -ne $_ })
     }
 
-    return @($Response)
+    return ,@($Response)
+}
+
+function Get-AssignedClusterTokens {
+    param($Idp)
+
+    $assigned = Get-PropertyValue $Idp @("defaultClusters", "clusters", "clusterIds")
+    $tokens = @()
+
+    foreach ($item in @(As-Array $assigned)) {
+        if ($null -eq $item) { continue }
+
+        if ($item -is [string] -or $item -is [ValueType]) {
+            $text = ([string]$item).Trim()
+            if (-not [string]::IsNullOrWhiteSpace($text)) { $tokens += $text }
+            continue
+        }
+
+        foreach ($name in @("clusterId", "id", "clusterName", "displayName", "name")) {
+            $value = Get-PropertyValue $item @($name)
+            if ($null -ne $value -and -not [string]::IsNullOrWhiteSpace([string]$value)) {
+                $tokens += ([string]$value).Trim()
+            }
+        }
+    }
+
+    return ,@($tokens | Select-Object -Unique)
+}
+
+function Test-IdpAssignedToCluster {
+    param($Idp, [string]$ClusterId, [string]$ClusterName)
+
+    $tokens = @(Get-AssignedClusterTokens $Idp)
+    if ($tokens.Length -eq 0) { return $false }
+
+    foreach ($token in $tokens) {
+        if ($token -ieq $ClusterId -or $token -ieq $ClusterName) {
+            return $true
+        }
+    }
+
+    return $false
 }
 
 Write-Host "=============================================" -ForegroundColor Cyan
@@ -125,57 +151,43 @@ Write-Host "   COHESITY SSO CONFIGURATION INVENTORY" -ForegroundColor White
 Write-Host "=============================================" -ForegroundColor Cyan
 
 try {
-    $clusterJson = Get-Json -Uri "$baseUrl/v2/mcm/cluster-mgmt/info" -Headers (New-Headers)
+    $clusterJson = Get-Json -Uri "$baseUrl/v2/mcm/cluster-mgmt/info"
+    $idpJson     = Get-Json -Uri "$baseUrl/v2/mcm/idps"
 }
 catch {
-    throw "Failed to query Helios clusters: $($_.Exception.Message)"
+    throw "Failed to query Helios: $($_.Exception.Message)"
 }
 
 $clusters = @()
 if ($null -ne $clusterJson) {
-    if ($clusterJson.cohesityClusters) { $clusters = @($clusterJson.cohesityClusters) }
-    elseif ($clusterJson.clusters) { $clusters = @($clusterJson.clusters) }
-    elseif ($clusterJson.clusterInfos) { $clusters = @($clusterJson.clusterInfos) }
-    elseif ($clusterJson.mcmInfo -and $clusterJson.mcmInfo.clusterInfos) { $clusters = @($clusterJson.mcmInfo.clusterInfos) }
+    $clusterSource = Get-PropertyValue $clusterJson @("cohesityClusters", "clusters", "clusterInfos")
+    if ($null -eq $clusterSource) {
+        $mcmInfo = Get-PropertyValue $clusterJson @("mcmInfo")
+        if ($null -ne $mcmInfo) {
+            $clusterSource = Get-PropertyValue $mcmInfo @("clusterInfos")
+        }
+    }
+    $clusters = @(@(As-Array $clusterSource) | Where-Object { $null -ne $_ })
 }
 
-if (@($clusters).Count -eq 0) {
+if ($clusters.Length -eq 0) {
     throw "No clusters were returned from Helios."
 }
 
-$clusters = @($clusters | Sort-Object { First-Property $_ @("clusterName", "displayName", "name") })
+$idps = @(Get-IdpArray -Response $idpJson)
 $rows = @()
-$issues = @()
 
 foreach ($cluster in $clusters) {
-    $clusterName = First-Property $cluster @("clusterName", "displayName", "name")
-    $clusterId   = First-Property $cluster @("clusterId", "id")
+    $clusterName = To-Text (Get-PropertyValue $cluster @("clusterName", "displayName", "name"))
+    $clusterId   = To-Text (Get-PropertyValue $cluster @("clusterId", "id"))
 
-    if ($clusterName -eq "N/A") { $clusterName = "Unknown" }
-
-    if ($clusterId -eq "N/A") {
-        $issues += [pscustomobject]@{
-            Cluster = $clusterName
-            Issue   = "Cluster ID missing"
+    $assignedIdps = @(
+        $idps | Where-Object {
+            Test-IdpAssignedToCluster -Idp $_ -ClusterId $clusterId -ClusterName $clusterName
         }
-        continue
-    }
+    )
 
-    Write-Host "Querying SSO configuration for $clusterName..." -ForegroundColor Yellow
-
-    try {
-        $idpResponse = Get-Json -Uri "$baseUrl/v2/mcm/idps" -Headers (New-Headers -ClusterId $clusterId)
-        $idps = @(Get-IdpArray -Response $idpResponse)
-    }
-    catch {
-        $issues += [pscustomobject]@{
-            Cluster = $clusterName
-            Issue   = $_.Exception.Message
-        }
-        continue
-    }
-
-    if (@($idps).Count -eq 0) {
+    if ($assignedIdps.Length -eq 0) {
         $rows += [pscustomobject][ordered]@{
             Cluster              = $clusterName
             ClusterId            = $clusterId
@@ -192,28 +204,26 @@ foreach ($cluster in $clusters) {
         continue
     }
 
-    foreach ($idp in $idps) {
+    foreach ($idp in $assignedIdps) {
+        $enabledValue = Get-PropertyValue $idp @("isEnabled", "enabled")
+
         $rows += [pscustomobject][ordered]@{
             Cluster              = $clusterName
             ClusterId            = $clusterId
             SSOConfigured        = "Yes"
-            IdentityProviderName = Convert-ToDisplayValue $idp.name
-            Enabled              = if ($null -eq $idp.isEnabled) { "N/A" } elseif ($idp.isEnabled) { "Yes" } else { "No" }
-            Domain               = Convert-ToDisplayValue $idp.domain
-            IssuerId             = Convert-ToDisplayValue $idp.issuerId
-            SSOUrl               = Convert-ToDisplayValue $idp.ssoUrl
-            DefaultClusters      = Convert-ToDisplayValue $idp.defaultClusters
-            DefaultRoles         = Convert-ToDisplayValue $idp.defaultRoles
-            Id                   = Convert-ToDisplayValue $idp.id
+            IdentityProviderName = To-Text (Get-PropertyValue $idp @("name", "displayName"))
+            Enabled              = if ($null -eq $enabledValue) { "N/A" } elseif ([bool]$enabledValue) { "Yes" } else { "No" }
+            Domain               = To-Text (Get-PropertyValue $idp @("domain", "domains"))
+            IssuerId             = To-Text (Get-PropertyValue $idp @("issuerId", "issuer"))
+            SSOUrl               = To-Text (Get-PropertyValue $idp @("ssoUrl", "loginUrl"))
+            DefaultClusters      = To-Text (Get-AssignedClusterTokens $idp)
+            DefaultRoles         = To-Text (Get-PropertyValue $idp @("defaultRoles", "roles"))
+            Id                   = To-Text (Get-PropertyValue $idp @("id", "idpId"))
         }
     }
 }
 
-$rows = @($rows | Sort-Object Cluster, IdentityProviderName, Domain)
-
-if (@($rows).Count -eq 0) {
-    throw "No SSO inventory rows were produced."
-}
+$rows = @($rows | Sort-Object Cluster, IdentityProviderName)
 
 $rows |
     Select-Object Cluster, SSOConfigured, IdentityProviderName, Enabled, Domain, DefaultRoles |
@@ -225,12 +235,7 @@ $csvPath = Join-Path $logDirectory "Cohesity_Helios_SSO_Configuration_$timestamp
 $rows | Export-Csv -Path $csvPath -NoTypeInformation -Encoding UTF8
 
 Write-Host ""
-Write-Host "Clusters discovered : $(@($clusters).Count)"
-Write-Host "Inventory rows      : $(@($rows).Count)"
-Write-Host "Cluster query issues: $(@($issues).Count)"
+Write-Host "Clusters discovered : $($clusters.Length)"
+Write-Host "Helios IDPs returned: $($idps.Length)"
+Write-Host "Inventory rows      : $($rows.Length)"
 Write-Host "CSV output          : $csvPath"
-
-if (@($issues).Count -gt 0) {
-    Write-Warning "One or more clusters could not be queried."
-    $issues | Format-Table -AutoSize -Wrap | Out-Host
-}
