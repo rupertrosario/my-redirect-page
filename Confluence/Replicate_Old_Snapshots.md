@@ -52,17 +52,18 @@ Navigate to the script directory:
 Set-Location "<SCRIPT_PATH>"
 ```
 
-Confirm that both required files are present:
+Confirm that the required files are present:
 
 ```powershell
-Get-ChildItem .\replicateOldSnapshots.ps1, .\cohesity-api.ps1
+Get-ChildItem .\replicateOldSnapshots.ps1, .\cohesity-api.ps1, .\Get_Replication_Date_Filters.ps1
 ```
 
-Required files:
+Files:
 
 ```text
 replicateOldSnapshots.ps1
 cohesity-api.ps1
+Get_Replication_Date_Filters.ps1   # Optional helper for date-filter calculation
 ```
 
 ---
@@ -344,23 +345,50 @@ Execution date minus 30 days
 </details>
 
 <details>
-<summary><strong>D. Replicate a Snapshot from a Specific Date</strong></summary>
+<summary><strong>D. Generate Filters for Specific Backup Dates</strong></summary>
 
-The script accepts age in days rather than a calendar date.
+The replication script accepts relative age values through `-newerThan` and `-olderThan`; it does not accept calendar dates directly.
 
-Calculate the number of days between the execution date and the required backup date:
+Use the helper stored in the same script directory:
 
-```powershell
-$targetDate = Get-Date "<TARGET_BACKUP_DATE>"
-$ageDays = [math]::Floor(((Get-Date) - $targetDate).TotalDays)
-
-$newerThan = $ageDays + 1
-$olderThan = $ageDays
-
-Write-Host "Use -newerThan $newerThan -olderThan $olderThan"
+```text
+Get_Replication_Date_Filters.ps1
 ```
 
-Use the calculated values:
+> **Run the helper on the actual day the replication will be performed. The calculated values change depending on the run date.**
+
+Run:
+
+```powershell
+.\Get_Replication_Date_Filters.ps1
+```
+
+The helper provides four options:
+
+```text
+1. Single backup date
+2. Continuous date range
+3. Random dates - maximum 5
+4. Dates from a text file - use for more than 5
+```
+
+### Example 1: Single Backup Date
+
+Assuming the helper is run on **21 July 2026**:
+
+```text
+Select option 1-4: 1
+Enter backup date (yyyy-MM-dd): 2026-07-01
+
+============================================================
+Single backup date
+Run date:          21 July 2026
+Backup date range: 01 July 2026 to 01 July 2026
+Number of days:    1
+Use: -newerThan 21 -olderThan 20
+```
+
+Use the generated values in the replication preview:
 
 ```powershell
 .\replicateOldSnapshots.ps1 `
@@ -369,18 +397,83 @@ Use the calculated values:
     -domain "<DOMAIN>" `
     -replicateTo "<TARGET_CLUSTER>" `
     -jobName "<PROTECTION_GROUP>" `
-    -newerThan <AGE_DAYS_PLUS_1> `
-    -olderThan <AGE_DAYS>
+    -newerThan 21 `
+    -olderThan 20
 ```
 
-Example for a snapshot approximately 45 days old:
+### Example 2: Continuous 10-Day Range
+
+```text
+Select option 1-4: 2
+Enter first backup date (yyyy-MM-dd): 2026-07-01
+Enter last backup date (yyyy-MM-dd): 2026-07-10
+
+============================================================
+Continuous backup date range
+Run date:          21 July 2026
+Backup date range: 01 July 2026 to 10 July 2026
+Number of days:    10
+Use: -newerThan 21 -olderThan 11
+```
+
+Use:
 
 ```powershell
--newerThan 46 `
--olderThan 45
+-newerThan 21 `
+-olderThan 11
 ```
 
-> **The filters use rolling 24-hour periods based on the script execution time. Confirm the exact snapshot timestamp in preview mode.**
+### Example 3: Random Dates
+
+```text
+Select option 1-4: 3
+Enter up to 5 dates separated by commas (yyyy-MM-dd): 2026-07-01, 2026-07-05, 2026-07-12
+```
+
+Example output:
+
+```text
+============================================================
+Random backup date
+Backup date range: 01 July 2026 to 01 July 2026
+Use: -newerThan 21 -olderThan 20
+
+============================================================
+Random backup date
+Backup date range: 05 July 2026 to 05 July 2026
+Use: -newerThan 17 -olderThan 16
+
+============================================================
+Random backup date
+Backup date range: 12 July 2026 to 12 July 2026
+Use: -newerThan 10 -olderThan 9
+```
+
+> **Random dates are non-contiguous. Run each generated filter pair separately so snapshots between the selected dates are not included.**
+
+### Example 4: Dates from a File
+
+For more than five non-contiguous dates, create a text file with one date per line:
+
+```text
+2026-07-01
+2026-07-05
+2026-07-12
+2026-07-18
+2026-07-19
+2026-07-20
+```
+
+Run:
+
+```text
+Select option 1-4: 4
+Enter text-file path: C:\Scripts\backup-dates.txt
+```
+
+The helper generates one `-newerThan` and `-olderThan` pair for each date.
+
+> **Run each generated pair separately in preview mode. Confirm that the required snapshot is displayed as `Would replicate` before adding `-commit`.**
 
 </details>
 
