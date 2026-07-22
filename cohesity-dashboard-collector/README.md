@@ -1,37 +1,51 @@
-# Cohesity dashboard collector
+# Cohesity Fleet Dashboard
 
-This package creates the JSON needed for the current mock-up: KPI cards, cluster list, and the selected-cluster overview.
+Complete collector and clickable dashboard for the current mock-up. It collects every cluster available through Helios and shows fleet KPIs, a cluster table, and a selected-cluster detail panel.
 
-## Authentication method
+## Authentication
 
-The collector uses the same method as `inventory/Get-CohesityProtectionInventory.ps1`:
+Uses the same working method as `inventory/Get-CohesityProtectionInventory.ps1`:
 
-- AES-encrypted API key loaded by `ApiKeyAesHelper.ps1`
-- Helios `apiKey` request header
-- `accessClusterId` header for cluster-scoped API calls
+- AES-encrypted API key loaded through `ApiKeyAesHelper.ps1`
+- Helios `apiKey` header
+- Cluster-scoped `accessClusterId` header
 
-No username, password, Bearer token, or API key is stored in this folder.
+No credential is stored in this folder.
 
-## Run
-
-1. Copy `config.example.psd1` to `config.psd1`.
-2. Confirm `ApiKeyHelperPath` and `EncryptedApiKeyPath`.
-3. Run:
+## One-time setup
 
 ```powershell
-./Collect-CohesityDashboard.ps1
+Copy-Item .\config.example.psd1 .\config.psd1
+notepad .\config.psd1
 ```
 
-Output: `output/dashboard.json`.
+Set `ApiKeyHelperPath`, `EncryptedApiKeyPath`, target version, and endpoint paths if your tenant differs.
+
+## Run the complete solution
+
+From Windows PowerShell or PowerShell 7:
+
+```powershell
+Set-Location .\cohesity-dashboard-collector
+.\Run-CohesityDashboard.ps1
+```
+
+The launcher collects all clusters into `output/dashboard.json`, starts a local web server, and opens the clickable dashboard at `http://localhost:8765/`. Press Ctrl+C in PowerShell to stop it.
+
+To generate JSON only:
+
+```powershell
+.\Collect-CohesityDashboard.ps1
+```
+
+## Output
+
+The page shows total/healthy/warning clusters, critical alerts, cluster name, location, version baseline, health, and capacity. Clicking a cluster shows capacity, protected sources, 7-day backup success, active policies, and open alerts.
+
+`sample/dashboard.sample.json` shows the expected schema. The SNOW button currently copies a safe incident payload; connect it to the approved ServiceNow API or Dynatrace webhook only after the endpoint and authentication method are confirmed.
 
 ## Validation
 
-Run against two clusters first and compare the generated capacity, protected-source, protection-group, run-success, and alert counts with Helios. Tenant response mappings remain isolated in `ConvertTo-DashboardModel.ps1`.
+Run once and compare one selected cluster's seven displayed values with Helios. If a value is blank, adjust only the response aliases in `modules/ConvertTo-DashboardModel.ps1` or the endpoint in `config.psd1`.
 
-For offline mapping, place `Clusters.json`, `Alerts.json`, `ProtectionGroups.json`, `Sources.json`, and `Runs.json` in a folder and run:
-
-```powershell
-./Collect-CohesityDashboard.ps1 -FixtureDirectory ./fixtures
-```
-
-Do not commit `config.psd1` or encrypted key material.
+Do not commit `config.psd1`, output JSON, or encrypted key material.
