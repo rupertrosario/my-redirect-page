@@ -2,7 +2,7 @@ function ConvertTo-DashboardModel {
     [CmdletBinding()]
     param([hashtable]$Raw, [hashtable]$Config)
 
-    $clusters = Get-Collection $Raw.Clusters @('clusters', 'items', 'data')
+    $clusters = Get-Collection $Raw.Clusters @('cohesityClusters', 'clusters', 'clusterInfos', 'items', 'data')
     $alerts = Get-Collection $Raw.Alerts @('alerts', 'items', 'data')
     $groups = Get-Collection $Raw.ProtectionGroups @('protectionGroups', 'items', 'data')
     $sources = Get-Collection $Raw.Sources @('sources', 'items', 'data')
@@ -10,7 +10,7 @@ function ConvertTo-DashboardModel {
 
     $clusterRows = foreach ($cluster in $clusters) {
         $id = [string](Get-PropertyValue $cluster @('clusterId', 'id'))
-        $name = [string](Get-PropertyValue $cluster @('clusterName', 'name') 'Unknown')
+        $name = [string](Get-PropertyValue $cluster @('clusterName', 'displayName', 'name') 'Unknown')
         $clusterAlerts = @($alerts | Where-Object { [string](Get-PropertyValue $_ @('clusterId', 'cluster_id')) -eq $id })
         $clusterGroups = @($groups | Where-Object { [string](Get-PropertyValue $_ @('clusterId', 'cluster_id')) -eq $id })
         $clusterSources = @($sources | Where-Object { [string](Get-PropertyValue $_ @('clusterId', 'cluster_id')) -eq $id })
