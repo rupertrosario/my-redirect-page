@@ -39,18 +39,17 @@ cohesity-dashboard-collector/
 │   ├── Get-ClusterSnapshot.ps1         # inventory/capacity/GC/failures
 │   └── ConvertTo-DashboardModel.ps1     # alerts, totals, stale-data merge
 ├── output/                              # generated locally; Git ignored
-└── sample/dashboard.sample.json         # UI/data-contract example
 ```
 
 ## Local location and first run
 
-Download the complete `cohesity-dashboard-collector` folder and keep it here:
+Copy the complete `cohesity-dashboard-collector` folder and keep it here:
 
 ```text
 X:\PowerShell\Cohesity_API_Scripts\cohesity-dashboard-collector\
 ```
 
-Do not download, install, or move the individual modules. On the first run, the launcher automatically creates the local `config.psd1` from the included template. Its defaults already point to:
+Keep every included file and the `modules` folder together; nothing is installed separately. On the first run, the launcher automatically creates the local `config.psd1` from the included template. Its defaults already point to:
 
 ```powershell
 ApiKeyHelperPath    = 'X:\PowerShell\Cohesity_API_Scripts\Common\ApiKeyAesHelper.ps1'
