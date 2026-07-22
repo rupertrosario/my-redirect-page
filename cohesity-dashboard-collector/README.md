@@ -1,22 +1,32 @@
 # Cohesity dashboard collector
 
-This package creates the JSON needed for the current mock-up: KPI cards, cluster list, and the selected-cluster overview (location, version, health, capacity, protected sources, seven-day backup success, active policies, and alerts).
+This package creates the JSON needed for the current mock-up: KPI cards, cluster list, and the selected-cluster overview.
+
+## Authentication method
+
+The collector uses the same method as `inventory/Get-CohesityProtectionInventory.ps1`:
+
+- AES-encrypted API key loaded by `ApiKeyAesHelper.ps1`
+- Helios `apiKey` request header
+- `accessClusterId` header for cluster-scoped API calls
+
+No username, password, Bearer token, or API key is stored in this folder.
 
 ## Run
 
 1. Copy `config.example.psd1` to `config.psd1`.
-2. Set an API key, or set the username and pass `-Password (Read-Host -AsSecureString)`.
+2. Confirm `ApiKeyHelperPath` and `EncryptedApiKeyPath`.
 3. Run:
 
 ```powershell
-./Collect-CohesityDashboard.ps1 -Password (Read-Host -AsSecureString)
+./Collect-CohesityDashboard.ps1
 ```
 
 Output: `output/dashboard.json`.
 
-## Important validation
+## Validation
 
-Helios response envelopes and endpoint availability can differ by tenant/release. Run against two clusters, review any endpoint warning, and compare the generated counts with Helios. If a response uses different field names, update only `ConvertTo-DashboardModel.ps1`; API calls remain isolated in `Get-HeliosData.ps1`.
+Run against two clusters first and compare the generated capacity, protected-source, protection-group, run-success, and alert counts with Helios. Tenant response mappings remain isolated in `ConvertTo-DashboardModel.ps1`.
 
 For offline mapping, place `Clusters.json`, `Alerts.json`, `ProtectionGroups.json`, `Sources.json`, and `Runs.json` in a folder and run:
 
@@ -24,4 +34,4 @@ For offline mapping, place `Clusters.json`, `Alerts.json`, `ProtectionGroups.jso
 ./Collect-CohesityDashboard.ps1 -FixtureDirectory ./fixtures
 ```
 
-Do not commit `config.psd1`; it may contain credentials.
+Do not commit `config.psd1` or encrypted key material.
