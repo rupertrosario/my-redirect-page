@@ -76,7 +76,7 @@ try {
             if ($refreshProcess -and -not $refreshProcess.HasExited) { Send-Json $context @{state='Running';message='A refresh is already running.'} 409; continue }
             $engine = (Get-Process -Id $PID).Path
             if ([string]::IsNullOrWhiteSpace($engine)) { throw 'Unable to locate the current PowerShell executable.' }
-            $arguments = @('-NoProfile','-ExecutionPolicy','Bypass','-File',('\"{0}\"' -f $collector),'-ConfigPath',('\"{0}\"' -f $ConfigPath),'-OutputPath',('\"{0}\"' -f $dataPath),'-StatusPath',('\"{0}\"' -f $statusPath))
+            $arguments = @('-NoProfile','-ExecutionPolicy','Bypass','-File',('"{0}"' -f $collector),'-ConfigPath',('"{0}"' -f $ConfigPath),'-OutputPath',('"{0}"' -f $dataPath),'-StatusPath',('"{0}"' -f $statusPath))
             $refreshProcess = Start-Process -FilePath $engine -ArgumentList $arguments -PassThru -WindowStyle Hidden
             Send-Json $context @{state='Running';message='Refresh started.';pid=$refreshProcess.Id} 202; continue
         }
