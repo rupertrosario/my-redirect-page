@@ -42,38 +42,33 @@ cohesity-dashboard-collector/
 └── sample/dashboard.sample.json         # UI/data-contract example
 ```
 
-## First-time configuration
+## Local location and first run
 
-From the folder:
+Download the complete `cohesity-dashboard-collector` folder and keep it here:
 
-```powershell
-Copy-Item .\config.example.psd1 .\config.psd1
-notepad .\config.psd1
+```text
+X:\PowerShell\Cohesity_API_Scripts\cohesity-dashboard-collector\
 ```
 
-Set only these values first:
+Do not download, install, or move the individual modules. On the first run, the launcher automatically creates the local `config.psd1` from the included template. Its defaults already point to:
 
 ```powershell
 ApiKeyHelperPath    = 'X:\PowerShell\Cohesity_API_Scripts\Common\ApiKeyAesHelper.ps1'
 EncryptedApiKeyPath = 'X:\PowerShell\Cohesity_API_Scripts\Common\Secure\cohesity_apikey.enc'
+TargetVersion       = $null
 ```
 
-`config.psd1`, generated output, and encrypted key material are intentionally excluded from Git.
+`TargetVersion = $null` means actual cluster versions are displayed without applying an unapproved baseline. `config.psd1`, generated output, and encrypted key material remain local and are excluded from Git.
 
 ## Run the complete solution
 
+Run this one command:
+
 ```powershell
-Set-Location .\cohesity-dashboard-collector
-.\Run-CohesityDashboard.ps1
+& 'X:\PowerShell\Cohesity_API_Scripts\cohesity-dashboard-collector\Run-CohesityDashboard.ps1'
 ```
 
-The first refresh completes before the browser opens. The dashboard is then available at:
-
-```text
-http://localhost:8765/
-```
-
-Keep the PowerShell window open. Press `Ctrl+C` to stop the local server.
+The first refresh completes, the local dashboard service starts, and the dashboard opens automatically in the default browser. You do not need to type `http://localhost:8765/`. Keep the PowerShell window open and press `Ctrl+C` to stop the dashboard.
 
 Useful alternatives:
 
