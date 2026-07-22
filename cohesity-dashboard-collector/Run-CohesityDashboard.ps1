@@ -8,8 +8,20 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $collector = Join-Path $PSScriptRoot 'Collect-CohesityDashboard.ps1'
+$configTemplate = Join-Path $PSScriptRoot 'config.example.psd1'
 $statusPath = Join-Path $PSScriptRoot 'output/refresh-status.json'
 $dataPath = Join-Path $PSScriptRoot 'output/dashboard.json'
+
+# Create the local configuration automatically on first run.
+if (-not (Test-Path -LiteralPath $ConfigPath -PathType Leaf)) {
+    if (-not (Test-Path -LiteralPath $configTemplate -PathType Leaf)) {
+        throw "Configuration template not found: $configTemplate"
+    }
+    Copy-Item -LiteralPath $configTemplate -Destination $ConfigPath
+    Write-Host "Created local configuration: $ConfigPath" -ForegroundColor Green
+    Write-Host 'The default paths point to X:\PowerShell\Cohesity_API_Scripts\Common.' -ForegroundColor Cyan
+}
+
 if (-not $SkipInitialRefresh -or -not (Test-Path $dataPath)) { & $collector -ConfigPath $ConfigPath }
 
 $root = [IO.Path]::GetFullPath($PSScriptRoot)
