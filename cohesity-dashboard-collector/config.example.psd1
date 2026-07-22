@@ -8,7 +8,9 @@
     RequestTimeoutSec   = 90
     FailureRunsPerPG    = 6
     VerifyTls           = $true
-    TargetVersion       = '6.8.1'
+
+    # No approved version baseline is configured. Actual cluster versions are displayed without grading.
+    TargetVersion       = $null
 
     Endpoints = @{
         Clusters         = '/v2/mcm/cluster-mgmt/info'
