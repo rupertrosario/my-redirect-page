@@ -1,51 +1,179 @@
-# Cohesity Fleet Dashboard
+# Cohesity Protection Fleet Dashboard
 
-Complete collector and clickable dashboard for the current mock-up. It collects every cluster available through Helios and shows fleet KPIs, a cluster table, and a selected-cluster detail panel.
+Local, GET-only Cohesity Helios dashboard for multi-cluster protection inventory and operational exceptions. It uses the repository's existing AES-encrypted API-key method and requires no module, web server, Node.js, Python, database, or package installation.
 
-## Authentication
+## What the dashboard shows
 
-Uses the same working method as `inventory/Get-CohesityProtectionInventory.ps1`:
+- Fleet totals: clusters, protected inventory, open alerts, capacity used, and GC reclaimable TB.
+- One row per cluster with Hyper-V, Nutanix, NAS, Oracle, SQL, and Physical inventory.
+- Each workload cell shows `Total · Successful · Failed · Cancelled` object counts.
+- Active and paused Protection Groups.
+- Object-level unresolved failures. SQL and Oracle are evaluated independently by Full, Incremental, and Log run type.
+- Hardware alerts below failures with severity, component, node, code, occurrence, state, and description.
+- `All Clusters` by default; select a cluster or click a workload badge to drill down.
+- Refresh button with Running, Completed, CompletedWithWarnings, or Failed status.
 
-- AES-encrypted API key loaded through `ApiKeyAesHelper.ps1`
-- Helios `apiKey` header
-- Cluster-scoped `accessClusterId` header
+There is no ServiceNow/SNOW integration in this solution.
 
-No credential is stored in this folder.
+## Requirements
 
-## One-time setup
+- Windows PowerShell 5.1 or PowerShell 7 already present on the machine.
+- Network access to `https://helios.cohesity.com`.
+- Existing `ApiKeyAesHelper.ps1` and encrypted Cohesity API-key file.
+- Helios API key with read access to the listed clusters, protection groups/runs, capacity statistics, and alerts.
+
+No installation command is required.
+
+## Folder layout
+
+```text
+cohesity-dashboard-collector/
+├── Collect-CohesityDashboard.ps1       # complete GET-only collection
+├── Run-CohesityDashboard.ps1           # local server + refresh endpoint
+├── config.example.psd1                 # safe example configuration
+├── index.html                          # dashboard UI (no external libraries)
+├── modules/
+│   ├── Common.ps1                      # response/status/object helpers
+│   ├── Get-HeliosSession.ps1           # AES key + apiKey headers
+│   ├── Get-HeliosData.ps1              # bounded parallel cluster workers
+│   ├── Get-ClusterSnapshot.ps1         # inventory/capacity/GC/failures
+│   └── ConvertTo-DashboardModel.ps1     # alerts, totals, stale-data merge
+├── output/                              # generated locally; Git ignored
+└── sample/dashboard.sample.json         # UI/data-contract example
+```
+
+## First-time configuration
+
+From the folder:
 
 ```powershell
 Copy-Item .\config.example.psd1 .\config.psd1
 notepad .\config.psd1
 ```
 
-Set `ApiKeyHelperPath`, `EncryptedApiKeyPath`, target version, and endpoint paths if your tenant differs.
+Set only these values first:
+
+```powershell
+ApiKeyHelperPath    = 'X:\PowerShell\Cohesity_API_Scripts\Common\ApiKeyAesHelper.ps1'
+EncryptedApiKeyPath = 'X:\PowerShell\Cohesity_API_Scripts\Common\Secure\cohesity_apikey.enc'
+```
+
+`config.psd1`, generated output, and encrypted key material are intentionally excluded from Git.
 
 ## Run the complete solution
-
-From Windows PowerShell or PowerShell 7:
 
 ```powershell
 Set-Location .\cohesity-dashboard-collector
 .\Run-CohesityDashboard.ps1
 ```
 
-The launcher collects all clusters into `output/dashboard.json`, starts a local web server, and opens the clickable dashboard at `http://localhost:8765/`. Press Ctrl+C in PowerShell to stop it.
+The first refresh completes before the browser opens. The dashboard is then available at:
 
-To generate JSON only:
+```text
+http://localhost:8765/
+```
+
+Keep the PowerShell window open. Press `Ctrl+C` to stop the local server.
+
+Useful alternatives:
 
 ```powershell
+# Use existing JSON immediately, without refreshing at startup
+.\Run-CohesityDashboard.ps1 -SkipInitialRefresh
+
+# Different local port
+.\Run-CohesityDashboard.ps1 -Port 8877
+
+# Collect JSON only; do not open/serve the dashboard
 .\Collect-CohesityDashboard.ps1
 ```
 
-## Output
+## Refresh design and performance
 
-The page shows total/healthy/warning clusters, critical alerts, cluster name, location, version baseline, health, and capacity. Clicking a cluster shows capacity, protected sources, 7-day backup success, active policies, and open alerts.
+The Refresh Data button calls only the local `POST /api/refresh` endpoint. The local server starts the collector in a background PowerShell process, prevents duplicate refreshes, and remains responsive while the browser polls `GET /api/status`.
 
-`sample/dashboard.sample.json` shows the expected schema. The SNOW button currently copies a safe incident payload; connect it to the approved ServiceNow API or Dynatrace webhook only after the endpoint and authentication method are confirmed.
+Cluster collection uses a built-in runspace pool. `MaxConcurrency = 6` means up to six clusters are collected in parallel without installing `ThreadJob` or any other module. Increase gradually only if Helios does not return throttling/timeouts:
 
-## Validation
+```powershell
+MaxConcurrency = 6       # recommended starting value
+RequestTimeoutSec = 90
+FailureRunsPerPG = 6
+```
 
-Run once and compare one selected cluster's seven displayed values with Helios. If a value is blank, adjust only the response aliases in `modules/ConvertTo-DashboardModel.ps1` or the endpoint in `config.psd1`.
+To keep refresh time down:
 
-Do not commit `config.psd1`, output JSON, or encrypted key material.
+1. Cluster capacity, GC, and six workload inventories run inside each parallel cluster worker.
+2. Hardware/open alerts are retrieved once at fleet level, not once per cluster.
+3. Hyper-V, Nutanix, NAS, and Physical object-run details are requested only when the PG's latest run is non-success or warning.
+4. SQL and Oracle recent runs are always inspected because Full, Incremental, and Log streams must be evaluated independently.
+5. Policy detail calls are not made; the dashboard needs PG state, not policy names.
+
+## Failure counting rules
+
+- Output is object-level: VM, NAS object/share, database, or physical server.
+- Runs are processed newest first and keyed by `object ID + run type`.
+- A failure/cancellation is excluded when a newer success exists for the same object and run type.
+- SQL/Oracle Log success does not clear a Full or Incremental failure.
+- `SucceededWithWarning` triggers object-detail inspection.
+- If Cohesity marks a PG failed but returns no object details, a clearly labelled `ProtectionGroupFallback` row is retained rather than silently hiding the failure.
+- Successful object count is `protected total - unresolved failed objects - unresolved cancelled objects`.
+
+## Cluster-gone and API error handling
+
+Every Cohesity operation is GET-only. A 403, 404, timeout, removed cluster, or invalid response does not stop other cluster workers.
+
+- When one cluster is unreachable, its last successful values remain visible and are marked `STALE` / `Unavailable`.
+- When a cluster disappears from the Helios cluster-list response, it is shown as `Cluster Gone` with its prior values.
+- Missing data is never silently replaced with zero when prior data exists.
+- A refresh with partial errors ends as `CompletedWithWarnings`.
+- Removal of a stale/inactive cluster from the dashboard is deliberately manual; successful collection never deletes history implicitly.
+- JSON files are written to a temporary file and atomically moved into place, so the browser never reads a half-written refresh.
+
+## Generated files
+
+| File | Purpose |
+|---|---|
+| `output/dashboard.json` | Full UI data contract |
+| `output/refresh-status.json` | Current/last refresh state and duration |
+| `output/claude-context.json` | Compact, credential-free future Claude Code context |
+
+Claude Code should read `claude-context.json`, not call Helios directly. That keeps prompts smaller, avoids credentials, and lets questions such as “which cluster needs attention and why?” use the same verified snapshot as the dashboard.
+
+## Helios GET endpoints
+
+| Data | Endpoint/pattern |
+|---|---|
+| Cluster list | `/v2/mcm/cluster-mgmt/info` |
+| Inventory and PG state | `/v2/data-protect/protection-groups?environments=...` |
+| Object run details | `/v2/data-protect/protection-groups/{id}/runs` |
+| Capacity | `/irisservices/api/v1/public/stats/storage` |
+| GC reclaimable | `timeSeriesStats` / `ApolloV2ClusterStats` / `EstimatedGarbageBytes` |
+| Open and hardware alerts | `/v2/mcm/alerts` |
+
+All cluster-scoped calls send both `apiKey` and `accessClusterId`, matching `inventory/Get-CohesityProtectionInventory.ps1`.
+
+## Fast validation after the first run
+
+Validate one normal cluster and one cluster with known exceptions:
+
+1. Compare the six protected-object totals and active/paused PG totals with Helios.
+2. Confirm one SQL or Oracle Full/Incremental/Log failure has no newer success in the same stream.
+3. Compare capacity and `EstimatedGarbageBytes` (displayed as decimal TB) with the existing GC script.
+4. Compare open Hardware alert count/detail with the existing alerts workflow.
+5. Temporarily use an invalid `accessClusterId` in a fixture/test and confirm other clusters complete while prior values are marked stale.
+
+## Troubleshooting
+
+| Symptom | Check |
+|---|---|
+| `Missing API key helper` | Correct `ApiKeyHelperPath` in local `config.psd1` |
+| `No clusters returned` | API-key read permission and `/v2/mcm/cluster-mgmt/info` response |
+| Workload count is zero unexpectedly | Tenant response parameter name in `Get-PgObjects` |
+| Refresh is slow | `refresh-status.json`, timeouts, then increase `MaxConcurrency` from 6 to 8 only after checking for throttling |
+| GC blank | Confirm the cluster entity-name format used by the existing GC script |
+| Browser loads but JSON fails | Start with `Run-CohesityDashboard.ps1`; do not open `index.html` directly from disk |
+| Port already in use | Run with `-Port 8877` |
+
+## Planned extension pattern
+
+AD, SSO, DNS/NTP, interfaces, and certificates should be added later as independent GET-only collector modules and collapsible dashboard sections. Do not add them to the base refresh path until each module has its own timeout, error result, and compact JSON contract.
