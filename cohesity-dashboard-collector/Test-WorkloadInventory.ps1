@@ -1,7 +1,6 @@
 # Cohesity workload inventory validation
-# GET-only, PowerShell 5.1 compatible, console output only.
-# Counts objects configured in ACTIVE protection groups.
-# Paused protection groups are counted, but their objects are excluded.
+# GET-only. Windows PowerShell 5.1 compatible.
+# Paused PGs are counted; only active PGs contribute protected objects.
 
 [CmdletBinding()]
 param()
@@ -26,16 +25,23 @@ if ([string]::IsNullOrWhiteSpace($ApiKey)) {
     throw 'AES API key helper returned an empty API key.'
 }
 
+# Required output order.
 $Workloads = @(
-    [pscustomobject]@{ Name = 'Hyper-V';     Environments = @('kHyperV');              Params = @('hypervParams','hyperVParams'); Kind = 'Standard' },
-    [pscustomobject]@{ Name = 'Nutanix AHV'; Environments = @('kAcropolis');           Params = @('acropolisParams','nutanixParams','ahvParams'); Kind = 'Standard' },
-    [pscustomobject]@{ Name = 'NAS';         Environments = @('kGenericNas','kIsilon');Params = @('genericNasParams','nasParams','isilonParams'); Kind = 'Standard' },
-    [pscustomobject]@{ Name = 'Oracle';      Environments = @('kOracle');              Params = @('oracleParams'); Kind = 'Oracle' },
-    [pscustomobject]@{ Name = 'SQL';         Environments = @('kSQL');                 Params = @('mssqlParams','sqlParams'); Kind = 'Database' },
-    [pscustomobject]@{ Name = 'Physical';    Environments = @('kPhysical');            Params = @('physicalParams'); Kind = 'Physical' }
+    [pscustomobject]@{ Name = 'Hyper-V';     Environments = @('kHyperV');               Kind = 'Standard'; Params = @('hypervParams','hyperVParams') },
+    [pscustomobject]@{ Name = 'Nutanix AHV'; Environments = @('kAcropolis');            Kind = 'Standard'; Params = @('acropolisParams','nutanixParams','ahvParams') },
+    [pscustomobject]@{ Name = 'NAS';         Environments = @('kGenericNas','kIsilon'); Kind = 'Standard'; Params = @('genericNasParams','nasParams','isilonParams') },
+    [pscustomobject]@{ Name = 'Physical';    Environments = @('kPhysical');             Kind = 'Physical'; Params = @('physicalParams') },
+    [pscustomobject]@{ Name = 'SQL';         Environments = @('kSQL');                  Kind = 'SQL';      Params = @('mssqlParams','sqlParams') },
+    [pscustomobject]@{ Name = 'Oracle';      Environments = @('kOracle');               Kind = 'Oracle';   Params = @('oracleParams') }
 )
 
-function Get-PropertyValue {
+function As-Array {
+    param($Value)
+    if ($null -eq $Value) { return @() }
+    return @($Value)
+}
+
+function Get-Val {
     param($Object, [string[]]$Names, $Default = $null)
 
     if ($null -eq $Object -or $Object -is [string]) { return $Default }
@@ -50,24 +56,7 @@ function Get-PropertyValue {
     return $Default
 }
 
-function Get-NestedValue {
-    param($Object, [string]$Path)
-
-    $current = $Object
-    foreach ($part in ($Path -split '\.')) {
-        $current = Get-PropertyValue -Object $current -Names @($part)
-        if ($null -eq $current) { return $null }
-    }
-    return $current
-}
-
-function ConvertTo-Array {
-    param($Value)
-    if ($null -eq $Value) { return @() }
-    return @($Value)
-}
-
-function Get-FirstText {
+function First-Text {
     param($Values)
 
     foreach ($value in @($Values)) {
@@ -80,14 +69,13 @@ function Get-FirstText {
     return ''
 }
 
-function ConvertTo-Boolean {
+function As-Bool {
     param($Value, [bool]$Default = $false)
 
     if ($Value -is [bool]) { return $Value }
     if ($null -eq $Value) { return $Default }
-    $text = ([string]$Value).Trim()
-    if ($text -match '^(?i:true|1|yes)$') { return $true }
-    if ($text -match '^(?i:false|0|no)$') { return $false }
+    if (([string]$Value).Trim() -match '^(?i:true|1|yes)$') { return $true }
+    if (([string]$Value).Trim() -match '^(?i:false|0|no)$') { return $false }
     return $Default
 }
 
@@ -101,21 +89,12 @@ function New-Headers {
     return $headers
 }
 
-function Invoke-CohesityGet {
+function Get-CohesityJson {
     param([string]$Uri, [hashtable]$Headers)
 
-    $parameters = @{
-        Uri = $Uri
-        Headers = $Headers
-        Method = 'Get'
-        ErrorAction = 'Stop'
-        TimeoutSec = 90
-    }
-    if ($PSVersionTable.PSVersion.Major -lt 6) {
-        $parameters.UseBasicParsing = $true
-    }
-    $response = Invoke-WebRequest @parameters
-    if (-not $response -or [string]::IsNullOrWhiteSpace($response.Content)) {
+    $response = Invoke-WebRequest -Uri $Uri -Headers $Headers -Method Get `
+        -UseBasicParsing -TimeoutSec 90 -ErrorAction Stop
+    if ($null -eq $response -or [string]::IsNullOrWhiteSpace($response.Content)) {
         return $null
     }
     return ($response.Content | ConvertFrom-Json)
@@ -126,210 +105,270 @@ function Get-ProtectionGroups {
 
     $groups = @()
     $cookie = ''
+    $seenCookies = @{}
+
     do {
         $uri = "$BaseUrl/v2/data-protect/protection-groups?environments=$([uri]::EscapeDataString($Environment))&isDeleted=false&includeLastRunInfo=false&maxResultCount=1000"
         if (-not [string]::IsNullOrWhiteSpace($cookie)) {
             $uri += "&paginationCookie=$([uri]::EscapeDataString($cookie))"
         }
 
-        $json = Invoke-CohesityGet -Uri $uri -Headers $Headers
-        $groups += @(ConvertTo-Array (Get-PropertyValue $json @('protectionGroups','items','data')) |
-            Where-Object { $null -ne $_ })
+        $json = Get-CohesityJson -Uri $uri -Headers $Headers
+        foreach ($group in @(As-Array (Get-Val $json @('protectionGroups','items','data')))) {
+            if ($null -ne $group) { $groups += $group }
+        }
 
-        $cookie = Get-FirstText @((Get-PropertyValue $json @('paginationCookie')))
-        $truncated = ConvertTo-Boolean (Get-PropertyValue $json @('isResponseTruncated')) $false
-        if (-not $truncated -and [string]::IsNullOrWhiteSpace($cookie)) { break }
-    } while (-not [string]::IsNullOrWhiteSpace($cookie))
+        $cookie = First-Text @((Get-Val $json @('paginationCookie')))
+        if (-not [string]::IsNullOrWhiteSpace($cookie)) {
+            if ($seenCookies.ContainsKey($cookie)) {
+                throw "Repeated pagination cookie returned for environment $Environment."
+            }
+            $seenCookies[$cookie] = $true
+        }
+    }
+    while (-not [string]::IsNullOrWhiteSpace($cookie))
 
     return @($groups)
 }
 
-function Get-ObjectIdentity {
-    param($Object, [string]$FallbackType)
+function Get-PgId {
+    param($ProtectionGroup)
+    return First-Text @(
+        (Get-Val $ProtectionGroup @('id','protectionGroupId')),
+        (Get-Val $ProtectionGroup @('name','protectionGroupName'))
+    )
+}
 
-    $name = Get-FirstText @(
-        (Get-PropertyValue $Object @('databaseUniqueName','databaseName','dbName','name','objectName','sourceName','vmName','hostName','displayName')),
-        (Get-PropertyValue $Object @('id','objectId','sourceId','databaseId','entityId'))
+function Get-PgName {
+    param($ProtectionGroup)
+    return First-Text @(
+        (Get-Val $ProtectionGroup @('name','protectionGroupName')),
+        (Get-PgId $ProtectionGroup)
     )
-    $id = Get-FirstText @(
-        (Get-PropertyValue $Object @('id','objectId','databaseId','databaseUuid','sourceId','vmId','entityId')),
-        $name
+}
+
+function Unwrap-Object {
+    param($Candidate)
+    if ($null -eq $Candidate) { return $null }
+    $nested = Get-Val $Candidate @('object')
+    if ($null -ne $nested) { return $nested }
+    return $Candidate
+}
+
+function Get-ObjectKey {
+    param($Candidate, [string]$Workload)
+
+    $object = Unwrap-Object $Candidate
+    if ($null -eq $object) { return '' }
+
+    $name = First-Text @(
+        (Get-Val $object @('databaseUniqueName','databaseName','dbName','name','objectName','displayName','hostName','sourceName'))
     )
-    $type = Get-FirstText @(
-        (Get-PropertyValue $Object @('objectType','type','entityType','environmentType')),
-        $FallbackType
+    $id = First-Text @(
+        (Get-Val $object @('id','objectId','databaseId','databaseUuid','entityId','uuid'))
     )
-    return [pscustomobject]@{ Name = $name; Id = $id; Type = $type }
+    $sourceId = First-Text @((Get-Val $object @('sourceId','parentId','rootNodeId')))
+
+    if ([string]::IsNullOrWhiteSpace($name) -and [string]::IsNullOrWhiteSpace($id)) {
+        return ''
+    }
+
+    return ('{0}|{1}|{2}|{3}' -f $Workload,$sourceId,(First-Text @($id,$name)),$name).ToLowerInvariant()
 }
 
 function Get-StandardObjects {
     param($ProtectionGroup, $Workload)
 
     $objects = @()
-    foreach ($parameterName in @($Workload.Params)) {
-        $parameters = Get-PropertyValue $ProtectionGroup @($parameterName)
-        if ($null -eq $parameters) { continue }
-        $objects += @(ConvertTo-Array (Get-PropertyValue $parameters @('objects')) |
-            Where-Object { $null -ne $_ })
+    foreach ($parameterName in $Workload.Params) {
+        $parameters = Get-Val $ProtectionGroup @($parameterName)
+        foreach ($object in @(As-Array (Get-Val $parameters @('objects')))) {
+            if ($null -ne $object) { $objects += $object }
+        }
     }
     return @($objects)
-}
-
-function Get-PhysicalObjects {
-    param($ProtectionGroup)
-
-    $physical = Get-PropertyValue $ProtectionGroup @('physicalParams')
-    if ($null -eq $physical) { return @() }
-
-    $objects = @()
-    $fileParameters = Get-PropertyValue $physical @('fileProtectionTypeParams')
-    $volumeParameters = Get-PropertyValue $physical @('volumeProtectionTypeParams')
-    $objects += @(ConvertTo-Array (Get-PropertyValue $fileParameters @('objects')) |
-        Where-Object { $null -ne $_ })
-    $objects += @(ConvertTo-Array (Get-PropertyValue $volumeParameters @('objects')) |
-        Where-Object { $null -ne $_ })
-    return @($objects)
-}
-
-function Find-DatabaseObjects {
-    param(
-        $Value,
-        [string]$PropertyName = '',
-        [int]$Depth = 0
-    )
-
-    if ($null -eq $Value -or $Depth -gt 12) { return @() }
-    $found = @()
-
-    if ($Value -is [System.Collections.IEnumerable] -and $Value -isnot [string] -and
-        $Value -isnot [System.Collections.IDictionary] -and
-        $Value -isnot [pscustomobject]) {
-        foreach ($item in @($Value)) {
-            $found += @(Find-DatabaseObjects -Value $item -PropertyName $PropertyName -Depth ($Depth + 1))
-        }
-        return @($found)
-    }
-
-    if ($Value -is [string] -or $Value -is [ValueType]) { return @() }
-
-    $type = Get-FirstText @((Get-PropertyValue $Value @('objectType','type','entityType')))
-    $databaseName = Get-FirstText @(
-        (Get-PropertyValue $Value @('databaseUniqueName','databaseName','dbName','dbUniqueName'))
-    )
-    $ordinaryName = Get-FirstText @(
-        (Get-PropertyValue $Value @('name','objectName','displayName'))
-    )
-
-    $isExcludedType = $type -match '(?i)instance|host|server|source|cluster'
-    $isDatabaseType = $type -match '(?i)database|kRACDatabase|kNonRACDatabase'
-    $isDatabaseCollection = $PropertyName -match '(?i)databases|databaseList|databaseObjects|dbChannels|dbList'
-
-    if (-not $isExcludedType -and
-        ($isDatabaseType -or -not [string]::IsNullOrWhiteSpace($databaseName) -or
-        ($isDatabaseCollection -and -not [string]::IsNullOrWhiteSpace($ordinaryName)))) {
-        $found += $Value
-    }
-
-    foreach ($property in @($Value.PSObject.Properties)) {
-        if ($property.Name -match '^(?i)hosts?|servers?|instances?|databaseNodeList$') {
-            continue
-        }
-        if ($null -ne $property.Value -and -not [object]::ReferenceEquals($property.Value,$Value)) {
-            $found += @(Find-DatabaseObjects -Value $property.Value -PropertyName $property.Name -Depth ($Depth + 1))
-        }
-    }
-    return @($found)
 }
 
 function Get-OracleDatabaseObjects {
     param($ProtectionGroup)
 
-    $oracle = Get-PropertyValue $ProtectionGroup @('oracleParams')
-    if ($null -eq $oracle) { return @() }
-
-    $databases = @()
-
-    # Proven path from the existing Oracle inventory:
+    # Proven Oracle inventory path:
     # oracleParams.objects[].dbParams.dbChannels[].databaseUniqueName
-    foreach ($oracleObject in @(ConvertTo-Array (Get-PropertyValue $oracle @('objects')))) {
-        $dbParameters = Get-PropertyValue $oracleObject @('dbParams')
-        $databases += @(ConvertTo-Array (Get-PropertyValue $dbParameters @('dbChannels')) |
-            Where-Object { $null -ne $_ })
-    }
-
-    # Handles versions that return explicit database objects elsewhere in oracleParams.
-    $databases += @(Find-DatabaseObjects -Value $oracle -PropertyName 'oracleParams')
-    return @($databases)
-}
-
-function Get-DatabaseObjects {
-    param($ProtectionGroup, $Workload)
-
     $databases = @()
-    foreach ($parameterName in @($Workload.Params)) {
-        $parameters = Get-PropertyValue $ProtectionGroup @($parameterName)
-        if ($null -ne $parameters) {
-            $databases += @(Find-DatabaseObjects -Value $parameters -PropertyName $parameterName)
+    $oracleParams = Get-Val $ProtectionGroup @('oracleParams')
+
+    foreach ($oracleObject in @(As-Array (Get-Val $oracleParams @('objects')))) {
+        $dbParams = Get-Val $oracleObject @('dbParams')
+        foreach ($channel in @(As-Array (Get-Val $dbParams @('dbChannels')))) {
+            $dbName = First-Text @((Get-Val $channel @('databaseUniqueName')))
+            if (-not [string]::IsNullOrWhiteSpace($dbName)) {
+                $databases += $channel
+            }
         }
     }
     return @($databases)
 }
 
-function Add-ObjectRows {
+function Is-SqlDatabase {
+    param($Candidate)
+
+    $object = Unwrap-Object $Candidate
+    if ($null -eq $object) { return $false }
+
+    $type = First-Text @((Get-Val $object @('objectType','type','entityType')))
+    $dbName = First-Text @((Get-Val $object @('databaseName','dbName')))
+
+    if ($type -match '(?i)host|server|instance|source|cluster') { return $false }
+    if ($type -ieq 'kSQL' -or $type -match '(?i)database') { return $true }
+    return (-not [string]::IsNullOrWhiteSpace($dbName))
+}
+
+function Get-RunObjects {
     param(
-        [System.Collections.Generic.List[object]]$Rows,
-        [hashtable]$Seen,
-        [string]$Cluster,
-        [string]$Workload,
-        [string]$ProtectionGroup,
         [string]$ProtectionGroupId,
-        [object[]]$Objects,
-        [string]$FallbackType
+        [string]$Environment,
+        [hashtable]$Headers
     )
 
-    foreach ($object in @($Objects)) {
-        if ($null -eq $object) { continue }
-        $identity = Get-ObjectIdentity -Object $object -FallbackType $FallbackType
-        if ([string]::IsNullOrWhiteSpace($identity.Name) -and
-            [string]::IsNullOrWhiteSpace($identity.Id)) {
-            continue
+    if ([string]::IsNullOrWhiteSpace($ProtectionGroupId)) { return @() }
+
+    $uri = "$BaseUrl/v2/data-protect/protection-groups/$([uri]::EscapeDataString($ProtectionGroupId))/runs?environments=$([uri]::EscapeDataString($Environment))&numRuns=3&excludeNonRestorableRuns=false&includeObjectDetails=true"
+    $json = Get-CohesityJson -Uri $uri -Headers $Headers
+    $runs = @(As-Array (Get-Val $json @('runs')))
+
+    $runs = @($runs | Sort-Object {
+        $maxEnd = 0
+        foreach ($localInfo in @(As-Array (Get-Val $_ @('localBackupInfo')))) {
+            $end = [int64](Get-Val $localInfo @('endTimeUsecs','startTimeUsecs') 0)
+            if ($end -gt $maxEnd) { $maxEnd = $end }
         }
-        $key = '{0}|{1}|{2}|{3}' -f $Cluster,$Workload,$ProtectionGroupId,
-            (Get-FirstText @($identity.Id,$identity.Name)).ToLowerInvariant()
-        if ($Seen.ContainsKey($key)) { continue }
-        $Seen[$key] = $true
-        $Rows.Add([pscustomobject]@{
-            Cluster = $Cluster
-            Workload = $Workload
-            ProtectionGroup = $ProtectionGroup
-            ProtectionGroupId = $ProtectionGroupId
-            ObjectName = $identity.Name
-            ObjectId = $identity.Id
-            ObjectType = $identity.Type
-        })
+        $maxEnd
+    } -Descending)
+
+    foreach ($run in $runs) {
+        $objects = @(As-Array (Get-Val $run @('objects')))
+        if ($objects.Count -gt 0) { return $objects }
     }
+    return @()
 }
 
-$clusterJson = Invoke-CohesityGet -Uri "$BaseUrl/v2/mcm/cluster-mgmt/info" -Headers (New-Headers)
-$clusters = @(ConvertTo-Array (Get-PropertyValue $clusterJson @('cohesityClusters','clusters','items')) |
-    ForEach-Object {
-        $clusterId = Get-FirstText @((Get-PropertyValue $_ @('clusterId','id')))
-        $clusterName = Get-FirstText @(
-            (Get-PropertyValue $_ @('clusterName','displayName','name')),
+function Get-SqlDatabaseObjects {
+    param($ProtectionGroup, [hashtable]$Headers)
+
+    $databases = @()
+    foreach ($parameterName in @('mssqlParams','sqlParams')) {
+        $parameters = Get-Val $ProtectionGroup @($parameterName)
+
+        foreach ($candidate in @(As-Array (Get-Val $parameters @('objects')))) {
+            if (Is-SqlDatabase $candidate) { $databases += $candidate }
+
+            $object = Unwrap-Object $candidate
+            foreach ($collectionName in @('databases','databaseList','databaseObjects','dbObjects','dbList')) {
+                foreach ($database in @(As-Array (Get-Val $object @($collectionName)))) {
+                    if (Is-SqlDatabase $database) { $databases += $database }
+                }
+            }
+        }
+
+        foreach ($collectionName in @('databases','databaseList','databaseObjects','dbObjects','dbList')) {
+            foreach ($database in @(As-Array (Get-Val $parameters @($collectionName)))) {
+                if (Is-SqlDatabase $database) { $databases += $database }
+            }
+        }
+    }
+
+    # Proven SQL run logic fallback: kSQL rows are DBs; kPhysical rows are hosts.
+    if ($databases.Count -eq 0) {
+        $pgId = Get-PgId $ProtectionGroup
+        try {
+            foreach ($candidate in @(Get-RunObjects -ProtectionGroupId $pgId -Environment 'kSQL' -Headers $Headers)) {
+                $type = First-Text @((Get-Val (Unwrap-Object $candidate) @('objectType','type','entityType')))
+                if ($type -ieq 'kSQL') { $databases += $candidate }
+            }
+        }
+        catch {
+            # The caller will report zero DB records if configuration also returned none.
+        }
+    }
+
+    return @($databases)
+}
+
+function Is-PhysicalHost {
+    param($Candidate, [bool]$AllowUntyped = $false)
+
+    $object = Unwrap-Object $Candidate
+    if ($null -eq $object) { return $false }
+
+    $type = First-Text @((Get-Val $object @('objectType','type','entityType')))
+    $environment = First-Text @((Get-Val $object @('environment','environmentType')))
+
+    if ($type -ieq 'kHost' -and ($environment -ieq 'kPhysical' -or [string]::IsNullOrWhiteSpace($environment))) {
+        return $true
+    }
+    if ($environment -ieq 'kPhysical' -and -not ($type -match '(?i)file|folder|volume')) {
+        return $true
+    }
+    if ($AllowUntyped -and [string]::IsNullOrWhiteSpace($type) -and [string]::IsNullOrWhiteSpace($environment)) {
+        return $true
+    }
+    return $false
+}
+
+function Get-PhysicalHostObjects {
+    param($ProtectionGroup, [hashtable]$Headers)
+
+    $hosts = @()
+    $pgId = Get-PgId $ProtectionGroup
+
+    # Proven Physical logic: run.objects where objectType=kHost and environment=kPhysical.
+    try {
+        foreach ($candidate in @(Get-RunObjects -ProtectionGroupId $pgId -Environment 'kPhysical' -Headers $Headers)) {
+            if (Is-PhysicalHost $candidate) { $hosts += $candidate }
+        }
+    }
+    catch {
+        # Continue with PG configuration so an unavailable run endpoint does not lose inventory.
+    }
+
+    # PG-configuration fallback also covers a new active PG with no completed run.
+    $physicalParams = Get-Val $ProtectionGroup @('physicalParams')
+    foreach ($parameterName in @('fileProtectionTypeParams','volumeProtectionTypeParams')) {
+        $typeParams = Get-Val $physicalParams @($parameterName)
+        foreach ($candidate in @(As-Array (Get-Val $typeParams @('objects')))) {
+            if (Is-PhysicalHost $candidate $true) { $hosts += $candidate }
+        }
+    }
+    foreach ($candidate in @(As-Array (Get-Val $physicalParams @('objects')))) {
+        if (Is-PhysicalHost $candidate $true) { $hosts += $candidate }
+    }
+
+    return @($hosts)
+}
+
+$clusterJson = Get-CohesityJson -Uri "$BaseUrl/v2/mcm/cluster-mgmt/info" -Headers (New-Headers)
+$clusters = @()
+foreach ($cluster in @(As-Array (Get-Val $clusterJson @('cohesityClusters','clusters','items')))) {
+    $clusterId = First-Text @((Get-Val $cluster @('clusterId','id')))
+    if ([string]::IsNullOrWhiteSpace($clusterId)) { continue }
+
+    $clusters += [pscustomobject]@{
+        ClusterId = $clusterId
+        ClusterName = First-Text @(
+            (Get-Val $cluster @('clusterName','displayName','name')),
             "Unknown-$clusterId"
         )
-        if (-not [string]::IsNullOrWhiteSpace($clusterId)) {
-            [pscustomobject]@{ ClusterName = $clusterName; ClusterId = $clusterId }
-        }
-    } | Sort-Object ClusterName)
+    }
+}
+$clusters = @($clusters | Sort-Object ClusterName)
+if ($clusters.Count -eq 0) { throw 'No clusters returned from Helios.' }
 
-if (@($clusters).Count -eq 0) { throw 'No clusters returned from Helios.' }
-
-$clusterMenu = for ($index = 0; $index -lt @($clusters).Count; $index++) {
-    [pscustomobject]@{
-        Index = $index + 1
-        ClusterName = $clusters[$index].ClusterName
-        ClusterId = $clusters[$index].ClusterId
+$clusterMenu = @()
+for ($i = 0; $i -lt $clusters.Count; $i++) {
+    $clusterMenu += [pscustomobject]@{
+        Index = $i + 1
+        ClusterName = $clusters[$i].ClusterName
+        ClusterId = $clusters[$i].ClusterId
     }
 }
 
@@ -342,157 +381,125 @@ Write-Host '[X] Exit' -ForegroundColor Yellow
 while ($true) {
     $selection = Read-Host 'Select cluster'
     if ($selection -match '^(?i:x|q)$') { return }
+
     $number = -1
-    if ([int]::TryParse($selection,[ref]$number) -and
-        $number -ge 0 -and $number -le @($clusterMenu).Count) {
+    if ([int]::TryParse($selection,[ref]$number) -and $number -ge 0 -and $number -le $clusterMenu.Count) {
         if ($number -eq 0) { $selectedClusters = @($clusterMenu) }
         else { $selectedClusters = @($clusterMenu | Where-Object { $_.Index -eq $number }) }
         break
     }
-    Write-Host "Enter 0, 1-$(@($clusterMenu).Count), or X." -ForegroundColor Red
+    Write-Host "Enter 0, 1-$($clusterMenu.Count), or X." -ForegroundColor Red
 }
 
-$summaryRows = New-Object System.Collections.Generic.List[object]
-$objectRows = New-Object System.Collections.Generic.List[object]
-$warningRows = New-Object System.Collections.Generic.List[object]
+$summary = @()
+$warnings = @()
 
-foreach ($cluster in @($selectedClusters)) {
-    $headers = New-Headers -ClusterId $cluster.ClusterId
+foreach ($workload in $Workloads) {
+    $activeCount = 0
+    $pausedCount = 0
+    $protectedObjects = @{}
 
-    foreach ($workload in @($Workloads)) {
+    foreach ($cluster in $selectedClusters) {
+        $headers = New-Headers -ClusterId $cluster.ClusterId
         $allGroups = @()
-        foreach ($environment in @($workload.Environments)) {
+
+        foreach ($environment in $workload.Environments) {
             try {
                 $allGroups += @(Get-ProtectionGroups -Environment $environment -Headers $headers)
             }
             catch {
-                $warningRows.Add([pscustomobject]@{
+                $warnings += [pscustomobject]@{
                     Cluster = $cluster.ClusterName
                     Workload = $workload.Name
                     ProtectionGroup = ''
-                    Warning = "Protection-group GET failed for $environment`: $($_.Exception.Message)"
-                })
+                    Warning = "PG GET failed for $environment`: $($_.Exception.Message)"
+                }
             }
         }
 
-        $groupSeen = @{}
-        $activeGroups = @()
-        $activeCount = 0
-        $pausedCount = 0
+        $seenGroups = @{}
+        foreach ($group in $allGroups) {
+            $pgId = Get-PgId $group
+            if ([string]::IsNullOrWhiteSpace($pgId)) { continue }
 
-        foreach ($group in @($allGroups)) {
-            $groupId = Get-FirstText @(
-                (Get-PropertyValue $group @('id','protectionGroupId')),
-                (Get-PropertyValue $group @('name','protectionGroupName'))
-            )
-            if ([string]::IsNullOrWhiteSpace($groupId) -or $groupSeen.ContainsKey($groupId)) {
-                continue
-            }
-            $groupSeen[$groupId] = $true
+            $pgKey = ('{0}|{1}' -f $cluster.ClusterId,$pgId).ToLowerInvariant()
+            if ($seenGroups.ContainsKey($pgKey)) { continue }
+            $seenGroups[$pgKey] = $true
 
-            $isPaused = ConvertTo-Boolean (Get-PropertyValue $group @('isPaused','paused')) $false
-            $isActive = ConvertTo-Boolean (Get-PropertyValue $group @('isActive','active')) $true
+            $isPaused = As-Bool (Get-Val $group @('isPaused','paused')) $false
+            $isActive = As-Bool (Get-Val $group @('isActive','active')) $true
+
             if ($isPaused) {
                 $pausedCount++
+                continue
             }
-            elseif ($isActive) {
-                $activeCount++
-                $activeGroups += $group
-            }
-        }
+            if (-not $isActive) { continue }
 
-        $workloadSeen = @{}
-        foreach ($group in @($activeGroups)) {
-            $groupId = Get-FirstText @(
-                (Get-PropertyValue $group @('id','protectionGroupId')),
-                (Get-PropertyValue $group @('name','protectionGroupName'))
-            )
-            $groupName = Get-FirstText @(
-                (Get-PropertyValue $group @('name','protectionGroupName')),
-                $groupId
-            )
+            $activeCount++
+            $objects = @()
 
-            switch ($workload.Kind) {
-                'Physical' {
-                    $objects = @(Get-PhysicalObjects -ProtectionGroup $group)
-                    $fallbackType = 'PhysicalObject'
-                }
-                'Oracle' {
-                    $objects = @(Get-OracleDatabaseObjects -ProtectionGroup $group)
-                    $fallbackType = 'kDatabase'
-                }
-                'Database' {
-                    $objects = @(Get-DatabaseObjects -ProtectionGroup $group -Workload $workload)
-                    $fallbackType = 'kDatabase'
-                }
-                default {
-                    $objects = @(Get-StandardObjects -ProtectionGroup $group -Workload $workload)
-                    $fallbackType = 'ProtectedObject'
+            try {
+                switch ($workload.Kind) {
+                    'Oracle'  { $objects = @(Get-OracleDatabaseObjects $group) }
+                    'SQL'     { $objects = @(Get-SqlDatabaseObjects $group $headers) }
+                    'Physical'{ $objects = @(Get-PhysicalHostObjects $group $headers) }
+                    default   { $objects = @(Get-StandardObjects $group $workload) }
                 }
             }
-
-            # Do not wrap a generic List[object] in @(...). Windows PowerShell
-            # 5.1 can fail with "Argument types do not match" when its dynamic
-            # binder converts a generic list through the array-subexpression
-            # operator.
-            $before = $objectRows.Count
-            Add-ObjectRows -Rows $objectRows -Seen $workloadSeen `
-                -Cluster $cluster.ClusterName -Workload $workload.Name `
-                -ProtectionGroup $groupName -ProtectionGroupId $groupId `
-                -Objects $objects -FallbackType $fallbackType
-
-            if ($objectRows.Count -eq $before) {
-                $warningRows.Add([pscustomobject]@{
+            catch {
+                $warnings += [pscustomobject]@{
                     Cluster = $cluster.ClusterName
                     Workload = $workload.Name
-                    ProtectionGroup = $groupName
-                    Warning = $(if ($workload.Kind -in @('Oracle','Database')) {
-                            'No database-level objects found; host/server/instance rows were deliberately excluded.'
-                        }
-                        else {
-                            'No configured object rows were found in the active PG.'
-                        })
-                })
+                    ProtectionGroup = (Get-PgName $group)
+                    Warning = "Object GET/processing failed: $($_.Exception.Message)"
+                }
+                continue
+            }
+
+            $foundInPg = 0
+            foreach ($candidate in $objects) {
+                $objectKey = Get-ObjectKey $candidate $workload.Name
+                if ([string]::IsNullOrWhiteSpace($objectKey)) { continue }
+                $foundInPg++
+                $protectedObjects[("$($cluster.ClusterId)|$objectKey").ToLowerInvariant()] = $true
+            }
+
+            if ($foundInPg -eq 0) {
+                $warningText = 'No protected object records found in this active PG.'
+                if ($workload.Kind -eq 'SQL' -or $workload.Kind -eq 'Oracle') {
+                    $warningText = 'No database records found; server, host and instance records were excluded.'
+                }
+                elseif ($workload.Kind -eq 'Physical') {
+                    $warningText = 'No kPhysical/kHost records found in run details or PG configuration.'
+                }
+
+                $warnings += [pscustomobject]@{
+                    Cluster = $cluster.ClusterName
+                    Workload = $workload.Name
+                    ProtectionGroup = (Get-PgName $group)
+                    Warning = $warningText
+                }
             }
         }
+    }
 
-        $protectedObjectCount = @($objectRows.ToArray() | Where-Object {
-            $_.Cluster -eq $cluster.ClusterName -and $_.Workload -eq $workload.Name
-        }).Count
-
-        $summaryRows.Add([pscustomobject]@{
-            Cluster = $cluster.ClusterName
-            Workload = $workload.Name
-            ActivePGs = $activeCount
-            PausedPGs = $pausedCount
-            ProtectedObjects = $protectedObjectCount
-        })
+    $summary += [pscustomobject][ordered]@{
+        Workload = $workload.Name
+        'Active PGs' = $activeCount
+        'Paused PGs' = $pausedCount
+        'Protected Objects' = $protectedObjects.Count
     }
 }
 
-$script:InventorySummary = @($summaryRows.ToArray() | Sort-Object Cluster,Workload)
-$script:InventoryObjects = @($objectRows.ToArray() | Sort-Object Cluster,Workload,ProtectionGroup,ObjectName)
-$script:InventoryWarnings = @($warningRows.ToArray() | Sort-Object Cluster,Workload,ProtectionGroup)
+$script:InventorySummary = @($summary)
+$script:InventoryWarnings = @($warnings | Sort-Object Cluster,Workload,ProtectionGroup)
 
 Write-Host ''
 Write-Host 'WORKLOAD INVENTORY SUMMARY' -ForegroundColor Cyan
-$script:InventorySummary | Format-Table Cluster,Workload,ActivePGs,PausedPGs,ProtectedObjects -AutoSize
+$script:InventorySummary | Format-Table 'Workload','Active PGs','Paused PGs','Protected Objects' -AutoSize
 
-Write-Host ''
-Write-Host 'SQL AND ORACLE DATABASE OBJECTS (servers and instances excluded)' -ForegroundColor Cyan
-$databaseRows = @($script:InventoryObjects | Where-Object { $_.Workload -in @('SQL','Oracle') })
-if (@($databaseRows).Count -gt 0) {
-    $databaseRows | Format-Table Cluster,Workload,ProtectionGroup,ObjectName,ObjectType -AutoSize
-}
-else {
-    Write-Host 'No SQL or Oracle database objects were returned.' -ForegroundColor Yellow
-}
-
-if (@($script:InventoryWarnings).Count -gt 0) {
+if ($script:InventoryWarnings.Count -gt 0) {
     Write-Host ''
     Write-Host 'COLLECTION WARNINGS' -ForegroundColor Yellow
     $script:InventoryWarnings | Format-Table Cluster,Workload,ProtectionGroup,Warning -Wrap -AutoSize
 }
-
-Write-Host ''
-Write-Host 'Full object detail remains available in $InventoryObjects.' -ForegroundColor DarkGray
