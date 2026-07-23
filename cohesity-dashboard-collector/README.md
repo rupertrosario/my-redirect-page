@@ -43,10 +43,28 @@ cohesity-dashboard-collector/
 
 ## Local location and first run
 
-Copy the complete `cohesity-dashboard-collector` folder and keep it here:
+The existing parent folder is:
 
 ```text
-X:\PowerShell\Cohesity_API_Scripts\cohesity-dashboard-collector\
+X:\PowerShell\Cohesity_API_Scripts\
+```
+
+Copy the complete `cohesity-dashboard-collector` folder beneath that parent. The resulting local layout must be:
+
+```text
+X:\PowerShell\Cohesity_API_Scripts\
+└── cohesity-dashboard-collector\
+    ├── Run-CohesityDashboard.ps1
+    ├── Collect-CohesityDashboard.ps1
+    ├── config.example.psd1
+    ├── index.html
+    └── modules\
+```
+
+Therefore, the launcher's full path is:
+
+```text
+X:\PowerShell\Cohesity_API_Scripts\cohesity-dashboard-collector\Run-CohesityDashboard.ps1
 ```
 
 Keep every included file and the `modules` folder together; nothing is installed separately. On the first run, the launcher automatically creates the local `config.psd1` from the included template. Its defaults already point to:
