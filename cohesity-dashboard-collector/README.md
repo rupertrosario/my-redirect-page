@@ -5,7 +5,7 @@ Local, GET-only Cohesity Helios dashboard for multi-cluster protection inventory
 ## What the dashboard shows
 
 - Fleet totals: clusters, protected inventory, open alerts, capacity used, and GC reclaimable TB.
-- One row per cluster with Hyper-V, Nutanix, NAS, Oracle, SQL, and Physical inventory.
+- One row per cluster with Hyper-V, Nutanix, NAS, Oracle, SQL, and Physical inventory. Counts are unique objects found in object-level run details, not PG-level estimates.
 - Each workload cell shows `Total · Successful · Failed · Cancelled` object counts.
 - Active and paused Protection Groups.
 - Object-level unresolved failures. SQL and Oracle are evaluated independently by Full, Incremental, and Log run type.
@@ -115,9 +115,9 @@ FailureRunsPerPG = 6
 To keep refresh time down:
 
 1. Cluster capacity, GC, and six workload inventories run inside each parallel cluster worker.
-2. Hardware/open alerts are retrieved once at fleet level, not once per cluster.
-3. Hyper-V, Nutanix, NAS, and Physical object-run details are requested only when the PG's latest run is non-success or warning.
-4. SQL and Oracle recent runs are always inspected because Full, Incremental, and Log streams must be evaluated independently.
+2. Open alerts are queried separately for each cluster with `/v2/alerts` and that cluster's `accessClusterId`; the MCM fleet-alert endpoint is not used.
+3. Object-detail runs are requested for every PG because all six inventory totals must be object-level.
+4. SQL and Oracle Full, Incremental, and Log streams are evaluated independently; a Log success cannot clear a Full or Incremental failure.
 5. Policy detail calls are not made; the dashboard needs PG state, not policy names.
 
 ## Failure counting rules
@@ -127,7 +127,7 @@ To keep refresh time down:
 - A failure/cancellation is excluded when a newer success exists for the same object and run type.
 - SQL/Oracle Log success does not clear a Full or Incremental failure.
 - `SucceededWithWarning` triggers object-detail inspection.
-- If Cohesity marks a PG failed but returns no object details, a clearly labelled `ProtectionGroupFallback` row is retained rather than silently hiding the failure.
+- If Cohesity marks a PG failed but returns no object details, the dashboard shows a collection warning; it does not invent a PG-level failure or replace the object count with zero silently.
 - Successful object count is `protected total - unresolved failed objects - unresolved cancelled objects`.
 
 ## Cluster-gone and API error handling
@@ -160,7 +160,7 @@ Claude Code should read `claude-context.json`, not call Helios directly. That ke
 | Object run details | `/v2/data-protect/protection-groups/{id}/runs` |
 | Capacity | `/irisservices/api/v1/public/stats/storage` |
 | GC reclaimable | `timeSeriesStats` / `ApolloV2ClusterStats` / `EstimatedGarbageBytes` |
-| Open and hardware alerts | `/v2/mcm/alerts` |
+| Open and hardware alerts | `/v2/alerts` per cluster with `accessClusterId` |
 
 All cluster-scoped calls send both `apiKey` and `accessClusterId`, matching `inventory/Get-CohesityProtectionInventory.ps1`.
 
@@ -180,7 +180,7 @@ Validate one normal cluster and one cluster with known exceptions:
 |---|---|
 | `Missing API key helper` | Correct `ApiKeyHelperPath` in local `config.psd1` |
 | `No clusters returned` | API-key read permission and `/v2/mcm/cluster-mgmt/info` response |
-| Workload count is zero unexpectedly | Tenant response parameter name in `Get-PgObjects` |
+| Workload count is zero unexpectedly | Open **Collection Warnings** and verify the PG `/runs?includeObjectDetails=true` response contains the expected `kVirtualMachine`, `kHost`, or `kDatabase` objects |
 | Refresh is slow | `refresh-status.json`, timeouts, then increase `MaxConcurrency` from 6 to 8 only after checking for throttling |
 | GC blank | Confirm the cluster entity-name format used by the existing GC script |
 | Browser loads but JSON fails | Start with `Run-CohesityDashboard.ps1`; do not open `index.html` directly from disk |
