@@ -59,7 +59,9 @@ function Get-ClusterSnapshot {
         if ($null -eq $used -or $null -eq $total) {
             throw 'Storage response did not contain numeric used and total capacity byte values.'
         }
-        if ($null -eq $available) { $available = [math]::Max(0,[double]$total-[double]$used) }
+        if ($null -eq $available) {
+            $available = [math]::Max([double]0,[double]$total-[double]$used)
+        }
         $capacity = [ordered]@{
             usedBytes=[double]$used
             totalBytes=[double]$total
