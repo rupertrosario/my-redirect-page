@@ -1,7 +1,6 @@
 # Cohesity workload inventory validation
 # GET-only. Windows PowerShell 5.1 compatible.
-# Paused PGs are counted, but only active PGs contribute protected objects.
-# Unprotected Objects comes from the Cohesity object search with isProtected=false.
+# Paused PGs are counted separately; only active PGs contribute protected objects.
 
 [CmdletBinding()]
 param()
@@ -26,14 +25,13 @@ if ([string]::IsNullOrWhiteSpace($ApiKey)) {
     throw 'AES API key helper returned an empty API key.'
 }
 
-# Required output order.
 $Workloads = @(
-    [pscustomobject]@{ Name = 'Hyper-V';     Environments = @('kHyperV');               Kind = 'HyperV';   Params = @('hypervParams','hyperVParams') },
-    [pscustomobject]@{ Name = 'Nutanix AHV'; Environments = @('kAcropolis');            Kind = 'Nutanix';  Params = @('acropolisParams','nutanixParams','ahvParams') },
-    [pscustomobject]@{ Name = 'NAS';         Environments = @('kGenericNas','kIsilon'); Kind = 'NAS';      Params = @('genericNasParams','nasParams','isilonParams') },
-    [pscustomobject]@{ Name = 'Physical';    Environments = @('kPhysical');             Kind = 'Physical'; Params = @('physicalParams') },
-    [pscustomobject]@{ Name = 'SQL';         Environments = @('kSQL');                  Kind = 'SQL';      Params = @('mssqlParams','sqlParams') },
-    [pscustomobject]@{ Name = 'Oracle';      Environments = @('kOracle');               Kind = 'Oracle';   Params = @('oracleParams') }
+    [pscustomobject]@{ Name = 'Hyper-V';     Environments = @('kHyperV');                Kind = 'HyperV';   Params = @('hypervParams','hyperVParams') },
+    [pscustomobject]@{ Name = 'Nutanix AHV'; Environments = @('kAcropolis');             Kind = 'Nutanix';  Params = @('acropolisParams','nutanixParams','ahvParams') },
+    [pscustomobject]@{ Name = 'NAS';         Environments = @('kGenericNas','kIsilon');  Kind = 'NAS';      Params = @('genericNasParams','nasParams','isilonParams') },
+    [pscustomobject]@{ Name = 'Physical';    Environments = @('kPhysical');              Kind = 'Physical'; Params = @('physicalParams') },
+    [pscustomobject]@{ Name = 'SQL';         Environments = @('kSQL');                   Kind = 'SQL';      Params = @('mssqlParams','sqlParams') },
+    [pscustomobject]@{ Name = 'Oracle';      Environments = @('kOracle');                Kind = 'Oracle';   Params = @('oracleParams') }
 )
 
 function As-Array {
@@ -105,7 +103,6 @@ function Get-ProtectionGroups {
     do {
         $uri = "$BaseUrl/v2/data-protect/protection-groups?environments=$([uri]::EscapeDataString($Environment))&isDeleted=false&maxResultCount=1000"
         if ($State -eq 'Active') {
-            # Matches the proven workload backup-failure collectors.
             $uri += '&isPaused=false&isActive=true&includeLastRunInfo=true'
         }
         else {
@@ -206,7 +203,6 @@ function Get-ObjectKey {
         return ''
     }
 
-    # Oracle PG channels reliably expose databaseUniqueName but not always an object id.
     if ($Workload -eq 'Oracle' -and -not [string]::IsNullOrWhiteSpace($name)) {
         return ("oracle|$name").ToLowerInvariant()
     }
@@ -227,7 +223,7 @@ function Get-ConfiguredObjects {
     return @($objects)
 }
 
-function Get-LatestRunObjects {
+function Get-RecentRuns {
     param(
         [string]$ProtectionGroupId,
         [string]$Environment,
@@ -235,10 +231,19 @@ function Get-LatestRunObjects {
     )
 
     if ([string]::IsNullOrWhiteSpace($ProtectionGroupId)) { return @() }
-
     $uri = "$BaseUrl/v2/data-protect/protection-groups/$([uri]::EscapeDataString($ProtectionGroupId))/runs?environments=$([uri]::EscapeDataString($Environment))&numRuns=10&excludeNonRestorableRuns=false&includeObjectDetails=true"
     $json = Get-CohesityJson -Uri $uri -Headers $Headers
-    $runs = @(As-Array (Get-Val $json @('runs')))
+    return @(As-Array (Get-Val $json @('runs')))
+}
+
+function Get-LatestRunObjects {
+    param(
+        [string]$ProtectionGroupId,
+        [string]$Environment,
+        [hashtable]$Headers
+    )
+
+    $runs = @(Get-RecentRuns -ProtectionGroupId $ProtectionGroupId -Environment $Environment -Headers $Headers)
     if ($runs.Count -eq 0) { return @() }
 
     $latestRun = $runs | Sort-Object {
@@ -252,6 +257,42 @@ function Get-LatestRunObjects {
 
     if ($null -eq $latestRun) { return @() }
     return @(As-Array (Get-Val $latestRun @('objects')))
+}
+
+function Get-LatestRunObjectsPerType {
+    param(
+        [string]$ProtectionGroupId,
+        [string]$Environment,
+        [hashtable]$Headers
+    )
+
+    # Matches the proven SQL backup-failure logic: identify every run type,
+    # select the latest run for each type, then inspect that run's objects.
+    $runs = @(Get-RecentRuns -ProtectionGroupId $ProtectionGroupId -Environment $Environment -Headers $Headers)
+    if ($runs.Count -eq 0) { return @() }
+
+    $runRecords = @()
+    foreach ($run in $runs) {
+        foreach ($localInfo in @(As-Array (Get-Val $run @('localBackupInfo')))) {
+            $runType = First-Text @((Get-Val $localInfo @('runType')))
+            if ([string]::IsNullOrWhiteSpace($runType)) { continue }
+            $runRecords += [pscustomobject]@{
+                Run = $run
+                RunType = $runType
+                EndTimeUsecs = [int64](Get-Val $localInfo @('endTimeUsecs','startTimeUsecs') 0)
+            }
+        }
+    }
+
+    $objects = @()
+    foreach ($group in @($runRecords | Group-Object RunType)) {
+        $latest = $group.Group | Sort-Object EndTimeUsecs -Descending | Select-Object -First 1
+        if ($null -eq $latest) { continue }
+        foreach ($candidate in @(As-Array (Get-Val $latest.Run @('objects')))) {
+            if ($null -ne $candidate) { $objects += $candidate }
+        }
+    }
+    return @($objects)
 }
 
 function Get-HyperVObjects {
@@ -275,8 +316,6 @@ function Get-HyperVObjects {
 function Get-NutanixObjects {
     param($ProtectionGroup, $Workload, [hashtable]$Headers)
 
-    # Proven Acropolis backup-failure logic:
-    # latestRun.objects where object.objectType=kVirtualMachine and environment=kAcropolis.
     $result = @()
     foreach ($candidate in @(Get-LatestRunObjects -ProtectionGroupId (Get-PgId $ProtectionGroup) -Environment 'kAcropolis' -Headers $Headers)) {
         $object = Unwrap-Object $candidate
@@ -287,7 +326,6 @@ function Get-NutanixObjects {
         }
     }
 
-    # Covers a new active PG which has not completed its first run.
     if ($result.Count -eq 0) {
         $result = @(Get-ConfiguredObjects -ProtectionGroup $ProtectionGroup -Workload $Workload)
     }
@@ -302,11 +340,11 @@ function Get-NasObjects {
 function Get-SqlDatabaseObjects {
     param($ProtectionGroup, [hashtable]$Headers)
 
-    # SQL is deliberately NOT parsed like Oracle. Reuse the proven SQL
-    # backup-failure logic: kSQL rows in latestRun.objects are databases;
-    # kPhysical rows are hosts and are excluded.
+    # SQL is not parsed like Oracle. The proven SQL backup-failure script
+    # evaluates the latest run for each run type and counts objectType=kSQL.
+    # kPhysical host rows are deliberately excluded.
     $databases = @()
-    foreach ($candidate in @(Get-LatestRunObjects -ProtectionGroupId (Get-PgId $ProtectionGroup) -Environment 'kSQL' -Headers $Headers)) {
+    foreach ($candidate in @(Get-LatestRunObjectsPerType -ProtectionGroupId (Get-PgId $ProtectionGroup) -Environment 'kSQL' -Headers $Headers)) {
         $object = Unwrap-Object $candidate
         $type = First-Text @((Get-Val $object @('objectType','type','entityType')))
         if ($type -ieq 'kSQL') {
@@ -339,10 +377,8 @@ function Get-OracleDatabaseObjects {
 function Get-PhysicalObjects {
     param($ProtectionGroup, [hashtable]$Headers)
 
-    # Proven Physical backup-failure logic:
-    # latestRun.objects where objectType=kHost and environment=kPhysical.
     $hosts = @()
-    foreach ($candidate in @(Get-LatestRunObjects -ProtectionGroupId (Get-PgId $ProtectionGroup) -Environment 'kPhysical' -Headers $Headers)) {
+    foreach ($candidate in @(Get-LatestRunObjectsPerType -ProtectionGroupId (Get-PgId $ProtectionGroup) -Environment 'kPhysical' -Headers $Headers)) {
         $object = Unwrap-Object $candidate
         $type = First-Text @((Get-Val $object @('objectType','type','entityType')))
         $environment = First-Text @((Get-Val $object @('environment','environmentType')))
@@ -351,7 +387,6 @@ function Get-PhysicalObjects {
         }
     }
 
-    # Covers a new active PG which has not completed its first run.
     if ($hosts.Count -eq 0) {
         $physicalParams = Get-Val $ProtectionGroup @('physicalParams')
         foreach ($parameterName in @('fileProtectionTypeParams','volumeProtectionTypeParams')) {
@@ -381,26 +416,15 @@ function Test-UnprotectedObjectForWorkload {
         return $false
     }
 
-    # Some Helios search responses omit objectType. In that case the
-    # environment + isProtected=false filters already identify leaf inventory.
     if ([string]::IsNullOrWhiteSpace($type)) { return $true }
 
     switch ($Workload.Kind) {
-        'HyperV'  { return ($type -ieq 'kVirtualMachine') }
-        'Nutanix' { return ($type -ieq 'kVirtualMachine') }
-        'Physical'{ return ($type -ieq 'kHost') }
-        'SQL' {
-            if ($type -match '(?i)database') { return $true }
-            if ($type -ieq 'kSQL') { return $true }
-            return $false
-        }
-        'Oracle' {
-            # Count Oracle databases only; hosts, instances and PDB/table rows are excluded.
-            return ($type -ieq 'kDatabase' -or $type -ieq 'kOracleDatabase')
-        }
-        'NAS' {
-            return ($type -match '(?i)volume|mountpoint|file.?system|fileset|share|view')
-        }
+        'HyperV'   { return ($type -ieq 'kVirtualMachine') }
+        'Nutanix'  { return ($type -ieq 'kVirtualMachine') }
+        'Physical' { return ($type -ieq 'kHost') }
+        'SQL'      { return ($type -ieq 'kSQL' -or $type -match '(?i)database') }
+        'Oracle'   { return ($type -ieq 'kDatabase' -or $type -ieq 'kOracleDatabase') }
+        'NAS'      { return ($type -match '(?i)volume|mountpoint|file.?system|fileset|share|view') }
     }
     return $false
 }
@@ -492,9 +516,7 @@ foreach ($workload in $Workloads) {
 
             try {
                 foreach ($candidate in @(Get-UnprotectedSearchObjects -Environment $environment -Headers $headers)) {
-                    if (-not (Test-UnprotectedObjectForWorkload -Candidate $candidate -Workload $workload)) {
-                        continue
-                    }
+                    if (-not (Test-UnprotectedObjectForWorkload -Candidate $candidate -Workload $workload)) { continue }
                     $key = Get-ObjectKey -Candidate $candidate -Workload $workload.Name
                     if (-not [string]::IsNullOrWhiteSpace($key)) {
                         $unprotectedObjects[("$($cluster.ClusterId)|$key").ToLowerInvariant()] = $true
