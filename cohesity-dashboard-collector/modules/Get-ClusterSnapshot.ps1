@@ -19,7 +19,7 @@ function Get-ClusterSnapshot {
     $inventory = [ordered]@{}
     foreach ($environment in @(Get-EnvironmentDefinitions)) {
         $inventory[$environment.Key] = [ordered]@{
-            label=$environment.Label; total=0; successful=0; failed=0; cancelled=0
+            label=$environment.Label; total=0; successful=0; failed=0; cancelled=0; objects=@()
         }
     }
 
@@ -108,6 +108,7 @@ function Get-ClusterSnapshot {
     foreach ($environment in @(Get-EnvironmentDefinitions)) {
         $objectIndex = @{}
         $streamState = @{}
+        $objectState = @{}
         $missingObjectDetailPgs = @{}
         $protectionGroupCount = 0
 
@@ -194,6 +195,38 @@ function Get-ClusterSnapshot {
                                 continue
                             }
 
+                            # Full per-object result, independent of the unresolved-failures
+                            # tracking below. Runs are processed newest-first, so the first
+                            # time a key is seen sets its current status; a later (older) run
+                            # is only used to backfill latestSuccessUtc.
+                            if ($objectState.ContainsKey($key)) {
+                                $existingObject = $objectState[$key]
+                                if ($null -ne $existingObject -and $state -eq 'Success' -and
+                                    [string]::IsNullOrWhiteSpace([string]$existingObject.latestSuccessUtc)) {
+                                    $existingObject.latestSuccessUtc = Convert-UsecsToUtc $time
+                                }
+                            } else {
+                                $objectMessage = ''
+                                if ($state -in @('Failed','Cancelled')) {
+                                    $objectMessage = Get-RunObjectMessage -RunObject $runObject -RunInfo $runInfo
+                                    if ([string]::IsNullOrWhiteSpace($objectMessage)) {
+                                        $objectMessage = 'Object-level failure state returned without an error message.'
+                                    }
+                                }
+                                $objectState[$key] = [ordered]@{
+                                    cluster=$name
+                                    workload=$environment.Label
+                                    protectionGroup=$pgName
+                                    objectName=[string]$identity.name
+                                    objectId=[string]$identity.id
+                                    runType=$runType
+                                    status=$state
+                                    resultTimeUtc=Convert-UsecsToUtc $time
+                                    latestSuccessUtc=if($state -eq 'Success'){Convert-UsecsToUtc $time}else{''}
+                                    error=$objectMessage
+                                }
+                            }
+
                             if ($streamState.ContainsKey($key)) {
                                 $existing = $streamState[$key]
                                 if ($null -ne $existing -and $state -eq 'Success' -and
@@ -257,6 +290,9 @@ function Get-ClusterSnapshot {
         $inventory[$environment.Key].cancelled = @($cancelledIds).Count
         $inventory[$environment.Key].successful = [math]::Max(
             0,$total-@($failedIds).Count-@($cancelledIds).Count
+        )
+        $inventory[$environment.Key].objects = @(
+            $objectState.Values | Where-Object { $null -ne $_ } | Sort-Object objectName
         )
         $allFailures += @($failures)
     }
