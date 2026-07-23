@@ -431,13 +431,17 @@ foreach ($cluster in @($selectedClusters)) {
                 }
             }
 
-            $before = @($objectRows).Count
+            # Do not wrap a generic List[object] in @(...). Windows PowerShell
+            # 5.1 can fail with "Argument types do not match" when its dynamic
+            # binder converts a generic list through the array-subexpression
+            # operator.
+            $before = $objectRows.Count
             Add-ObjectRows -Rows $objectRows -Seen $workloadSeen `
                 -Cluster $cluster.ClusterName -Workload $workload.Name `
                 -ProtectionGroup $groupName -ProtectionGroupId $groupId `
                 -Objects $objects -FallbackType $fallbackType
 
-            if (@($objectRows).Count -eq $before) {
+            if ($objectRows.Count -eq $before) {
                 $warningRows.Add([pscustomobject]@{
                     Cluster = $cluster.ClusterName
                     Workload = $workload.Name
@@ -452,7 +456,7 @@ foreach ($cluster in @($selectedClusters)) {
             }
         }
 
-        $protectedObjectCount = @($objectRows | Where-Object {
+        $protectedObjectCount = @($objectRows.ToArray() | Where-Object {
             $_.Cluster -eq $cluster.ClusterName -and $_.Workload -eq $workload.Name
         }).Count
 
@@ -466,9 +470,9 @@ foreach ($cluster in @($selectedClusters)) {
     }
 }
 
-$script:InventorySummary = @($summaryRows | Sort-Object Cluster,Workload)
-$script:InventoryObjects = @($objectRows | Sort-Object Cluster,Workload,ProtectionGroup,ObjectName)
-$script:InventoryWarnings = @($warningRows | Sort-Object Cluster,Workload,ProtectionGroup)
+$script:InventorySummary = @($summaryRows.ToArray() | Sort-Object Cluster,Workload)
+$script:InventoryObjects = @($objectRows.ToArray() | Sort-Object Cluster,Workload,ProtectionGroup,ObjectName)
+$script:InventoryWarnings = @($warningRows.ToArray() | Sort-Object Cluster,Workload,ProtectionGroup)
 
 Write-Host ''
 Write-Host 'WORKLOAD INVENTORY SUMMARY' -ForegroundColor Cyan
