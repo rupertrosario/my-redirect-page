@@ -594,7 +594,11 @@ foreach ($cluster in $selectedClusters) {
                     foreach ($runObject in @(As-Array (Get-Val $record.Run @('objects','objectDetails')))) {
                         $objectId = Get-ObjectId $runObject
                         $objectName = Get-ObjectName $runObject
-                        if (-not [string]::IsNullOrWhiteSpace($objectId) -and
+                        $objectType = Get-ObjectType $runObject
+                        $objectEnvironment = Get-ObjectEnvironment $runObject
+
+                        if (($objectType -ieq 'kHost' -or $objectEnvironment -ieq 'kPhysical') -and
+                            -not [string]::IsNullOrWhiteSpace($objectId) -and
                             -not [string]::IsNullOrWhiteSpace($objectName)) {
                             $hostNamesById[$objectId] = $objectName
                         }
@@ -607,6 +611,11 @@ foreach ($cluster in $selectedClusters) {
                     $targetObjects = @($runObjects | Where-Object {
                         Test-TargetObject -RunObject $_ -Workload $workload
                     })
+
+                    if ($workload.Kind -eq 'NAS' -and -not $runFallbackSeen -and
+                        $targetObjects.Count -gt 0) {
+                        $runFallbackSeen = $true
+                    }
 
                     foreach ($runObject in $targetObjects) {
                         $objectKey = Get-ObjectKey $runObject
@@ -632,6 +641,8 @@ foreach ($cluster in $selectedClusters) {
                             ProtectionGroup = $pgName
                             Host = $hostName
                             ObjectName = Get-ObjectName $runObject
+                            ObjectId = Get-ObjectId $runObject
+                            SourceId = $sourceId
                             ObjectType = Get-ObjectType $runObject
                             Environment = Get-ObjectEnvironment $runObject
                             RunType = $record.RunType
@@ -667,6 +678,8 @@ foreach ($cluster in $selectedClusters) {
                                 ProtectionGroup = $pgName
                                 Host = Get-ObjectName $runObject
                                 ObjectName = 'No database object returned'
+                                ObjectId = Get-ObjectId $runObject
+                                SourceId = Get-SourceId $runObject
                                 ObjectType = Get-ObjectType $runObject
                                 Environment = Get-ObjectEnvironment $runObject
                                 RunType = $record.RunType
@@ -708,6 +721,8 @@ foreach ($cluster in $selectedClusters) {
                                 ProtectionGroup = $pgName
                                 Host = ''
                                 ObjectName = $pgName
+                                ObjectId = ''
+                                SourceId = ''
                                 ObjectType = ''
                                 Environment = First-Text @($workload.Environments)
                                 RunType = $record.RunType
@@ -729,7 +744,7 @@ foreach ($cluster in $selectedClusters) {
 $script:FailureResults = @(
     $allResults |
         Group-Object {
-            "$($_.Cluster)|$($_.Workload)|$($_.Scope)|$($_.ProtectionGroup)|$($_.Host)|$($_.ObjectName)|$($_.RunType)"
+            "$($_.Cluster)|$($_.Workload)|$($_.Scope)|$($_.ProtectionGroup)|$($_.Host)|$($_.ObjectName)|$($_.ObjectId)|$($_.SourceId)|$($_.RunType)"
         } |
         ForEach-Object {
             $_.Group | Sort-Object FailureTimeUtc -Descending | Select-Object -First 1
