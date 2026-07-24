@@ -24,32 +24,22 @@ function Get-HeliosData {
 
     $commonPath = Join-Path $PSScriptRoot 'Common.ps1'
     $snapshotPath = Join-Path $PSScriptRoot 'Get-ClusterSnapshot.ps1'
-    $validatedInventoryPath = Join-Path $PSScriptRoot 'Get-ValidatedWorkloadInventory.ps1'
     $maxConcurrency = [math]::Max(1,[int]$Config.MaxConcurrency)
     $pool = [runspacefactory]::CreateRunspacePool(1,$maxConcurrency)
     $pool.Open()
     $jobs = @()
     $worker = {
-        param($CommonPath,$SnapshotPath,$ValidatedInventoryPath,$Cluster,$Config,$Headers)
+        param($CommonPath,$SnapshotPath,$Cluster,$Config,$Headers)
         . $CommonPath
         . $SnapshotPath
-        . $ValidatedInventoryPath
-
-        $snapshot = Get-ClusterSnapshot -Cluster $Cluster -Config $Config -BaseHeaders $Headers
-        $clusterId = [string](Get-PropertyValue $Cluster @('clusterId','id') '')
-        $clusterHeaders = @{}
-        foreach ($key in $Headers.Keys) { $clusterHeaders[$key] = $Headers[$key] }
-        $clusterHeaders.accessClusterId = $clusterId
-
-        Add-ValidatedInventoryToSnapshot -Snapshot $snapshot -Cluster $Cluster `
-            -Config $Config -Headers $clusterHeaders
+        Get-ClusterSnapshot -Cluster $Cluster -Config $Config -BaseHeaders $Headers
     }
 
     try {
         foreach ($cluster in @($clusters)) {
             $ps = [powershell]::Create()
             $ps.RunspacePool = $pool
-            [void]$ps.AddScript($worker.ToString()).AddArgument($commonPath).AddArgument($snapshotPath).AddArgument($validatedInventoryPath).AddArgument($cluster).AddArgument($Config).AddArgument($Headers)
+            [void]$ps.AddScript($worker.ToString()).AddArgument($commonPath).AddArgument($snapshotPath).AddArgument($cluster).AddArgument($Config).AddArgument($Headers)
             $jobs += [pscustomobject]@{
                 PowerShell=$ps
                 Handle=$ps.BeginInvoke()
@@ -71,17 +61,7 @@ function Get-HeliosData {
                 $emptyInventory = [ordered]@{}
                 foreach ($environment in @(Get-EnvironmentDefinitions)) {
                     $emptyInventory[$environment.Key] = [ordered]@{
-                        label=$environment.Label
-                        total=0
-                        successful=0
-                        failed=0
-                        cancelled=0
-                        objects=@()
-                        protectedObjects=@()
-                        activeProtectionGroups=$null
-                        pausedProtectionGroups=$null
-                        inventorySource='Unavailable'
-                        inventoryComplete=$false
+                        label=$environment.Label; total=0; successful=0; failed=0; cancelled=0
                     }
                 }
                 $snapshots += [ordered]@{
