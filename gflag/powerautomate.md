@@ -111,3 +111,26 @@ Equivalent five-field cron for Monday at midnight:
 ```cron
 0 0 * * 1
 ```
+
+## Brief impact assessment
+
+### Business problem
+
+Dynatrace workflows send Cohesity GFlag configuration reports by email. Keeping them only in Outlook makes long-term retrieval difficult for audits, troubleshooting, configuration reference, and reuse across other clusters.
+
+### How the solution addresses it
+
+Power Automate copies each report to a central SharePoint folder, creating an accessible historical record while leaving the original email unchanged.
+
+### Key inputs and outputs
+
+**Inputs:** Dynatrace-generated GFlag report emails, subject, and report content.  
+**Outputs:** Timestamped Cluster Common or Cluster Specific HTML files stored in SharePoint.
+
+### Impact if the solution fails
+
+The report remains available in Outlook but may not be copied to SharePoint. This could temporarily delay audit, troubleshooting, or configuration-reference activities. Production systems are not affected.
+
+### Failure mitigation
+
+The original email is retained, failed runs can be reviewed in Power Automate, and missing reports can be manually copied or the flow rerun after the issue is corrected.
