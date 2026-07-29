@@ -1,220 +1,227 @@
 # Cohesity SQL Inventory
 
-## Current Status
+## Current test
 
-The full SQL database inventory is still under development.
+Use:
 
-Use **Test 01** first. It reads active SQL protection groups and displays three record types in one grid:
+```text
+Tests/Test-02-SQLDatabaseInventory.ps1
+```
 
-1. SQL configuration fields under `mssqlParams`
-2. Protection-group alert settings under `alertPolicy`
-3. Latest-run protected objects with both object ID and object name
+This test produces **one row per SQL database**. It does not use the raw field/value layout from Test 01.
 
-The same grid rows are exported to CSV automatically.
+The helper file must remain in the same folder:
 
-## Files
+```text
+Tests/SQLInventory.Helpers.ps1
+```
 
-| File | Status | Purpose |
-|---|---|---|
-| `Tests/Test-01-SQLProtectionGroups.ps1` | Current test | Display SQL settings, alert policy, and resolved object details in one grid |
-| `Get-CohesitySQLInventory.ps1` | Experimental | Earlier full-inventory trial; do not use as the validated baseline |
-| `README.md` | Current | Run instructions and output definition |
+`Test-01-SQLProtectionGroups.ps1` remains available as the earlier raw API-inspection test.
 
-# Run Test 01
+## Run instructions
 
-## 1. Open PowerShell
-
-Open **Windows PowerShell 5.1** on the server or workstation where the Cohesity PowerShell folders and `X:` drive are available.
-
-## 2. Go to the SQL inventory folder
+Open Windows PowerShell 5.1 and go to the SQL inventory folder:
 
 ```powershell
 Set-Location "X:\PowerShell\Cohesity_API_Scripts\Cohesity_SQL_Inventory"
 ```
 
-Use the actual local repository path when the repository is checked out somewhere else.
-
-## 3. Run the test
+Run the default test:
 
 ```powershell
-.\Tests\Test-01-SQLProtectionGroups.ps1
+.\Tests\Test-02-SQLDatabaseInventory.ps1
 ```
 
 The default run:
 
-- discovers clusters through Helios;
 - checks clusters alphabetically;
-- stops after the first cluster containing active SQL protection groups;
-- inspects one SQL protection group;
-- expands every leaf field under `mssqlParams`;
-- expands every leaf field under `alertPolicy`;
-- requests the latest protection-group run with object details;
-- resolves each returned object ID to the object name returned by Cohesity;
-- exports CSV;
-- opens `Out-GridView` automatically.
+- stops after the first cluster containing an active SQL protection group;
+- inspects one protection group;
+- reads the latest 20 protection-group runs;
+- opens one `Out-GridView`;
+- exports the same rows to CSV.
 
-No grid switch is required.
+## Select a cluster and protection group
 
-## Run Against a Specific Cluster
+Specific cluster:
 
 ```powershell
-.\Tests\Test-01-SQLProtectionGroups.ps1 -ClusterName "CHS-PROD-01"
+.\Tests\Test-02-SQLDatabaseInventory.ps1 -ClusterName "CHS-PROD-01"
 ```
 
-Wildcard matching is supported:
+Specific protection group:
 
 ```powershell
-.\Tests\Test-01-SQLProtectionGroups.ps1 -ClusterName "*PROD*"
+.\Tests\Test-02-SQLDatabaseInventory.ps1 -ClusterName "CHS-PROD-01" -ProtectionGroupName "SQL-PROD-AAG"
 ```
 
-## Inspect More Protection Groups
-
-The default is one protection group.
+Wildcards are supported:
 
 ```powershell
-.\Tests\Test-01-SQLProtectionGroups.ps1 -MaxProtectionGroups 5
+.\Tests\Test-02-SQLDatabaseInventory.ps1 -ClusterName "*PROD*" -ProtectionGroupName "*SQL*"
 ```
 
-For a particular cluster:
+Inspect five protection groups on the first matching cluster:
 
 ```powershell
-.\Tests\Test-01-SQLProtectionGroups.ps1 -ClusterName "CHS-PROD-01" -MaxProtectionGroups 5
+.\Tests\Test-02-SQLDatabaseInventory.ps1 -MaxProtectionGroups 5
 ```
 
-## Scan All Clusters
+Scan all clusters and up to five protection groups per cluster:
 
 ```powershell
-.\Tests\Test-01-SQLProtectionGroups.ps1 -ScanAllClusters
+.\Tests\Test-02-SQLDatabaseInventory.ps1 -ScanAllClusters -MaxProtectionGroups 5
 ```
 
-To inspect up to five SQL protection groups per cluster:
+Read more run history:
 
 ```powershell
-.\Tests\Test-01-SQLProtectionGroups.ps1 -ScanAllClusters -MaxProtectionGroups 5
+.\Tests\Test-02-SQLDatabaseInventory.ps1 -RunHistoryCount 50
 ```
 
-# Grid Output
+Include database objects that appeared in older returned runs but not in the latest run:
 
-`Out-GridView` opens automatically with these columns:
+```powershell
+.\Tests\Test-02-SQLDatabaseInventory.ps1 -IncludeHistoricalObjects
+```
 
-| Column | Meaning |
-|---|---|
-| `Cluster` | Cohesity cluster name |
-| `ProtectionGroupName` | SQL protection-group name |
-| `ProtectionGroupId` | Protection-group identifier |
-| `Environment` | Expected value is `kSQL` |
-| `PolicyId` | Assigned policy identifier |
-| `RecordType` | `SQLSetting`, `AlertPolicy`, or `ProtectedObject` |
-| `ParameterSection` | Configuration section containing the field |
-| `Field` | Nested field path |
-| `Value` | Actual value returned by the API |
-| `ObjectId` | Cohesity object ID for protected-object rows |
-| `ObjectName` | Object name returned for that ID |
-| `SourceId` | Registered source ID |
-| `SourceName` | Registered source name |
-| `ObjectEnvironment` | Object environment returned by Cohesity |
-| `ObjectType` | Cohesity object type when returned |
-| `SnapshotStatus` | Latest object snapshot status when returned |
+Save raw PG, policy, and run JSON for troubleshooting:
 
-## Important SQL setting
+```powershell
+.\Tests\Test-02-SQLDatabaseInventory.ps1 -SaveRawJson
+```
 
-The following field is included when returned by the API:
+## Row design
+
+The row identity is:
 
 ```text
-RecordType       = SQLSetting
-ParameterSection = fileProtectionTypeParams
-Field            = advancedSettings.logChainBreakAutoTriggerOobIncrBackup
-Value            = True or False
+Cluster + ServerInstance + Database + ProtectionGroup
 ```
 
-The same field can also appear under `nativeProtectionTypeParams` or `volumeProtectionTypeParams`, depending on `mssqlParams.protectionType`.
-
-## Alert-policy rows
+Each SQL database appears once for that source and protection group.
 
 Examples:
 
-```text
-RecordType       = AlertPolicy
-ParameterSection = alertPolicy
-Field            = alertTargets[0].emailAddress
-Value            = sql-alerts@example.com
-```
+| Cluster | ServerInstance | Database | ProtectionGroup |
+|---|---|---|---|
+| CHS-PROD-01 | SQLPRD01\MSSQLSERVER | FinanceDB | SQL-PROD |
+| CHS-PROD-01 | SQLPRD01\INSTANCE1 | FinanceDB | SQL-PROD |
+
+Those are two different database objects because they belong to different SQL instances.
+
+## Main grid columns
+
+### Database identity
+
+- `Cluster`
+- `ServerInstance`
+- `Database`
+- `AvailabilityGroup`
+- `ReplicaRole`
+- `ProtectionGroup`
+- `PolicyName`
+
+### Protection-group SQL settings
+
+- `ProtectionType`
+- `AAGBackupPreference`
+- `BackupSystemDBs`
+- `UserDBPreference`
+- `LogChainBreakOOBIncremental`
+- `AlertEmails`
+- `AlertOnStatuses`
+
+Alert target language and recipient type are not displayed.
+
+The following unwanted raw fields are not displayed as independent columns:
+
+- object ID;
+- source ID;
+- source type;
+- object type;
+- regular-expression indicator;
+- `logBackupWithClause`;
+- `newDatabaseAutoTriggerOobIncrBackup`.
+
+## Exclusions
+
+`ObjectExclusions` contains filters that match the current database object.
+
+`OtherObjectExclusions` preserves configured exclusions that did not match any currently displayed database. To avoid repeating the same stale or unmatched exclusion on every database row, this value appears only on the first database row for that protection group.
+
+The script uses the regular-expression flag internally for matching but does not display it.
+
+## Backup success columns
+
+The script reads multiple runs and adds:
+
+- `LatestBackupType`
+- `LatestBackupStatus`
+- `LatestBackupStart`
+- `LatestBackupEnd`
+- `LatestFailureMessage`
+- `LastFullStatus`
+- `LastFullTime`
+- `LastIncrementalStatus`
+- `LastIncrementalTime`
+- `LastLogStatus`
+- `LastLogTime`
+- `SeenInLatestRun`
+
+Run types containing `regular` or `increment` are classified as incremental. Run types containing `full` or `log` are classified accordingly.
+
+## Source, object, and policy details
+
+The following columns retain additional returned parameters without creating extra database rows:
+
+- `SourceSettings`
+- `ObjectParameters`
+- `PolicySettings`
+- `RawObjectName`
+
+The collector checks returned SQL, AAG, host, database, source, connection, schedule, backup, retention, and policy sections. Password, token, secret, credential, and API-key fields are excluded.
+
+The source/object parameter paths are intentionally retained as `path=value` text during validation because Cohesity versions may return different nested SQL structures.
+
+## API calls
+
+Test 02 uses only `GET` requests:
 
 ```text
-RecordType       = AlertPolicy
-ParameterSection = alertPolicy
-Field            = alertTargets[0].recipientType
-Value            = kTo
+GET /v2/mcm/cluster-mgmt/info
+GET /v2/data-protect/protection-groups?environments=kSQL&isDeleted=false&isActive=true
+GET /v2/data-protect/policies?ids={policyId}
+GET /v2/data-protect/protection-groups/{pgId}/runs?numRuns={count}&includeObjectDetails=true
+GET /v2/data-protect/objects/{objectId}
 ```
+
+The target cluster is selected with the `accessClusterId` header.
+
+No `POST`, `PUT`, `PATCH`, or `DELETE` request is used.
+
+## Output files
+
+Main CSV:
 
 ```text
-RecordType       = AlertPolicy
-ParameterSection = alertPolicy
-Field            = backupRunStatus[0]
-Value            = kFailure
+X:\PowerShell\Data\Cohesity\SQLInventory\Tests\Test-02-SQLDatabaseInventory_YYYYMMDD_HHMMSS.csv
 ```
 
-All other returned `alertPolicy` fields are also included.
-
-## Protected-object rows
-
-Object details are read from:
+Issues CSV, when required:
 
 ```text
-GET /v2/data-protect/protection-groups/{id}/runs?numRuns=1&includeObjectDetails=true
+X:\PowerShell\Data\Cohesity\SQLInventory\Tests\Test-02-SQLDatabaseInventoryIssues_YYYYMMDD_HHMMSS.csv
 ```
 
-Each protected-object row includes both:
+Raw JSON files are created only when `-SaveRawJson` is used.
 
-```text
-ObjectId
-ObjectName
-```
+## Authentication
 
-It also includes source name, source ID, object environment, object type, and latest snapshot status when Cohesity returns those fields.
-
-A protected-object row represents the objects present in the latest returned protection-group run. It is not yet the final discovered SQL database inventory.
-
-# CSV Output
-
-The complete grid is exported automatically to:
-
-```text
-X:\PowerShell\Data\Cohesity\SQLInventory\Tests\Test-01-SQLProtectionGroupDetails_YYYYMMDD_HHMMSS.csv
-```
-
-When issues are detected, a separate issues CSV is written to:
-
-```text
-X:\PowerShell\Data\Cohesity\SQLInventory\Tests\Test-01-SQLProtectionGroupIssues_YYYYMMDD_HHMMSS.csv
-```
-
-# Console Summary
-
-Before the grid opens, PowerShell displays:
-
-```text
-SQL protection-group detail test
-Clusters checked: <count>
-Protection groups inspected: <count>
-Grid rows collected: <count>
-Objects resolved to names: <count>
-CSV: <path>
-```
-
-The script does not return a second PowerShell summary object.
-
-# Authentication Requirements
-
-The shared AES helper must exist at:
+The script expects:
 
 ```text
 X:\PowerShell\Cohesity_API_Scripts\Common\ApiKeyAesHelper.ps1
-```
-
-The encrypted API-key file must exist at:
-
-```text
 X:\PowerShell\Cohesity_API_Scripts\Common\Secure\cohesity_apikey.enc
 ```
 
@@ -224,40 +231,6 @@ The helper must provide:
 Get-CohesityApiKeyFromAes -EncryptedFile <path>
 ```
 
-# API Safety
+## Validation note
 
-Test 01 uses only HTTP `GET` requests:
-
-```text
-GET /v2/mcm/cluster-mgmt/info
-GET /v2/data-protect/protection-groups?environments=kSQL&isDeleted=false&isActive=true
-GET /v2/data-protect/protection-groups/{id}/runs?numRuns=1&includeObjectDetails=true
-```
-
-The target cluster is selected through the `accessClusterId` header.
-
-No `POST`, `PUT`, `PATCH`, or `DELETE` request is used.
-
-# Troubleshooting
-
-## Out-GridView is not available
-
-Run the test in Windows PowerShell on Windows and verify:
-
-```powershell
-Get-Command Out-GridView
-```
-
-## Object names are blank or `N/A`
-
-The latest protection-group run did not return complete object details. Review the generated issues CSV.
-
-The current test deliberately uses the latest run because it is a small validation step. A later inventory stage will resolve the complete current SQL object hierarchy separately.
-
-## Too much data in the grid
-
-Keep the default of one protection group or specify one cluster:
-
-```powershell
-.\Tests\Test-01-SQLProtectionGroups.ps1 -ClusterName "<cluster name>" -MaxProtectionGroups 1
-```
+This test still requires execution in the user environment. A PowerShell runtime is not available in the repository-editing environment, so API response shape and parser behavior must be confirmed using the generated grid, issues CSV, and optional raw JSON files.
