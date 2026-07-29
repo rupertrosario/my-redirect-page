@@ -1,5 +1,5 @@
 # Cohesity SQL Inventory - Test 01
-# Purpose: Inspect every field returned under mssqlParams for active SQL protection groups.
+# Purpose: Inspect SQL protection settings, alert policy, and latest-run object details.
 # Scope: GET-only, grid output is mandatory, CSV export is created automatically.
 
 [CmdletBinding()]
@@ -90,6 +90,43 @@ function Get-PropertyValue {
 
         if ($null -ne $property -and $null -ne $property.Value) {
             return $property.Value
+        }
+    }
+
+    return $Default
+}
+
+function Get-NestedValue {
+    param(
+        $Object,
+        [string[]]$Paths,
+        $Default = $null
+    )
+
+    foreach ($path in $Paths) {
+        $current = $Object
+        $found = $true
+
+        foreach ($segment in ($path -split '\.')) {
+            if ($null -eq $current) {
+                $found = $false
+                break
+            }
+
+            $property = @($current.PSObject.Properties) |
+                Where-Object { $_.Name -ieq $segment } |
+                Select-Object -First 1
+
+            if ($null -eq $property) {
+                $found = $false
+                break
+            }
+
+            $current = $property.Value
+        }
+
+        if ($found -and $null -ne $current) {
+            return $current
         }
     }
 
@@ -239,6 +276,46 @@ function Expand-LeafValue {
     }
 }
 
+function New-GridRow {
+    param(
+        [string]$Cluster,
+        [string]$ProtectionGroupName,
+        [string]$ProtectionGroupId,
+        [string]$Environment,
+        [string]$PolicyId,
+        [string]$RecordType,
+        [string]$ParameterSection,
+        [string]$Field,
+        [string]$Value,
+        [string]$ObjectId = "",
+        [string]$ObjectName = "",
+        [string]$SourceId = "",
+        [string]$SourceName = "",
+        [string]$ObjectEnvironment = "",
+        [string]$ObjectType = "",
+        [string]$SnapshotStatus = ""
+    )
+
+    return [pscustomobject][ordered]@{
+        Cluster             = $Cluster
+        ProtectionGroupName = $ProtectionGroupName
+        ProtectionGroupId   = $ProtectionGroupId
+        Environment         = $Environment
+        PolicyId            = $PolicyId
+        RecordType          = $RecordType
+        ParameterSection    = $ParameterSection
+        Field               = $Field
+        Value               = $Value
+        ObjectId            = $ObjectId
+        ObjectName          = $ObjectName
+        SourceId            = $SourceId
+        SourceName          = $SourceName
+        ObjectEnvironment   = $ObjectEnvironment
+        ObjectType          = $ObjectType
+        SnapshotStatus      = $SnapshotStatus
+    }
+}
+
 $commonHeaders = @{
     accept = "application/json"
     apiKey = $apiKey
@@ -271,6 +348,7 @@ $rows = @()
 $issues = @()
 $clustersChecked = 0
 $protectionGroupsInspected = 0
+$objectsResolved = 0
 
 foreach ($cluster in $clusters) {
     $resolvedClusterName = Get-ClusterNameValue $cluster
@@ -310,41 +388,142 @@ foreach ($cluster in $clusters) {
             $pgId = [string](Get-PropertyValue $pg @("id") "N/A")
             $environment = [string](Get-PropertyValue $pg @("environment") "N/A")
             $policyId = [string](Get-PropertyValue $pg @("policyId") "N/A")
-            $mssqlParams = Get-PropertyValue $pg @("mssqlParams") $null
 
+            $mssqlParams = Get-PropertyValue $pg @("mssqlParams") $null
             if ($null -eq $mssqlParams) {
                 $issues += [pscustomobject]@{
                     Cluster = $resolvedClusterName
                     Stage   = "mssqlParams"
                     Issue   = "Protection group '$pgName' did not return mssqlParams"
                 }
+            }
+            else {
+                foreach ($flatField in @(Expand-LeafValue -Value $mssqlParams -Path "")) {
+                    $fullPath = [string]$flatField.Field
+                    $firstDot = $fullPath.IndexOf(".")
+
+                    if ($firstDot -gt 0) {
+                        $parameterSection = $fullPath.Substring(0, $firstDot)
+                        $fieldName = $fullPath.Substring($firstDot + 1)
+                    }
+                    else {
+                        $parameterSection = "mssqlParams"
+                        $fieldName = $fullPath
+                    }
+
+                    $rows += New-GridRow `
+                        -Cluster $resolvedClusterName `
+                        -ProtectionGroupName $pgName `
+                        -ProtectionGroupId $pgId `
+                        -Environment $environment `
+                        -PolicyId $policyId `
+                        -RecordType "SQLSetting" `
+                        -ParameterSection $parameterSection `
+                        -Field $fieldName `
+                        -Value ([string]$flatField.Value)
+                }
+            }
+
+            $alertPolicy = Get-PropertyValue $pg @("alertPolicy") $null
+            if ($null -eq $alertPolicy) {
+                $issues += [pscustomobject]@{
+                    Cluster = $resolvedClusterName
+                    Stage   = "alertPolicy"
+                    Issue   = "Protection group '$pgName' did not return alertPolicy"
+                }
+            }
+            else {
+                foreach ($flatField in @(Expand-LeafValue -Value $alertPolicy -Path "")) {
+                    $rows += New-GridRow `
+                        -Cluster $resolvedClusterName `
+                        -ProtectionGroupName $pgName `
+                        -ProtectionGroupId $pgId `
+                        -Environment $environment `
+                        -PolicyId $policyId `
+                        -RecordType "AlertPolicy" `
+                        -ParameterSection "alertPolicy" `
+                        -Field ([string]$flatField.Field) `
+                        -Value ([string]$flatField.Value)
+                }
+            }
+
+            if ($pgId -eq "N/A") {
+                $issues += [pscustomobject]@{
+                    Cluster = $resolvedClusterName
+                    Stage   = "Protection group runs"
+                    Issue   = "Protection group '$pgName' did not return an ID; object names could not be resolved"
+                }
                 continue
             }
 
-            $flatFields = @(Expand-LeafValue -Value $mssqlParams -Path "")
+            try {
+                $encodedPgId = [uri]::EscapeDataString($pgId)
+                $runsUri = "$baseUrl/v2/data-protect/protection-groups/$encodedPgId/runs?numRuns=1&includeObjectDetails=true"
+                $runsResponse = Invoke-CohesityGet -Uri $runsUri -Headers $headers
+                $latestRun = @($runsResponse.runs) | Select-Object -First 1
 
-            foreach ($flatField in $flatFields) {
-                $fullPath = [string]$flatField.Field
-                $firstDot = $fullPath.IndexOf(".")
-
-                if ($firstDot -gt 0) {
-                    $parameterSection = $fullPath.Substring(0, $firstDot)
-                    $fieldName = $fullPath.Substring($firstDot + 1)
+                if ($null -eq $latestRun) {
+                    $issues += [pscustomobject]@{
+                        Cluster = $resolvedClusterName
+                        Stage   = "Protection group runs"
+                        Issue   = "No run was returned for protection group '$pgName'"
+                    }
+                    continue
                 }
-                else {
-                    $parameterSection = "mssqlParams"
-                    $fieldName = $fullPath
+
+                $runObjects = @(Get-PropertyValue $latestRun @("objects") @())
+                if ($runObjects.Count -eq 0) {
+                    $issues += [pscustomobject]@{
+                        Cluster = $resolvedClusterName
+                        Stage   = "Protection group objects"
+                        Issue   = "Latest run for protection group '$pgName' did not return object details"
+                    }
+                    continue
                 }
 
-                $rows += [pscustomobject][ordered]@{
-                    Cluster             = $resolvedClusterName
-                    ProtectionGroupName = $pgName
-                    ProtectionGroupId   = $pgId
-                    Environment         = $environment
-                    PolicyId            = $policyId
-                    ParameterSection    = $parameterSection
-                    Field               = $fieldName
-                    Value               = [string]$flatField.Value
+                foreach ($runObject in $runObjects) {
+                    $objectSummary = Get-PropertyValue $runObject @("object") $null
+                    if ($null -eq $objectSummary) {
+                        continue
+                    }
+
+                    $objectId = [string](Get-PropertyValue $objectSummary @("id") "N/A")
+                    $objectName = [string](Get-PropertyValue $objectSummary @("name") "N/A")
+                    $sourceId = [string](Get-PropertyValue $objectSummary @("sourceId") "N/A")
+                    $sourceName = [string](Get-PropertyValue $objectSummary @("sourceName") "N/A")
+                    $objectEnvironment = [string](Get-PropertyValue $objectSummary @("environment") "N/A")
+                    $objectType = [string](Get-PropertyValue $objectSummary @("objectType") "N/A")
+                    $snapshotStatus = [string](Get-NestedValue $runObject @(
+                        "localSnapshotInfo.snapshotInfo.status",
+                        "originalBackupInfo.snapshotInfo.status"
+                    ) "N/A")
+
+                    $rows += New-GridRow `
+                        -Cluster $resolvedClusterName `
+                        -ProtectionGroupName $pgName `
+                        -ProtectionGroupId $pgId `
+                        -Environment $environment `
+                        -PolicyId $policyId `
+                        -RecordType "ProtectedObject" `
+                        -ParameterSection "latestRun.objects" `
+                        -Field "object" `
+                        -Value $objectName `
+                        -ObjectId $objectId `
+                        -ObjectName $objectName `
+                        -SourceId $sourceId `
+                        -SourceName $sourceName `
+                        -ObjectEnvironment $objectEnvironment `
+                        -ObjectType $objectType `
+                        -SnapshotStatus $snapshotStatus
+
+                    $objectsResolved++
+                }
+            }
+            catch {
+                $issues += [pscustomobject]@{
+                    Cluster = $resolvedClusterName
+                    Stage   = "Protection group runs"
+                    Issue   = "Protection group '$pgName': $($_.Exception.Message)"
                 }
             }
         }
@@ -364,24 +543,25 @@ foreach ($cluster in $clusters) {
 
 $rows = @(
     $rows |
-        Sort-Object Cluster, ProtectionGroupName, ParameterSection, Field
+        Sort-Object Cluster, ProtectionGroupName, RecordType, ParameterSection, Field, ObjectName
 )
 
 if ($rows.Count -eq 0) {
     if ($issues.Count -gt 0) {
         $issues | Format-Table -AutoSize -Wrap | Out-Host
     }
-    throw "No SQL protection-group fields were collected."
+    throw "No SQL protection-group data was collected."
 }
 
 $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
-$csvPath = Join-Path $OutputDirectory "Test-01-SQLProtectionGroupFields_$timestamp.csv"
+$csvPath = Join-Path $OutputDirectory "Test-01-SQLProtectionGroupDetails_$timestamp.csv"
 $rows | Export-Csv -Path $csvPath -NoTypeInformation -Encoding UTF8
 
-Write-Host "`nSQL protection-group field test" -ForegroundColor Cyan
+Write-Host "`nSQL protection-group detail test" -ForegroundColor Cyan
 Write-Host "Clusters checked: $clustersChecked"
 Write-Host "Protection groups inspected: $protectionGroupsInspected"
-Write-Host "Fields collected: $($rows.Count)"
+Write-Host "Grid rows collected: $($rows.Count)"
+Write-Host "Objects resolved to names: $objectsResolved"
 Write-Host "CSV: $csvPath" -ForegroundColor Green
 
 if ($issues.Count -gt 0) {
@@ -390,4 +570,4 @@ if ($issues.Count -gt 0) {
     Write-Warning "$($issues.Count) issue(s) were recorded. Issues CSV: $issuesPath"
 }
 
-$rows | Out-GridView -Title "Cohesity SQL Protection Group Fields"
+$rows | Out-GridView -Title "Cohesity SQL Protection Group Details"
