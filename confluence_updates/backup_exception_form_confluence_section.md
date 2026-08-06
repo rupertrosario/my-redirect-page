@@ -1,10 +1,10 @@
-# Confluence Section — Interim Backup Exception Request Form
+# Confluence Section — Backup Exception Request Form
 
-## Interim Backup Exception Request Form
+## Backup Exception Request Form
 
-Until the formal STEM process is finalized, the Backup Exception Request Form will be used as the interim control for backup exclusion, retention extension, and legal hold requests.
+For any new backup exception request, the Backup Exception Request Form must be completed and attached to the related incident.
 
-The completed form must be attached to the related incident and used to capture the required request details, approval evidence, backup team review, status updates, and closure comments.
+The form is used to capture the request details, approval evidence, backup team review, status updates, and closure comments.
 
 Use the relevant workbook tab based on the request type:
 
