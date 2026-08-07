@@ -88,8 +88,6 @@ $activeRecords = @($records | Where-Object {$_.OriginalStatus -notin $finishedSt
 $allRunningPctValues = @()
 
 if($activeRecords.Count -gt 0){
-    Write-Host ("Checking {0} active replication record(s)..." -f $activeRecords.Count) -ForegroundColor DarkGray
-
     foreach($record in $activeRecords){
         # Same detailed GET path used by the original script.
         $run = api get "/backupjobruns?allUnderHierarchy=true&exactMatchStartTimeUsecs=$($record.StartTimeUsecs)&id=$($record.JobId)"
