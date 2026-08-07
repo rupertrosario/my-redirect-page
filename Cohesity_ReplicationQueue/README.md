@@ -36,16 +36,6 @@ Use the Cohesity cluster VIP/name directly:
 
 If no `-password` is supplied, `cohesity-api.ps1` uses its normal cached-password / interactive prompt behavior.
 
-You can also pass a password explicitly:
-
-```powershell
-.\replicationQueueSummary.ps1 `
-    -vip mycluster `
-    -username myusername `
-    -domain local `
-    -password 'mypassword'
-```
-
 For an AD account, replace `local` with the appropriate domain.
 
 This version is intended for a direct cluster connection, not `helios.cohesity.com`.
@@ -68,22 +58,26 @@ Multiple protection groups can be supplied:
 
 `-numRuns` controls how many recent runs are inspected per protection group and defaults to `999`.
 
+## How Running Status Is Detected
+
+The queue-level `copyRun.status` is not sufficient by itself.
+
+A remote copy can still have a top-level status such as `kAccepted` while one or more replication subtasks are already `kRunning`.
+
+The script therefore follows the same pattern as the original `replicationQueue.ps1`:
+
+1. Read remote copy runs.
+2. Treat `kCanceled`, `kSuccess`, `kFailure`, and `kWarning` as finished.
+3. For every non-finished remote copy, GET the detailed backup run.
+4. Read replication `activeCopySubTasks` where `snapshotTarget.type = 2`.
+5. If any active replication subtask is `kRunning`, classify that replication as `kRunning` and calculate its percentage.
+6. Otherwise report `kAccepted`, `kSkipped`, or the actual status returned by Cohesity.
+
+This prevents an active replication from being incorrectly reported as only waiting.
+
 ## Console Output
 
-Collection progress is lightweight:
-
-```text
-Scanning replication queue on CLUSTER01...
-
-[1/23] PG_SQL_PROD
-[2/23] PG_VMWARE_PROD
-...
-[23/23] PG_FILESERVER
-```
-
-If replication is running, the script performs the same GET detail lookup used by the original queue script to calculate average running progress.
-
-Example summary:
+Example:
 
 ```text
 ================ REPLICATION SUMMARY ================
@@ -120,7 +114,7 @@ protectionRuns?jobId=<jobId>&numRuns=<numRuns>&excludeTasks=true
 /backupjobruns?allUnderHierarchy=true&exactMatchStartTimeUsecs=<time>&id=<jobId>
 ```
 
-The last GET is used only when a `kRunning` replication exists and is needed to calculate running percentage.
+The detailed `/backupjobruns` GET is executed for each non-finished remote replication so the script can read the actual active replication subtask status and running percentage.
 
 ## Source Reference
 
