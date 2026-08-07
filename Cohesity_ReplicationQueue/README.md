@@ -1,53 +1,32 @@
-# Cohesity Replication Queue Summary
+# Cohesity Replication Queue Status
 
 ## Purpose
 
-`replicationQueueSummary.ps1` is a reporting-enhanced version of the Cohesity community `replicationQueue.ps1` workflow.
+`replicationQueueSummary.ps1` is a minimal read-only replication status checker based on the Cohesity community `replicationQueue.ps1` logic.
 
-It keeps the same Cohesity API approach used by the original script and adds a consolidated summary so you can quickly see:
+It is intentionally limited to status reporting:
 
-- total replication tasks found
-- successful replications
-- currently running replications
-- accepted work
-- queued work
-- failed, warning, and canceled replications
-- remaining replication work still to go
-- backup date
-- protection group / job name
-- active replication task ID
-- active item count
-- running, accepted, and queued item counts
-- object-level replication status and percentage complete
+- Cohesity data operations are GET only
+- no cancellation logic
+- no `POST`, `PUT`, `PATCH`, or `DELETE` data operations
+- no CSV files are created
+- no task-detail or object-detail console sections
+- one compact replication summary only
 
-The script does not change how replication is performed. The existing cancellation behavior from the source script is retained.
+API-key authentication is required because the Cohesity helper validates API-key authentication with GET requests. Username/password authentication is not used because that authentication path performs `POST /login`.
 
 ## Files
 
-| File | Purpose |
-|---|---|
-| `replicationQueueSummary.ps1` | Replication queue collector and summary report |
-| `cohesity-api.ps1` | Cohesity REST API helper required by the script |
+Place these files in the same directory:
 
-`cohesity-api.ps1` must be in the same directory as `replicationQueueSummary.ps1`.
-
-## Recommended Run
-
-To show the active queue plus completed replication results:
-
-```powershell
-.\replicationQueueSummary.ps1 `
-    -vip mycluster `
-    -username myusername `
-    -domain local `
-    -showFinished
+```text
+replicationQueueSummary.ps1
+cohesity-api.ps1
 ```
 
-Replace `mycluster`, `myusername`, and `local` with the values for your Cohesity environment.
+## Run Against a Cluster
 
-### Active replication work only
-
-Without `-showFinished`, finished replication rows are omitted from the task-detail table:
+If the API key is already cached by `cohesity-api.ps1`:
 
 ```powershell
 .\replicationQueueSummary.ps1 `
@@ -56,169 +35,95 @@ Without `-showFinished`, finished replication rows are omitted from the task-det
     -domain local
 ```
 
-### Specific protection group
+Or provide the API key through the existing helper password parameter:
 
 ```powershell
 .\replicationQueueSummary.ps1 `
     -vip mycluster `
     -username myusername `
     -domain local `
-    -jobName "SQL_PROD" `
-    -showFinished
+    -password '<API_KEY>'
 ```
 
-### Multiple protection groups
+## Run Through Helios
+
+```powershell
+.\replicationQueueSummary.ps1 `
+    -vip helios.cohesity.com `
+    -username helios `
+    -clusterName 'CLUSTER01'
+```
+
+## Optional Protection Group Filter
 
 ```powershell
 .\replicationQueueSummary.ps1 `
     -vip mycluster `
     -username myusername `
     -domain local `
-    -jobName "SQL_PROD","VMWARE_PROD" `
-    -showFinished
+    -jobName 'SQL_PROD'
 ```
 
-### Date filtering
-
-Show replications older than 7 days:
+Multiple protection groups can be supplied:
 
 ```powershell
-.\replicationQueueSummary.ps1 `
-    -vip mycluster `
-    -username myusername `
-    -domain local `
-    -olderThan 7 `
-    -showFinished
+-jobName 'SQL_PROD','VMWARE_PROD'
 ```
 
-You can also use `-before`, `-after`, or `-newerThan` as supported by the original queue script.
+`-numRuns` controls how many recent runs are inspected per protection group and defaults to `999`.
 
-## Live Progress
+## Console Output
 
-The queue scan now shows progress for every protection group so a long API call does not look like the script has silently stopped:
+During collection the script prints only lightweight progress:
 
 ```text
 Scanning replication queue on CLUSTER01...
 
-[1/25] Getting tasks for SQL_PROD - querying up to 999 runs...
-      Returned 999 backup runs; found 42 remote replication record(s).
-[2/25] Getting tasks for VMWARE_PROD - querying up to 999 runs...
-      Returned 620 backup runs; found 18 remote replication record(s).
+[1/23] PG_SQL_PROD
+[2/23] PG_VMWARE_PROD
+...
+[23/23] PG_FILESERVER
 ```
 
-After the initial queue scan, the summary is printed before the script performs the slower active-task detail lookups.
+If replication is currently running, the script performs the same GET detail lookup used by the original queue script to calculate average running progress.
 
-Active detail retrieval also shows progress:
-
-```text
-[Detail 1/18] SQL_PROD - 07/15/2026 01:00:00
-[Detail 2/18] VMWARE_PROD - 07/16/2026 01:00:00
-```
-
-## Console Summary
-
-Example:
+Example summary:
 
 ```text
 ================ REPLICATION SUMMARY ================
 
-Metric                    Count
-------                    -----
-Total Replication Tasks     120
-Successful                   82
-Running                       6
-Accepted                      8
-Queued                        4
-Failed                        3
-Warning                       1
-Canceled                      0
-Other Active                  0
+Status       Count Detail
+------       ----- ------
+kSuccess        82 -
+kRunning         6 47% avg
+kAccepted       12 Waiting
+kSkipped         4 -
+kFailure         3 -
+kWarning         1 -
+kCanceled        0 -
 
-Remaining to go: 18 task(s) - 6 Running, 8 Accepted, 4 Queued.
+Remaining to go: 18 - 6 kRunning, 12 kAccepted (waiting).
 ```
 
-`Remaining to go` is intentionally shown as one sentence instead of another table metric. It counts replication records whose status is not one of the finished states:
+If Cohesity returns another status not listed above, the script adds that exact status to the summary as `Returned by API` rather than hiding it.
+
+## GET Operations
+
+The status workflow uses GET requests for:
 
 ```text
-kCanceled
-kSuccess
-kFailure
-kWarning
+cluster
+protectionJobs
+protectionRuns?jobId=<jobId>&numRuns=<numRuns>&excludeTasks=true
+/backupjobruns?allUnderHierarchy=true&exactMatchStartTimeUsecs=<time>&id=<jobId>
 ```
 
-## Task Detail
-
-For active replication tasks the script retrieves the replication task ID and active subtask information.
-
-Example:
-
-```text
-BackupDate           ProtectionGroup ReplicationTaskId Status     Items RunningItems AcceptedItems QueuedItems Progress
-----------           --------------- ----------------- ------     ----- ------------ ------------- ----------- --------
-07/15/2026 01:00:00 SQL_PROD        1876543           kRunning      12            4             6           2 68%
-07/16/2026 01:00:00 VMWARE_PROD     1876921           kRunning      24            7            12           5 42%
-07/17/2026 01:00:00 ORACLE_PROD     1877055           kAccepted      8            0             8           0 0%
-```
-
-For completed copy runs, the original API flow may no longer return an active task object. In that case `ReplicationTaskId` is shown as `-`.
-
-## Active Item Detail
-
-For active remote copy tasks, each object/subtask is shown with its current status and percentage complete.
-
-Example:
-
-```text
-BackupDate           ProtectionGroup ReplicationTaskId Status     Object          PercentComplete
-----------           --------------- ----------------- ------     ------          ---------------
-07/15/2026 01:00:00 SQL_PROD        1876543           kRunning   SQLSERVER01                  68
-07/15/2026 01:00:00 SQL_PROD        1876543           kAccepted  SQLSERVER02                   0
-```
-
-## Output Files
-
-Each run writes four CSV files in the current directory:
-
-| File | Contents |
-|---|---|
-| `replicationQueue-<cluster>.csv` | Queue-level backup date, job, and status |
-| `replicationQueue-<cluster>-activeObjects.csv` | Active object/subtask status and percent complete |
-| `replicationQueue-<cluster>-summary.csv` | Consolidated status counts |
-| `replicationQueue-<cluster>-taskDetails.csv` | Backup date, protection group, task ID, item counts, and progress |
-
-## Status Interpretation
-
-The script uses the same finished-state definition as the original `replicationQueue.ps1`:
-
-```powershell
-$finishedStates = @('kCanceled', 'kSuccess', 'kFailure', 'kWarning')
-```
-
-The summary reports:
-
-| Summary | Status logic |
-|---|---|
-| Successful | `kSuccess` |
-| Running | `kRunning` |
-| Accepted | `kAccepted` |
-| Queued | `kQueued` |
-| Failed | `kFailure` |
-| Warning | `kWarning` |
-| Canceled | `kCanceled` |
-| Other Active | Any other non-finished status |
-
-## Cancellation Safety
-
-The source script supports `-cancelAll`, `-cancelOutdated`, and `-commit`. These capabilities are retained.
-
-Without `-commit`, cancellation commands run in test mode.
-
-Do not use `-commit` until the queue output and selected filters have been reviewed.
+The last GET is used only when a `kRunning` replication exists and is needed to calculate running percentage.
 
 ## Source Reference
 
-This script is based on the Cohesity community automation sample:
+Based on:
 
-`bseltz-cohesity/scripts/powershell/replicationQueue`
-
-The reporting additions are intended to make the current replication workload and remaining work easier to operationally track.
+```text
+bseltz-cohesity/scripts/powershell/replicationQueue
+```
