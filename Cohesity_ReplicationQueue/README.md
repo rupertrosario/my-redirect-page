@@ -2,18 +2,17 @@
 
 ## Purpose
 
-`replicationQueueSummary.ps1` is a minimal read-only replication status checker based on the Cohesity community `replicationQueue.ps1` logic.
+`replicationQueueSummary.ps1` is a minimal replication status checker based on the Cohesity community `replicationQueue.ps1` logic.
 
 It is intentionally limited to status reporting:
 
-- Cohesity data operations are GET only
+- normal Cohesity username/password authentication
+- authentication uses the standard `POST /login`
+- after authentication, all replication/status operations are GET only
 - no cancellation logic
-- no `POST`, `PUT`, `PATCH`, or `DELETE` data operations
+- no PUT, PATCH, or DELETE operations
 - no CSV files are created
-- no task-detail or object-detail console sections
 - one compact replication summary only
-
-API-key authentication is required because the Cohesity helper validates API-key authentication with GET requests. Username/password authentication is not used because that authentication path performs `POST /login`.
 
 ## Files
 
@@ -24,9 +23,9 @@ replicationQueueSummary.ps1
 cohesity-api.ps1
 ```
 
-## Run Against a Cluster
+## Run
 
-If the API key is already cached by `cohesity-api.ps1`:
+Use the Cohesity cluster VIP/name directly:
 
 ```powershell
 .\replicationQueueSummary.ps1 `
@@ -35,24 +34,21 @@ If the API key is already cached by `cohesity-api.ps1`:
     -domain local
 ```
 
-Or provide the API key through the existing helper password parameter:
+If no `-password` is supplied, `cohesity-api.ps1` uses its normal cached-password / interactive prompt behavior.
+
+You can also pass a password explicitly:
 
 ```powershell
 .\replicationQueueSummary.ps1 `
     -vip mycluster `
     -username myusername `
     -domain local `
-    -password '<API_KEY>'
+    -password 'mypassword'
 ```
 
-## Run Through Helios
+For an AD account, replace `local` with the appropriate domain.
 
-```powershell
-.\replicationQueueSummary.ps1 `
-    -vip helios.cohesity.com `
-    -username helios `
-    -clusterName 'CLUSTER01'
-```
+This version is intended for a direct cluster connection, not `helios.cohesity.com`.
 
 ## Optional Protection Group Filter
 
@@ -74,7 +70,7 @@ Multiple protection groups can be supplied:
 
 ## Console Output
 
-During collection the script prints only lightweight progress:
+Collection progress is lightweight:
 
 ```text
 Scanning replication queue on CLUSTER01...
@@ -85,7 +81,7 @@ Scanning replication queue on CLUSTER01...
 [23/23] PG_FILESERVER
 ```
 
-If replication is currently running, the script performs the same GET detail lookup used by the original queue script to calculate average running progress.
+If replication is running, the script performs the same GET detail lookup used by the original queue script to calculate average running progress.
 
 Example summary:
 
@@ -107,9 +103,15 @@ Remaining to go: 18 - 6 kRunning, 12 kAccepted (waiting).
 
 If Cohesity returns another status not listed above, the script adds that exact status to the summary as `Returned by API` rather than hiding it.
 
-## GET Operations
+## API Behavior
 
-The status workflow uses GET requests for:
+Authentication:
+
+```text
+POST /login
+```
+
+Status collection after authentication uses GET requests for:
 
 ```text
 cluster
