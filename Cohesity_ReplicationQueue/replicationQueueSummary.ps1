@@ -86,13 +86,9 @@ foreach($job in $selectedJobs){
     }
 }
 
-# IMPORTANT:
 # The top-level remote copy status can still be kAccepted while one or more
-# active replication subtasks are already kRunning. The original script does
-# not rely on copyRun.status alone: for every non-finished copy it GETs the
-# detailed backup run and reads activeCopySubTasks.publicStatus.
-#
-# Do the same here so the summary reflects what is actually running.
+# active replication subtasks are already kRunning. For every non-finished
+# copy, inspect activeCopySubTasks.publicStatus like the original script.
 $activeRecords = @($records | Where-Object {$_.OriginalStatus -notin $finishedStates})
 $allRunningPctValues = @()
 
@@ -130,8 +126,6 @@ if($activeRecords.Count -gt 0){
 
         $subStatuses = @($remoteSubTasks.publicStatus | Where-Object {$_})
 
-        # One replication can contain both running and waiting objects.
-        # Classify the replication as running whenever at least one object is running.
         if('kRunning' -in $subStatuses){
             $record.Status = 'kRunning'
 
@@ -187,7 +181,7 @@ $summary = @()
 foreach($status in $statusOrder){
     $count = @($records | Where-Object {$_.Status -eq $status}).Count
 
-    $detail = '-'
+    $detail = ''
     if($status -eq 'kRunning'){
         $detail = $runningProgress
     }
@@ -196,9 +190,9 @@ foreach($status in $statusOrder){
     }
 
     $summary += [PSCustomObject]@{
-        Status = $status
-        Count  = $count
-        Detail = $detail
+        Status  = $status
+        Count   = $count
+        Details = $detail
     }
 }
 
@@ -211,21 +205,29 @@ $otherStatuses = @(
 
 foreach($status in $otherStatuses){
     $summary += [PSCustomObject]@{
-        Status = $status
-        Count  = @($records | Where-Object {$_.Status -eq $status}).Count
-        Detail = 'Returned by API'
+        Status  = $status
+        Count   = @($records | Where-Object {$_.Status -eq $status}).Count
+        Details = 'Returned by API'
     }
 }
 
+$totalCount = @($records).Count
 $runningCount = @($records | Where-Object {$_.Status -eq 'kRunning'}).Count
 $acceptedCount = @($records | Where-Object {$_.Status -eq 'kAccepted'}).Count
 $remainingCount = $runningCount + $acceptedCount
 
+# Keep the output simple: one summary table and one totals line.
+$summary += [PSCustomObject]@{
+    Status  = 'Total'
+    Count   = $totalCount
+    Details = ''
+}
+
 Write-Host ''
 Write-Host '================ REPLICATION SUMMARY ================' -ForegroundColor Cyan
 Write-Host ''
-$summary | Format-Table -AutoSize
+$summary | Format-Table Status, Count, Details -AutoSize
 
-Write-Host ("Remaining to go: {0} - {1} kRunning, {2} kAccepted (waiting)." -f `
-    $remainingCount, $runningCount, $acceptedCount) -ForegroundColor Yellow
+Write-Host ("Total tasks: {0} | Total remaining: {1} - {2} running and {3} accepted/waiting." -f `
+    $totalCount, $remainingCount, $runningCount, $acceptedCount) -ForegroundColor Yellow
 Write-Host ''
