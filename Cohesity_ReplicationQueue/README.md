@@ -9,14 +9,15 @@ It keeps the same Cohesity API approach used by the original script and adds a c
 - total replication tasks found
 - successful replications
 - currently running replications
-- accepted / queued / pending work
+- accepted work
+- queued work
 - failed, warning, and canceled replications
 - remaining replication work still to go
 - backup date
 - protection group / job name
 - active replication task ID
 - active item count
-- running item count
+- running, accepted, and queued item counts
 - object-level replication status and percentage complete
 
 The script does not change how replication is performed. The existing cancellation behavior from the source script is retained.
@@ -92,6 +93,28 @@ Show replications older than 7 days:
 
 You can also use `-before`, `-after`, or `-newerThan` as supported by the original queue script.
 
+## Live Progress
+
+The queue scan now shows progress for every protection group so a long API call does not look like the script has silently stopped:
+
+```text
+Scanning replication queue on CLUSTER01...
+
+[1/25] Getting tasks for SQL_PROD - querying up to 999 runs...
+      Returned 999 backup runs; found 42 remote replication record(s).
+[2/25] Getting tasks for VMWARE_PROD - querying up to 999 runs...
+      Returned 620 backup runs; found 18 remote replication record(s).
+```
+
+After the initial queue scan, the summary is printed before the script performs the slower active-task detail lookups.
+
+Active detail retrieval also shows progress:
+
+```text
+[Detail 1/18] SQL_PROD - 07/15/2026 01:00:00
+[Detail 2/18] VMWARE_PROD - 07/16/2026 01:00:00
+```
+
 ## Console Summary
 
 Example:
@@ -104,15 +127,17 @@ Metric                    Count
 Total Replication Tasks     120
 Successful                   82
 Running                       6
-Accepted / Queued             12
-Failed                         3
-Warning                        1
-Canceled                       0
-Other Active                   0
-Remaining / To Go             18
+Accepted                      8
+Queued                        4
+Failed                        3
+Warning                       1
+Canceled                      0
+Other Active                  0
+
+Remaining to go: 18 task(s) - 6 Running, 8 Accepted, 4 Queued.
 ```
 
-`Remaining / To Go` counts replication records whose status is not one of the finished states:
+`Remaining to go` is intentionally shown as one sentence instead of another table metric. It counts replication records whose status is not one of the finished states:
 
 ```text
 kCanceled
@@ -128,11 +153,11 @@ For active replication tasks the script retrieves the replication task ID and ac
 Example:
 
 ```text
-BackupDate           ProtectionGroup ReplicationTaskId Status     Items RunningItems AcceptedQueued Progress
-----------           --------------- ----------------- ------     ----- ------------ -------------- --------
-07/15/2026 01:00:00 SQL_PROD        1876543           kRunning      12            4              8  68%
-07/16/2026 01:00:00 VMWARE_PROD     1876921           kRunning      24            7             17  42%
-07/17/2026 01:00:00 ORACLE_PROD     1877055           kAccepted      8            0              8  0%
+BackupDate           ProtectionGroup ReplicationTaskId Status     Items RunningItems AcceptedItems QueuedItems Progress
+----------           --------------- ----------------- ------     ----- ------------ ------------- ----------- --------
+07/15/2026 01:00:00 SQL_PROD        1876543           kRunning      12            4             6           2 68%
+07/16/2026 01:00:00 VMWARE_PROD     1876921           kRunning      24            7            12           5 42%
+07/17/2026 01:00:00 ORACLE_PROD     1877055           kAccepted      8            0             8           0 0%
 ```
 
 For completed copy runs, the original API flow may no longer return an active task object. In that case `ReplicationTaskId` is shown as `-`.
@@ -175,11 +200,12 @@ The summary reports:
 |---|---|
 | Successful | `kSuccess` |
 | Running | `kRunning` |
-| Accepted / Queued | `kAccepted`, `kQueued`, or `kPending` |
+| Accepted | `kAccepted` |
+| Queued | `kQueued` |
 | Failed | `kFailure` |
 | Warning | `kWarning` |
 | Canceled | `kCanceled` |
-| Remaining / To Go | Any status not in the finished-state list |
+| Other Active | Any other non-finished status |
 
 ## Cancellation Safety
 
