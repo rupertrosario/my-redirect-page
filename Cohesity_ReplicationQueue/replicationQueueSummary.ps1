@@ -1,14 +1,15 @@
 ### Cohesity Replication Queue Status Summary
-### Read-only checker based on bseltz-cohesity/scripts powershell/replicationQueue
-### Cohesity data operations are GET only. No POST/PUT/PATCH/DELETE, no cancellation, no CSV output.
+### Minimal status checker based on bseltz-cohesity/scripts powershell/replicationQueue
+### Authentication uses the normal Cohesity username/password login POST.
+### After authentication, all replication/status operations are GET only.
+### No cancellation, no PUT/PATCH/DELETE, and no CSV output.
 
 [CmdletBinding()]
 param (
-    [Parameter()][string]$vip = 'helios.cohesity.com',
-    [Parameter()][string]$username = 'helios',
+    [Parameter(Mandatory=$True)][string]$vip,
+    [Parameter(Mandatory=$True)][string]$username,
     [Parameter()][string]$domain = 'local',
     [Parameter()][string]$password,
-    [Parameter()][string]$clusterName,
     [Parameter()][array]$jobName,
     [Parameter()][int]$numRuns = 999
 )
@@ -16,29 +17,27 @@ param (
 # Cohesity REST API helper must be in the same directory.
 . $(Join-Path -Path $PSScriptRoot -ChildPath cohesity-api.ps1)
 
-# API-key authentication is required so authentication validation is GET-only.
-apiauth -vip $vip `
-        -username $username `
-        -domain $domain `
-        -passwd $password `
-        -apiKeyAuthentication $true
-
-if(!$cohesity_api.authorized){
-    Write-Host 'Not authenticated. This checker requires Cohesity API-key authentication.' -ForegroundColor Yellow
+# This version intentionally uses direct-cluster username/password authentication.
+# Helios authentication uses an API key in the Cohesity helper and is not required here.
+if($vip -in @('helios.cohesity.com', 'helios.gov-cohesity.com')){
+    Write-Host 'Use the Cohesity cluster VIP/name for this script, not Helios.' -ForegroundColor Yellow
     exit 1
 }
 
-# Select a Helios-managed cluster when connecting through Helios.
-if($USING_HELIOS){
-    if($clusterName){
-        $null = heliosCluster $clusterName
-    }else{
-        Write-Host 'Please provide -clusterName when connecting through Helios.' -ForegroundColor Yellow
-        exit 1
-    }
+# Normal Cohesity authentication. If -password is omitted, cohesity-api.ps1
+# uses its normal cached-password / interactive prompt behavior.
+# This authentication path performs POST /login.
+apiauth -vip $vip `
+        -username $username `
+        -domain $domain `
+        -passwd $password
+
+if(!$cohesity_api.authorized){
+    Write-Host 'Not authenticated.' -ForegroundColor Yellow
+    exit 1
 }
 
-# GET cluster identity and protection groups.
+# Everything below this point is GET only.
 $cluster = api get cluster
 $jobs = @(api get protectionJobs)
 
@@ -67,7 +66,7 @@ foreach($job in $selectedJobs){
     $jobIndex++
     Write-Host ("[{0}/{1}] {2}" -f $jobIndex, $selectedJobs.Count, $job.name) -ForegroundColor DarkGray
 
-    # GET only: retrieve recent protection runs for this protection group.
+    # GET recent protection runs for this protection group.
     $runs = @(api get "protectionRuns?jobId=$($job.id)&numRuns=$numRuns&excludeTasks=true")
 
     foreach($run in $runs){
@@ -86,8 +85,8 @@ foreach($job in $selectedJobs){
     }
 }
 
-# Calculate average percentage only for currently running replication subtasks.
-# This reuses the same GET detail call used by the original replicationQueue script.
+# Calculate average percentage for running replication subtasks only.
+# Uses the same GET detail path as the original replicationQueue script.
 $runningPctValues = @()
 $runningRecords = @($records | Where-Object {$_.Status -eq 'kRunning'})
 
@@ -95,7 +94,11 @@ if($runningRecords.Count -gt 0){
     Write-Host ''
     Write-Host ("Checking progress for {0} running replication(s)..." -f $runningRecords.Count) -ForegroundColor DarkGray
 
+    $runningIndex = 0
     foreach($record in $runningRecords){
+        $runningIndex++
+        Write-Host ("  [{0}/{1}] {2}" -f $runningIndex, $runningRecords.Count, $record.JobName) -ForegroundColor DarkGray
+
         $run = api get "/backupjobruns?allUnderHierarchy=true&exactMatchStartTimeUsecs=$($record.StartTimeUsecs)&id=$($record.JobId)"
 
         if($run -and $run.backupJobRuns.protectionRuns.Count -gt 0){
@@ -121,7 +124,7 @@ if($runningPctValues.Count -gt 0){
     $runningProgress = '-'
 }
 
-# Statuses requested for the operational summary.
+# Operational status order requested for the summary.
 $statusOrder = @(
     'kSuccess',
     'kRunning',
@@ -136,21 +139,21 @@ $summary = @()
 foreach($status in $statusOrder){
     $count = @($records | Where-Object {$_.Status -eq $status}).Count
 
-    $note = '-'
+    $detail = '-'
     if($status -eq 'kRunning'){
-        $note = $runningProgress
+        $detail = $runningProgress
     }elseif($status -eq 'kAccepted'){
-        $note = 'Waiting'
+        $detail = 'Waiting'
     }
 
     $summary += [PSCustomObject]@{
         Status = $status
         Count  = $count
-        Detail = $note
+        Detail = $detail
     }
 }
 
-# Do not hide a status returned by Cohesity that is not in the expected list.
+# Surface any additional status returned by Cohesity instead of hiding it.
 $otherStatuses = @(
     $records.Status |
         Where-Object {$_ -and $_ -notin $statusOrder} |
