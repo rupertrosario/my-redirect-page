@@ -57,14 +57,9 @@ $finishedStates = @('kCanceled', 'kSuccess', 'kFailure', 'kWarning')
 $records = @()
 
 Write-Host ''
-Write-Host ("Scanning replication queue on {0}..." -f $cluster.name) -ForegroundColor Cyan
-Write-Host ''
+Write-Host ("Scanning replication queue on {0} ({1} protection groups)..." -f $cluster.name, $selectedJobs.Count) -ForegroundColor Cyan
 
-$jobIndex = 0
 foreach($job in $selectedJobs){
-    $jobIndex++
-    Write-Host ("[{0}/{1}] {2}" -f $jobIndex, $selectedJobs.Count, $job.name) -ForegroundColor DarkGray
-
     # Same queue-level GET used by the original replicationQueue script.
     $runs = @(api get "protectionRuns?jobId=$($job.id)&numRuns=$numRuns&excludeTasks=true")
 
@@ -93,14 +88,9 @@ $activeRecords = @($records | Where-Object {$_.OriginalStatus -notin $finishedSt
 $allRunningPctValues = @()
 
 if($activeRecords.Count -gt 0){
-    Write-Host ''
     Write-Host ("Checking {0} active replication record(s)..." -f $activeRecords.Count) -ForegroundColor DarkGray
 
-    $activeIndex = 0
     foreach($record in $activeRecords){
-        $activeIndex++
-        Write-Host ("  [{0}/{1}] {2}" -f $activeIndex, $activeRecords.Count, $record.JobName) -ForegroundColor DarkGray
-
         # Same detailed GET path used by the original script.
         $run = api get "/backupjobruns?allUnderHierarchy=true&exactMatchStartTimeUsecs=$($record.StartTimeUsecs)&id=$($record.JobId)"
 
