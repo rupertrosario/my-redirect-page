@@ -25,10 +25,12 @@ if($vip -in @('helios.cohesity.com', 'helios.gov-cohesity.com')){
     exit 1
 }
 
+# Quiet authentication keeps normal successful runs limited to the final summary.
 apiauth -vip $vip `
         -username $username `
         -domain $domain `
-        -passwd $password
+        -passwd $password `
+        -quiet
 
 if(!$cohesity_api.authorized){
     Write-Host 'Not authenticated.' -ForegroundColor Yellow
@@ -55,9 +57,6 @@ $selectedJobs = @(
 
 $finishedStates = @('kCanceled', 'kSuccess', 'kFailure', 'kWarning')
 $records = @()
-
-Write-Host ''
-Write-Host ("Scanning replication queue on {0} ({1} protection groups)..." -f $cluster.name, $selectedJobs.Count) -ForegroundColor Cyan
 
 foreach($job in $selectedJobs){
     # Same queue-level GET used by the original replicationQueue script.
@@ -204,7 +203,6 @@ $runningCount = @($records | Where-Object {$_.Status -eq 'kRunning'}).Count
 $acceptedCount = @($records | Where-Object {$_.Status -eq 'kAccepted'}).Count
 $remainingCount = $runningCount + $acceptedCount
 
-# Keep the output simple: one summary table and one totals line.
 $summary += [PSCustomObject]@{
     Status  = 'Total'
     Count   = $totalCount
