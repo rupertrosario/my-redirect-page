@@ -17,16 +17,14 @@ param (
 # Cohesity REST API helper must be in the same directory.
 . $(Join-Path -Path $PSScriptRoot -ChildPath cohesity-api.ps1)
 
-# This version intentionally uses direct-cluster username/password authentication.
-# Helios authentication uses an API key in the Cohesity helper and is not required here.
+# Direct-cluster username/password authentication.
+# If -password is omitted, cohesity-api.ps1 uses its normal cached-password /
+# interactive prompt behavior. This authentication path performs POST /login.
 if($vip -in @('helios.cohesity.com', 'helios.gov-cohesity.com')){
     Write-Host 'Use the Cohesity cluster VIP/name for this script, not Helios.' -ForegroundColor Yellow
     exit 1
 }
 
-# Normal Cohesity authentication. If -password is omitted, cohesity-api.ps1
-# uses its normal cached-password / interactive prompt behavior.
-# This authentication path performs POST /login.
 apiauth -vip $vip `
         -username $username `
         -domain $domain `
@@ -55,6 +53,7 @@ $selectedJobs = @(
         Where-Object {!$jobName -or $_.name -in $jobName}
 )
 
+$finishedStates = @('kCanceled', 'kSuccess', 'kFailure', 'kWarning')
 $records = @()
 
 Write-Host ''
@@ -66,7 +65,7 @@ foreach($job in $selectedJobs){
     $jobIndex++
     Write-Host ("[{0}/{1}] {2}" -f $jobIndex, $selectedJobs.Count, $job.name) -ForegroundColor DarkGray
 
-    # GET recent protection runs for this protection group.
+    # Same queue-level GET used by the original replicationQueue script.
     $runs = @(api get "protectionRuns?jobId=$($job.id)&numRuns=$numRuns&excludeTasks=true")
 
     foreach($run in $runs){
@@ -78,53 +77,102 @@ foreach($job in $selectedJobs){
                     JobName        = $job.name
                     JobId          = $job.id
                     StartTimeUsecs = [Int64]$runStartTimeUsecs
+                    OriginalStatus = [string]$copyRun.status
                     Status         = [string]$copyRun.status
+                    Progress       = $null
                 }
             }
         }
     }
 }
 
-# Calculate average percentage for running replication subtasks only.
-# Uses the same GET detail path as the original replicationQueue script.
-$runningPctValues = @()
-$runningRecords = @($records | Where-Object {$_.Status -eq 'kRunning'})
+# IMPORTANT:
+# The top-level remote copy status can still be kAccepted while one or more
+# active replication subtasks are already kRunning. The original script does
+# not rely on copyRun.status alone: for every non-finished copy it GETs the
+# detailed backup run and reads activeCopySubTasks.publicStatus.
+#
+# Do the same here so the summary reflects what is actually running.
+$activeRecords = @($records | Where-Object {$_.OriginalStatus -notin $finishedStates})
+$allRunningPctValues = @()
 
-if($runningRecords.Count -gt 0){
+if($activeRecords.Count -gt 0){
     Write-Host ''
-    Write-Host ("Checking progress for {0} running replication(s)..." -f $runningRecords.Count) -ForegroundColor DarkGray
+    Write-Host ("Checking {0} active replication record(s)..." -f $activeRecords.Count) -ForegroundColor DarkGray
 
-    $runningIndex = 0
-    foreach($record in $runningRecords){
-        $runningIndex++
-        Write-Host ("  [{0}/{1}] {2}" -f $runningIndex, $runningRecords.Count, $record.JobName) -ForegroundColor DarkGray
+    $activeIndex = 0
+    foreach($record in $activeRecords){
+        $activeIndex++
+        Write-Host ("  [{0}/{1}] {2}" -f $activeIndex, $activeRecords.Count, $record.JobName) -ForegroundColor DarkGray
 
+        # Same detailed GET path used by the original script.
         $run = api get "/backupjobruns?allUnderHierarchy=true&exactMatchStartTimeUsecs=$($record.StartTimeUsecs)&id=$($record.JobId)"
 
-        if($run -and $run.backupJobRuns.protectionRuns.Count -gt 0){
-            foreach($task in @($run.backupJobRuns.protectionRuns[0].copyRun.activeTasks)){
-                if($task.snapshotTarget.type -eq 2){
-                    foreach($subTask in @($task.activeCopySubTasks)){
-                        if($subTask.snapshotTarget.type -eq 2 -and $subTask.publicStatus -eq 'kRunning'){
-                            if($subTask.replicationInfo -and $subTask.replicationInfo.PSObject.Properties['pctCompleted']){
-                                $runningPctValues += [double]$subTask.replicationInfo.pctCompleted
-                            }
-                        }
+        if(!$run -or $run.backupJobRuns.protectionRuns.Count -eq 0){
+            continue
+        }
+
+        $remoteSubTasks = @()
+
+        foreach($task in @($run.backupJobRuns.protectionRuns[0].copyRun.activeTasks)){
+            if($task.snapshotTarget.type -eq 2){
+                foreach($subTask in @($task.activeCopySubTasks)){
+                    if($subTask.snapshotTarget.type -eq 2){
+                        $remoteSubTasks += $subTask
                     }
                 }
             }
         }
+
+        if($remoteSubTasks.Count -eq 0){
+            continue
+        }
+
+        $subStatuses = @($remoteSubTasks.publicStatus | Where-Object {$_})
+
+        # One replication can contain both running and waiting objects.
+        # Classify the replication as running whenever at least one object is running.
+        if('kRunning' -in $subStatuses){
+            $record.Status = 'kRunning'
+
+            $pctValues = @(
+                $remoteSubTasks |
+                    Where-Object {$_.publicStatus -eq 'kRunning'} |
+                    ForEach-Object {
+                        if($_.replicationInfo -and $_.replicationInfo.PSObject.Properties['pctCompleted']){
+                            [double]$_.replicationInfo.pctCompleted
+                        }
+                    }
+            )
+
+            if($pctValues.Count -gt 0){
+                $record.Progress = [math]::Round((($pctValues | Measure-Object -Average).Average), 1)
+                $allRunningPctValues += $pctValues
+            }
+        }
+        elseif('kAccepted' -in $subStatuses){
+            $record.Status = 'kAccepted'
+        }
+        elseif('kSkipped' -in $subStatuses){
+            $record.Status = 'kSkipped'
+        }
+        else{
+            # Preserve any status Cohesity actually returns rather than inventing one.
+            $firstStatus = @($subStatuses | Sort-Object -Unique | Select-Object -First 1)
+            if($firstStatus.Count -gt 0){
+                $record.Status = [string]$firstStatus[0]
+            }
+        }
     }
 }
 
-if($runningPctValues.Count -gt 0){
-    $runningAverage = [math]::Round((($runningPctValues | Measure-Object -Average).Average), 1)
+if($allRunningPctValues.Count -gt 0){
+    $runningAverage = [math]::Round((($allRunningPctValues | Measure-Object -Average).Average), 1)
     $runningProgress = "$runningAverage% avg"
 }else{
     $runningProgress = '-'
 }
 
-# Operational status order requested for the summary.
 $statusOrder = @(
     'kSuccess',
     'kRunning',
@@ -142,7 +190,8 @@ foreach($status in $statusOrder){
     $detail = '-'
     if($status -eq 'kRunning'){
         $detail = $runningProgress
-    }elseif($status -eq 'kAccepted'){
+    }
+    elseif($status -eq 'kAccepted'){
         $detail = 'Waiting'
     }
 
