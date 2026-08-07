@@ -137,30 +137,45 @@ Write-Host ""
 Write-Host "Scanning replication queue on $($cluster.name)..." -ForegroundColor Cyan
 Write-Host ""
 
-foreach($job in $jobs | Sort-Object -Property name){
+$selectedJobs = @(
+    $jobs |
+        Sort-Object -Property name |
+        Where-Object {$jobNames.Count -eq 0 -or $_.name -in $jobNames}
+)
+
+$totalJobsToScan = $selectedJobs.Count
+$jobNumber = 0
+
+foreach($job in $selectedJobs){
+    $jobNumber++
     $jobId = $job.id
     $thisJobName = $job.name
 
-    if($jobNames.Count -eq 0 -or $thisJobName -in $jobNames){
-        Write-Host "Getting tasks for $thisJobName"
+    Write-Host ("[{0}/{1}] Getting tasks for {2} - querying up to {3} runs..." -f `
+        $jobNumber, $totalJobsToScan, $thisJobName, $numRuns) -ForegroundColor DarkGray
 
-        $runs = api get "protectionRuns?jobId=$jobId&numRuns=$numRuns&excludeTasks=true"
+    $runs = api get "protectionRuns?jobId=$jobId&numRuns=$numRuns&excludeTasks=true"
+    $returnedRuns = @($runs).Count
+    $remoteBefore = $replicationRecords.Count
 
-        foreach($run in $runs){
-            $runStartTimeUsecs = $run.backupRun.stats.startTimeUsecs
+    foreach($run in $runs){
+        $runStartTimeUsecs = $run.backupRun.stats.startTimeUsecs
 
-            foreach($copyRun in $run.copyRun){
-                if($copyRun.target.type -eq 'kRemote'){
-                    $replicationRecords += [PSCustomObject]@{
-                        JobName        = $thisJobName
-                        JobId          = $jobId
-                        StartTimeUsecs = [Int64]$runStartTimeUsecs
-                        Status         = $copyRun.status
-                    }
+        foreach($copyRun in $run.copyRun){
+            if($copyRun.target.type -eq 'kRemote'){
+                $replicationRecords += [PSCustomObject]@{
+                    JobName        = $thisJobName
+                    JobId          = $jobId
+                    StartTimeUsecs = [Int64]$runStartTimeUsecs
+                    Status         = $copyRun.status
                 }
             }
         }
     }
+
+    $remoteFound = $replicationRecords.Count - $remoteBefore
+    Write-Host ("      Returned {0} backup runs; found {1} remote replication record(s)." -f `
+        $returnedRuns, $remoteFound) -ForegroundColor DarkGray
 }
 
 # Apply the same time filters to both summary and detail output
@@ -189,7 +204,8 @@ $filteredRecords = @(
 $totalCount      = @($filteredRecords).Count
 $successCount    = @($filteredRecords | Where-Object {$_.Status -eq 'kSuccess'}).Count
 $runningCount    = @($filteredRecords | Where-Object {$_.Status -eq 'kRunning'}).Count
-$acceptedCount   = @($filteredRecords | Where-Object {$_.Status -match '^k(Accepted|Queued|Pending)$'}).Count
+$acceptedCount   = @($filteredRecords | Where-Object {$_.Status -eq 'kAccepted'}).Count
+$queuedCount     = @($filteredRecords | Where-Object {$_.Status -eq 'kQueued'}).Count
 $failedCount     = @($filteredRecords | Where-Object {$_.Status -eq 'kFailure'}).Count
 $warningCount    = @($filteredRecords | Where-Object {$_.Status -eq 'kWarning'}).Count
 $canceledCount   = @($filteredRecords | Where-Object {$_.Status -eq 'kCanceled'}).Count
@@ -201,18 +217,64 @@ $remainingCount = $remainingRecords.Count
 
 $otherActiveCount = @(
     $remainingRecords | Where-Object {
-        $_.Status -ne 'kRunning' -and
-        $_.Status -notmatch '^k(Accepted|Queued|Pending)$'
+        $_.Status -notin @('kRunning', 'kAccepted', 'kQueued')
     }
 ).Count
+
+# ---------------------------------------------------------------------------
+# CONSOLE SUMMARY - display immediately after queue scan
+# ---------------------------------------------------------------------------
+
+Write-Host ""
+Write-Host "================ REPLICATION SUMMARY ================" -ForegroundColor Cyan
+
+$summaryRows = @(
+    [PSCustomObject]@{ Metric = 'Total Replication Tasks'; Count = $totalCount }
+    [PSCustomObject]@{ Metric = 'Successful';              Count = $successCount }
+    [PSCustomObject]@{ Metric = 'Running';                 Count = $runningCount }
+    [PSCustomObject]@{ Metric = 'Accepted';                Count = $acceptedCount }
+    [PSCustomObject]@{ Metric = 'Queued';                  Count = $queuedCount }
+    [PSCustomObject]@{ Metric = 'Failed';                  Count = $failedCount }
+    [PSCustomObject]@{ Metric = 'Warning';                 Count = $warningCount }
+    [PSCustomObject]@{ Metric = 'Canceled';                Count = $canceledCount }
+    [PSCustomObject]@{ Metric = 'Other Active';            Count = $otherActiveCount }
+)
+
+$summaryRows | Format-Table -AutoSize
+$summaryRows | Export-Csv -Path $summaryFile -NoTypeInformation
+
+$remainingParts = @()
+if($runningCount -gt 0){ $remainingParts += "$runningCount Running" }
+if($acceptedCount -gt 0){ $remainingParts += "$acceptedCount Accepted" }
+if($queuedCount -gt 0){ $remainingParts += "$queuedCount Queued" }
+if($otherActiveCount -gt 0){ $remainingParts += "$otherActiveCount Other Active" }
+
+if($remainingParts.Count -gt 0){
+    Write-Host ("Remaining to go: {0} task(s) - {1}." -f `
+        $remainingCount, ($remainingParts -join ', ')) -ForegroundColor Yellow
+}else{
+    Write-Host "Remaining to go: 0 tasks." -ForegroundColor Green
+}
+
+Write-Host ""
 
 # ---------------------------------------------------------------------------
 # TASK / OBJECT DETAIL
 # ---------------------------------------------------------------------------
 
-foreach($t in ($filteredRecords | Sort-Object StartTimeUsecs, JobName)){
+$sortedRecords = @($filteredRecords | Sort-Object StartTimeUsecs, JobName)
+$detailNumber = 0
+$activeDetailTotal = @($sortedRecords | Where-Object {$_.Status -notin $finishedStates}).Count
+
+foreach($t in $sortedRecords){
 
     $backupDate = usecsToDate $t.StartTimeUsecs
+
+    if($t.Status -notin $finishedStates){
+        $detailNumber++
+        Write-Host ("[Detail {0}/{1}] {2} - {3}" -f `
+            $detailNumber, $activeDetailTotal, $t.JobName, $backupDate) -ForegroundColor DarkGray
+    }
 
     # Preserve original basic queue CSV
     '"{0}","{1}","{2}"' -f $backupDate, $t.JobName, $t.Status |
@@ -241,7 +303,8 @@ foreach($t in ($filteredRecords | Sort-Object StartTimeUsecs, JobName)){
                     Status           = $t.Status
                     Items            = 0
                     RunningItems     = 0
-                    AcceptedQueued   = 0
+                    AcceptedItems    = 0
+                    QueuedItems      = 0
                     Progress         = '-'
                 }
             }
@@ -268,9 +331,10 @@ foreach($t in ($filteredRecords | Sort-Object StartTimeUsecs, JobName)){
                     $remoteSubTasks | Where-Object {$_.publicStatus -eq 'kRunning'}
                 ).Count
                 $acceptedItems = @(
-                    $remoteSubTasks | Where-Object {
-                        $_.publicStatus -match '^k(Accepted|Queued|Pending)$'
-                    }
+                    $remoteSubTasks | Where-Object {$_.publicStatus -eq 'kAccepted'}
+                ).Count
+                $queuedItems = @(
+                    $remoteSubTasks | Where-Object {$_.publicStatus -eq 'kQueued'}
                 ).Count
 
                 # Keep progress calculation close to original script behavior:
@@ -308,7 +372,8 @@ foreach($t in ($filteredRecords | Sort-Object StartTimeUsecs, JobName)){
                     Status            = $displayStatus
                     Items             = $itemCount
                     RunningItems      = $runningItems
-                    AcceptedQueued    = $acceptedItems
+                    AcceptedItems     = $acceptedItems
+                    QueuedItems       = $queuedItems
                     Progress          = $progressDisplay
                 }
 
@@ -371,33 +436,12 @@ foreach($t in ($filteredRecords | Sort-Object StartTimeUsecs, JobName)){
             Status            = $t.Status
             Items             = '-'
             RunningItems      = '-'
-            AcceptedQueued    = '-'
+            AcceptedItems     = '-'
+            QueuedItems       = '-'
             Progress          = '-'
         }
     }
 }
-
-# ---------------------------------------------------------------------------
-# CONSOLE SUMMARY
-# ---------------------------------------------------------------------------
-
-Write-Host ""
-Write-Host "================ REPLICATION SUMMARY ================" -ForegroundColor Cyan
-
-$summaryRows = @(
-    [PSCustomObject]@{ Metric = 'Total Replication Tasks'; Count = $totalCount }
-    [PSCustomObject]@{ Metric = 'Successful';              Count = $successCount }
-    [PSCustomObject]@{ Metric = 'Running';                 Count = $runningCount }
-    [PSCustomObject]@{ Metric = 'Accepted / Queued';       Count = $acceptedCount }
-    [PSCustomObject]@{ Metric = 'Failed';                  Count = $failedCount }
-    [PSCustomObject]@{ Metric = 'Warning';                 Count = $warningCount }
-    [PSCustomObject]@{ Metric = 'Canceled';                Count = $canceledCount }
-    [PSCustomObject]@{ Metric = 'Other Active';            Count = $otherActiveCount }
-    [PSCustomObject]@{ Metric = 'Remaining / To Go';       Count = $remainingCount }
-)
-
-$summaryRows | Format-Table -AutoSize
-$summaryRows | Export-Csv -Path $summaryFile -NoTypeInformation
 
 # ---------------------------------------------------------------------------
 # TASK DETAIL
@@ -416,7 +460,8 @@ if($taskRows.Count -gt 0){
                      Status,
                      Items,
                      RunningItems,
-                     AcceptedQueued,
+                     AcceptedItems,
+                     QueuedItems,
                      Progress -AutoSize
 
     $taskRows |
