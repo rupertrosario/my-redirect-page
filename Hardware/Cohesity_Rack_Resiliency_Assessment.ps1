@@ -169,6 +169,7 @@ foreach ($dc in $clusters) {
             NodeCount=if($null -ne $nodeIds){@($nodeIds).Count}else{$NR};CohesityRackID=Txt $rid
             CohesityRackName=Txt (Value $r @('name','rackName'));ChassisLocation=Txt (Value $c @('location'))
             RackLocation=Txt (Value $r @('location'))
+            ConfiguredRackMapping=if($null -ne $r){'YES'}else{'NO'}
         }
     }
 
@@ -231,7 +232,7 @@ foreach ($dc in $clusters) {
             FTOptionsAPI=if($fr.OK){'AVAILABLE'}else{'UNAVAILABLE'}
             GlobalTolerance=if($fr.OK){Json $global}else{$NA};DefaultFaultTolerance=if($fr.OK){Json $defaultFt}else{$NA}
             FailureDomainCount=if($fr.OK){Txt $fdCount}else{$NA};SupportedFailureDomainLevels=$rackText
-            MinimumFailureDomains=$minText;DisabledOrWarningChoices=if($disabled.Count){$disabled-join','}elseif($fr.OK){$NR}else{$NA}
+            MinimumFailureDomains=$minText;DisabledOrWarningChoices=if($disabled.Count){$disabled -join ','}elseif($fr.OK){$NR}else{$NA}
         }
         $sdFt+="$sname=$currentFt";$ecList+="$sname=$ecText";$rackFt+="$sname=$rackText";$minFt+="$sname=$minText"
     }
@@ -250,12 +251,12 @@ foreach ($dc in $clusters) {
         Cluster=$cluster;Version=$version;PhysicalVirtual=$type;Nodes=$nodes.Count;ClusterEndpointNodeCount=$clusterNodes
         Chassis=$chassis.Count;CohesityRacksConfigured=$racks.Count
         RackConfigurationState=if($racks.Count -eq 0){'NO COHESITY RACK CONFIGURATION PRESENT'}else{'CONFIGURED'}
-        ChassisWithRackId=$withRack;ChassisWithoutRackId=($chassis.Count-$withRack);NoRackAssignedApiCount=$noRack.Count
-        RackNames=if($rackNames.Count){$rackNames-join','}else{$NR};RackLocations=if($rackLoc.Count){$rackLoc-join','}else{$NR}
-        ChassisLocations=if($chLoc.Count){$chLoc-join','}else{$NR};CurrentFailureDomainInformation=$failureText
-        CurrentStorageDomainFT=if($sdFt.Count){$sdFt-join'; '}else{$NR};CurrentEC=if($ecList.Count){$ecList-join'; '}else{$NR}
-        RackFTOptionsReportedByAPI=if($rackFt.Count){$rackFt-join'; '}else{$NR}
-        MinimumFailureDomainsReportedByAPI=if($minFt.Count){$minFt-join'; '}else{$NR}
+        ChassisWithRackId=$withRack;ChassisWithoutRackId=($chassis.Count - $withRack);NoRackAssignedApiCount=$noRack.Count
+        RackNames=if($rackNames.Count){$rackNames -join ','}else{$NR};RackLocations=if($rackLoc.Count){$rackLoc -join ','}else{$NR}
+        ChassisLocations=if($chLoc.Count){$chLoc -join ','}else{$NR};CurrentFailureDomainInformation=$failureText
+        CurrentStorageDomainFT=if($sdFt.Count){$sdFt -join '; '}else{$NR};CurrentEC=if($ecList.Count){$ecList -join '; '}else{$NR}
+        RackFTOptionsReportedByAPI=if($rackFt.Count){$rackFt -join '; '}else{$NR}
+        MinimumFailureDomainsReportedByAPI=if($minFt.Count){$minFt -join '; '}else{$NR}
         PhysicalChassisToDatacenterRackMappingKnownFromCohesity=$mapping
     }
 }
