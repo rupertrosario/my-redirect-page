@@ -1,15 +1,18 @@
-# Cohesity Rack Readiness Data Collection - READ ONLY
+# Cohesity Rack Readiness / Rack Resiliency Data Collector
 # PowerShell 5.1 compatible
-# STRICT SAFETY: HTTP GET ONLY. No Cohesity configuration changes.
+# Cohesity API access is strictly HTTP GET only.
 
-$ErrorActionPreference = "Stop"
+$ErrorActionPreference = 'Stop'
 $FormatEnumerationLimit = -1
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
-$baseUrl             = "https://helios.cohesity.com"
-$outputDirectory     = "X:\PowerShell\Data\Cohesity\RackResiliencyAssessment"
-$helperPath          = "X:\PowerShell\Cohesity_API_Scripts\Common\ApiKeyAesHelper.ps1"
-$encryptedApiKeyPath = "X:\PowerShell\Cohesity_API_Scripts\Common\Secure\cohesity_apikey.enc"
+$baseUrl             = 'https://helios.cohesity.com'
+$outputDirectory     = 'X:\PowerShell\Data\Cohesity\RackResiliencyAssessment'
+$helperPath          = 'X:\PowerShell\Cohesity_API_Scripts\Common\ApiKeyAesHelper.ps1'
+$encryptedApiKeyPath = 'X:\PowerShell\Cohesity_API_Scripts\Common\Secure\cohesity_apikey.enc'
+$expectedClusters    = 23
+$expectedNodes       = 173
+$na                  = 'N/A'
 
 if (-not (Test-Path $outputDirectory -PathType Container)) {
     New-Item -Path $outputDirectory -ItemType Directory -Force | Out-Null
@@ -24,19 +27,19 @@ if (-not (Test-Path $encryptedApiKeyPath -PathType Leaf)) {
 . $helperPath
 $apiKey = Get-CohesityApiKeyFromAes -EncryptedFile $encryptedApiKeyPath
 if ([string]::IsNullOrWhiteSpace($apiKey)) {
-    throw "AES API key helper returned an empty API key."
+    throw 'AES API key helper returned an empty API key.'
 }
 
 function New-Headers {
     param([string]$ClusterId)
 
     $headers = @{
-        accept = "application/json"
+        accept = 'application/json'
         apiKey = $apiKey
     }
 
     if (-not [string]::IsNullOrWhiteSpace($ClusterId)) {
-        $headers["accessClusterId"] = $ClusterId
+        $headers['accessClusterId'] = $ClusterId
     }
 
     return $headers
@@ -44,225 +47,141 @@ function New-Headers {
 
 function Get-Json {
     param(
-        [Parameter(Mandatory)][string]$Uri,
-        [Parameter(Mandatory)][hashtable]$Headers
+        [Parameter(Mandatory = $true)][string]$Uri,
+        [Parameter(Mandatory = $true)][hashtable]$Headers
     )
 
-    $method = "GET"
-    if ($method -ne "GET") {
-        throw "SAFETY BLOCK: only HTTP GET is permitted."
+    if (-not $Uri.StartsWith($baseUrl, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "Safety block: URI is outside approved Helios base URL: $Uri"
     }
 
-    if ($PSVersionTable.PSVersion.Major -lt 6) {
-        $response = Invoke-WebRequest -Uri $Uri -Headers $Headers -Method Get -UseBasicParsing -ErrorAction Stop
-    }
-    else {
-        $response = Invoke-WebRequest -Uri $Uri -Headers $Headers -Method Get -ErrorAction Stop
+    $parsedUri = [uri]$Uri
+    $approvedGetPaths = @(
+        '/v2/mcm/cluster-mgmt/info',
+        '/v2/clusters/nodes',
+        '/v2/chassis',
+        '/v2/ipmi/get-lan-info',
+        '/v2/storage-domains',
+        '/v2/storage-domains/fault-tolerance-options',
+        '/irisservices/api/v1/public/cluster'
+    )
+    if ($approvedGetPaths -cnotcontains $parsedUri.AbsolutePath) {
+        throw "Safety block: GET endpoint is not approved: $($parsedUri.AbsolutePath)"
     }
 
-    if (-not $response -or [string]::IsNullOrWhiteSpace($response.Content)) {
+    $response = Invoke-WebRequest -Uri $Uri -Headers $Headers -Method GET -UseBasicParsing -ErrorAction Stop
+    if ($null -eq $response -or [string]::IsNullOrWhiteSpace([string]$response.Content)) {
         return $null
     }
 
     return ($response.Content | ConvertFrom-Json)
 }
 
-function First-Property {
+function Get-ExactMember {
     param(
         $Object,
-        [string[]]$Names,
-        $Default = "N/A"
-    )
-
-    if ($null -eq $Object) {
-        return $Default
-    }
-
-    foreach ($name in $Names) {
-        foreach ($property in @($Object.PSObject.Properties)) {
-            if ($property.Name -ieq $name -and $null -ne $property.Value) {
-                if ($property.Value -is [System.Array]) {
-                    if (@($property.Value).Count -gt 0) {
-                        return $property.Value
-                    }
-                }
-                else {
-                    $text = ([string]$property.Value).Trim()
-                    if (-not [string]::IsNullOrWhiteSpace($text)) {
-                        return $property.Value
-                    }
-                }
-            }
-        }
-    }
-
-    return $Default
-}
-
-function Array-Property {
-    param(
-        $Object,
-        [string[]]$Names
-    )
-
-    if ($null -eq $Object) {
-        return @()
-    }
-
-    foreach ($name in $Names) {
-        foreach ($property in @($Object.PSObject.Properties)) {
-            if ($property.Name -ieq $name -and $null -ne $property.Value) {
-                return @($property.Value)
-            }
-        }
-    }
-
-    return @()
-}
-
-function Get-NestedObject {
-    param(
-        $Object,
-        [string[]]$Names
+        [Parameter(Mandatory = $true)][string]$Name
     )
 
     if ($null -eq $Object) {
         return $null
     }
 
-    foreach ($name in $Names) {
-        foreach ($property in @($Object.PSObject.Properties)) {
-            if ($property.Name -ieq $name -and $null -ne $property.Value) {
-                return $property.Value
-            }
+    foreach ($property in @($Object.PSObject.Properties)) {
+        if ($property.Name -ceq $Name) {
+            return $property
         }
     }
 
     return $null
 }
 
-function Get-Clusters {
-    param($Response)
+function Get-ExactValue {
+    param(
+        $Object,
+        [Parameter(Mandatory = $true)][string]$Name
+    )
 
-    if ($null -eq $Response) { return @() }
-    if ($Response.cohesityClusters) { return @($Response.cohesityClusters) }
-    if ($Response.clusters) { return @($Response.clusters) }
-    if ($Response.clusterInfos) { return @($Response.clusterInfos) }
-    if ($Response.mcmInfo -and $Response.mcmInfo.clusterInfos) { return @($Response.mcmInfo.clusterInfos) }
-    if ($Response -is [System.Array]) { return @($Response) }
-    return @()
+    $member = Get-ExactMember -Object $Object -Name $Name
+    if ($null -eq $member -or $null -eq $member.Value) {
+        return $na
+    }
+
+    if ($member.Value -is [string] -and [string]::IsNullOrWhiteSpace([string]$member.Value)) {
+        return $na
+    }
+
+    return $member.Value
 }
 
-function Get-Nodes {
-    param($Response)
+function Get-ExactObject {
+    param(
+        $Object,
+        [Parameter(Mandatory = $true)][string]$Name
+    )
 
-    if ($null -eq $Response) { return @() }
-    if ($Response -is [System.Array]) { return @($Response) }
-    if ($Response.nodes) { return @($Response.nodes) }
-    if ($Response.nodeList) { return @($Response.nodeList) }
-    if ($Response.items) { return @($Response.items) }
-    if ($Response.PSObject.Properties["nodeId"] -or $Response.PSObject.Properties["id"]) { return @($Response) }
-    return @()
+    $member = Get-ExactMember -Object $Object -Name $Name
+    if ($null -eq $member -or $null -eq $member.Value) {
+        return $null
+    }
+
+    return $member.Value
 }
 
-function Get-Chassis {
-    param($Response)
+function Get-ExactArray {
+    param(
+        $Object,
+        [Parameter(Mandatory = $true)][string]$Name
+    )
 
-    if ($null -eq $Response) { return @() }
-    if ($Response -is [System.Array]) { return @($Response) }
-    if ($Response.chassis) { return @($Response.chassis) }
-    if ($Response.chassisList) { return @($Response.chassisList) }
-    if ($Response.items) { return @($Response.items) }
-    if ($Response.PSObject.Properties["nodeIds"] -or $Response.PSObject.Properties["hardwareModel"]) { return @($Response) }
-    return @()
+    $member = Get-ExactMember -Object $Object -Name $Name
+    if ($null -eq $member -or $null -eq $member.Value) {
+        return @()
+    }
+
+    return @($member.Value)
 }
 
-function Get-StorageDomains {
-    param($Response)
+function Format-FaultTolerance {
+    param(
+        $DiskFailures,
+        $DomainFailures
+    )
 
-    if ($null -eq $Response) { return @() }
-    if ($Response -is [System.Array]) { return @($Response) }
-    if ($Response.storageDomains) { return @($Response.storageDomains) }
-    if ($Response.items) { return @($Response.items) }
-    if ($Response.PSObject.Properties["storagePolicy"] -or $Response.PSObject.Properties["id"]) { return @($Response) }
-    return @()
+    if ($null -eq $DiskFailures -or $null -eq $DomainFailures) {
+        return $na
+    }
+    if ([string]$DiskFailures -eq $na -or [string]$DomainFailures -eq $na) {
+        return $na
+    }
+
+    return ('{0}D:{1}N' -f $DiskFailures, $DomainFailures)
 }
 
-function Get-HardwareBucket {
-    param([string]$Model)
+function Format-ErasureCoding {
+    param($ErasureCodingObject)
 
-    switch -Regex ([string]$Model) {
-        '^CX8405$' { return "CX8405" }
-        '^C6025$'  { return "C6025" }
-        '^C5066$'  { return "C5066" }
-        '^C5026$'  { return "C5026" }
-        '^C5016$'  { return "C5016" }
-        default    { return "Other" }
+    if ($null -eq $ErasureCodingObject) {
+        return $na
     }
+
+    $data = Get-ExactValue -Object $ErasureCodingObject -Name 'numDataStripes'
+    $coded = Get-ExactValue -Object $ErasureCodingObject -Name 'numCodedStripes'
+    if ([string]$data -eq $na -or [string]$coded -eq $na) {
+        return $na
+    }
+
+    return ('{0}:{1}' -f $data, $coded)
 }
 
-function Format-HardwareMix {
-    param($Nodes)
+function Add-GetFailure {
+    param(
+        [System.Collections.Generic.List[string]]$Failures,
+        [string]$ClusterAlias,
+        [string]$Endpoint
+    )
 
-    $counts = @{
-        CX8405 = 0
-        C6025  = 0
-        C5066  = 0
-        C5026  = 0
-        C5016  = 0
-        Other  = 0
-    }
-
-    foreach ($node in @($Nodes)) {
-        $model = [string](First-Property $node @("productModel","nodeModel","hardwareModel","chassisModel"))
-        $bucket = Get-HardwareBucket $model
-        $counts[$bucket]++
-    }
-
-    $parts = @()
-    foreach ($name in @("CX8405","C6025","C5066","C5026","C5016","Other")) {
-        if ($counts[$name] -gt 0) {
-            $parts += "$name=$($counts[$name])"
-        }
-    }
-
-    if ($parts.Count -eq 0) { return "N/A" }
-    return ($parts -join "; ")
-}
-
-function Format-NodesPerChassis {
-    param($ChassisList)
-
-    $counts = @()
-    foreach ($chassis in @($ChassisList)) {
-        $counts += @(Array-Property $chassis @("nodeIds")).Count
-    }
-
-    if ($counts.Count -eq 0) { return "N/A" }
-    return (($counts | Sort-Object) -join ",")
-}
-
-function Get-ClusterFtState {
-    param($Response)
-
-    if ($null -eq $Response) {
-        return [pscustomobject][ordered]@{
-            FaultToleranceLevel          = "N/A"
-            MetadataFaultToleranceFactor = "N/A"
-            MinimumFailureDomainsNeeded  = "N/A"
-        }
-    }
-
-    $clusterObject = $Response
-    if ($Response -is [System.Array]) {
-        if (@($Response).Count -gt 0) { $clusterObject = @($Response)[0] }
-    }
-
-    return [pscustomobject][ordered]@{
-        FaultToleranceLevel          = First-Property $clusterObject @("faultToleranceLevel")
-        MetadataFaultToleranceFactor = First-Property $clusterObject @("metadataFaultToleranceFactor")
-        MinimumFailureDomainsNeeded  = First-Property $clusterObject @("minimumFailureDomainsNeeded")
-    }
+    $Failures.Add(('{0} | GET {1} | FAILED' -f $ClusterAlias, $Endpoint))
 }
 
 function Get-StorageDomainAssessment {
@@ -273,141 +192,213 @@ function Get-StorageDomainAssessment {
         [System.Collections.Generic.List[string]]$Failures
     )
 
-    $domainSummaries = @()
-    $ftRows = @()
-    $index = 0
+    $ecSummaries = New-Object System.Collections.Generic.List[string]
+    $defaultFtSummaries = New-Object System.Collections.Generic.List[string]
+    $globalLevelSummaries = New-Object System.Collections.Generic.List[string]
+    $globalCountSummaries = New-Object System.Collections.Generic.List[string]
+    $failureDomainSummaries = New-Object System.Collections.Generic.List[string]
+    $replicationSummaries = New-Object System.Collections.Generic.List[string]
+    $ftOptionSummaries = New-Object System.Collections.Generic.List[string]
+    $summaryObjects = @()
 
-    foreach ($sd in @($StorageDomains)) {
-        $index++
-        $sdAlias = "SD-$index"
-        $sdId = [string](First-Property $sd @("id","storageDomainId"))
+    $orderedDomains = @($StorageDomains | Sort-Object { [string](Get-ExactValue -Object $_ -Name 'id') })
+    $sdIndex = 0
 
-        $storagePolicy = Get-NestedObject $sd @("storagePolicy")
-        $ecParams = Get-NestedObject $storagePolicy @("erasureCodingParams")
+    foreach ($sd in $orderedDomains) {
+        $sdIndex++
+        $sdAlias = 'SD-{0}' -f $sdIndex
+        $sdId = Get-ExactValue -Object $sd -Name 'id'
 
-        $ecEnabled = First-Property $ecParams @("enabled")
-        $dataStripes = First-Property $ecParams @("numDataStripes")
-        $codedStripes = First-Property $ecParams @("numCodedStripes")
-        $inlineEc = First-Property $ecParams @("inlineEnabled")
+        $storagePolicy = Get-ExactObject -Object $sd -Name 'storagePolicy'
+        $ecParams = Get-ExactObject -Object $storagePolicy -Name 'erasureCodingParams'
+        $ecEnabled = Get-ExactValue -Object $ecParams -Name 'enabled'
+        $inlineEnabled = Get-ExactValue -Object $ecParams -Name 'inlineEnabled'
+        $ecPair = Format-ErasureCoding -ErasureCodingObject $ecParams
+        $ecSummaries.Add(('{0}=EC:{1},Enabled:{2},Inline:{3}' -f $sdAlias, $ecPair, $ecEnabled, $inlineEnabled))
 
-        if ($dataStripes -ne "N/A" -and $codedStripes -ne "N/A") {
-            $ec = "$dataStripes`:$codedStripes"
-        }
-        else {
-            $ec = "N/A"
-        }
-
-        $ft = $null
-        if ($sdId -ne "N/A") {
+        $ftResponse = $null
+        if ([string]$sdId -ne $na) {
             try {
-                $encodedId = [uri]::EscapeDataString($sdId)
-                $ft = Get-Json `
-                    -Uri "$baseUrl/v2/storage-domains/fault-tolerance-options?storageDomainId=$encodedId" `
-                    -Headers $Headers
+                $encodedId = [uri]::EscapeDataString([string]$sdId)
+                $ftResponse = Get-Json -Uri "$baseUrl/v2/storage-domains/fault-tolerance-options?storageDomainId=$encodedId" -Headers $Headers
             }
             catch {
-                $Failures.Add("$ClusterAlias | FT options $sdAlias | $($_.Exception.Message)")
+                Add-GetFailure -Failures $Failures -ClusterAlias $ClusterAlias -Endpoint '/v2/storage-domains/fault-tolerance-options'
             }
         }
 
-        $globalTolerance = Get-NestedObject $ft @("globalTolerance")
-        $defaultTolerance = Get-NestedObject $ft @("defaultFaultTolerance")
+        $settingsEnabled = Get-ExactValue -Object $ftResponse -Name 'enabled'
+        $failureDomainCount = Get-ExactValue -Object $ftResponse -Name 'failureDomainCount'
+        $globalTolerance = Get-ExactObject -Object $ftResponse -Name 'globalTolerance'
+        $globalLevel = Get-ExactValue -Object $globalTolerance -Name 'faultToleranceLevel'
+        $globalCount = Get-ExactValue -Object $globalTolerance -Name 'count'
+        $defaultTolerance = Get-ExactObject -Object $ftResponse -Name 'defaultFaultTolerance'
+        $defaultDiskFailures = Get-ExactValue -Object $defaultTolerance -Name 'numDiskFailuresTolerated'
+        $defaultDomainFailures = Get-ExactValue -Object $defaultTolerance -Name 'numDomainFailuresTolerated'
+        $defaultFt = Format-FaultTolerance -DiskFailures $defaultDiskFailures -DomainFailures $defaultDomainFailures
 
-        $globalLevel = First-Property $globalTolerance @("faultToleranceLevel")
-        $globalCount = First-Property $globalTolerance @("count")
-        $failureDomainCount = First-Property $ft @("failureDomainCount")
-        $defaultDiskFt = First-Property $defaultTolerance @("numDiskFailuresTolerated","diskFailuresTolerated")
-        $defaultDomainFt = First-Property $defaultTolerance @("numDomainFailuresTolerated","numFailureDomainFailuresTolerated","failureDomainFailuresTolerated")
-        $defaultEc = First-Property $ft @("defaultErasureCoding","defaultEc","defaultEC")
-        $defaultRf = First-Property $ft @("defaultReplicationFactor","defaultRf","defaultRF")
+        $defaultFtSummaries.Add(('{0}={1}' -f $sdAlias, $defaultFt))
+        $globalLevelSummaries.Add(('{0}={1}' -f $sdAlias, $globalLevel))
+        $globalCountSummaries.Add(('{0}={1}' -f $sdAlias, $globalCount))
+        $failureDomainSummaries.Add(('{0}={1}' -f $sdAlias, $failureDomainCount))
 
-        $options = @()
-        if ($null -ne $ft) {
-            foreach ($name in @("faultToleranceOptions","options","availableOptions")) {
-                $candidate = @(Array-Property $ft @($name))
-                if ($candidate.Count -gt 0) {
-                    $options = $candidate
-                    break
-                }
+        $optionIndex = 0
+        $optionTexts = New-Object System.Collections.Generic.List[string]
+        $rfTexts = New-Object System.Collections.Generic.List[string]
+
+        foreach ($option in @(Get-ExactArray -Object $ftResponse -Name 'faultToleranceOptions')) {
+            $optionIndex++
+            $faultTolerance = Get-ExactObject -Object $option -Name 'faultTolerance'
+            $diskFailures = Get-ExactValue -Object $faultTolerance -Name 'numDiskFailuresTolerated'
+            $domainFailures = Get-ExactValue -Object $faultTolerance -Name 'numDomainFailuresTolerated'
+            $ftLabel = Format-FaultTolerance -DiskFailures $diskFailures -DomainFailures $domainFailures
+            $disabled = Get-ExactValue -Object $option -Name 'disabled'
+            $hasWarning = Get-ExactValue -Object $option -Name 'hasWarning'
+            $minDomains = Get-ExactValue -Object $option -Name 'minFailureDomainsRequired'
+            $defaultReplicationFactor = Get-ExactValue -Object $option -Name 'defaultReplicationFactor'
+            $defaultErasureCoding = Get-ExactObject -Object $option -Name 'defaultErasureCoding'
+            $defaultEcPair = Format-ErasureCoding -ErasureCodingObject $defaultErasureCoding
+
+            $ecOptionIndex = 0
+            $ecOptionTexts = New-Object System.Collections.Generic.List[string]
+            foreach ($ecOption in @(Get-ExactArray -Object $option -Name 'erasureCodingOptions')) {
+                $ecOptionIndex++
+                $erasureCoding = Get-ExactObject -Object $ecOption -Name 'erasureCoding'
+                $ecOptionPair = Format-ErasureCoding -ErasureCodingObject $erasureCoding
+                $inlineSupported = Get-ExactValue -Object $ecOption -Name 'inlineSupported'
+                $isSuboptimal = Get-ExactValue -Object $ecOption -Name 'isSuboptimal'
+                $minDomainsForHeal = Get-ExactValue -Object $ecOption -Name 'minDomainsForHeal'
+                $ecOptionTexts.Add(('EC-{0}:{1},InlineSupported:{2},Suboptimal:{3},MinDomainsForHeal:{4}' -f $ecOptionIndex, $ecOptionPair, $inlineSupported, $isSuboptimal, $minDomainsForHeal))
             }
+
+            $ecOptionsText = if ($ecOptionTexts.Count -gt 0) { $ecOptionTexts -join ' | ' } else { $na }
+            $optionTexts.Add(('Option-{0}:{1},Disabled:{2},Warning:{3},MinDomains:{4},RF:{5},DefaultEC:{6},ECOptions:[{7}]' -f $optionIndex, $ftLabel, $disabled, $hasWarning, $minDomains, $defaultReplicationFactor, $defaultEcPair, $ecOptionsText))
+            $rfTexts.Add(('{0}={1}' -f $ftLabel, $defaultReplicationFactor))
         }
 
-        $rackOptionTexts = @()
-        foreach ($option in $options) {
-            $optionLevel = [string](First-Property $option @("faultToleranceLevel","failureDomainType","level"))
-            $minDomains = First-Property $option @("minFailureDomainsRequired","minimumFailureDomainsRequired")
-            $disabled = First-Property $option @("disabled","isDisabled")
-            $warning = First-Property $option @("hasWarning","warning")
-            $suboptimal = First-Property $option @("isSuboptimal","suboptimal")
-            $optionEc = First-Property $option @("erasureCoding","ecConfig","ecConfiguration")
-            $optionRf = First-Property $option @("replicationFactor","rf")
+        $optionSummaryText = if ($optionTexts.Count -gt 0) { $optionTexts -join ' || ' } else { $na }
+        $rfSummaryText = if ($rfTexts.Count -gt 0) { $rfTexts -join ' | ' } else { $na }
+        $replicationSummaries.Add(('{0}={1}' -f $sdAlias, $rfSummaryText))
+        $ftOptionSummaries.Add(('{0}=SettingsEnabled:{1}; {2}' -f $sdAlias, $settingsEnabled, $optionSummaryText))
 
-            if ($optionLevel -match '(?i)rack') {
-                $rackOptionTexts += "Level=$optionLevel,EC=$optionEc,RF=$optionRf,MinDomains=$minDomains,Disabled=$disabled,Warning=$warning,Suboptimal=$suboptimal"
-            }
-        }
-
-        $rackOptionsText = if ($rackOptionTexts.Count -gt 0) { $rackOptionTexts -join " | " } else { "N/A" }
-
-        $domainSummaries += "$sdAlias EC=$ec Enabled=$ecEnabled Inline=$inlineEc"
-
-        $ftRows += [pscustomobject][ordered]@{
-            StorageDomainAlias         = $sdAlias
-            StorageDomainId            = $sdId
-            ECEnabled                  = $ecEnabled
-            ECDataCoded                = $ec
-            InlineEC                   = $inlineEc
-            GlobalToleranceLevel       = $globalLevel
-            GlobalToleranceCount       = $globalCount
-            FailureDomainCount         = $failureDomainCount
-            DefaultDiskFailures        = $defaultDiskFt
-            DefaultDomainFailures      = $defaultDomainFt
-            DefaultErasureCoding       = $defaultEc
-            DefaultReplicationFactor   = $defaultRf
-            RackFaultToleranceOptions  = $rackOptionsText
+        $summaryObjects += [pscustomobject][ordered]@{
+            Alias                    = $sdAlias
+            Id                       = $sdId
+            ECPair                   = $ecPair
+            ECEnabled                = $ecEnabled
+            InlineEnabled            = $inlineEnabled
+            DefaultFT                = $defaultFt
+            GlobalToleranceLevel     = $globalLevel
+            GlobalToleranceCount     = $globalCount
+            FailureDomainCount       = $failureDomainCount
+            DefaultReplicationFactor = $rfSummaryText
+            FaultToleranceOptions    = $optionSummaryText
         }
     }
 
     return [pscustomobject][ordered]@{
-        Count   = @($StorageDomains).Count
-        Summary = if ($domainSummaries.Count -gt 0) { $domainSummaries -join "; " } else { "N/A" }
-        FTRows  = @($ftRows)
+        Count                    = @($orderedDomains).Count
+        EC                       = if ($ecSummaries.Count -gt 0) { $ecSummaries -join '; ' } else { $na }
+        DefaultFT                = if ($defaultFtSummaries.Count -gt 0) { $defaultFtSummaries -join '; ' } else { $na }
+        GlobalToleranceLevel     = if ($globalLevelSummaries.Count -gt 0) { $globalLevelSummaries -join '; ' } else { $na }
+        GlobalToleranceCount     = if ($globalCountSummaries.Count -gt 0) { $globalCountSummaries -join '; ' } else { $na }
+        FailureDomainCount       = if ($failureDomainSummaries.Count -gt 0) { $failureDomainSummaries -join '; ' } else { $na }
+        DefaultReplicationFactor = if ($replicationSummaries.Count -gt 0) { $replicationSummaries -join '; ' } else { $na }
+        RackFTOptions            = if ($ftOptionSummaries.Count -gt 0) { $ftOptionSummaries -join '; ' } else { $na }
+        Domains                  = @($summaryObjects)
     }
 }
 
-Write-Host ""
-Write-Host "========================================================" -ForegroundColor Cyan
-Write-Host " COHESITY RACK READINESS COLLECTION - GET ONLY" -ForegroundColor White
-Write-Host "========================================================" -ForegroundColor Cyan
+function Get-HardwareBucket {
+    param([string]$Model)
 
-$clusterResponse = Get-Json `
-    -Uri "$baseUrl/v2/mcm/cluster-mgmt/info" `
-    -Headers (New-Headers)
+    switch ($Model) {
+        'CX8405' { return 'CX8405' }
+        'C6025'  { return 'C6025' }
+        'C5066'  { return 'C5066' }
+        'C5026'  { return 'C5026' }
+        'C5016'  { return 'C5016' }
+        default  { return 'Other' }
+    }
+}
 
-$clusterObjects = @(Get-Clusters $clusterResponse)
+function Format-HardwareMix {
+    param($NodeRows)
+
+    $counts = @{}
+    foreach ($row in @($NodeRows)) {
+        $model = [string]$row.ProductModel
+        if (-not $counts.ContainsKey($model)) {
+            $counts[$model] = 0
+        }
+        $counts[$model]++
+    }
+
+    if ($counts.Count -eq 0) {
+        return $na
+    }
+
+    $parts = @()
+    foreach ($model in @($counts.Keys | Sort-Object)) {
+        $parts += ('{0}={1}' -f $model, $counts[$model])
+    }
+
+    return ($parts -join '; ')
+}
+
+function Format-NodesPerChassis {
+    param($ChassisList)
+
+    $counts = @()
+    foreach ($chassis in @($ChassisList)) {
+        $nodeIds = @(Get-ExactArray -Object $chassis -Name 'nodeIds')
+        $counts += $nodeIds.Count
+    }
+
+    if ($counts.Count -eq 0) {
+        return $na
+    }
+
+    return (($counts | Sort-Object) -join ',')
+}
+
+Write-Host ''
+Write-Host '========================================================' -ForegroundColor Cyan
+Write-Host ' COHESITY RACK READINESS COLLECTION - GET ONLY' -ForegroundColor White
+Write-Host '========================================================' -ForegroundColor Cyan
+
+$failures = New-Object System.Collections.Generic.List[string]
+$validationWarnings = New-Object System.Collections.Generic.List[string]
+$detailRows = @()
+$summaryRows = @()
+
+$clusterResponse = Get-Json -Uri "$baseUrl/v2/mcm/cluster-mgmt/info" -Headers (New-Headers)
+$clusterObjects = @(Get-ExactArray -Object $clusterResponse -Name 'cohesityClusters')
 if ($clusterObjects.Count -eq 0) {
-    throw "No clusters returned by GET /v2/mcm/cluster-mgmt/info."
+    throw 'No clusters returned from GET /v2/mcm/cluster-mgmt/info via exact property cohesityClusters.'
 }
 
 $clusters = @()
 foreach ($cluster in $clusterObjects) {
-    $clusterId = [string](First-Property $cluster @("clusterId","id"))
-    if ($clusterId -eq "N/A") { continue }
+    $clusterId = Get-ExactValue -Object $cluster -Name 'clusterId'
+    $clusterName = Get-ExactValue -Object $cluster -Name 'clusterName'
+
+    if ([string]$clusterId -eq $na) {
+        $validationWarnings.Add('Cluster discovery returned an item without exact clusterId; item skipped')
+        continue
+    }
 
     $clusters += [pscustomobject][ordered]@{
-        ClusterName = First-Property $cluster @("clusterName","displayName","name")
-        ClusterId   = $clusterId
+        ClusterId   = [string]$clusterId
+        ClusterName = $clusterName
     }
 }
 
-$clusters = @($clusters | Sort-Object ClusterName,ClusterId -Unique)
+$clusters = @($clusters | Sort-Object ClusterId -Unique)
 if ($clusters.Count -eq 0) {
-    throw "No usable clusters returned by Helios."
+    throw 'Cluster discovery returned no usable clusterId values.'
 }
 
-$detailRows = @()
-$summaryRows = @()
-$failures = New-Object System.Collections.Generic.List[string]
 $totalNodes = 0
 $totalChassis = 0
 $totalStorageDomains = 0
@@ -415,126 +406,159 @@ $clusterIndex = 0
 
 foreach ($cluster in $clusters) {
     $clusterIndex++
-    $clusterAlias = "Cluster-{0:D2}" -f $clusterIndex
+    $clusterAlias = 'Cluster-{0:D2}' -f $clusterIndex
     $headers = New-Headers -ClusterId $cluster.ClusterId
 
-    Write-Host "Processing $clusterAlias" -ForegroundColor Yellow
+    Write-Host ("Processing {0}" -f $clusterAlias) -ForegroundColor Yellow
 
     $nodes = @()
     $chassisList = @()
     $storageDomains = @()
-    $clusterFt = $null
+    $clusterFtResponse = $null
 
     try {
-        $nodes = @(Get-Nodes (Get-Json -Uri "$baseUrl/v2/clusters/nodes" -Headers $headers))
+        $nodesResponse = Get-Json -Uri "$baseUrl/v2/clusters/nodes" -Headers $headers
+        $nodes = @($nodesResponse)
     }
     catch {
-        $failures.Add("$clusterAlias | GET /v2/clusters/nodes | $($_.Exception.Message)")
-    }
-
-    try {
-        $chassisList = @(Get-Chassis (Get-Json -Uri "$baseUrl/v2/chassis" -Headers $headers))
-    }
-    catch {
-        $failures.Add("$clusterAlias | GET /v2/chassis | $($_.Exception.Message)")
+        Add-GetFailure -Failures $failures -ClusterAlias $clusterAlias -Endpoint '/v2/clusters/nodes'
     }
 
     try {
-        $storageDomains = @(Get-StorageDomains (Get-Json -Uri "$baseUrl/v2/storage-domains?matchPartialNames=false&includeTenants=true&includeStats=true" -Headers $headers))
+        $chassisResponse = Get-Json -Uri "$baseUrl/v2/chassis" -Headers $headers
+        $chassisList = @(Get-ExactArray -Object $chassisResponse -Name 'chassis')
     }
     catch {
-        $failures.Add("$clusterAlias | GET /v2/storage-domains | $($_.Exception.Message)")
+        Add-GetFailure -Failures $failures -ClusterAlias $clusterAlias -Endpoint '/v2/chassis'
     }
 
     try {
-        $clusterFt = Get-ClusterFtState (Get-Json -Uri "$baseUrl/irisservices/api/v1/public/cluster?fetchStats=true" -Headers $headers)
+        $storageDomainsResponse = Get-Json -Uri "$baseUrl/v2/storage-domains?matchPartialNames=false&includeTenants=true&includeStats=true" -Headers $headers
+        $storageDomains = @(Get-ExactArray -Object $storageDomainsResponse -Name 'storageDomains')
     }
     catch {
-        $failures.Add("$clusterAlias | GET /irisservices/api/v1/public/cluster?fetchStats=true | $($_.Exception.Message)")
-        $clusterFt = Get-ClusterFtState $null
+        Add-GetFailure -Failures $failures -ClusterAlias $clusterAlias -Endpoint '/v2/storage-domains'
     }
 
-    $sdAssessment = Get-StorageDomainAssessment `
-        -StorageDomains $storageDomains `
-        -Headers $headers `
-        -ClusterAlias $clusterAlias `
-        -Failures $failures
+    try {
+        $clusterFtResponse = Get-Json -Uri "$baseUrl/irisservices/api/v1/public/cluster?fetchStats=true" -Headers $headers
+    }
+    catch {
+        Add-GetFailure -Failures $failures -ClusterAlias $clusterAlias -Endpoint '/irisservices/api/v1/public/cluster?fetchStats=true'
+    }
 
-    $chassisByNodeId = @{}
+    $faultToleranceLevel = Get-ExactValue -Object $clusterFtResponse -Name 'faultToleranceLevel'
+    $metadataFaultToleranceFactor = Get-ExactValue -Object $clusterFtResponse -Name 'metadataFaultToleranceFactor'
+    $minimumFailureDomainsNeeded = Get-ExactValue -Object $clusterFtResponse -Name 'minimumFailureDomainsNeeded'
+
+    $sdAssessment = Get-StorageDomainAssessment -StorageDomains $storageDomains -Headers $headers -ClusterAlias $clusterAlias -Failures $failures
+
+    $chassisById = @{}
     foreach ($chassis in $chassisList) {
-        foreach ($nodeId in @(Array-Property $chassis @("nodeIds"))) {
-            if ($null -ne $nodeId) {
-                $chassisByNodeId[[string]$nodeId] = $chassis
+        $inventoryChassisId = Get-ExactValue -Object $chassis -Name 'id'
+        if ([string]$inventoryChassisId -ne $na) {
+            $chassisById[[string]$inventoryChassisId] = $chassis
+        }
+    }
+
+    $clusterNodeRows = @()
+    foreach ($node in $nodes) {
+        $nodeId = Get-ExactValue -Object $node -Name 'id'
+        $hostName = Get-ExactValue -Object $node -Name 'hostName'
+        $nodeIp = Get-ExactValue -Object $node -Name 'ip'
+        $cohesityNodeSerial = Get-ExactValue -Object $node -Name 'cohesityNodeSerial'
+        $productModel = Get-ExactValue -Object $node -Name 'productModel'
+        $slotNumber = Get-ExactValue -Object $node -Name 'slotNumber'
+        $chassisInfo = Get-ExactObject -Object $node -Name 'chassisInfo'
+        $chassisId = Get-ExactValue -Object $chassisInfo -Name 'chassisId'
+
+        $ipmiIp = $na
+        $ipmiSource = $na
+        $ipmiSubnetMask = $na
+        if ([string]$nodeId -ne $na) {
+            try {
+                $encodedNodeId = [uri]::EscapeDataString([string]$nodeId)
+                $ipmiResponse = Get-Json -Uri "$baseUrl/v2/ipmi/get-lan-info?nodeId=$encodedNodeId" -Headers $headers
+                $ipmiIp = Get-ExactValue -Object $ipmiResponse -Name 'lanIp'
+                $ipmiSource = Get-ExactValue -Object $ipmiResponse -Name 'ipAddrSource'
+                $ipmiSubnetMask = Get-ExactValue -Object $ipmiResponse -Name 'subnetMask'
+            }
+            catch {
+                Add-GetFailure -Failures $failures -ClusterAlias $clusterAlias -Endpoint '/v2/ipmi/get-lan-info'
             }
         }
-    }
 
-    $ftSummary = @()
-    foreach ($ftRow in @($sdAssessment.FTRows)) {
-        $ftSummary += "$($ftRow.StorageDomainAlias):Global=$($ftRow.GlobalToleranceLevel)/$($ftRow.GlobalToleranceCount),Domains=$($ftRow.FailureDomainCount),DiskFT=$($ftRow.DefaultDiskFailures),DomainFT=$($ftRow.DefaultDomainFailures),DefaultEC=$($ftRow.DefaultErasureCoding),DefaultRF=$($ftRow.DefaultReplicationFactor),RackOptions=$($ftRow.RackFaultToleranceOptions)"
-    }
-    $ftSummaryText = if ($ftSummary.Count -gt 0) { $ftSummary -join "; " } else { "N/A" }
-
-    foreach ($node in $nodes) {
-        $nodeId = [string](First-Property $node @("nodeId","id"))
         $chassis = $null
-        if ($nodeId -ne "N/A" -and $chassisByNodeId.ContainsKey($nodeId)) {
-            $chassis = $chassisByNodeId[$nodeId]
+        if ([string]$chassisId -ne $na -and $chassisById.ContainsKey([string]$chassisId)) {
+            $chassis = $chassisById[[string]$chassisId]
         }
 
-        $detailRows += [pscustomobject][ordered]@{
+        $chassisSerial = Get-ExactValue -Object $chassis -Name 'serialNumber'
+        $chassisModel = Get-ExactValue -Object $chassis -Name 'hardwareModel'
+
+        $row = [pscustomobject][ordered]@{
             ClusterName                 = $cluster.ClusterName
             ClusterId                   = $cluster.ClusterId
-            FaultToleranceLevel         = $clusterFt.FaultToleranceLevel
-            MetadataFTFactor            = $clusterFt.MetadataFaultToleranceFactor
-            MinimumFailureDomainsNeeded = $clusterFt.MinimumFailureDomainsNeeded
+            FaultToleranceLevel         = $faultToleranceLevel
+            MetadataFaultToleranceFactor = $metadataFaultToleranceFactor
+            MinimumFailureDomainsNeeded = $minimumFailureDomainsNeeded
             NodeId                      = $nodeId
-            Hostname                    = First-Property $node @("hostname","hostName","name")
-            NodeIP                      = First-Property $node @("ip","nodeIp","ipAddress")
-            IPMIIP                      = First-Property $node @("ipmiIp","ipmiIP","ipmiAddress")
-            NodeSerial                  = First-Property $node @("nodeSerial")
-            CohesityNodeSerial          = First-Property $node @("cohesityNodeSerial")
-            NodeModel                   = First-Property $node @("nodeModel")
-            ProductModel                = First-Property $node @("productModel")
-            ProductModelType            = First-Property $node @("productModelType")
-            SlotNumber                  = First-Property $node @("slotNumber","slot")
-            NodeStatus                  = First-Property $node @("status","nodeStatus")
-            Reachable                   = First-Property $node @("isReachable","reachable","reachability")
-            ChassisId                   = if ($chassis) { First-Property $chassis @("id","chassisId") } else { First-Property $node @("chassisId") }
-            ChassisName                 = if ($chassis) { First-Property $chassis @("name","chassisName") } else { "N/A" }
-            ChassisSerial               = if ($chassis) { First-Property $chassis @("serialNumber","chassisSerial") } else { First-Property $node @("chassisSerial") }
-            CohesityChassisSerial       = First-Property $node @("cohesityChassisSerial")
-            ChassisModel                = if ($chassis) { First-Property $chassis @("hardwareModel","chassisModel") } else { First-Property $node @("chassisModel") }
+            Hostname                    = $hostName
+            NodeIP                      = $nodeIp
+            IPMIIP                      = $ipmiIp
+            IPMISource                  = $ipmiSource
+            IPMISubnetMask              = $ipmiSubnetMask
+            NodeSerial                  = $na
+            CohesityNodeSerial          = $cohesityNodeSerial
+            NodeModel                   = $na
+            ProductModel                = $productModel
+            ProductModelType            = $na
+            SlotNumber                  = $slotNumber
+            NodeStatus                  = $na
+            Reachable                   = $na
+            ChassisId                   = $chassisId
+            ChassisSerial               = $chassisSerial
+            CohesityChassisSerial       = $na
+            ChassisModel                = $chassisModel
+            ChassisType                 = $na
+            MaxSlots                    = $na
             StorageDomainCount          = $sdAssessment.Count
-            StorageDomainEC             = $sdAssessment.Summary
-            StorageDomainFT             = $ftSummaryText
+            StorageDomainEC             = $sdAssessment.EC
+            StorageDomainDefaultFT      = $sdAssessment.DefaultFT
+            GlobalToleranceLevel        = $sdAssessment.GlobalToleranceLevel
+            GlobalToleranceCount        = $sdAssessment.GlobalToleranceCount
+            FailureDomainCount          = $sdAssessment.FailureDomainCount
+            DefaultReplicationFactor    = $sdAssessment.DefaultReplicationFactor
+            RackFTOptions                = $sdAssessment.RackFTOptions
         }
+
+        $detailRows += $row
+        $clusterNodeRows += $row
+    }
+
+    $defaultFtForSummary = $sdAssessment.DefaultFT
+    $summaryRows += [pscustomobject][ordered]@{
+        Cluster       = $clusterAlias
+        Nodes         = $nodes.Count
+        Chassis       = $chassisList.Count
+        HardwareMix   = Format-HardwareMix -NodeRows $clusterNodeRows
+        NodesChassis  = Format-NodesPerChassis -ChassisList $chassisList
+        EC            = $sdAssessment.EC
+        CurrentFT     = $faultToleranceLevel
+        DefaultFT     = $defaultFtForSummary
     }
 
     $totalNodes += $nodes.Count
     $totalChassis += $chassisList.Count
     $totalStorageDomains += $sdAssessment.Count
-
-    $summaryRows += [pscustomobject][ordered]@{
-        Cluster            = $clusterAlias
-        Nodes              = $nodes.Count
-        Chassis            = $chassisList.Count
-        HardwareMix        = Format-HardwareMix -Nodes $nodes
-        NodesPerChassis    = Format-NodesPerChassis -ChassisList $chassisList
-        StorageDomains     = $sdAssessment.Count
-        EC                 = $sdAssessment.Summary
-        CurrentFT          = $clusterFt.FaultToleranceLevel
-        MetadataFTFactor   = $clusterFt.MetadataFaultToleranceFactor
-        FailureDomainsNeed = $clusterFt.MinimumFailureDomainsNeeded
-    }
 }
 
-$timestamp = Get-Date -Format "yyyyMMdd_HHmm"
+$timestamp = Get-Date -Format 'yyyyMMdd_HHmmss'
 $csvPath = Join-Path $outputDirectory "Cohesity_Rack_Readiness_Detail_$timestamp.csv"
 $txtPath = Join-Path $outputDirectory "Cohesity_Rack_Readiness_Summary_$timestamp.txt"
 
 $detailRows |
-    Sort-Object ClusterName,Hostname,NodeId |
+    Sort-Object ClusterName, Hostname, NodeId |
     Export-Csv -Path $csvPath -NoTypeInformation -Encoding UTF8
 
 $hardwareCounts = @{
@@ -547,76 +571,96 @@ $hardwareCounts = @{
 }
 
 foreach ($row in $detailRows) {
-    $model = [string]$row.ProductModel
-    if ($model -eq "N/A") { $model = [string]$row.NodeModel }
-    $hardwareCounts[(Get-HardwareBucket $model)]++
+    $bucket = Get-HardwareBucket -Model ([string]$row.ProductModel)
+    $hardwareCounts[$bucket]++
 }
 
-$ftCounts = @{}
+$ftCounts = @{
+    kNode    = 0
+    kChassis = 0
+    kRack    = 0
+}
 foreach ($row in $summaryRows) {
-    $key = [string]$row.CurrentFT
-    if (-not $ftCounts.ContainsKey($key)) { $ftCounts[$key] = 0 }
-    $ftCounts[$key]++
+    $currentFt = [string]$row.CurrentFT
+    if ($ftCounts.ContainsKey($currentFt)) {
+        $ftCounts[$currentFt]++
+    }
+}
+
+$estateValidation = if ($clusters.Count -eq $expectedClusters -and $totalNodes -eq $expectedNodes) {
+    'PASS'
+}
+else {
+    ('WARNING - expected {0} clusters / {1} nodes; collected {2} clusters / {3} nodes' -f $expectedClusters, $expectedNodes, $clusters.Count, $totalNodes)
 }
 
 $txt = New-Object System.Collections.Generic.List[string]
-$txt.Add("COHESITY RACK READINESS SUMMARY")
-$txt.Add("===============================")
-$txt.Add("")
-$txt.Add("Cluster Summary")
-$txt.Add("---------------")
-$txt.Add(($summaryRows | Format-Table Cluster,Nodes,Chassis,HardwareMix,NodesPerChassis,StorageDomains,EC,CurrentFT,MetadataFTFactor,FailureDomainsNeed -AutoSize | Out-String -Width 240).TrimEnd())
-$txt.Add("")
-$txt.Add("Estate Totals")
-$txt.Add("-------------")
-$txt.Add("Clusters        : $($clusters.Count)")
-$txt.Add("Nodes           : $totalNodes")
-$txt.Add("Chassis         : $totalChassis")
-$txt.Add("Storage Domains : $totalStorageDomains")
-$txt.Add("")
-$txt.Add("Hardware")
-$txt.Add("--------")
-foreach ($name in @("CX8405","C6025","C5066","C5026","C5016","Other")) {
-    $txt.Add(("{0,-7}: {1}" -f $name,$hardwareCounts[$name]))
+$txt.Add('COHESITY RACK READINESS SUMMARY')
+$txt.Add('===============================')
+$txt.Add('')
+$txt.Add('Cluster Summary')
+$txt.Add('---------------')
+$txt.Add(($summaryRows | Format-Table Cluster, Nodes, Chassis, HardwareMix, NodesChassis, EC, CurrentFT, DefaultFT -AutoSize -Wrap | Out-String -Width 280).TrimEnd())
+$txt.Add('')
+$txt.Add('Estate Totals')
+$txt.Add('-------------')
+$txt.Add(('Clusters        : {0}' -f $clusters.Count))
+$txt.Add(('Nodes           : {0}' -f $totalNodes))
+$txt.Add(('Chassis         : {0}' -f $totalChassis))
+$txt.Add(('Storage Domains : {0}' -f $totalStorageDomains))
+$txt.Add(('Estate validation: {0}' -f $estateValidation))
+$txt.Add('')
+$txt.Add('Hardware')
+$txt.Add('--------')
+foreach ($name in @('CX8405', 'C6025', 'C5066', 'C5026', 'C5016', 'Other')) {
+    $txt.Add(('{0,-7}: {1}' -f $name, $hardwareCounts[$name]))
 }
-$txt.Add("")
-$txt.Add("Current Fault Tolerance")
-$txt.Add("-----------------------")
-foreach ($name in @($ftCounts.Keys | Sort-Object)) {
-    $txt.Add(("{0,-12}: {1} clusters" -f $name,$ftCounts[$name]))
+$txt.Add('')
+$txt.Add('Current FT')
+$txt.Add('----------')
+foreach ($name in @('kNode', 'kChassis', 'kRack')) {
+    $txt.Add(('{0,-9}: {1}' -f $name, $ftCounts[$name]))
 }
-$txt.Add("")
-$txt.Add("GET failures    : $($failures.Count)")
-$txt.Add("Non-GET calls   : 0")
+$txt.Add('')
+$txt.Add(('GET failures    : {0}' -f $failures.Count))
+$txt.Add('Non-GET calls   : 0')
 
 if ($failures.Count -gt 0) {
-    $txt.Add("")
-    $txt.Add("GET Failures")
-    $txt.Add("------------")
+    $txt.Add('')
+    $txt.Add('GET Failures')
+    $txt.Add('------------')
     foreach ($failure in $failures) {
         $txt.Add($failure)
     }
 }
 
+if ($validationWarnings.Count -gt 0) {
+    $txt.Add('')
+    $txt.Add('Validation Warnings')
+    $txt.Add('-------------------')
+    foreach ($warning in $validationWarnings) {
+        $txt.Add($warning)
+    }
+}
+
 $txt | Set-Content -Path $txtPath -Encoding UTF8
 
-Write-Host ""
-Write-Host "CLUSTER SUMMARY" -ForegroundColor Cyan
+Write-Host ''
+Write-Host 'CLUSTER SUMMARY' -ForegroundColor Cyan
 $summaryRows |
-    Format-Table Cluster,Nodes,Chassis,HardwareMix,NodesPerChassis,StorageDomains,EC,CurrentFT,MetadataFTFactor,FailureDomainsNeed -AutoSize -Wrap |
+    Format-Table Cluster, Nodes, Chassis, HardwareMix, NodesChassis, EC, CurrentFT, DefaultFT -AutoSize -Wrap |
     Out-Host
 
-Write-Host ""
-Write-Host "==============================" -ForegroundColor Cyan
-Write-Host "COLLECTION SUMMARY" -ForegroundColor White
-Write-Host "==============================" -ForegroundColor Cyan
-Write-Host "Clusters        : $($clusters.Count)"
-Write-Host "Nodes           : $totalNodes"
-Write-Host "Chassis         : $totalChassis"
-Write-Host "Storage Domains : $totalStorageDomains"
-Write-Host "GET failures    : $($failures.Count)"
-Write-Host "Non-GET calls   : 0" -ForegroundColor Green
-Write-Host "CSV detail      : $csvPath"
-Write-Host "TXT summary     : $txtPath"
-Write-Host ""
-Write-Host "READ-ONLY VALIDATION: No Cohesity configuration was modified during this assessment." -ForegroundColor Green
+Write-Host ''
+Write-Host '==============================' -ForegroundColor Cyan
+Write-Host 'COLLECTION SUMMARY' -ForegroundColor White
+Write-Host '==============================' -ForegroundColor Cyan
+Write-Host ('Clusters        : {0}' -f $clusters.Count)
+Write-Host ('Nodes           : {0}' -f $totalNodes)
+Write-Host ('Chassis         : {0}' -f $totalChassis)
+Write-Host ('Storage Domains : {0}' -f $totalStorageDomains)
+Write-Host ('Estate validation: {0}' -f $estateValidation)
+Write-Host ('GET failures    : {0}' -f $failures.Count)
+Write-Host 'Non-GET calls   : 0' -ForegroundColor Green
+Write-Host ('CSV detail      : {0}' -f $csvPath)
+Write-Host ('TXT summary     : {0}' -f $txtPath)
