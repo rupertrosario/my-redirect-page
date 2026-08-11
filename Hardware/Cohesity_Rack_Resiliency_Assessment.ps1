@@ -1,6 +1,6 @@
 # Cohesity Rack Resiliency Assessment - READ ONLY
 # PowerShell 5.1 compatible
-# ABSOLUTE RULE: HTTP GET ONLY. No Cohesity configuration changes are performed.
+# STRICT SAFETY: HTTP GET ONLY. No Cohesity configuration changes.
 
 $ErrorActionPreference = "Stop"
 $FormatEnumerationLimit = -1
@@ -10,842 +10,447 @@ $baseUrl             = "https://helios.cohesity.com"
 $outputDirectory     = "X:\PowerShell\Data\Cohesity\RackResiliencyAssessment"
 $helperPath          = "X:\PowerShell\Cohesity_API_Scripts\Common\ApiKeyAesHelper.ps1"
 $encryptedApiKeyPath = "X:\PowerShell\Cohesity_API_Scripts\Common\Secure\cohesity_apikey.enc"
-
-$expectedClusterCount = 22
-$expectedNodeCount    = 169
-$notAvailable         = "NOT AVAILABLE THROUGH APPROVED READ-ONLY COLLECTION"
+$expectedClusters    = 22
+$expectedNodes       = 169
+$notAvailable        = "NOT AVAILABLE THROUGH APPROVED READ-ONLY COLLECTION"
 
 if (-not (Test-Path $outputDirectory -PathType Container)) {
     New-Item -Path $outputDirectory -ItemType Directory -Force | Out-Null
 }
-if (-not (Test-Path $helperPath -PathType Leaf)) {
-    throw "API key helper not found: $helperPath"
-}
-if (-not (Test-Path $encryptedApiKeyPath -PathType Leaf)) {
-    throw "Encrypted API key file not found: $encryptedApiKeyPath"
-}
+if (-not (Test-Path $helperPath -PathType Leaf)) { throw "API key helper not found: $helperPath" }
+if (-not (Test-Path $encryptedApiKeyPath -PathType Leaf)) { throw "Encrypted API key file not found: $encryptedApiKeyPath" }
 
 . $helperPath
 $apiKey = Get-CohesityApiKeyFromAes -EncryptedFile $encryptedApiKeyPath
-if ([string]::IsNullOrWhiteSpace($apiKey)) {
-    throw "AES API key helper returned an empty API key."
-}
+if ([string]::IsNullOrWhiteSpace($apiKey)) { throw "AES API key helper returned an empty API key." }
 
-function New-CohesityHeaders {
-    param([string]$AccessClusterId)
-
-    $headers = @{
-        accept = "application/json"
-        apiKey = $apiKey
+function New-Headers {
+    param([string]$ClusterId)
+    $headers = @{ accept = "application/json"; apiKey = $apiKey }
+    if (-not [string]::IsNullOrWhiteSpace($ClusterId)) {
+        $headers["accessClusterId"] = $ClusterId
     }
-
-    if (-not [string]::IsNullOrWhiteSpace($AccessClusterId)) {
-        $headers["accessClusterId"] = $AccessClusterId
-    }
-
     return $headers
 }
 
-function Invoke-CohesityGet {
+function Get-Json {
     param(
         [Parameter(Mandatory)][string]$Uri,
         [Parameter(Mandatory)][hashtable]$Headers,
-        [Parameter(Mandatory)][string]$ApiLabel
+        [Parameter(Mandatory)][string]$Label
     )
 
+    # Safety gate before every API request.
     $method = "GET"
-    if ($method -ne "GET") {
-        throw "SAFETY BLOCK: Non-GET HTTP method requested for $ApiLabel"
+    if ($method -ne "GET") { throw "SAFETY BLOCK: non-GET method requested for $Label" }
+
+    if ($PSVersionTable.PSVersion.Major -lt 6) {
+        $response = Invoke-WebRequest -Uri $Uri -Headers $Headers -Method Get -UseBasicParsing -ErrorAction Stop
+    }
+    else {
+        $response = Invoke-WebRequest -Uri $Uri -Headers $Headers -Method Get -ErrorAction Stop
     }
 
-    try {
-        if ($PSVersionTable.PSVersion.Major -lt 6) {
-            $response = Invoke-WebRequest `
-                -Uri $Uri `
-                -Headers $Headers `
-                -Method Get `
-                -UseBasicParsing `
-                -ErrorAction Stop
-        }
-        else {
-            $response = Invoke-WebRequest `
-                -Uri $Uri `
-                -Headers $Headers `
-                -Method Get `
-                -ErrorAction Stop
-        }
-
-        if (-not $response -or [string]::IsNullOrWhiteSpace($response.Content)) {
-            return $null
-        }
-
-        return ($response.Content | ConvertFrom-Json)
-    }
-    catch {
-        throw "$ApiLabel GET failed: $($_.Exception.Message)"
-    }
+    if (-not $response -or [string]::IsNullOrWhiteSpace($response.Content)) { return $null }
+    return ($response.Content | ConvertFrom-Json)
 }
 
-function Get-PropertyValue {
-    param(
-        $Object,
-        [string[]]$Names,
-        $Default = $notAvailable
-    )
+function As-Array {
+    param($Value)
+    if ($null -eq $Value) { return @() }
+    return @($Value)
+}
 
-    if ($null -eq $Object) {
-        return $Default
-    }
-
+function First-Property {
+    param($Object,[string[]]$Names,$Default=$notAvailable)
+    if ($null -eq $Object) { return $Default }
     foreach ($name in $Names) {
-        $property = $Object.PSObject.Properties |
-            Where-Object { $_.Name -ieq $name } |
-            Select-Object -First 1
-
-        if ($property -and $null -ne $property.Value) {
-            if ($property.Value -is [System.Array]) {
-                if (@($property.Value).Count -gt 0) {
-                    return $property.Value
+        foreach ($property in @($Object.PSObject.Properties)) {
+            if ($property.Name -ieq $name -and $null -ne $property.Value) {
+                if ($property.Value -is [System.Array]) {
+                    if (@($property.Value).Count -gt 0) { return $property.Value }
                 }
-            }
-            else {
-                $text = ([string]$property.Value).Trim()
-                if (-not [string]::IsNullOrWhiteSpace($text)) {
-                    return $property.Value
+                else {
+                    $text = ([string]$property.Value).Trim()
+                    if (-not [string]::IsNullOrWhiteSpace($text)) { return $property.Value }
                 }
             }
         }
     }
-
     return $Default
 }
 
 function Get-ArrayProperty {
-    param(
-        $Object,
-        [string[]]$Names
-    )
-
-    if ($null -eq $Object) {
-        return @()
-    }
-
+    param($Object,[string[]]$Names)
+    if ($null -eq $Object) { return @() }
     foreach ($name in $Names) {
-        $property = $Object.PSObject.Properties |
-            Where-Object { $_.Name -ieq $name } |
-            Select-Object -First 1
-
-        if ($property -and $null -ne $property.Value) {
-            return @($property.Value)
+        foreach ($property in @($Object.PSObject.Properties)) {
+            if ($property.Name -ieq $name -and $null -ne $property.Value) { return @($property.Value) }
         }
     }
-
     return @()
 }
 
-function Normalize-Objects {
-    param(
-        $Response,
-        [string[]]$WrapperNames,
-        [string[]]$IdentityProperties
-    )
+function Get-ClusterObjects {
+    param($Response)
+    if ($null -eq $Response) { return @() }
+    if ($Response.cohesityClusters) { return @($Response.cohesityClusters) }
+    if ($Response.clusters) { return @($Response.clusters) }
+    if ($Response.clusterInfos) { return @($Response.clusterInfos) }
+    if ($Response.mcmInfo -and $Response.mcmInfo.clusterInfos) { return @($Response.mcmInfo.clusterInfos) }
+    if ($Response -is [System.Array]) { return @($Response) }
+    return @()
+}
 
-    if ($null -eq $Response) {
-        return @()
+function Get-Objects {
+    param($Response,[string[]]$Wrappers,[string[]]$IdentityFields)
+    if ($null -eq $Response) { return @() }
+    if ($Response -is [System.Array]) { return @($Response) }
+    foreach ($wrapper in $Wrappers) {
+        $items = Get-ArrayProperty $Response @($wrapper)
+        if ($items.Count -gt 0) { return @($items) }
     }
-
-    if ($Response -is [System.Array]) {
-        return @($Response)
+    foreach ($field in $IdentityFields) {
+        if ($Response.PSObject.Properties[$field]) { return @($Response) }
     }
-
-    foreach ($wrapper in $WrapperNames) {
-        $items = Get-ArrayProperty -Object $Response -Names @($wrapper)
-        if ($items.Count -gt 0) {
-            return @($items)
-        }
-    }
-
-    foreach ($identity in $IdentityProperties) {
-        if ($Response.PSObject.Properties[$identity]) {
-            return @($Response)
-        }
-    }
-
     return @()
 }
 
 function To-Text {
     param($Value)
-
-    if ($null -eq $Value) {
-        return $notAvailable
-    }
-
+    if ($null -eq $Value) { return $notAvailable }
     if ($Value -is [System.Array]) {
-        if (@($Value).Count -eq 0) {
-            return $notAvailable
-        }
+        if (@($Value).Count -eq 0) { return $notAvailable }
         return (@($Value) -join "; ")
     }
-
     $text = ([string]$Value).Trim()
-    if ([string]::IsNullOrWhiteSpace($text)) {
-        return $notAvailable
-    }
-
+    if ([string]::IsNullOrWhiteSpace($text)) { return $notAvailable }
     return $text
-}
-
-function Get-NumericValue {
-    param($Value)
-
-    if ($null -eq $Value) {
-        return $null
-    }
-
-    $number = 0.0
-    if ([double]::TryParse(([string]$Value), [ref]$number)) {
-        return $number
-    }
-
-    return $null
-}
-
-function Convert-ToCapacityText {
-    param($Value)
-
-    $n = Get-NumericValue $Value
-    if ($null -eq $n) {
-        return (To-Text $Value)
-    }
-
-    if ($n -ge 1PB) {
-        return ("{0:N2} PB" -f ($n / 1PB))
-    }
-    if ($n -ge 1TB) {
-        return ("{0:N2} TB" -f ($n / 1TB))
-    }
-    if ($n -ge 1GB) {
-        return ("{0:N2} GB" -f ($n / 1GB))
-    }
-
-    return ("{0:N0} B" -f $n)
-}
-
-function Get-HardwareBucket {
-    param([string]$Model)
-
-    switch -Regex ($Model) {
-        '^CX8405$' { return 'CX8405' }
-        '^C6025$'  { return 'C6025' }
-        '^C5066$'  { return 'C5066' }
-        '^C5026$'  { return 'C5026' }
-        '^C5016$'  { return 'C5016' }
-        default    { return 'Other' }
-    }
 }
 
 function Escape-Markdown {
     param($Value)
-
     return ((To-Text $Value) -replace '\|','\\|')
 }
 
-function Get-BooleanTrue {
+function Is-True {
     param($Value)
-
     return ([string]$Value -match '^(?i:true|yes|1)$')
 }
 
-function Get-AssessmentFlag {
-    param(
-        [bool]$Incomplete,
-        [bool]$NoRacks,
-        [bool]$UnassignedChassis,
-        [bool]$WarningOrSuboptimal,
-        [bool]$InsufficientDomains,
-        [bool]$UnevenDistribution,
-        [bool]$MixedArchitecture
-    )
+function Get-Number {
+    param($Value)
+    $number = 0.0
+    if ($null -ne $Value -and [double]::TryParse(([string]$Value),[ref]$number)) { return $number }
+    return $null
+}
 
-    if ($Incomplete) {
-        return "UNKNOWN"
+function Get-HardwareBucket {
+    param([string]$Model)
+    switch -Regex ($Model) {
+        '^CX8405$' { 'CX8405'; break }
+        '^C6025$'  { 'C6025'; break }
+        '^C5066$'  { 'C5066'; break }
+        '^C5026$'  { 'C5026'; break }
+        '^C5016$'  { 'C5016'; break }
+        default    { 'Other' }
     }
-    if ($InsufficientDomains -or $WarningOrSuboptimal) {
-        return "WARNING"
-    }
-    if ($NoRacks -or $UnassignedChassis -or $UnevenDistribution -or $MixedArchitecture) {
-        return "REVIEW"
-    }
-
-    return "NORMAL"
 }
 
 $apiCalls = New-Object System.Collections.Generic.List[string]
 $apiFailures = New-Object System.Collections.Generic.List[string]
-$unavailableFields = New-Object System.Collections.Generic.HashSet[string]
-
 $clusterRows = @()
 $nodeRows = @()
 $chassisRows = @()
 $rackRows = @()
 $storageDomainRows = @()
-$ftOptionRows = @()
-$internalClusterSummary = @()
+$ftRows = @()
+$clusterSummary = @()
 
 Write-Host ""
 Write-Host "========================================================" -ForegroundColor Cyan
 Write-Host " COHESITY RACK RESILIENCY ASSESSMENT - GET ONLY" -ForegroundColor White
 Write-Host "========================================================" -ForegroundColor Cyan
-Write-Host "Safety mode: HTTP GET only. No configuration changes." -ForegroundColor Green
 
+# IMPORTANT: use the same proven Helios discovery method as the working AD and hardware scripts.
 try {
-    $apiCalls.Add("GET /v2/clusters")
-    $clusterResponse = Invoke-CohesityGet `
-        -Uri "$baseUrl/v2/clusters" `
-        -Headers (New-CohesityHeaders) `
-        -ApiLabel "/v2/clusters"
-
-    $clusterObjects = @(
-        Normalize-Objects `
-            -Response $clusterResponse `
-            -WrapperNames @("clusters","items") `
-            -IdentityProperties @("id","clusterId")
-    )
+    $apiCalls.Add("GET /v2/mcm/cluster-mgmt/info")
+    $clusterResponse = Get-Json "$baseUrl/v2/mcm/cluster-mgmt/info" (New-Headers) "/v2/mcm/cluster-mgmt/info"
 }
 catch {
-    $apiFailures.Add("GET /v2/clusters : $($_.Exception.Message)")
-    throw "Cannot continue without read-only cluster discovery. $($_.Exception.Message)"
+    throw "Cluster discovery failed: $($_.Exception.Message)"
 }
 
-if ($clusterObjects.Count -eq 0) {
-    throw "GET /v2/clusters returned no usable cluster objects."
-}
+$clusters = @(Get-ClusterObjects $clusterResponse)
+if ($clusters.Count -eq 0) { throw "No clusters returned from Helios cluster discovery." }
 
+$clusters = @($clusters | Sort-Object { To-Text (First-Property $_ @("clusterName","displayName","name")) })
 $clusterIndex = 0
-foreach ($cluster in $clusterObjects) {
-    $clusterId = To-Text (Get-PropertyValue $cluster @("id","clusterId"))
 
-    if ($clusterId -eq $notAvailable) {
-        continue
-    }
+foreach ($cluster in $clusters) {
+    $clusterId = To-Text (First-Property $cluster @("clusterId","id"))
+    if ($clusterId -eq $notAvailable) { continue }
 
     $clusterIndex++
-    $clusterAlias = "Cluster-{0:D2}" -f $clusterIndex
-    $clusterName = To-Text (Get-PropertyValue $cluster @("name","clusterName","displayName"))
+    $alias = "Cluster-{0:D2}" -f $clusterIndex
+    $name = To-Text (First-Property $cluster @("clusterName","displayName","name"))
 
     $clusterRows += [pscustomobject][ordered]@{
-        ClusterAlias    = $clusterAlias
-        ClusterId       = $clusterId
-        ClusterName     = $clusterName
-        SoftwareVersion = To-Text (Get-PropertyValue $cluster @("softwareVersion","version","clusterSoftwareVersion"))
-        HardwareModels  = To-Text (Get-PropertyValue $cluster @("hardwareModels","hardwareModel"))
-        NodeCount       = To-Text (Get-PropertyValue $cluster @("nodeCount","numNodes"))
-        FailureDomain   = To-Text (Get-PropertyValue $cluster @("failureDomain","failureDomainType","faultToleranceLevel"))
+        ClusterAlias    = $alias
+        ClusterId       = [string]$clusterId
+        ClusterName     = $name
+        SoftwareVersion = To-Text (First-Property $cluster @("softwareVersion","version","clusterSoftwareVersion"))
     }
 }
 
-$clusterRows = @($clusterRows | Sort-Object ClusterAlias)
+foreach ($cluster in $clusterRows) {
+    $alias = $cluster.ClusterAlias
+    $headers = New-Headers ([string]$cluster.ClusterId)
+    $incomplete = $false
 
-foreach ($clusterRow in $clusterRows) {
-    $clusterId = $clusterRow.ClusterId
-    $clusterAlias = $clusterRow.ClusterAlias
-    $clusterName = $clusterRow.ClusterName
-    $headers = New-CohesityHeaders -AccessClusterId $clusterId
-    $clusterIncomplete = $false
-
+    # NODES
     try {
-        $apiCalls.Add("GET /v2/clusters/nodes [$clusterAlias]")
-        $nodeResponse = Invoke-CohesityGet `
-            -Uri "$baseUrl/v2/clusters/nodes" `
-            -Headers $headers `
-            -ApiLabel "/v2/clusters/nodes [$clusterAlias]"
-
-        $nodes = @(
-            Normalize-Objects `
-                -Response $nodeResponse `
-                -WrapperNames @("nodes","items","nodeList") `
-                -IdentityProperties @("nodeId","id")
-        )
+        $apiCalls.Add("GET /v2/clusters/nodes [$alias]")
+        $response = Get-Json "$baseUrl/v2/clusters/nodes" $headers "/v2/clusters/nodes [$alias]"
+        $nodes = @(Get-Objects $response @("nodes","nodeList","items") @("nodeId","id"))
     }
     catch {
-        $apiFailures.Add("GET /v2/clusters/nodes [$clusterAlias] : $($_.Exception.Message)")
-        $nodes = @()
-        $clusterIncomplete = $true
+        $apiFailures.Add("GET /v2/clusters/nodes [$alias] : $($_.Exception.Message)")
+        $nodes = @(); $incomplete = $true
     }
 
     foreach ($node in $nodes) {
-        $nodeId = To-Text (Get-PropertyValue $node @("nodeId","id"))
-        $model = To-Text (Get-PropertyValue $node @("productModel","nodeModel","hardwareModel"))
-
+        $nodeId = To-Text (First-Property $node @("nodeId","id"))
+        $model = To-Text (First-Property $node @("productModel","nodeModel","hardwareModel"))
         $nodeRows += [pscustomobject][ordered]@{
-            ClusterAlias     = $clusterAlias
-            ClusterId        = $clusterId
-            ClusterName      = $clusterName
+            ClusterAlias     = $alias
+            ClusterId        = $cluster.ClusterId
             NodeId           = $nodeId
-            ChassisId        = To-Text (Get-PropertyValue $node @("chassisId"))
+            ChassisId        = To-Text (First-Property $node @("chassisId"))
             HardwareModel    = $model
             HardwareBucket   = Get-HardwareBucket $model
-            NodeModel        = To-Text (Get-PropertyValue $node @("nodeModel"))
-            ProductModel     = To-Text (Get-PropertyValue $node @("productModel"))
-            ProductModelType = To-Text (Get-PropertyValue $node @("productModelType"))
-            SlotNumber       = To-Text (Get-PropertyValue $node @("slotNumber","slot"))
-            Status           = To-Text (Get-PropertyValue $node @("status","nodeStatus"))
-            Reachability     = To-Text (Get-PropertyValue $node @("isReachable","reachable","reachability"))
-            PhysicalCapacity = To-Text (Get-PropertyValue $node @("physicalCapacityBytes","physicalCapacity","capacityBytes"))
+            NodeModel        = To-Text (First-Property $node @("nodeModel"))
+            ProductModel     = To-Text (First-Property $node @("productModel"))
+            ProductModelType = To-Text (First-Property $node @("productModelType"))
+            SlotNumber       = To-Text (First-Property $node @("slotNumber","slot"))
+            Status           = To-Text (First-Property $node @("status","nodeStatus"))
+            Reachability     = To-Text (First-Property $node @("isReachable","reachable","reachability"))
+            PhysicalCapacity = To-Text (First-Property $node @("physicalCapacityBytes","physicalCapacity","capacityBytes"))
         }
     }
 
+    # SUPPLEMENTARY NODE HARDWARE
     try {
-        $apiCalls.Add("GET /v2/node/hardware-info [$clusterAlias]")
-        $hardwareResponse = Invoke-CohesityGet `
-            -Uri "$baseUrl/v2/node/hardware-info" `
-            -Headers $headers `
-            -ApiLabel "/v2/node/hardware-info [$clusterAlias]"
-
-        $hardwareObjects = @(
-            Normalize-Objects `
-                -Response $hardwareResponse `
-                -WrapperNames @("hardwareInfo","hardwareInfos","items") `
-                -IdentityProperties @("nodeModel","productModel","chassisModel")
-        )
-
-        foreach ($hardware in $hardwareObjects) {
-            $hardwareNodeId = To-Text (Get-PropertyValue $hardware @("nodeId","id"))
-
-            if ($hardwareNodeId -eq $notAvailable) {
-                continue
-            }
-
-            $target = $nodeRows |
-                Where-Object {
-                    $_.ClusterAlias -eq $clusterAlias -and
-                    $_.NodeId -eq $hardwareNodeId
-                } |
-                Select-Object -First 1
-
-            if ($target) {
-                $target.NodeModel = To-Text (Get-PropertyValue $hardware @("nodeModel") $target.NodeModel)
-                $target.ProductModel = To-Text (Get-PropertyValue $hardware @("productModel") $target.ProductModel)
-                $target.ProductModelType = To-Text (Get-PropertyValue $hardware @("productModelType") $target.ProductModelType)
-                $target.SlotNumber = To-Text (Get-PropertyValue $hardware @("slotNumber") $target.SlotNumber)
-            }
-        }
+        $apiCalls.Add("GET /v2/node/hardware-info [$alias]")
+        $response = Get-Json "$baseUrl/v2/node/hardware-info" $headers "/v2/node/hardware-info [$alias]"
+        $hardware = @(Get-Objects $response @("hardwareInfo","hardwareInfos","items") @("nodeModel","productModel","chassisModel"))
     }
     catch {
-        $apiFailures.Add("GET /v2/node/hardware-info [$clusterAlias] : $($_.Exception.Message)")
+        $apiFailures.Add("GET /v2/node/hardware-info [$alias] : $($_.Exception.Message)")
+        $hardware = @()
     }
 
+    # CHASSIS
     try {
-        $apiCalls.Add("GET /v2/chassis [$clusterAlias]")
-        $chassisResponse = Invoke-CohesityGet `
-            -Uri "$baseUrl/v2/chassis" `
-            -Headers $headers `
-            -ApiLabel "/v2/chassis [$clusterAlias]"
-
-        $chassisList = @(
-            Normalize-Objects `
-                -Response $chassisResponse `
-                -WrapperNames @("chassis","items","chassisList") `
-                -IdentityProperties @("id","chassisId","nodeIds")
-        )
+        $apiCalls.Add("GET /v2/chassis [$alias]")
+        $response = Get-Json "$baseUrl/v2/chassis" $headers "/v2/chassis [$alias]"
+        $chassisList = @(Get-Objects $response @("chassis","chassisList","items") @("id","chassisId","nodeIds"))
     }
     catch {
-        $apiFailures.Add("GET /v2/chassis [$clusterAlias] : $($_.Exception.Message)")
-        $chassisList = @()
-        $clusterIncomplete = $true
+        $apiFailures.Add("GET /v2/chassis [$alias] : $($_.Exception.Message)")
+        $chassisList = @(); $incomplete = $true
     }
 
     foreach ($chassis in $chassisList) {
-        $chassisId = To-Text (Get-PropertyValue $chassis @("id","chassisId"))
+        $chassisId = To-Text (First-Property $chassis @("id","chassisId"))
         $nodeIds = @(Get-ArrayProperty $chassis @("nodeIds")) | ForEach-Object { [string]$_ }
-        $hardwareModel = To-Text (Get-PropertyValue $chassis @("hardwareModel","model","chassisModel"))
-        $rackId = To-Text (Get-PropertyValue $chassis @("rackId"))
+        $model = To-Text (First-Property $chassis @("hardwareModel","model","chassisModel"))
+        $rackId = To-Text (First-Property $chassis @("rackId"))
 
         $chassisRows += [pscustomobject][ordered]@{
-            ClusterAlias   = $clusterAlias
-            ClusterId      = $clusterId
-            ClusterName    = $clusterName
+            ClusterAlias   = $alias
+            ClusterId      = $cluster.ClusterId
             ChassisId      = $chassisId
-            HardwareModel  = $hardwareModel
-            HardwareBucket = Get-HardwareBucket $hardwareModel
+            HardwareModel  = $model
+            HardwareBucket = Get-HardwareBucket $model
             NodeCount      = $nodeIds.Count
             NodeIds        = ($nodeIds -join ";")
             RackId         = $rackId
-            Location       = To-Text (Get-PropertyValue $chassis @("location"))
+            Location       = To-Text (First-Property $chassis @("location"))
         }
 
-        foreach ($nodeIdFromChassis in $nodeIds) {
-            $targetNode = $nodeRows |
-                Where-Object {
-                    $_.ClusterAlias -eq $clusterAlias -and
-                    $_.NodeId -eq [string]$nodeIdFromChassis
-                } |
-                Select-Object -First 1
-
-            if ($targetNode) {
-                $targetNode.ChassisId = $chassisId
-
-                if ($targetNode.HardwareModel -eq $notAvailable) {
-                    $targetNode.HardwareModel = $hardwareModel
-                    $targetNode.HardwareBucket = Get-HardwareBucket $hardwareModel
+        foreach ($nodeId in $nodeIds) {
+            $target = $nodeRows | Where-Object { $_.ClusterAlias -eq $alias -and $_.NodeId -eq [string]$nodeId } | Select-Object -First 1
+            if ($target) {
+                $target.ChassisId = $chassisId
+                if ($target.HardwareModel -eq $notAvailable) {
+                    $target.HardwareModel = $model
+                    $target.HardwareBucket = Get-HardwareBucket $model
                 }
             }
         }
     }
 
+    # RACKS
     try {
-        $apiCalls.Add("GET /v2/racks [$clusterAlias]")
-        $rackResponse = Invoke-CohesityGet `
-            -Uri "$baseUrl/v2/racks" `
-            -Headers $headers `
-            -ApiLabel "/v2/racks [$clusterAlias]"
-
-        $racks = @(
-            Normalize-Objects `
-                -Response $rackResponse `
-                -WrapperNames @("racks","items","rackList") `
-                -IdentityProperties @("id","rackId")
-        )
+        $apiCalls.Add("GET /v2/racks [$alias]")
+        $response = Get-Json "$baseUrl/v2/racks" $headers "/v2/racks [$alias]"
+        $racks = @(Get-Objects $response @("racks","rackList","items") @("id","rackId"))
     }
     catch {
-        $apiFailures.Add("GET /v2/racks [$clusterAlias] : $($_.Exception.Message)")
-        $racks = @()
-        $clusterIncomplete = $true
+        $apiFailures.Add("GET /v2/racks [$alias] : $($_.Exception.Message)")
+        $racks = @(); $incomplete = $true
     }
 
     $rackCounter = 0
     foreach ($rack in $racks) {
         $rackCounter++
-        $rackId = To-Text (Get-PropertyValue $rack @("id","rackId"))
-        $rackAlias = "Rack-$rackCounter"
-        $rackChassisIds = @(Get-ArrayProperty $rack @("chassisIds","chassisIdList")) | ForEach-Object { [string]$_ }
-
-        if ($rackChassisIds.Count -eq 0 -and $rackId -ne $notAvailable) {
-            $rackChassisIds = @(
-                $chassisRows |
-                    Where-Object {
-                        $_.ClusterAlias -eq $clusterAlias -and
-                        $_.RackId -eq $rackId
-                    } |
-                    Select-Object -ExpandProperty ChassisId
-            )
+        $rackId = To-Text (First-Property $rack @("id","rackId"))
+        $chassisIds = @(Get-ArrayProperty $rack @("chassisIds","chassisIdList")) | ForEach-Object { [string]$_ }
+        if ($chassisIds.Count -eq 0 -and $rackId -ne $notAvailable) {
+            $chassisIds = @($chassisRows | Where-Object { $_.ClusterAlias -eq $alias -and $_.RackId -eq $rackId } | Select-Object -ExpandProperty ChassisId)
         }
-
-        $rackNodeIds = @()
-
-        foreach ($cid in $rackChassisIds) {
-            $rackNodeIds += @(
-                $chassisRows |
-                    Where-Object {
-                        $_.ClusterAlias -eq $clusterAlias -and
-                        $_.ChassisId -eq [string]$cid
-                    } |
-                    ForEach-Object {
-                        if ($_.NodeIds) {
-                            $_.NodeIds -split ";"
-                        }
-                    }
-            )
+        $nodeIds = @()
+        foreach ($cid in $chassisIds) {
+            $nodeIds += @($chassisRows | Where-Object { $_.ClusterAlias -eq $alias -and $_.ChassisId -eq $cid } | ForEach-Object { if ($_.NodeIds) { $_.NodeIds -split ';' } })
         }
-
-        $rackNodeIds = @(
-            $rackNodeIds |
-                Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
-                Select-Object -Unique
-        )
+        $nodeIds = @($nodeIds | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique)
 
         $rackRows += [pscustomobject][ordered]@{
-            ClusterAlias = $clusterAlias
-            ClusterId    = $clusterId
-            ClusterName  = $clusterName
-            RackAlias    = $rackAlias
+            ClusterAlias = $alias
+            RackAlias    = "Rack-$rackCounter"
             RackId       = $rackId
-            ChassisCount = $rackChassisIds.Count
-            ChassisIds   = ($rackChassisIds -join ";")
-            NodeCount    = $rackNodeIds.Count
-            NodeIds      = ($rackNodeIds -join ";")
+            ChassisCount = $chassisIds.Count
+            ChassisIds   = ($chassisIds -join ";")
+            NodeCount    = $nodeIds.Count
+            NodeIds      = ($nodeIds -join ";")
         }
     }
 
+    # STORAGE DOMAINS
     try {
-        $apiCalls.Add("GET /v2/storage-domains [$clusterAlias]")
-        $sdResponse = Invoke-CohesityGet `
-            -Uri "$baseUrl/v2/storage-domains" `
-            -Headers $headers `
-            -ApiLabel "/v2/storage-domains [$clusterAlias]"
-
-        $storageDomains = @(
-            Normalize-Objects `
-                -Response $sdResponse `
-                -WrapperNames @("storageDomains","items") `
-                -IdentityProperties @("id","storageDomainId")
-        )
+        $apiCalls.Add("GET /v2/storage-domains [$alias]")
+        $response = Get-Json "$baseUrl/v2/storage-domains" $headers "/v2/storage-domains [$alias]"
+        $storageDomains = @(Get-Objects $response @("storageDomains","items") @("id","storageDomainId"))
     }
     catch {
-        $apiFailures.Add("GET /v2/storage-domains [$clusterAlias] : $($_.Exception.Message)")
-        $storageDomains = @()
-        $clusterIncomplete = $true
+        $apiFailures.Add("GET /v2/storage-domains [$alias] : $($_.Exception.Message)")
+        $storageDomains = @(); $incomplete = $true
     }
 
     $sdCounter = 0
     foreach ($sd in $storageDomains) {
         $sdCounter++
         $sdAlias = "SD-$sdCounter"
-        $sdId = To-Text (Get-PropertyValue $sd @("id","storageDomainId"))
-
+        $sdId = To-Text (First-Property $sd @("id","storageDomainId"))
         $storageDomainRows += [pscustomobject][ordered]@{
-            ClusterAlias     = $clusterAlias
-            ClusterId        = $clusterId
-            ClusterName      = $clusterName
-            StorageDomain    = $sdAlias
-            StorageDomainId  = $sdId
-            CurrentEC        = To-Text (Get-PropertyValue $sd @("ecConfig","erasureCodingConfig","ecConfiguration"))
-            CurrentRF        = To-Text (Get-PropertyValue $sd @("replicationFactor","rf"))
-            CurrentFT        = To-Text (Get-PropertyValue $sd @("faultTolerance","faultToleranceLevel","failureDomain"))
-            PhysicalCapacity = Convert-ToCapacityText (Get-PropertyValue $sd @("physicalCapacityBytes","physicalCapacity"))
-            UsedCapacity     = Convert-ToCapacityText (Get-PropertyValue $sd @("usedCapacityBytes","usedCapacity"))
-            FreeCapacity     = Convert-ToCapacityText (Get-PropertyValue $sd @("freeCapacityBytes","freeCapacity","availableCapacityBytes"))
-            StoragePolicy    = To-Text (Get-PropertyValue $sd @("storagePolicy","resiliencyPolicy","policy"))
+            ClusterAlias    = $alias
+            StorageDomain   = $sdAlias
+            StorageDomainId = $sdId
+            CurrentEC       = To-Text (First-Property $sd @("ecConfig","erasureCodingConfig","ecConfiguration"))
+            CurrentRF       = To-Text (First-Property $sd @("replicationFactor","rf"))
+            CurrentFT       = To-Text (First-Property $sd @("faultTolerance","faultToleranceLevel","failureDomain"))
+            PhysicalCapacity= To-Text (First-Property $sd @("physicalCapacityBytes","physicalCapacity"))
+            UsedCapacity    = To-Text (First-Property $sd @("usedCapacityBytes","usedCapacity"))
+            FreeCapacity    = To-Text (First-Property $sd @("freeCapacityBytes","freeCapacity","availableCapacityBytes"))
         }
 
-        if ($sdId -eq $notAvailable) {
-            $unavailableFields.Add("Storage Domain ID") | Out-Null
-            continue
-        }
+        if ($sdId -eq $notAvailable) { continue }
 
         try {
             $encodedSdId = [uri]::EscapeDataString([string]$sdId)
-            $apiCalls.Add("GET /v2/storage-domains/fault-tolerance-options?storageDomainId=<ID> [$clusterAlias/$sdAlias]")
+            $apiCalls.Add("GET /v2/storage-domains/fault-tolerance-options [$alias/$sdAlias]")
+            $ft = Get-Json "$baseUrl/v2/storage-domains/fault-tolerance-options?storageDomainId=$encodedSdId" $headers "/v2/storage-domains/fault-tolerance-options [$alias/$sdAlias]"
+            $global = First-Property $ft @("globalTolerance") $null
+            $options = @(Get-Objects $ft @("options","faultToleranceOptions","availableOptions") @("ecConfig","replicationFactor","rf"))
+            if ($options.Count -eq 0) { $options = @($null) }
 
-            $ftResponse = Invoke-CohesityGet `
-                -Uri "$baseUrl/v2/storage-domains/fault-tolerance-options?storageDomainId=$encodedSdId" `
-                -Headers $headers `
-                -ApiLabel "/v2/storage-domains/fault-tolerance-options [$clusterAlias/$sdAlias]"
-
-            $enabled = To-Text (Get-PropertyValue $ftResponse @("enabled"))
-            $globalTolerance = Get-PropertyValue $ftResponse @("globalTolerance") $null
-
-            if ($null -ne $globalTolerance) {
-                $globalLevel = To-Text (Get-PropertyValue $globalTolerance @("faultToleranceLevel","level"))
-                $globalCount = To-Text (Get-PropertyValue $globalTolerance @("count"))
-            }
-            else {
-                $globalLevel = $notAvailable
-                $globalCount = $notAvailable
-            }
-
-            $failureDomainCount = To-Text (Get-PropertyValue $ftResponse @("failureDomainCount","numFailureDomains"))
-            $defaultFt = To-Text (Get-PropertyValue $ftResponse @("defaultFaultTolerance"))
-            $defaultEc = To-Text (Get-PropertyValue $ftResponse @("defaultEc","defaultEC","currentEc","currentEC"))
-            $defaultRf = To-Text (Get-PropertyValue $ftResponse @("defaultRf","defaultRF","currentRf","currentRF"))
-
-            $options = @(
-                Normalize-Objects `
-                    -Response $ftResponse `
-                    -WrapperNames @("options","faultToleranceOptions","availableOptions") `
-                    -IdentityProperties @("ecConfig","replicationFactor","rf")
-            )
-
-            if ($options.Count -eq 0) {
-                $ftOptionRows += [pscustomobject][ordered]@{
-                    ClusterAlias                   = $clusterAlias
-                    ClusterId                      = $clusterId
+            foreach ($option in $options) {
+                $ftRows += [pscustomobject][ordered]@{
+                    ClusterAlias                   = $alias
                     StorageDomain                  = $sdAlias
-                    StorageDomainId                = $sdId
-                    Enabled                        = $enabled
-                    GlobalFTLevel                  = $globalLevel
-                    GlobalFTCount                  = $globalCount
-                    FailureDomainCount             = $failureDomainCount
-                    DefaultFaultTolerance          = $defaultFt
-                    DefaultEC                      = $defaultEc
-                    DefaultRF                      = $defaultRf
-                    DiskFailuresTolerated          = $notAvailable
-                    FailureDomainFailuresTolerated = $notAvailable
-                    EC                             = $notAvailable
-                    RF                             = $notAvailable
-                    Disabled                       = $notAvailable
-                    HasWarning                     = $notAvailable
-                    IsSuboptimal                   = $notAvailable
-                    MinFailureDomainsRequired      = $notAvailable
-                    MinFailureDomainsToHeal        = $notAvailable
-                    InlineECSupport                = $notAvailable
-                }
-            }
-            else {
-                foreach ($option in $options) {
-                    $ftOptionRows += [pscustomobject][ordered]@{
-                        ClusterAlias                   = $clusterAlias
-                        ClusterId                      = $clusterId
-                        StorageDomain                  = $sdAlias
-                        StorageDomainId                = $sdId
-                        Enabled                        = $enabled
-                        GlobalFTLevel                  = $globalLevel
-                        GlobalFTCount                  = $globalCount
-                        FailureDomainCount             = $failureDomainCount
-                        DefaultFaultTolerance          = $defaultFt
-                        DefaultEC                      = $defaultEc
-                        DefaultRF                      = $defaultRf
-                        DiskFailuresTolerated          = To-Text (Get-PropertyValue $option @("diskFailuresTolerated","numDiskFailuresTolerated"))
-                        FailureDomainFailuresTolerated = To-Text (Get-PropertyValue $option @("failureDomainFailuresTolerated","numFailureDomainFailuresTolerated"))
-                        EC                             = To-Text (Get-PropertyValue $option @("ecConfig","ecConfiguration","erasureCodingConfig"))
-                        RF                             = To-Text (Get-PropertyValue $option @("replicationFactor","rf"))
-                        Disabled                       = To-Text (Get-PropertyValue $option @("disabled","isDisabled"))
-                        HasWarning                     = To-Text (Get-PropertyValue $option @("hasWarning","warning"))
-                        IsSuboptimal                   = To-Text (Get-PropertyValue $option @("isSuboptimal","suboptimal"))
-                        MinFailureDomainsRequired      = To-Text (Get-PropertyValue $option @("minFailureDomainsRequired","minimumFailureDomainsRequired"))
-                        MinFailureDomainsToHeal        = To-Text (Get-PropertyValue $option @("minFailureDomainsToHeal","minimumFailureDomainsRequiredToHeal"))
-                        InlineECSupport                = To-Text (Get-PropertyValue $option @("inlineEcSupport","inlineECSupport","supportsInlineEC"))
-                    }
+                    Enabled                        = To-Text (First-Property $ft @("enabled"))
+                    GlobalFTLevel                  = if ($global) { To-Text (First-Property $global @("faultToleranceLevel","level")) } else { $notAvailable }
+                    GlobalFTCount                  = if ($global) { To-Text (First-Property $global @("count")) } else { $notAvailable }
+                    FailureDomainCount             = To-Text (First-Property $ft @("failureDomainCount","numFailureDomains"))
+                    DefaultFaultTolerance          = To-Text (First-Property $ft @("defaultFaultTolerance"))
+                    DefaultEC                      = To-Text (First-Property $ft @("defaultEc","defaultEC","currentEc","currentEC"))
+                    DefaultRF                      = To-Text (First-Property $ft @("defaultRf","defaultRF","currentRf","currentRF"))
+                    DiskFailuresTolerated          = if ($option) { To-Text (First-Property $option @("diskFailuresTolerated","numDiskFailuresTolerated")) } else { $notAvailable }
+                    FailureDomainFailuresTolerated = if ($option) { To-Text (First-Property $option @("failureDomainFailuresTolerated","numFailureDomainFailuresTolerated")) } else { $notAvailable }
+                    EC                             = if ($option) { To-Text (First-Property $option @("ecConfig","ecConfiguration","erasureCodingConfig")) } else { $notAvailable }
+                    RF                             = if ($option) { To-Text (First-Property $option @("replicationFactor","rf")) } else { $notAvailable }
+                    Disabled                       = if ($option) { To-Text (First-Property $option @("disabled","isDisabled")) } else { $notAvailable }
+                    HasWarning                     = if ($option) { To-Text (First-Property $option @("hasWarning","warning")) } else { $notAvailable }
+                    IsSuboptimal                   = if ($option) { To-Text (First-Property $option @("isSuboptimal","suboptimal")) } else { $notAvailable }
+                    MinFailureDomainsRequired      = if ($option) { To-Text (First-Property $option @("minFailureDomainsRequired","minimumFailureDomainsRequired")) } else { $notAvailable }
+                    MinFailureDomainsToHeal        = if ($option) { To-Text (First-Property $option @("minFailureDomainsToHeal","minimumFailureDomainsRequiredToHeal")) } else { $notAvailable }
                 }
             }
         }
         catch {
-            $apiFailures.Add("GET FT options [$clusterAlias/$sdAlias] : $($_.Exception.Message)")
-            $clusterIncomplete = $true
+            $apiFailures.Add("GET FT options [$alias/$sdAlias] : $($_.Exception.Message)")
+            $incomplete = $true
         }
     }
 
-    $clusterNodes = @($nodeRows | Where-Object ClusterAlias -eq $clusterAlias)
-    $clusterChassis = @($chassisRows | Where-Object ClusterAlias -eq $clusterAlias)
-    $clusterRacks = @($rackRows | Where-Object ClusterAlias -eq $clusterAlias)
-    $clusterFt = @($ftOptionRows | Where-Object ClusterAlias -eq $clusterAlias)
+    $cNodes = @($nodeRows | Where-Object ClusterAlias -eq $alias)
+    $cChassis = @($chassisRows | Where-Object ClusterAlias -eq $alias)
+    $cRacks = @($rackRows | Where-Object ClusterAlias -eq $alias)
+    $cFt = @($ftRows | Where-Object ClusterAlias -eq $alias)
 
-    $unassignedChassis = @(
-        $clusterChassis |
-            Where-Object { $_.RackId -eq $notAvailable }
-    ).Count
-
-    $rackNodeCounts = @($clusterRacks | Select-Object -ExpandProperty NodeCount)
-
-    if ($rackNodeCounts.Count -gt 0) {
-        $largestRackNodes = ($rackNodeCounts | Measure-Object -Maximum).Maximum
+    $unassigned = @($cChassis | Where-Object { $_.RackId -eq $notAvailable }).Count
+    $rackCounts = @($cRacks | Select-Object -ExpandProperty NodeCount)
+    $largestRackPct = 0
+    if ($rackCounts.Count -gt 0 -and $cNodes.Count -gt 0) {
+        $largest = ($rackCounts | Measure-Object -Maximum).Maximum
+        $largestRackPct = [math]::Round(($largest / $cNodes.Count) * 100,1)
     }
-    else {
-        $largestRackNodes = 0
+    $uneven = $false
+    if ($rackCounts.Count -gt 1) {
+        $uneven = (($rackCounts | Measure-Object -Maximum).Maximum -ne ($rackCounts | Measure-Object -Minimum).Minimum)
     }
-
-    if ($clusterNodes.Count -gt 0 -and $largestRackNodes -gt 0) {
-        $largestRackPct = [math]::Round(($largestRackNodes / $clusterNodes.Count) * 100,1)
+    $nodesPerChassis = @($cChassis | Select-Object -ExpandProperty NodeCount -Unique)
+    $mixed = (($nodesPerChassis -contains 1) -and @($nodesPerChassis | Where-Object { $_ -ge 4 }).Count -gt 0)
+    $warning = @($cFt | Where-Object { (Is-True $_.Disabled) -or (Is-True $_.HasWarning) -or (Is-True $_.IsSuboptimal) }).Count -gt 0
+    $insufficient = $false
+    foreach ($option in $cFt) {
+        $min = Get-Number $option.MinFailureDomainsRequired
+        if ($null -ne $min -and $cRacks.Count -lt $min) { $insufficient = $true; break }
     }
-    else {
-        $largestRackPct = 0
-    }
+    $levels = @($cFt | Select-Object -ExpandProperty GlobalFTLevel -Unique | Where-Object { $_ -ne $notAvailable })
+    $counts = @($cFt | Select-Object -ExpandProperty GlobalFTCount -Unique | Where-Object { $_ -ne $notAvailable })
+    $failureDomains = @($cFt | Select-Object -ExpandProperty FailureDomainCount -Unique | Where-Object { $_ -ne $notAvailable })
+    $currentFT = if ($levels.Count -gt 0) { $levels -join "; " } else { $notAvailable }
+    $failuresTolerated = if ($counts.Count -gt 0) { $counts -join "; " } else { $notAvailable }
+    $failureDomainCount = if ($failureDomains.Count -gt 0) { $failureDomains -join "; " } else { $notAvailable }
+    $hardwareMix = @($cNodes | Group-Object HardwareBucket | Sort-Object Name | ForEach-Object { "$($_.Name)=$($_.Count)" }) -join "; "
+    if ([string]::IsNullOrWhiteSpace($hardwareMix)) { $hardwareMix = $notAvailable }
 
-    $unevenDistribution = $false
-    if ($rackNodeCounts.Count -gt 1) {
-        $maxNodes = ($rackNodeCounts | Measure-Object -Maximum).Maximum
-        $minNodes = ($rackNodeCounts | Measure-Object -Minimum).Minimum
+    $flag = "NORMAL"
+    if ($incomplete) { $flag = "UNKNOWN" }
+    elseif ($warning -or $insufficient) { $flag = "WARNING" }
+    elseif ($cRacks.Count -eq 0 -or $unassigned -gt 0 -or $uneven -or $mixed) { $flag = "REVIEW" }
 
-        if ($maxNodes -ne $minNodes) {
-            $unevenDistribution = $true
-        }
-    }
-
-    $nodesPerChassis = @($clusterChassis | Select-Object -ExpandProperty NodeCount -Unique)
-    $hasOneNodeChassis = ($nodesPerChassis -contains 1)
-    $hasFourOrMoreNodeChassis = @($nodesPerChassis | Where-Object { $_ -ge 4 }).Count -gt 0
-    $mixedArchitecture = ($nodesPerChassis.Count -gt 1 -and $hasOneNodeChassis -and $hasFourOrMoreNodeChassis)
-
-    $warningOrSuboptimal = @(
-        $clusterFt |
-            Where-Object {
-                (Get-BooleanTrue $_.HasWarning) -or
-                (Get-BooleanTrue $_.IsSuboptimal) -or
-                (Get-BooleanTrue $_.Disabled)
-            }
-    ).Count -gt 0
-
-    $insufficientDomains = $false
-    foreach ($option in $clusterFt) {
-        $minReqNumeric = Get-NumericValue $option.MinFailureDomainsRequired
-
-        if ($null -ne $minReqNumeric -and $clusterRacks.Count -lt $minReqNumeric) {
-            $insufficientDomains = $true
-            break
-        }
-    }
-
-    $failureDomainLevels = @(
-        $clusterFt |
-            Select-Object -ExpandProperty GlobalFTLevel -Unique |
-            Where-Object { $_ -ne $notAvailable }
-    )
-
-    if ($failureDomainLevels.Count -eq 1) {
-        $currentFailureDomain = $failureDomainLevels[0]
-    }
-    elseif ($failureDomainLevels.Count -gt 1) {
-        $currentFailureDomain = ($failureDomainLevels -join "; ")
-    }
-    else {
-        $currentFailureDomain = $clusterRow.FailureDomain
-    }
-
-    $failuresToleratedValues = @(
-        $clusterFt |
-            Select-Object -ExpandProperty GlobalFTCount -Unique |
-            Where-Object { $_ -ne $notAvailable }
-    )
-
-    if ($failuresToleratedValues.Count -gt 0) {
-        $failuresTolerated = ($failuresToleratedValues -join "; ")
-    }
-    else {
-        $failuresTolerated = $notAvailable
-    }
-
-    $failureDomainCountValues = @(
-        $clusterFt |
-            Select-Object -ExpandProperty FailureDomainCount -Unique |
-            Where-Object { $_ -ne $notAvailable }
-    )
-
-    if ($failureDomainCountValues.Count -gt 0) {
-        $failureDomainCount = ($failureDomainCountValues -join "; ")
-    }
-    else {
-        $failureDomainCount = $notAvailable
-    }
-
-    $hardwareMix = @(
-        $clusterNodes |
-            Group-Object HardwareBucket |
-            Sort-Object Name |
-            ForEach-Object { "$($_.Name)=$($_.Count)" }
-    ) -join "; "
-
-    if ([string]::IsNullOrWhiteSpace($hardwareMix)) {
-        $hardwareMix = $notAvailable
-    }
-
-    $flag = Get-AssessmentFlag `
-        -Incomplete $clusterIncomplete `
-        -NoRacks ($clusterRacks.Count -eq 0) `
-        -UnassignedChassis ($unassignedChassis -gt 0) `
-        -WarningOrSuboptimal $warningOrSuboptimal `
-        -InsufficientDomains $insufficientDomains `
-        -UnevenDistribution $unevenDistribution `
-        -MixedArchitecture $mixedArchitecture
-
-    $internalClusterSummary += [pscustomobject][ordered]@{
-        ClusterAlias           = $clusterAlias
-        ClusterId              = $clusterId
-        ClusterName            = $clusterName
-        Nodes                  = $clusterNodes.Count
-        Chassis                = $clusterChassis.Count
-        Racks                  = $clusterRacks.Count
+    $clusterSummary += [pscustomobject][ordered]@{
+        ClusterAlias           = $alias
+        ClusterId              = $cluster.ClusterId
+        ClusterName            = $cluster.ClusterName
+        SoftwareVersion        = $cluster.SoftwareVersion
+        Nodes                  = $cNodes.Count
+        Chassis                = $cChassis.Count
+        Racks                  = $cRacks.Count
         HardwareMix            = $hardwareMix
-        CurrentFailureDomain   = $currentFailureDomain
+        CurrentFailureDomain   = $currentFT
         FailureDomainCount     = $failureDomainCount
         FailuresTolerated      = $failuresTolerated
-        UnassignedChassis      = $unassignedChassis
+        UnassignedChassis      = $unassigned
         LargestRackNodePct     = $largestRackPct
-        UnevenRackDistribution = $unevenDistribution
-        MixedArchitecture      = $mixedArchitecture
-        WarningOrSuboptimalFT  = $warningOrSuboptimal
-        InsufficientDomains    = $insufficientDomains
-        IncompleteData         = $clusterIncomplete
+        UnevenRackDistribution = $uneven
+        MixedArchitecture      = $mixed
+        WarningOrSuboptimalFT  = $warning
+        InsufficientDomains    = $insufficient
+        IncompleteData         = $incomplete
         AssessmentFlag         = $flag
     }
 }
@@ -853,75 +458,33 @@ foreach ($clusterRow in $clusterRows) {
 $timestamp = Get-Date -Format "yyyyMMdd_HHmm"
 $internalReportPath  = Join-Path $outputDirectory "Cohesity_Rack_Resiliency_Internal_$timestamp.md"
 $sanitizedReportPath = Join-Path $outputDirectory "Cohesity_Rack_Resiliency_Sanitized_$timestamp.md"
-$internalNodeCsv     = Join-Path $outputDirectory "Cohesity_Rack_Resiliency_Nodes_Internal_$timestamp.csv"
-$internalChassisCsv  = Join-Path $outputDirectory "Cohesity_Rack_Resiliency_Chassis_Internal_$timestamp.csv"
-$internalRackCsv     = Join-Path $outputDirectory "Cohesity_Rack_Resiliency_Racks_Internal_$timestamp.csv"
-$internalSdCsv       = Join-Path $outputDirectory "Cohesity_Rack_Resiliency_StorageDomains_Internal_$timestamp.csv"
-$internalFtCsv       = Join-Path $outputDirectory "Cohesity_Rack_Resiliency_FTOptions_Internal_$timestamp.csv"
+$nodeCsv             = Join-Path $outputDirectory "Cohesity_Rack_Resiliency_Nodes_Internal_$timestamp.csv"
+$chassisCsv          = Join-Path $outputDirectory "Cohesity_Rack_Resiliency_Chassis_Internal_$timestamp.csv"
+$rackCsv             = Join-Path $outputDirectory "Cohesity_Rack_Resiliency_Racks_Internal_$timestamp.csv"
+$sdCsv               = Join-Path $outputDirectory "Cohesity_Rack_Resiliency_StorageDomains_Internal_$timestamp.csv"
+$ftCsv               = Join-Path $outputDirectory "Cohesity_Rack_Resiliency_FTOptions_Internal_$timestamp.csv"
 
-$nodeRows |
-    Select-Object ClusterAlias,ClusterId,NodeId,ChassisId,HardwareModel,HardwareBucket,NodeModel,ProductModel,ProductModelType,SlotNumber,Status,Reachability,PhysicalCapacity |
-    Export-Csv -Path $internalNodeCsv -NoTypeInformation -Encoding UTF8
-
-$chassisRows |
-    Select-Object ClusterAlias,ClusterId,ChassisId,HardwareModel,HardwareBucket,NodeCount,NodeIds,RackId,Location |
-    Export-Csv -Path $internalChassisCsv -NoTypeInformation -Encoding UTF8
-
-$rackRows |
-    Select-Object ClusterAlias,ClusterId,RackAlias,RackId,ChassisCount,ChassisIds,NodeCount,NodeIds |
-    Export-Csv -Path $internalRackCsv -NoTypeInformation -Encoding UTF8
-
-$storageDomainRows | Export-Csv -Path $internalSdCsv -NoTypeInformation -Encoding UTF8
-$ftOptionRows | Export-Csv -Path $internalFtCsv -NoTypeInformation -Encoding UTF8
+$nodeRows | Export-Csv $nodeCsv -NoTypeInformation -Encoding UTF8
+$chassisRows | Export-Csv $chassisCsv -NoTypeInformation -Encoding UTF8
+$rackRows | Export-Csv $rackCsv -NoTypeInformation -Encoding UTF8
+$storageDomainRows | Export-Csv $sdCsv -NoTypeInformation -Encoding UTF8
+$ftRows | Export-Csv $ftCsv -NoTypeInformation -Encoding UTF8
 
 $internal = New-Object System.Collections.Generic.List[string]
 $internal.Add("# Cohesity Rack Resiliency Assessment - Internal Detailed Report")
 $internal.Add("")
 $internal.Add("READ-ONLY DATA COLLECTION ONLY. No Cohesity configuration changes were performed.")
 $internal.Add("")
-$internal.Add("## Cluster Summary")
-$internal.Add("")
-$internal.Add("| Cluster | Cluster ID | Nodes | Chassis | Racks | Hardware Mix | Current Failure Domain | Failure Domains | Failures Tolerated | Unassigned Chassis | Largest Rack % | Flag |")
-$internal.Add("|---|---|---:|---:|---:|---|---|---|---|---:|---:|---|")
-
-foreach ($row in $internalClusterSummary) {
-    $internal.Add("| $($row.ClusterName) | $($row.ClusterId) | $($row.Nodes) | $($row.Chassis) | $($row.Racks) | $(Escape-Markdown $row.HardwareMix) | $(Escape-Markdown $row.CurrentFailureDomain) | $(Escape-Markdown $row.FailureDomainCount) | $(Escape-Markdown $row.FailuresTolerated) | $($row.UnassignedChassis) | $($row.LargestRackNodePct)% | $($row.AssessmentFlag) |")
+$internal.Add("| Cluster | Cluster ID | Version | Nodes | Chassis | Racks | Hardware Mix | Current Failure Domain | Failure Domains | Failures Tolerated | Unassigned Chassis | Largest Rack % | Flag |")
+$internal.Add("|---|---|---|---:|---:|---:|---|---|---|---|---:|---:|---|")
+foreach ($row in $clusterSummary) {
+    $internal.Add("| $($row.ClusterName) | $($row.ClusterId) | $(Escape-Markdown $row.SoftwareVersion) | $($row.Nodes) | $($row.Chassis) | $($row.Racks) | $(Escape-Markdown $row.HardwareMix) | $(Escape-Markdown $row.CurrentFailureDomain) | $(Escape-Markdown $row.FailureDomainCount) | $(Escape-Markdown $row.FailuresTolerated) | $($row.UnassignedChassis) | $($row.LargestRackNodePct)% | $($row.AssessmentFlag) |")
 }
-
-$internal.Add("")
-$internal.Add("## Storage Domain Resiliency")
-$internal.Add("")
-$internal.Add("| Cluster | SD | SD ID | Current EC | Current RF | Current FT | Physical | Used | Free |")
-$internal.Add("|---|---|---|---|---|---|---|---|---|")
-
-foreach ($sd in $storageDomainRows) {
-    $internal.Add("| $($sd.ClusterName) | $($sd.StorageDomain) | $($sd.StorageDomainId) | $(Escape-Markdown $sd.CurrentEC) | $(Escape-Markdown $sd.CurrentRF) | $(Escape-Markdown $sd.CurrentFT) | $(Escape-Markdown $sd.PhysicalCapacity) | $(Escape-Markdown $sd.UsedCapacity) | $(Escape-Markdown $sd.FreeCapacity) |")
-}
-
-$internal.Add("")
-$internal.Add("## Supporting CSVs")
-$internal.Add("")
-$internal.Add("- Nodes: $internalNodeCsv")
-$internal.Add("- Chassis: $internalChassisCsv")
-$internal.Add("- Racks: $internalRackCsv")
-$internal.Add("- Storage Domains: $internalSdCsv")
-$internal.Add("- Fault Tolerance Options: $internalFtCsv")
 $internal.Add("")
 $internal.Add("Number of POST/PUT/PATCH/DELETE operations executed: **0**")
 $internal.Add("")
 $internal.Add("READ-ONLY VALIDATION: No Cohesity configuration was modified during this assessment.")
-$internal | Set-Content -Path $internalReportPath -Encoding UTF8
-
-$totalNodes = $nodeRows.Count
-$totalChassis = $chassisRows.Count
-$totalRacks = $rackRows.Count
-$clustersWithRacks = @($internalClusterSummary | Where-Object Racks -gt 0).Count
-$clustersWithoutRacks = @($internalClusterSummary | Where-Object Racks -eq 0).Count
-$totalUnassignedChassis = ($internalClusterSummary | Measure-Object UnassignedChassis -Sum).Sum
-
-if ($null -eq $totalUnassignedChassis) {
-    $totalUnassignedChassis = 0
-}
+$internal | Set-Content $internalReportPath -Encoding UTF8
 
 $sanitized = New-Object System.Collections.Generic.List[string]
 $sanitized.Add("# Cohesity Rack Resiliency Assessment - Sanitized Summary")
@@ -929,261 +492,102 @@ $sanitized.Add("")
 $sanitized.Add("### Estate Summary")
 $sanitized.Add("")
 $sanitized.Add("- Total clusters: $($clusterRows.Count)")
-$sanitized.Add("- Total nodes: $totalNodes")
-$sanitized.Add("- Total chassis: $totalChassis")
-$sanitized.Add("- Total configured racks: $totalRacks")
-$sanitized.Add("- Clusters with racks configured: $clustersWithRacks")
-$sanitized.Add("- Clusters without racks configured: $clustersWithoutRacks")
-$sanitized.Add("- Chassis without rack assignment: $totalUnassignedChassis")
+$sanitized.Add("- Total nodes: $($nodeRows.Count)")
+$sanitized.Add("- Total chassis: $($chassisRows.Count)")
+$sanitized.Add("- Total configured racks: $($rackRows.Count)")
+$sanitized.Add("- Clusters with racks configured: $(@($clusterSummary | Where-Object Racks -gt 0).Count)")
+$sanitized.Add("- Clusters without racks configured: $(@($clusterSummary | Where-Object Racks -eq 0).Count)")
+$sanitized.Add("- Chassis without rack assignment: $(($clusterSummary | Measure-Object UnassignedChassis -Sum).Sum)")
 $sanitized.Add("")
 $sanitized.Add("### Hardware Distribution")
 $sanitized.Add("")
 $sanitized.Add("| Model | Nodes | Chassis/Blocks | Clusters Using Model |")
 $sanitized.Add("|---|---:|---:|---:|")
-
 foreach ($bucket in @("CX8405","C6025","C5066","C5026","C5016","Other")) {
-    $bucketNodes = @($nodeRows | Where-Object HardwareBucket -eq $bucket).Count
-    $bucketChassis = @($chassisRows | Where-Object HardwareBucket -eq $bucket).Count
-    $bucketClusters = @($nodeRows | Where-Object HardwareBucket -eq $bucket | Select-Object -ExpandProperty ClusterAlias -Unique).Count
-    $sanitized.Add("| $bucket | $bucketNodes | $bucketChassis | $bucketClusters |")
+    $bn = @($nodeRows | Where-Object HardwareBucket -eq $bucket).Count
+    $bc = @($chassisRows | Where-Object HardwareBucket -eq $bucket).Count
+    $bcl = @($nodeRows | Where-Object HardwareBucket -eq $bucket | Select-Object -ExpandProperty ClusterAlias -Unique).Count
+    $sanitized.Add("| $bucket | $bn | $bc | $bcl |")
 }
-
 $sanitized.Add("")
 $sanitized.Add("### Cluster Resiliency Summary")
 $sanitized.Add("")
 $sanitized.Add("| Cluster | Nodes | Chassis | Racks | Hardware Mix | Current Failure Domain | Failures Tolerated | Rack Distribution | Assessment Flag |")
 $sanitized.Add("|---|---:|---:|---:|---|---|---|---|---|")
-
-foreach ($row in $internalClusterSummary) {
-    $rackDist = @(
-        $rackRows |
-            Where-Object ClusterAlias -eq $row.ClusterAlias |
-            ForEach-Object { "$($_.RackAlias)=$($_.NodeCount) nodes" }
-    ) -join "; "
-
-    if ([string]::IsNullOrWhiteSpace($rackDist)) {
-        $rackDist = "No configured racks returned"
-    }
-
-    $sanitized.Add("| $($row.ClusterAlias) | $($row.Nodes) | $($row.Chassis) | $($row.Racks) | $(Escape-Markdown $row.HardwareMix) | $(Escape-Markdown $row.CurrentFailureDomain) | $(Escape-Markdown $row.FailuresTolerated) | $(Escape-Markdown $rackDist) | $($row.AssessmentFlag) |")
+foreach ($row in $clusterSummary) {
+    $dist = @($rackRows | Where-Object ClusterAlias -eq $row.ClusterAlias | ForEach-Object { "$($_.RackAlias)=$($_.NodeCount) nodes" }) -join "; "
+    if ([string]::IsNullOrWhiteSpace($dist)) { $dist = "No configured racks returned" }
+    $sanitized.Add("| $($row.ClusterAlias) | $($row.Nodes) | $($row.Chassis) | $($row.Racks) | $(Escape-Markdown $row.HardwareMix) | $(Escape-Markdown $row.CurrentFailureDomain) | $(Escape-Markdown $row.FailuresTolerated) | $(Escape-Markdown $dist) | $($row.AssessmentFlag) |")
 }
-
 $sanitized.Add("")
 $sanitized.Add("### Storage Domain Resiliency")
 $sanitized.Add("")
 $sanitized.Add("| Cluster | SD | Current EC/RF | Current FT | Failure Domains Available | Rack FT Option Available | Min Domains Required | Min Domains to Heal | Cohesity Warning/Suboptimal |")
 $sanitized.Add("|---|---|---|---|---|---|---|---|---|")
-
 foreach ($sd in $storageDomainRows) {
-    $options = @(
-        $ftOptionRows |
-            Where-Object {
-                $_.ClusterAlias -eq $sd.ClusterAlias -and
-                $_.StorageDomain -eq $sd.StorageDomain
-            }
-    )
-
-    $fdAvailable = @($options | Select-Object -ExpandProperty FailureDomainCount -Unique) -join "; "
-    if ([string]::IsNullOrWhiteSpace($fdAvailable)) {
-        $fdAvailable = $notAvailable
-    }
-
-    $rackOptions = @(
-        $options |
-            Where-Object {
-                ([string]$_.GlobalFTLevel -match '(?i)rack') -or
-                ([string]$_.FailureDomainFailuresTolerated -notmatch '^NOT AVAILABLE')
-            }
-    )
-
-    if ($rackOptions.Count -gt 0) {
-        $rackAvailable = "Yes"
-    }
-    else {
-        $rackAvailable = $notAvailable
-    }
-
-    $minReq = @(
-        $options |
-            Select-Object -ExpandProperty MinFailureDomainsRequired -Unique |
-            Where-Object { $_ -ne $notAvailable }
-    ) -join "; "
-
-    if ([string]::IsNullOrWhiteSpace($minReq)) {
-        $minReq = $notAvailable
-    }
-
-    $minHeal = @(
-        $options |
-            Select-Object -ExpandProperty MinFailureDomainsToHeal -Unique |
-            Where-Object { $_ -ne $notAvailable }
-    ) -join "; "
-
-    if ([string]::IsNullOrWhiteSpace($minHeal)) {
-        $minHeal = $notAvailable
-    }
-
-    $warn = @(
-        $options |
-            Where-Object {
-                (Get-BooleanTrue $_.Disabled) -or
-                (Get-BooleanTrue $_.HasWarning) -or
-                (Get-BooleanTrue $_.IsSuboptimal)
-            }
-    ).Count -gt 0
-
-    $currentEcRf = "EC=$(Escape-Markdown $sd.CurrentEC); RF=$(Escape-Markdown $sd.CurrentRF)"
-    $warningText = if ($warn) { "Yes" } else { "No" }
-
-    $sanitized.Add("| $($sd.ClusterAlias) | $($sd.StorageDomain) | $currentEcRf | $(Escape-Markdown $sd.CurrentFT) | $(Escape-Markdown $fdAvailable) | $rackAvailable | $(Escape-Markdown $minReq) | $(Escape-Markdown $minHeal) | $warningText |")
+    $opts = @($ftRows | Where-Object { $_.ClusterAlias -eq $sd.ClusterAlias -and $_.StorageDomain -eq $sd.StorageDomain })
+    $fd = @($opts | Select-Object -ExpandProperty FailureDomainCount -Unique | Where-Object { $_ -ne $notAvailable }) -join "; "
+    if ([string]::IsNullOrWhiteSpace($fd)) { $fd = $notAvailable }
+    $rackOption = @($opts | Where-Object { ([string]$_.GlobalFTLevel -match '(?i)rack') -or ([string]$_.FailureDomainFailuresTolerated -ne $notAvailable }).Count -gt 0
+    $minReq = @($opts | Select-Object -ExpandProperty MinFailureDomainsRequired -Unique | Where-Object { $_ -ne $notAvailable }) -join "; "
+    if ([string]::IsNullOrWhiteSpace($minReq)) { $minReq = $notAvailable }
+    $minHeal = @($opts | Select-Object -ExpandProperty MinFailureDomainsToHeal -Unique | Where-Object { $_ -ne $notAvailable }) -join "; "
+    if ([string]::IsNullOrWhiteSpace($minHeal)) { $minHeal = $notAvailable }
+    $warn = @($opts | Where-Object { (Is-True $_.Disabled) -or (Is-True $_.HasWarning) -or (Is-True $_.IsSuboptimal) }).Count -gt 0
+    $sanitized.Add("| $($sd.ClusterAlias) | $($sd.StorageDomain) | EC=$(Escape-Markdown $sd.CurrentEC); RF=$(Escape-Markdown $sd.CurrentRF) | $(Escape-Markdown $sd.CurrentFT) | $(Escape-Markdown $fd) | $(if($rackOption){'Yes'}else{$notAvailable}) | $(Escape-Markdown $minReq) | $(Escape-Markdown $minHeal) | $(if($warn){'Yes'}else{'No'}) |")
 }
-
 $sanitized.Add("")
 $sanitized.Add("### Rack Distribution")
 $sanitized.Add("")
-
-foreach ($cluster in $internalClusterSummary) {
-    $sanitized.Add("**$($cluster.ClusterAlias)**")
+foreach ($row in $clusterSummary) {
+    $sanitized.Add("**$($row.ClusterAlias)**")
     $sanitized.Add("")
-
-    $clusterRackRows = @($rackRows | Where-Object ClusterAlias -eq $cluster.ClusterAlias)
-    $sanitized.Add("- Rack count: $($clusterRackRows.Count)")
-
-    foreach ($rack in $clusterRackRows) {
-        if ($cluster.Nodes -gt 0) {
-            $pct = [math]::Round(($rack.NodeCount / $cluster.Nodes) * 100,1)
-        }
-        else {
-            $pct = 0
-        }
-
+    $rr = @($rackRows | Where-Object ClusterAlias -eq $row.ClusterAlias)
+    $sanitized.Add("- Rack count: $($rr.Count)")
+    foreach ($rack in $rr) {
+        $pct = if ($row.Nodes -gt 0) { [math]::Round(($rack.NodeCount / $row.Nodes) * 100,1) } else { 0 }
         $sanitized.Add("- $($rack.RackAlias): $($rack.ChassisCount) chassis / $($rack.NodeCount) nodes / $pct% of cluster nodes")
     }
-
-    $sanitized.Add("- Unassigned chassis: $($cluster.UnassignedChassis)")
-    $sanitized.Add("- Largest single-rack node concentration: $($cluster.LargestRackNodePct)%")
+    $sanitized.Add("- Unassigned chassis: $($row.UnassignedChassis)")
+    $sanitized.Add("- Largest single-rack node concentration: $($row.LargestRackNodePct)%")
     $sanitized.Add("")
 }
-
 $sanitized.Add("### Findings")
 $sanitized.Add("")
 $sanitized.Add("**Confirmed**")
-$sanitized.Add("")
-
-foreach ($cluster in $internalClusterSummary) {
-    if ($cluster.Racks -eq 0) {
-        $sanitized.Add("- $($cluster.ClusterAlias): no rack configuration was returned by GET /v2/racks.")
-    }
-    if ($cluster.UnassignedChassis -gt 0) {
-        $sanitized.Add("- $($cluster.ClusterAlias): $($cluster.UnassignedChassis) chassis have no rack assignment returned by GET data.")
-    }
-    if ([string]$cluster.CurrentFailureDomain -match '(?i)node|chassis|rack') {
-        $sanitized.Add("- $($cluster.ClusterAlias): current failure-domain value returned: $($cluster.CurrentFailureDomain).")
-    }
-    if ($cluster.WarningOrSuboptimalFT) {
-        $sanitized.Add("- $($cluster.ClusterAlias): at least one Storage Domain FT option is disabled, warning, or suboptimal.")
-    }
+foreach ($row in $clusterSummary) {
+    if ($row.Racks -eq 0) { $sanitized.Add("- $($row.ClusterAlias): no rack configuration was returned by GET /v2/racks.") }
+    if ($row.UnassignedChassis -gt 0) { $sanitized.Add("- $($row.ClusterAlias): $($row.UnassignedChassis) chassis have no rack assignment returned by GET data.") }
+    if ($row.WarningOrSuboptimalFT) { $sanitized.Add("- $($row.ClusterAlias): at least one returned FT option is disabled, warning, or suboptimal.") }
 }
-
 $sanitized.Add("")
 $sanitized.Add("**Calculated**")
-$sanitized.Add("")
-
-foreach ($cluster in $internalClusterSummary) {
-    if ($cluster.UnevenRackDistribution) {
-        $sanitized.Add("- $($cluster.ClusterAlias): node distribution across returned racks is uneven; largest rack concentration is $($cluster.LargestRackNodePct)%.")
-    }
-    if ($cluster.MixedArchitecture) {
-        $sanitized.Add("- $($cluster.ClusterAlias): returned chassis data shows mixed 1-node and 4-or-more-node chassis/block architecture.")
-    }
-    if ($cluster.InsufficientDomains) {
-        $sanitized.Add("- $($cluster.ClusterAlias): configured rack count is below at least one returned minFailureDomainsRequired value.")
-    }
+foreach ($row in $clusterSummary) {
+    if ($row.UnevenRackDistribution) { $sanitized.Add("- $($row.ClusterAlias): rack node distribution is uneven; largest rack concentration is $($row.LargestRackNodePct)%.") }
+    if ($row.MixedArchitecture) { $sanitized.Add("- $($row.ClusterAlias): mixed 1-node and 4-or-more-node chassis/block architecture was returned.") }
+    if ($row.InsufficientDomains) { $sanitized.Add("- $($row.ClusterAlias): configured rack count is below at least one returned minFailureDomainsRequired value.") }
 }
-
 $sanitized.Add("")
 $sanitized.Add("**Unknown / Requires Cohesity Confirmation**")
-$sanitized.Add("")
-$unknownCount = 0
-
-foreach ($cluster in $internalClusterSummary | Where-Object IncompleteData -eq $true) {
-    $sanitized.Add("- $($cluster.ClusterAlias): one or more approved GET collections failed or returned incomplete data; Rack FT eligibility is not proven.")
-    $unknownCount++
-}
-
-if ($unknownCount -eq 0) {
-    $sanitized.Add("- No additional unknowns identified from successful GET collection; option availability alone is not treated as proof that a configuration is safe.")
-}
-
+$unknown = @($clusterSummary | Where-Object IncompleteData -eq $true)
+if ($unknown.Count -eq 0) { $sanitized.Add("- No additional GET collection gaps identified. Option availability is not proof that a configuration is safe.") }
+else { foreach ($row in $unknown) { $sanitized.Add("- $($row.ClusterAlias): one or more approved GET collections failed or returned incomplete data.") } }
 $sanitized.Add("")
 $sanitized.Add("### Most Important Exceptions")
-$sanitized.Add("")
-
-$exceptionRows = @(
-    $internalClusterSummary |
-        Where-Object {
-            $_.Racks -eq 0 -or
-            $_.UnassignedChassis -gt 0 -or
-            $_.UnevenRackDistribution -or
-            $_.WarningOrSuboptimalFT -or
-            $_.InsufficientDomains -or
-            $_.MixedArchitecture -or
-            $_.IncompleteData
-        }
-)
-
-if ($exceptionRows.Count -eq 0) {
-    $sanitized.Add("- None proven by the collected GET results.")
-}
-else {
-    foreach ($cluster in $exceptionRows) {
-        $reasons = @()
-
-        if ($cluster.Racks -eq 0) { $reasons += "no rack configuration" }
-        if ($cluster.UnassignedChassis -gt 0) { $reasons += "unassigned chassis" }
-        if ($cluster.UnevenRackDistribution) { $reasons += "uneven rack distribution" }
-        if ($cluster.WarningOrSuboptimalFT) { $reasons += "warning/suboptimal/disabled FT option" }
-        if ($cluster.InsufficientDomains) { $reasons += "insufficient failure domains" }
-        if ($cluster.MixedArchitecture) { $reasons += "mixed chassis architecture" }
-        if ($cluster.IncompleteData) { $reasons += "unknown/ambiguous configuration" }
-
-        $sanitized.Add("- $($cluster.ClusterAlias): $($reasons -join '; ').")
-    }
-}
-
+$exceptions = @($clusterSummary | Where-Object { $_.Racks -eq 0 -or $_.UnassignedChassis -gt 0 -or $_.UnevenRackDistribution -or $_.WarningOrSuboptimalFT -or $_.InsufficientDomains -or $_.MixedArchitecture -or $_.IncompleteData })
+if ($exceptions.Count -eq 0) { $sanitized.Add("- None proven by the collected GET results.") }
+else { foreach ($row in $exceptions) { $sanitized.Add("- $($row.ClusterAlias): $($row.AssessmentFlag)") } }
 $sanitized.Add("")
 $sanitized.Add("### Data Quality")
-$sanitized.Add("")
-
-$uniqueApiCalls = @(
-    $apiCalls |
-        ForEach-Object { $_ -replace ' \[.*$','' } |
-        Select-Object -Unique
-)
-
-$sanitized.Add("- GET APIs queried: $($uniqueApiCalls -join '; ')")
-
-if ($apiFailures.Count -gt 0) {
-    $sanitized.Add("- GET APIs that failed: $($apiFailures.Count) call(s). See internal report/log output for cluster-local details.")
-}
-else {
-    $sanitized.Add("- GET APIs that failed: None")
-}
-
-if ($unavailableFields.Count -gt 0) {
-    $unavailableText = @($unavailableFields) -join "; "
-}
-else {
-    $unavailableText = "None explicitly tracked; individual unavailable values are marked $notAvailable"
-}
-
-$sanitized.Add("- Fields unavailable: $unavailableText")
-$incompleteClusters = @($internalClusterSummary | Where-Object IncompleteData -eq $true).Count
-$sanitized.Add("- Clusters with incomplete data: $incompleteClusters")
+$uniqueCalls = @($apiCalls | ForEach-Object { $_ -replace ' \[.*$','' } | Select-Object -Unique)
+$sanitized.Add("- GET APIs queried: $($uniqueCalls -join '; ')")
+$sanitized.Add("- GET APIs that failed: $($apiFailures.Count)")
+$sanitized.Add("- Fields unavailable: individual unavailable values are marked $notAvailable")
+$sanitized.Add("- Clusters with incomplete data: $(@($clusterSummary | Where-Object IncompleteData -eq $true).Count)")
 $sanitized.Add("- Number of POST/PUT/PATCH/DELETE operations executed: **0**")
 $sanitized.Add("")
 $sanitized.Add("READ-ONLY VALIDATION: No Cohesity configuration was modified during this assessment.")
-$sanitized | Set-Content -Path $sanitizedReportPath -Encoding UTF8
+$sanitized | Set-Content $sanitizedReportPath -Encoding UTF8
 
 Write-Host ""
 Write-Host "================ READ-ONLY COLLECTION SUMMARY ================" -ForegroundColor Cyan
@@ -1192,25 +596,17 @@ Write-Host "Nodes collected           : $($nodeRows.Count)"
 Write-Host "Chassis collected         : $($chassisRows.Count)"
 Write-Host "Racks collected           : $($rackRows.Count)"
 Write-Host "Storage Domains collected : $($storageDomainRows.Count)"
-Write-Host "FT option rows collected  : $($ftOptionRows.Count)"
+Write-Host "FT option rows collected  : $($ftRows.Count)"
 Write-Host "GET failures              : $($apiFailures.Count)"
 Write-Host "Non-GET operations        : 0" -ForegroundColor Green
 Write-Host "Internal report           : $internalReportPath"
 Write-Host "Sanitized report          : $sanitizedReportPath"
-
-if ($expectedClusterCount -gt 0 -and $clusterRows.Count -ne $expectedClusterCount) {
-    Write-Host "Expected clusters         : $expectedClusterCount (CHECK REQUIRED)" -ForegroundColor Yellow
-}
-
-if ($expectedNodeCount -gt 0 -and $nodeRows.Count -ne $expectedNodeCount) {
-    Write-Host "Expected nodes            : $expectedNodeCount (CHECK REQUIRED)" -ForegroundColor Yellow
-}
-
+if ($clusterRows.Count -ne $expectedClusters) { Write-Host "Expected clusters         : $expectedClusters (CHECK REQUIRED)" -ForegroundColor Yellow }
+if ($nodeRows.Count -ne $expectedNodes) { Write-Host "Expected nodes            : $expectedNodes (CHECK REQUIRED)" -ForegroundColor Yellow }
 if ($apiFailures.Count -gt 0) {
     Write-Host ""
     Write-Host "GET FAILURES" -ForegroundColor Yellow
     $apiFailures | ForEach-Object { Write-Host "- $_" }
 }
-
 Write-Host ""
 Write-Host "READ-ONLY VALIDATION: No Cohesity configuration was modified during this assessment." -ForegroundColor Green
