@@ -1,90 +1,85 @@
-# Cohesity Helios Node + Chassis Inventory
+# Cohesity Hardware / Rack Resiliency Automation
 
-Read-only PowerShell inventory for Cohesity clusters connected through Helios.
+Branch: `Cohesity_Automations`
 
-## Script
-`Cohesity_Helios_Hardware_Inventory.ps1`
+## Rack Resiliency Assessment
 
-## Strict GET-only design
-The script performs only these API reads:
+Script: `Cohesity_Rack_Resiliency_Assessment.ps1`
 
-```text
-GET /v2/mcm/cluster-mgmt/info
-GET /v2/clusters/nodes
-GET /v2/chassis
-```
+Purpose: collect READ-ONLY Cohesity data required to assess Rack-level Failure Domain / Rack Resiliency readiness. The script does not change Cohesity configuration and is intentionally blocked to HTTP GET only.
 
-No POST, PUT, PATCH, or DELETE requests are used.
+### Safety
 
-## Collection model
-- Discover the Helios-connected clusters.
-- Query `GET /v2/clusters/nodes` once per cluster. Omitting `ids` returns all nodes.
-- Query `GET /v2/chassis` once per cluster.
-- Correlate `chassis.nodeIds[]` with each node's internal `nodeId`.
-- Export one combined CSV row per node.
-- `NodeId` is used internally for the join but is not displayed or exported.
+The request wrapper verifies the HTTP method is `GET` before every API request. The script contains no POST, PUT, PATCH, DELETE, rack assignment, chassis reassignment, Storage Domain modification, Fault Tolerance modification, node modification, or cluster modification logic.
 
-## CSV columns
+Missing information is reported as:
 
-```text
-ClusterName
-Hostname
-NodeIP
-IPMIIP
-NodeSerial
-CohesityNodeSerial
-NodeModel
-ProductModel
-SlotNumber
-ChassisSerial
-CohesityChassisSerial
-ChassisModel
-ChassisName
-RackId
-```
+`NOT AVAILABLE THROUGH APPROVED READ-ONLY COLLECTION`
 
-Missing values are written as `N/A`; no IP address or hardware value is inferred.
+### GET APIs
 
-## Expected environment validation
+- `GET /v2/clusters`
+- `GET /v2/clusters/nodes`
+- `GET /v2/node/hardware-info`
+- `GET /v2/chassis`
+- `GET /v2/racks`
+- `GET /v2/storage-domains`
+- `GET /v2/storage-domains/fault-tolerance-options?storageDomainId=<ID>` for every returned Storage Domain
 
-```text
-Clusters : 22
-Nodes    : 169
-```
+All cluster-scoped calls are routed through Helios with the existing `accessClusterId` header.
 
-A PASS additionally requires:
-- zero failed clusters
-- all 169 node rows returned
-- all returned nodes mapped to a chassis
+### Collection
 
-## Output
-One timestamped CSV:
+The collector gathers node/chassis/rack topology, selected hardware models, node reachability/status, Storage Domain EC/RF/capacity data, current failure-domain state, and every returned Fault Tolerance option including disabled/warning/suboptimal status and minimum failure-domain requirements when the GET response exposes them.
 
-```text
-Cohesity_Node_Chassis_Inventory_yyyyMMdd_HHmm.csv
-```
+No hostnames, DNS names, IP addresses, IPMI addresses, interface addresses, node serials, or chassis serials are written to the generated reports. Node/chassis/Storage Domain IDs are retained only in internal outputs where required for local correlation.
 
-Default output directory:
+### Hardware model buckets
 
-```text
-X:\PowerShell\Data\Cohesity\HardwareInventory
-```
+- CX8405
+- C6025
+- C5066
+- C5026
+- C5016
+- Other
 
-The console shows the same combined node + chassis table and one summary at the end.
+### Outputs
 
-## Summary example
+The script generates two primary Markdown reports:
 
-```text
-Clusters discovered     : 22
-Clusters successful     : 22
-Clusters failed         : 0
-Nodes discovered        : 169
-Chassis discovered      : <actual>
-Nodes mapped to chassis : 169
-Unmapped nodes          : 0
-Nodes with Node IP      : <actual>
-Nodes with IPMI IP      : <actual>
-Expected clusters       : 22
-Expected nodes          : 169
-Validation              : PASS
-```
+1. `Cohesity_Rack_Resiliency_Internal_<timestamp>.md`
+   - internal cluster identifiers and detailed local correlation data
+   - no credentials, tokens, passwords, hostnames, IPs, or serial numbers
+
+2. `Cohesity_Rack_Resiliency_Sanitized_<timestamp>.md`
+   - clusters anonymized as `Cluster-01`, `Cluster-02`, etc.
+   - racks anonymized as `Rack-1`, `Rack-2`, etc.
+   - Storage Domains anonymized as `SD-1`, `SD-2`, etc.
+   - structured Estate Summary, Hardware Distribution, Cluster Resiliency Summary, Storage Domain Resiliency, Rack Distribution, Findings, Most Important Exceptions, and Data Quality sections
+
+Supporting internal CSV files are also produced for node, chassis, rack, Storage Domain, and Fault Tolerance option correlation. They exclude names/IPs/serials.
+
+### Current estate validation baseline
+
+The script currently checks the known baseline:
+
+- Expected clusters: 22
+- Expected nodes: 169
+
+A mismatch is reported as `CHECK REQUIRED`; it never triggers a configuration change.
+
+### Assessment behavior
+
+The script flags only conditions proven or calculated from GET results, including no racks configured, unassigned chassis, uneven rack/node distribution, mixed 1-node and 4-or-more-node chassis architecture, warning/suboptimal/disabled FT options, and rack count below a returned `minFailureDomainsRequired` value.
+
+It does **not** state that Rack FT is safe merely because an option is available. Incomplete or ambiguous GET data is marked `UNKNOWN` and requires Cohesity confirmation.
+
+### Final safety line
+
+Every sanitized report ends with:
+
+`READ-ONLY VALIDATION: No Cohesity configuration was modified during this assessment.`
+
+## Existing Node + Chassis Inventory
+
+`Cohesity_Helios_Hardware_Inventory.ps1` remains available as the earlier GET-only node/chassis CSV inventory script.
