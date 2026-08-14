@@ -225,9 +225,8 @@ if ($Matches.Count -eq 0) {
     return
 }
 
-# NOC table: show the exact matched switch/port first, then the node and the
-# single physical bond slave associated with that returned uplink record.
-# Do not show BondName/bond0.VLAN or the complete BondSlaves list.
+# Single full-width NOC table. Out-GridView avoids the console host width limit
+# and keeps every requested column in one horizontally scrollable table.
 $DisplayRows = $Matches | Select-Object `
     @{n='Switch';e={$_.SwitchInfo}},
     @{n='Ethernet';e={$_.PortId}},
@@ -246,8 +245,7 @@ $DisplayRows = $Matches | Select-Object `
     TxErrors,
     TxDropped
 
-# Render at a wide fixed width so PowerShell does not omit later columns.
-$DisplayRows | Format-Table -AutoSize | Out-String -Width 4096 | Write-Host
+$DisplayRows | Out-GridView -Title 'Cohesity Interface Diagnosis'
 Write-Host "`nMatched rows: $($Matches.Count)" -ForegroundColor Green
 
 if ($Failures.Count -gt 0) {
