@@ -10,7 +10,7 @@
 # No port matching or synthetic per-port reconstruction is performed here.
 
 param(
-    [string]$TargetsFile = 'X:\PowerShell\Cohesity_API_Scripts\Interface_Diagnosis_Targets.txt'
+    [string]$TargetsFile = 'X:\PowerShell\Cohesity_Automations\Interface\Interface_Diagnosis_Targets.txt'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -82,6 +82,24 @@ function Test-SwitchMatch {
     return (Get-ShortSwitchName $RequestedFull) -eq (Get-ShortSwitchName $ActualFull)
 }
 
+function Get-StatValue {
+    param(
+        [AllowNull()][object]$Stats,
+        [Parameter(Mandatory)][string[]]$Names
+    )
+
+    if ($null -eq $Stats) { return 'NOT RETURNED' }
+
+    foreach ($Name in $Names) {
+        $Property = $Stats.PSObject.Properties[$Name]
+        if ($null -ne $Property -and $null -ne $Property.Value -and "$($Property.Value)" -ne '') {
+            return "$($Property.Value)"
+        }
+    }
+
+    return 'NOT RETURNED'
+}
+
 # -----------------------------------------------------------------------------
 # 1) Read only the first valid target line.
 #    For this validation build we use ONLY the switch value.
@@ -123,7 +141,7 @@ if ($clusters.Count -eq 0) {
 }
 
 # -----------------------------------------------------------------------------
-# 3) EXACT old working /public/interface invocation pattern
+# 3) EXACT old working /public/interface invocation pattern + includeStats
 # -----------------------------------------------------------------------------
 $url = "$BaseUrl/irisservices/api/v1/public/interface"
 $body = @{
@@ -131,6 +149,7 @@ $body = @{
     ifaceGroupAssignedOnly  = 'true'
     includeUplinkSwitchInfo = 'true'
     includeBondSlaveDetails = 'true'
+    includeStats            = 'true'
 }
 
 $AllRows = @()
@@ -171,6 +190,10 @@ foreach ($cluster in ($clusters | Sort-Object clusterName)) {
         $slotTypes   = @()
         $switchInfos = @()
         $portIds     = @()
+        $rxErrors    = @()
+        $rxDropped   = @()
+        $txErrors    = @()
+        $txDropped   = @()
 
         foreach ($iface in @($node.interfaces)) {
             if ($null -eq $iface) { continue }
@@ -182,6 +205,13 @@ foreach ($cluster in ($clusters | Sort-Object clusterName)) {
             if ($null -ne $iface.mtu -and "$($iface.mtu)" -ne '') {
                 $mtus += "$($iface.mtu)"
             }
+
+            # Reuse the proven interface-health stats scope: iface.stats.
+            # Do not synthesize counters. If a field is absent, show NOT RETURNED.
+            $rxErrors  += Get-StatValue -Stats $iface.stats -Names @('rxErr','rxErrs','rxErrors')
+            $rxDropped += Get-StatValue -Stats $iface.stats -Names @('rxDropped','rxDrop','rxDrops')
+            $txErrors  += Get-StatValue -Stats $iface.stats -Names @('txErr','txErrs','txErrors')
+            $txDropped += Get-StatValue -Stats $iface.stats -Names @('txDropped','txDrop','txDrops')
 
             foreach ($slave in @($iface.bondSlaves)) {
                 if ($null -ne $slave -and "$slave" -ne '') {
@@ -240,6 +270,10 @@ foreach ($cluster in ($clusters | Sort-Object clusterName)) {
             SlotType             = $slotTypes
             SwitchInfo           = $switchInfos
             PortId               = $portIds
+            RxErrors             = $rxErrors
+            RxDropped            = $rxDropped
+            TxErrors             = $txErrors
+            TxDropped            = $txDropped
         }
     }
 }
@@ -287,12 +321,16 @@ $DisplayRows = $Matches | Select-Object `
     @{n='SlaveSpeed'; e={ To-CsvList $_.SlaveSpeed }},
     @{n='SlotType'; e={ To-CsvList $_.SlotType }},
     @{n='SwitchInfo'; e={ To-CsvList $_.SwitchInfo }},
-    @{n='PortId'; e={ To-CsvList $_.PortId }}
+    @{n='PortId'; e={ To-CsvList $_.PortId }},
+    @{n='RxErrors'; e={ To-CsvList $_.RxErrors }},
+    @{n='RxDropped'; e={ To-CsvList $_.RxDropped }},
+    @{n='TxErrors'; e={ To-CsvList $_.TxErrors }},
+    @{n='TxDropped'; e={ To-CsvList $_.TxDropped }}
 
 $DisplayRows | Format-List
 
 Write-Host "Matched node rows: $($Matches.Count)" -ForegroundColor Green
-Write-Host 'This build intentionally stops here. If this data is correct, port-specific correlation is the next step.' -ForegroundColor DarkGray
+Write-Host 'RX/TX values above are current counters returned by iface.stats; NOT RETURNED means the API did not expose that field.' -ForegroundColor DarkGray
 
 if ($Failures.Count -gt 0) {
     Write-Host "`nClusters that could not be queried:" -ForegroundColor Yellow
