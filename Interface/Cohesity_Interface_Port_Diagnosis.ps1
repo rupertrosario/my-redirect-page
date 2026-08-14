@@ -2,9 +2,10 @@
 # STRICTLY READ-ONLY / GET ONLY
 #
 # Input file format:
-#   Switch|Interface
-#   SWITCH-NAME-01|Ethernet1/17
+#   SWITCH-NAME-01 Ethernet1/17
+#   SWITCH-NAME-02 Ethernet1/18
 #
+# One switch/interface pair per line. Spaces or tabs are accepted.
 # The script scans accessible Cohesity clusters, finds the bond member connected
 # to the supplied switch/interface, then reports link, speed, MTU and RX/TX counters.
 # A second sample is taken so NOC can see whether error/drop counters are increasing.
@@ -71,24 +72,23 @@ if (-not (Test-Path -LiteralPath $TargetsFile)) {
     throw "Targets file not found: $TargetsFile"
 }
 
-$targetLines = Get-Content -LiteralPath $TargetsFile |
+$targetLines = @(Get-Content -LiteralPath $TargetsFile |
     ForEach-Object { $_.Trim() } |
-    Where-Object { $_ -and -not $_.StartsWith("#") }
+    Where-Object { $_ -and -not $_.StartsWith("#") })
 
-if ($targetLines.Count -lt 2) {
+if ($targetLines.Count -eq 0) {
     throw "No switch/interface targets found in $TargetsFile"
 }
 
 $Targets = foreach ($line in $targetLines) {
-    if ($line -eq "Switch|Interface") { continue }
+    $parts = @($line -split '\s+', 2)
 
-    $parts = $line -split '\|', 2
     if ($parts.Count -ne 2) {
         Write-Warning "Skipping invalid target line: $line"
         continue
     }
 
-    $switchName = $parts[0].Trim()
+    $switchName    = $parts[0].Trim()
     $interfaceName = $parts[1].Trim()
 
     if ([string]::IsNullOrWhiteSpace($switchName) -or
@@ -119,7 +119,6 @@ if ($Clusters.Count -eq 0) {
     throw "No accessible Cohesity clusters returned by Helios."
 }
 
-# Documented v2 network-interface endpoint.
 $interfaceQuery = @(
     "cache=false"
     "bondInterfaceOnly=true"
@@ -168,18 +167,13 @@ function Get-DiagnosticSnapshot {
                 foreach ($member in $members) {
                     if ($null -eq $member) { continue }
 
-                    $uplink = $member.uplinkSwitch
+                    $uplink         = $member.uplinkSwitch
                     $reportedSwitch = Get-FirstValue $uplink @("name") ""
                     $reportedPort   = Get-FirstValue $uplink @("portId") ""
 
                     foreach ($target in $Targets) {
-                        if ((Normalize-Text $reportedSwitch) -ne (Normalize-Text $target.Switch)) {
-                            continue
-                        }
-
-                        if ((Normalize-Text $reportedPort) -ne (Normalize-Text $target.Interface)) {
-                            continue
-                        }
+                        if ((Normalize-Text $reportedSwitch) -ne (Normalize-Text $target.Switch)) { continue }
+                        if ((Normalize-Text $reportedPort) -ne (Normalize-Text $target.Interface)) { continue }
 
                         $stats = $member.stats
 
@@ -274,8 +268,7 @@ foreach ($target in $Targets) {
         $txErrDelta  = if ($previous) { [int64]$row.TxErrors  - [int64]$previous.TxErrors  } else { 0 }
         $txDropDelta = if ($previous) { [int64]$row.TxDropped - [int64]$previous.TxDropped } else { 0 }
 
-        $linkUp = (Normalize-Text $row.Link) -eq "up"
-        $status = if (-not $linkUp) {
+        $status = if ((Normalize-Text $row.Link) -ne "up") {
             "LINK DOWN"
         }
         elseif ($rxErrDelta -gt 0 -or $rxDropDelta -gt 0 -or $txErrDelta -gt 0 -or $txDropDelta -gt 0) {
