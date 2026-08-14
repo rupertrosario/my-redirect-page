@@ -1,18 +1,16 @@
-# Cohesity Interface Port Diagnosis - SINGLE TARGET VALIDATION
+# Cohesity Interface Diagnosis - SINGLE SWITCH VALIDATION
 # STRICTLY READ-ONLY / GET ONLY
 # PowerShell 5.1 compatible
 #
-# Purpose of this version:
-#   Validate ONE switch/interface from the first non-comment TXT line.
-#   Match directly against bondSlavesDetails.uplinkSwitchInfo.sysName.
-#   Once the switch matches, report the enclosing node/interface/bond-slave data.
-#   PortId is secondary validation only.
-#
-# BASE: proven /public/interface collector used by the existing interface scripts.
+# IMPORTANT:
+# This version intentionally uses the old known-good interface collector shape:
+#   Invoke-WebRequest -Method Get -Body $body
+#   node -> interfaces -> bondSlavesDetails -> uplinkSwitchInfo
+# It reads only the FIRST non-comment target line and matches ONLY SwitchInfo.
+# No port matching or synthetic per-port reconstruction is performed here.
 
 param(
-    [string]$TargetsFile = 'X:\PowerShell\Cohesity_API_Scripts\Interface_Diagnosis_Targets.txt',
-    [string]$HistoryDir  = 'X:\PowerShell\Data\Cohesity\InterfaceDiagnosis'
+    [string]$TargetsFile = 'X:\PowerShell\Cohesity_API_Scripts\Interface_Diagnosis_Targets.txt'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -23,7 +21,7 @@ $AesHelper = 'X:\PowerShell\Cohesity_API_Scripts\Common\ApiKeyAesHelper.ps1'
 $EncryptedKeyFile = 'X:\PowerShell\Cohesity_API_Scripts\Common\Secure\cohesity_apikey.enc'
 
 # -----------------------------------------------------------------------------
-# Existing encrypted API-key flow
+# AES API key - existing proven credential flow
 # -----------------------------------------------------------------------------
 if (-not (Test-Path -LiteralPath $AesHelper)) {
     throw "AES helper not found: $AesHelper"
@@ -39,36 +37,34 @@ if ([string]::IsNullOrWhiteSpace([string]$ApiKey)) {
 }
 
 # -----------------------------------------------------------------------------
-# Helpers
+# Helpers copied from the old working interface collector approach
 # -----------------------------------------------------------------------------
-function Invoke-CohesityGet {
-    param(
-        [Parameter(Mandatory)][string]$Uri,
-        [Parameter(Mandatory)][hashtable]$Headers
-    )
+function To-CsvList {
+    param([object]$v)
 
-    $Method = 'GET'
-    if ($Method -cne 'GET') {
-        throw 'SAFETY BLOCK: HTTP method is not GET.'
-    }
-    if (-not $Uri.StartsWith($BaseUrl, [System.StringComparison]::OrdinalIgnoreCase)) {
-        throw "SAFETY BLOCK: URI outside Helios: $Uri"
-    }
+    if ($null -eq $v) { return '' }
 
-    Invoke-RestMethod -Method Get -Uri $Uri -Headers $Headers -ErrorAction Stop
+    $arr = @($v | ForEach-Object { "$_" } | Where-Object { $_ -ne '' })
+
+    if ($arr.Count -eq 0) { return '' }
+    if ($arr.Count -eq 1) { return $arr[0] }
+
+    return ($arr -join ' ; ')
 }
 
-function Normalize-Text {
+function Normalize-SwitchName {
     param([AllowNull()][object]$Value)
+
     if ($null -eq $Value) { return '' }
-    return ([string]$Value).Trim().ToLowerInvariant()
+    return ([string]$Value).Trim().TrimEnd('.').ToLowerInvariant()
 }
 
-function Get-ShortHostName {
+function Get-ShortSwitchName {
     param([AllowNull()][object]$Value)
-    $Text = (Normalize-Text $Value).TrimEnd('.')
-    if (-not $Text) { return '' }
-    return ($Text -split '\.', 2)[0]
+
+    $Name = Normalize-SwitchName $Value
+    if (-not $Name) { return '' }
+    return ($Name -split '\.', 2)[0]
 }
 
 function Test-SwitchMatch {
@@ -77,85 +73,18 @@ function Test-SwitchMatch {
         [AllowNull()][object]$Actual
     )
 
-    $RequestedFull = (Normalize-Text $Requested).TrimEnd('.')
-    $ActualFull    = (Normalize-Text $Actual).TrimEnd('.')
+    $RequestedFull = Normalize-SwitchName $Requested
+    $ActualFull    = Normalize-SwitchName $Actual
 
     if (-not $RequestedFull -or -not $ActualFull) { return $false }
     if ($RequestedFull -eq $ActualFull) { return $true }
 
-    return (Get-ShortHostName $RequestedFull) -eq (Get-ShortHostName $ActualFull)
-}
-
-function Get-FirstPropertyValue {
-    param(
-        [AllowNull()][object]$InputObject,
-        [Parameter(Mandatory)][string[]]$PropertyNames,
-        [AllowNull()][object]$DefaultValue = 0
-    )
-
-    if ($null -eq $InputObject) { return $DefaultValue }
-
-    foreach ($PropertyName in $PropertyNames) {
-        $Property = $InputObject.PSObject.Properties[$PropertyName]
-        if ($null -ne $Property -and $null -ne $Property.Value) {
-            return $Property.Value
-        }
-    }
-
-    return $DefaultValue
-}
-
-function Get-PortNames {
-    param([AllowNull()][object]$PortId)
-
-    $Names = @()
-
-    foreach ($Port in @($PortId)) {
-        if ($null -eq $Port) { continue }
-
-        if ($Port -is [string]) {
-            $Text = $Port.Trim()
-            if ($Text -match '^(?i)ifname\s+(.+)$') {
-                $Names += $Matches[1].Trim()
-            }
-            elseif ($Text) {
-                $Names += $Text
-            }
-            continue
-        }
-
-        if ($null -ne $Port.PSObject.Properties['ifname']) {
-            foreach ($IfName in @($Port.ifname)) {
-                if (-not [string]::IsNullOrWhiteSpace([string]$IfName)) {
-                    $Names += ([string]$IfName).Trim()
-                }
-            }
-            continue
-        }
-
-        if ($null -ne $Port.PSObject.Properties['ifName']) {
-            foreach ($IfName in @($Port.ifName)) {
-                if (-not [string]::IsNullOrWhiteSpace([string]$IfName)) {
-                    $Names += ([string]$IfName).Trim()
-                }
-            }
-        }
-    }
-
-    return @($Names | Where-Object { $_ } | Select-Object -Unique)
-}
-
-function To-CleanList {
-    param([AllowNull()][object]$Value)
-
-    if ($null -eq $Value) { return '' }
-    $Items = @($Value | ForEach-Object { "$_".Trim() } | Where-Object { $_ })
-    if ($Items.Count -eq 0) { return '' }
-    return ($Items -join ', ')
+    return (Get-ShortSwitchName $RequestedFull) -eq (Get-ShortSwitchName $ActualFull)
 }
 
 # -----------------------------------------------------------------------------
-# 1) Read ONLY the first valid target line
+# 1) Read only the first valid target line.
+#    For this validation build we use ONLY the switch value.
 # -----------------------------------------------------------------------------
 if (-not (Test-Path -LiteralPath $TargetsFile)) {
     throw "Targets file not found: $TargetsFile"
@@ -171,174 +100,199 @@ if (-not $TargetLine) {
 }
 
 $Parts = @($TargetLine -split '\s+', 2)
-if ($Parts.Count -ne 2) {
-    throw "Target must be: <switch> <interface>. Found: $TargetLine"
-}
-
 $RequestedSwitch = $Parts[0].Trim()
-$RequestedPort   = $Parts[1].Trim()
+$RequestedInterface = if ($Parts.Count -gt 1) { $Parts[1].Trim() } else { '' }
 
-Write-Host "`nSINGLE TARGET VALIDATION" -ForegroundColor Cyan
-Write-Host "Switch    : $RequestedSwitch"
-Write-Host "Interface : $RequestedPort"
+Write-Host "`nSINGLE SWITCH VALIDATION" -ForegroundColor Cyan
+Write-Host "Switch from TXT    : $RequestedSwitch"
+if ($RequestedInterface) {
+    Write-Host "Interface from TXT : $RequestedInterface (not used for filtering in this validation)"
+}
 
 # -----------------------------------------------------------------------------
 # 2) Cluster discovery - GET only
 # -----------------------------------------------------------------------------
-$ClusterResponse = Invoke-CohesityGet `
-    -Uri "$BaseUrl/v2/mcm/cluster-mgmt/info" `
-    -Headers @{ apiKey = $ApiKey }
+$clusterUrl = "$BaseUrl/v2/mcm/cluster-mgmt/info"
+$commonHeaders = @{ apiKey = $ApiKey }
 
-$Clusters = @($ClusterResponse.cohesityClusters)
-if ($Clusters.Count -eq 0) {
-    throw 'No clusters returned by Helios.'
+$clusterResponse = Invoke-RestMethod -Method Get -Uri $clusterUrl -Headers $commonHeaders
+$clusters = @($clusterResponse.cohesityClusters)
+
+if ($clusters.Count -eq 0) {
+    throw 'No clusters were returned by Helios.'
 }
 
 # -----------------------------------------------------------------------------
-# 3) Same proven /public/interface GET
+# 3) EXACT old working /public/interface invocation pattern
 # -----------------------------------------------------------------------------
-$InterfaceQuery = @(
-    'bondInterfaceOnly=true'
-    'ifaceGroupAssignedOnly=true'
-    'includeUplinkSwitchInfo=true'
-    'includeBondSlaveDetails=true'
-    'includeStats=true'
-) -join '&'
+$url = "$BaseUrl/irisservices/api/v1/public/interface"
+$body = @{
+    bondInterfaceOnly       = 'true'
+    ifaceGroupAssignedOnly  = 'true'
+    includeUplinkSwitchInfo = 'true'
+    includeBondSlaveDetails = 'true'
+}
 
-$InterfaceUrl = "$BaseUrl/irisservices/api/v1/public/interface?$InterfaceQuery"
+$AllRows = @()
+$Failures = @()
 
-$Matches = [System.Collections.Generic.List[object]]::new()
-$SwitchSeen = $false
-$Failures = [System.Collections.Generic.List[object]]::new()
+foreach ($cluster in ($clusters | Sort-Object clusterName)) {
+    $clusterName = [string]$cluster.clusterName
+    $clusterId   = $cluster.clusterId
 
-foreach ($Cluster in ($Clusters | Sort-Object clusterName)) {
-    $ClusterName = [string]$Cluster.clusterName
-    $ClusterId   = $Cluster.clusterId
-
-    $Headers = @{
+    $headers = @{
         apiKey          = $ApiKey
-        accessClusterId = $ClusterId
+        accessClusterId = $clusterId
     }
 
     try {
-        $Nodes = @(Invoke-CohesityGet -Uri $InterfaceUrl -Headers $Headers)
+        # STRICTLY GET. This is the same GET + Body pattern as the old known-good script.
+        $responseIF = Invoke-WebRequest -Method Get -Uri $url -Headers $headers -Body $body
+        $jsonIF = $responseIF.Content | ConvertFrom-Json
     }
     catch {
-        $Failures.Add([pscustomobject]@{
-            Cluster = $ClusterName
+        $Failures += [pscustomobject]@{
+            Cluster = $clusterName
             Error   = $_.Exception.Message
-        })
+        }
         continue
     }
 
-    foreach ($Node in $Nodes) {
-        foreach ($Iface in @($Node.interfaces)) {
-            if ($null -eq $Iface) { continue }
+    if (-not $jsonIF) { continue }
 
-            # Direct fields exactly like the existing collector.
-            $Stats = $Iface.stats
-            $BondName = $Iface.name
-            $MTU = $Iface.mtu
-            $BondingMode = $Iface.bondingMode
-            $ActiveBondSlave = $Iface.activeBondSlave
+    foreach ($node in $jsonIF) {
 
-            $RxErrors  = Get-FirstPropertyValue $Stats @('rxErr','rxErrs','rxErrors') 0
-            $RxDropped = Get-FirstPropertyValue $Stats @('rxDropped','rxDrop','rxDrops') 0
-            $TxErrors  = Get-FirstPropertyValue $Stats @('txErr','txErrs','txErrors') 0
-            $TxDropped = Get-FirstPropertyValue $Stats @('txDropped','txDrop','txDrops') 0
+        $bondNames   = @()
+        $mtus        = @()
+        $bondSlaves  = @()
+        $linkStates  = @()
+        $macs        = @()
+        $speeds      = @()
+        $slotTypes   = @()
+        $switchInfos = @()
+        $portIds     = @()
 
-            foreach ($Detail in @($Iface.bondSlavesDetails)) {
-                if ($null -eq $Detail) { continue }
+        foreach ($iface in @($node.interfaces)) {
+            if ($null -eq $iface) { continue }
 
-                # Direct bond-slave fields exactly like the existing collector.
-                $BondSlave  = $Detail.name
-                $LinkState  = $Detail.linkState
-                $SlaveSpeed = $Detail.speed
-                $MacAddress = $Detail.macAddr
-                $SlotType   = Get-FirstPropertyValue $Detail @('slotType','slot') ''
+            if ($null -ne $iface.name -and "$($iface.name)" -ne '') {
+                $bondNames += "$($iface.name)"
+            }
 
-                foreach ($Uplink in @($Detail.uplinkSwitchInfo)) {
-                    if ($null -eq $Uplink) { continue }
+            if ($null -ne $iface.mtu -and "$($iface.mtu)" -ne '') {
+                $mtus += "$($iface.mtu)"
+            }
 
-                    foreach ($ActualSwitch in @($Uplink.sysName)) {
-                        if ([string]::IsNullOrWhiteSpace([string]$ActualSwitch)) { continue }
-                        if (-not (Test-SwitchMatch -Requested $RequestedSwitch -Actual $ActualSwitch)) { continue }
+            foreach ($slave in @($iface.bondSlaves)) {
+                if ($null -ne $slave -and "$slave" -ne '') {
+                    $bondSlaves += "$slave"
+                }
+            }
 
-                        $SwitchSeen = $true
-                        $PortNames = @(Get-PortNames -PortId $Uplink.portId)
+            foreach ($bsd in @($iface.bondSlavesDetails)) {
+                if ($null -eq $bsd) { continue }
 
-                        # One row per switch match. The enclosing interface details
-                        # come directly from the exact node/iface/detail that owns it.
-                        $PortMatch = @($PortNames | Where-Object {
-                            (Normalize-Text $_) -eq (Normalize-Text $RequestedPort)
-                        }).Count -gt 0
+                if ($null -ne $bsd.linkState -and "$($bsd.linkState)" -ne '') {
+                    $linkStates += "$($bsd.linkState)"
+                }
 
-                        $Matches.Add([pscustomobject]@{
-                            RequestedSwitch    = $RequestedSwitch
-                            RequestedInterface = $RequestedPort
-                            SwitchFQDN         = [string]$ActualSwitch
-                            ReturnedPorts      = To-CleanList $PortNames
-                            PortMatched        = $PortMatch
-                            Cluster            = $ClusterName
-                            NodeID             = [string]$Node.nodeId
-                            NodeIP             = [string]$Node.nodeIp
-                            ChassisSerial      = [string]$Node.chassisSerial
-                            Bond               = [string]$BondName
-                            BondingMode        = [string]$BondingMode
-                            ActiveSlave        = [string]$ActiveBondSlave
-                            BondSlave          = [string]$BondSlave
-                            LinkState          = [string]$LinkState
-                            SlaveSpeed         = [string]$SlaveSpeed
-                            MTU                = [string]$MTU
-                            MacAddress         = [string]$MacAddress
-                            SlotType           = [string]$SlotType
-                            RxErrors           = [string]$RxErrors
-                            RxDropped          = [string]$RxDropped
-                            TxErrors           = [string]$TxErrors
-                            TxDropped          = [string]$TxDropped
-                            Status             = if ($PortMatch) { 'SWITCH + PORT MATCH' } else { 'SWITCH MATCH; PORT DIFFERENT' }
-                        })
+                if ($null -ne $bsd.macAddr -and "$($bsd.macAddr)" -ne '') {
+                    $macs += "$($bsd.macAddr)"
+                }
+
+                if ($null -ne $bsd.speed -and "$($bsd.speed)" -ne '') {
+                    $speeds += "$($bsd.speed)"
+                }
+
+                if ($bsd.uplinkSwitchInfo) {
+                    foreach ($usi in @($bsd.uplinkSwitchInfo)) {
+                        if ($null -eq $usi) { continue }
+
+                        if ($null -ne $usi.sysName -and "$($usi.sysName)" -ne '') {
+                            $switchInfos += "$($usi.sysName)"
+                        }
+
+                        if ($null -ne $usi.portId -and "$($usi.portId)" -ne '') {
+                            $portIds += "$($usi.portId)"
+                        }
                     }
                 }
             }
+
+            foreach ($slot in @($iface.bondSlavesSlotTypes)) {
+                if ($null -ne $slot -and "$slot" -ne '') {
+                    $slotTypes += "$slot"
+                }
+            }
+        }
+
+        $AllRows += [pscustomobject]@{
+            Cluster              = $clusterName
+            NodeID               = "$($node.nodeId)"
+            NodeIP               = $node.nodeIp
+            ChassisSerial        = $node.chassisSerial
+            BondName             = $bondNames
+            MTU                  = $mtus
+            BondSlaves           = $bondSlaves
+            SlaveInterfaceStatus = $linkStates
+            MAC                  = $macs
+            SlaveSpeed           = $speeds
+            SlotType             = $slotTypes
+            SwitchInfo           = $switchInfos
+            PortId               = $portIds
         }
     }
 }
 
+if (-not $AllRows -or $AllRows.Count -eq 0) {
+    Write-Host 'No rows collected from interface API.' -ForegroundColor Yellow
+    if ($Failures.Count -gt 0) {
+        $Failures | Format-Table Cluster, Error -AutoSize
+    }
+    return
+}
+
 # -----------------------------------------------------------------------------
-# 4) Output only the single target result
+# 4) ONLY NEW LOGIC: search the existing SwitchInfo array
 # -----------------------------------------------------------------------------
+$Matches = @($AllRows | Where-Object {
+    $Row = $_
+    @($Row.SwitchInfo | Where-Object {
+        Test-SwitchMatch -Requested $RequestedSwitch -Actual $_
+    }).Count -gt 0
+})
+
 Write-Host "`nRESULT" -ForegroundColor Cyan
 Write-Host '======' -ForegroundColor Cyan
 
-if (-not $SwitchSeen) {
-    Write-Host "Switch '$RequestedSwitch' was NOT found in uplinkSwitchInfo.sysName." -ForegroundColor Yellow
-}
-else {
-    $Exact = @($Matches | Where-Object { $_.PortMatched })
-    $Display = if ($Exact.Count -gt 0) { $Exact } else { @($Matches) }
+if ($Matches.Count -eq 0) {
+    Write-Host "Switch '$RequestedSwitch' was NOT found in the collected SwitchInfo values." -ForegroundColor Yellow
 
-    $Display |
-        Format-Table RequestedSwitch, RequestedInterface, SwitchFQDN, ReturnedPorts,
-            Cluster, NodeID, NodeIP, Bond, BondSlave, LinkState, SlaveSpeed, MTU,
-            MacAddress, RxErrors, RxDropped, TxErrors, TxDropped, Status -AutoSize
-
-    if ($Exact.Count -eq 0) {
-        Write-Host "`nSwitch matched, but requested interface '$RequestedPort' was not one of the returned ports above." -ForegroundColor Yellow
-    }
+    # Small diagnostic only: show near evidence without dumping the estate.
+    $Available = @($AllRows.SwitchInfo | ForEach-Object { $_ } | Where-Object { $_ } | Sort-Object -Unique)
+    Write-Host "Collected SwitchInfo count: $($Available.Count)" -ForegroundColor DarkGray
+    return
 }
 
-# Save only this single-target validation result.
-if ($Matches.Count -gt 0) {
-    if (-not (Test-Path -LiteralPath $HistoryDir)) {
-        New-Item -Path $HistoryDir -ItemType Directory -Force | Out-Null
-    }
+$DisplayRows = $Matches | Select-Object `
+    Cluster,
+    NodeID,
+    NodeIP,
+    ChassisSerial,
+    @{n='BondName'; e={ To-CsvList $_.BondName }},
+    @{n='MTU'; e={ To-CsvList $_.MTU }},
+    @{n='BondSlaves'; e={ To-CsvList $_.BondSlaves }},
+    @{n='SlaveInterfaceStatus'; e={ To-CsvList $_.SlaveInterfaceStatus }},
+    @{n='MAC'; e={ To-CsvList $_.MAC }},
+    @{n='SlaveSpeed'; e={ To-CsvList $_.SlaveSpeed }},
+    @{n='SlotType'; e={ To-CsvList $_.SlotType }},
+    @{n='SwitchInfo'; e={ To-CsvList $_.SwitchInfo }},
+    @{n='PortId'; e={ To-CsvList $_.PortId }}
 
-    $Timestamp = Get-Date -Format 'yyyyMMdd_HHmmss'
-    $CsvPath = Join-Path $HistoryDir "Interface_Single_Target_$Timestamp.csv"
-    $Matches | Export-Csv -Path $CsvPath -NoTypeInformation -Encoding UTF8
-    Write-Host "`nSaved snapshot: $CsvPath" -ForegroundColor DarkGray
-}
+$DisplayRows | Format-List
+
+Write-Host "Matched node rows: $($Matches.Count)" -ForegroundColor Green
+Write-Host 'This build intentionally stops here. If this data is correct, port-specific correlation is the next step.' -ForegroundColor DarkGray
 
 if ($Failures.Count -gt 0) {
     Write-Host "`nClusters that could not be queried:" -ForegroundColor Yellow
