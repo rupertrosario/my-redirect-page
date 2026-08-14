@@ -3,7 +3,9 @@
 # PowerShell 5.1 compatible
 #
 # Reuses the proven /public/interface collection used by
-# Cohesity_Interface_Health_Stats.ps1 and only adds uplinkSwitchInfo filtering.
+# Cohesity_Interface_Health_Stats.ps1 and only adds target filtering.
+# Nested Cohesity arrays/objects are expanded into logical scalar rows before
+# matching or displaying; object renderings are never written to output cells.
 
 param(
     [string]$TargetsFile = 'X:\PowerShell\Cohesity_Automations\Interface\Interface_Diagnosis_Targets.txt',
@@ -46,7 +48,7 @@ function Invoke-CohesityGet {
     Invoke-RestMethod -Method Get -Uri $Uri -Headers $Headers -ErrorAction Stop
 }
 
-function Get-FirstPropertyValue {
+function Get-PropertyValue {
     param(
         [AllowNull()][object]$InputObject,
         [Parameter(Mandatory)][string[]]$PropertyNames,
@@ -62,6 +64,98 @@ function Get-FirstPropertyValue {
         }
     }
 
+    return $DefaultValue
+}
+
+# Recursively return only actual scalar values. Never stringify a PSCustomObject,
+# because that is what produced cells such as "ifname Ethernet11 ..." and
+# System.Object[]/property dumps.
+function Get-ScalarValues {
+    param(
+        [AllowNull()][object]$Value,
+        [string[]]$PreferredProperties = @()
+    )
+
+    $Out = [System.Collections.Generic.List[string]]::new()
+
+    function Add-ScalarValue {
+        param([AllowNull()][object]$Item)
+
+        if ($null -eq $Item) { return }
+
+        if ($Item -is [string]) {
+            $Text = $Item.Trim()
+            if ($Text) { $Out.Add($Text) }
+            return
+        }
+
+        if ($Item -is [bool] -or
+            $Item -is [byte] -or $Item -is [sbyte] -or
+            $Item -is [int16] -or $Item -is [uint16] -or
+            $Item -is [int32] -or $Item -is [uint32] -or
+            $Item -is [int64] -or $Item -is [uint64] -or
+            $Item -is [single] -or $Item -is [double] -or $Item -is [decimal]) {
+            $Out.Add([string]$Item)
+            return
+        }
+
+        if ($Item -is [System.Collections.IEnumerable] -and $Item -isnot [string] -and $Item -isnot [System.Collections.IDictionary]) {
+            foreach ($Child in $Item) { Add-ScalarValue $Child }
+            return
+        }
+
+        foreach ($Name in $PreferredProperties) {
+            $P = $Item.PSObject.Properties[$Name]
+            if ($null -ne $P -and $null -ne $P.Value) {
+                $Before = $Out.Count
+                Add-ScalarValue $P.Value
+                if ($Out.Count -gt $Before) { return }
+            }
+        }
+
+        # Unknown complex objects are deliberately not converted to strings.
+        return
+    }
+
+    Add-ScalarValue $Value
+    return @($Out | Where-Object { $_ } | Select-Object -Unique)
+}
+
+function Get-FieldValues {
+    param(
+        [AllowNull()][object]$Object,
+        [Parameter(Mandatory)][string[]]$PropertyNames,
+        [string[]]$NestedPreferredProperties = @()
+    )
+
+    $Raw = Get-PropertyValue -InputObject $Object -PropertyNames $PropertyNames -DefaultValue $null
+    return @(Get-ScalarValues -Value $Raw -PreferredProperties $NestedPreferredProperties)
+}
+
+function Get-OneValue {
+    param(
+        [AllowNull()][object]$Object,
+        [Parameter(Mandatory)][string[]]$PropertyNames,
+        [string[]]$NestedPreferredProperties = @(),
+        [string]$DefaultValue = ''
+    )
+
+    $Values = @(Get-FieldValues -Object $Object -PropertyNames $PropertyNames -NestedPreferredProperties $NestedPreferredProperties)
+    if ($Values.Count -eq 0) { return $DefaultValue }
+    return $Values[0]
+}
+
+function Get-IndexedValue {
+    param(
+        [object[]]$Values,
+        [int]$Index,
+        [string]$DefaultValue = ''
+    )
+
+    $Items = @($Values)
+    if ($Items.Count -eq 0) { return $DefaultValue }
+    if ($Items.Count -eq 1) { return [string]$Items[0] }
+    if ($Index -lt $Items.Count) { return [string]$Items[$Index] }
     return $DefaultValue
 }
 
@@ -89,7 +183,6 @@ function Test-SwitchMatch {
 
     if (-not $RequestedFull -or -not $ActualFull) { return $false }
     if ($RequestedFull -eq $ActualFull) { return $true }
-
     return (Get-ShortHostName $RequestedFull) -eq (Get-ShortHostName $ActualFull)
 }
 
@@ -99,8 +192,9 @@ function Get-Counter {
         [string[]]$Names
     )
 
-    $Value = Get-FirstPropertyValue -InputObject $Stats -PropertyNames $Names -DefaultValue 0
-    try { return [uint64]$Value } catch { return [uint64]0 }
+    $Values = @(Get-FieldValues -Object $Stats -PropertyNames $Names)
+    if ($Values.Count -eq 0) { return [uint64]0 }
+    try { return [uint64]$Values[0] } catch { return [uint64]0 }
 }
 
 function To-DisplayValue {
@@ -109,51 +203,45 @@ function To-DisplayValue {
     return [string]$Value
 }
 
-# Cohesity can return uplinkSwitchInfo.portId as an object/array rather than
-# a scalar string. In the observed payload the actual switch port is in ifname.
-# Flatten every returned port into a clean string before matching.
-function Get-UplinkPortNames {
+# Expand one uplinkSwitchInfo object into scalar switch/port pairs. This handles:
+# - one switch + one port
+# - one switch + many ports
+# - parallel arrays of switches and ports
+function Get-UplinkPairs {
     param([AllowNull()][object]$Uplink)
 
     if ($null -eq $Uplink) { return @() }
 
-    $RawPortId = Get-FirstPropertyValue -InputObject $Uplink -PropertyNames @('portId') -DefaultValue $null
-    if ($null -eq $RawPortId) { return @() }
+    $SwitchNames = @(Get-FieldValues -Object $Uplink -PropertyNames @('sysName','name'))
+    $PortIdsRaw = Get-PropertyValue -InputObject $Uplink -PropertyNames @('portId') -DefaultValue $null
+    $PortNames = @(Get-ScalarValues -Value $PortIdsRaw -PreferredProperties @('ifname','ifName','name','portName','interfaceName'))
 
-    $Ports = [System.Collections.Generic.List[string]]::new()
+    if ($SwitchNames.Count -eq 0 -or $PortNames.Count -eq 0) { return @() }
 
-    foreach ($Item in @($RawPortId)) {
-        if ($null -eq $Item) { continue }
+    $Pairs = [System.Collections.Generic.List[object]]::new()
 
-        if ($Item -is [string]) {
-            $Text = $Item.Trim()
-            if (-not $Text) { continue }
-
-            # Handles text such as "ifname Ethernet11" if PowerShell/string
-            # rendering has already flattened the object.
-            if ($Text -match '(?i)^ifname\s+(.+)$') {
-                $Ports.Add($Matches[1].Trim())
-            }
-            else {
-                $Ports.Add($Text)
-            }
-            continue
+    if ($SwitchNames.Count -eq 1) {
+        foreach ($Port in $PortNames) {
+            $Pairs.Add([pscustomobject]@{ SwitchFQDN = $SwitchNames[0]; PortId = $Port })
         }
-
-        $IfName = Get-FirstPropertyValue -InputObject $Item -PropertyNames @('ifname','ifName','name','portName','interfaceName') -DefaultValue $null
-        if ($null -ne $IfName -and -not [string]::IsNullOrWhiteSpace([string]$IfName)) {
-            $Ports.Add(([string]$IfName).Trim())
-            continue
-        }
-
-        # Last-resort representation for unexpected releases, without guessing.
-        $Text = ([string]$Item).Trim()
-        if ($Text -match '(?i)^ifname\s+(.+)$') {
-            $Ports.Add($Matches[1].Trim())
-        }
+        return @($Pairs)
     }
 
-    return @($Ports | Where-Object { $_ } | Select-Object -Unique)
+    if ($PortNames.Count -eq 1) {
+        foreach ($Switch in $SwitchNames) {
+            $Pairs.Add([pscustomobject]@{ SwitchFQDN = $Switch; PortId = $PortNames[0] })
+        }
+        return @($Pairs)
+    }
+
+    # When both are arrays, preserve positional correlation instead of creating
+    # a cross-product that could invent mappings.
+    $Count = [Math]::Min($SwitchNames.Count, $PortNames.Count)
+    for ($i = 0; $i -lt $Count; $i++) {
+        $Pairs.Add([pscustomobject]@{ SwitchFQDN = $SwitchNames[$i]; PortId = $PortNames[$i] })
+    }
+
+    return @($Pairs)
 }
 
 # ============================================================================
@@ -205,8 +293,8 @@ $AllRows = [System.Collections.Generic.List[object]]::new()
 $Failures = [System.Collections.Generic.List[object]]::new()
 
 foreach ($Cluster in ($Clusters | Sort-Object clusterName)) {
-    $ClusterName = [string]$Cluster.clusterName
-    $ClusterId = $Cluster.clusterId
+    $ClusterName = Get-OneValue -Object $Cluster -PropertyNames @('clusterName','name') -DefaultValue ''
+    $ClusterId = Get-OneValue -Object $Cluster -PropertyNames @('clusterId','id') -DefaultValue ''
 
     $Headers = @{
         apiKey = $ApiKey
@@ -228,10 +316,14 @@ foreach ($Cluster in ($Clusters | Sort-Object clusterName)) {
     $Nodes = if ($Raw.PSObject.Properties['nodes']) { @($Raw.nodes) } else { @($Raw) }
 
     foreach ($Node in $Nodes) {
+        $NodeID = Get-OneValue -Object $Node -PropertyNames @('nodeId','id')
+        $NodeName = Get-OneValue -Object $Node -PropertyNames @('nodeName','name','hostname','hostName')
+        $NodeIP = Get-OneValue -Object $Node -PropertyNames @('nodeIp','ip')
+        $ChassisSerial = Get-OneValue -Object $Node -PropertyNames @('chassisSerial')
+
         foreach ($Iface in @($Node.interfaces)) {
             if ($null -eq $Iface) { continue }
 
-            # Reuse the existing collector's iface.stats logic exactly.
             $Stats = $Iface.stats
             $RxPkts = Get-Counter $Stats @('rxPkts','rxPackets')
             $RxBytes = Get-Counter $Stats @('rxBytes')
@@ -242,50 +334,69 @@ foreach ($Cluster in ($Clusters | Sort-Object clusterName)) {
             $TxErrors = Get-Counter $Stats @('txErr','txErrs','txErrors')
             $TxDropped = Get-Counter $Stats @('txDropped','txDrop','txDrops')
 
-            $BondName = Get-FirstPropertyValue $Iface @('name','interfaceName') ''
-            $MTU = Get-FirstPropertyValue $Iface @('mtu') $null
-            $BondingMode = Get-FirstPropertyValue $Iface @('bondingMode') ''
-            $ActiveSlave = Get-FirstPropertyValue $Iface @('activeBondSlave') ''
+            $BondNames = @(Get-FieldValues -Object $Iface -PropertyNames @('name','interfaceName'))
+            $Mtus = @(Get-FieldValues -Object $Iface -PropertyNames @('mtu'))
+            $BondModes = @(Get-FieldValues -Object $Iface -PropertyNames @('bondingMode'))
+            $ActiveSlaves = @(Get-FieldValues -Object $Iface -PropertyNames @('activeBondSlave'))
 
             foreach ($Detail in @($Iface.bondSlavesDetails)) {
                 if ($null -eq $Detail) { continue }
 
-                $BondSlave = Get-FirstPropertyValue $Detail @('name','@name','ifaceName','interfaceName','nicName') ''
-                $LinkState = Get-FirstPropertyValue $Detail @('linkState','state','status') ''
-                $SlaveSpeed = Get-FirstPropertyValue $Detail @('speed') $null
-                $MacAddress = Get-FirstPropertyValue $Detail @('macAddr','mac','macAddress','mac_address') ''
-                $SlotType = Get-FirstPropertyValue $Detail @('slotType','slot') ''
+                $BondSlaves = @(Get-FieldValues -Object $Detail -PropertyNames @('name','@name','ifaceName','interfaceName','nicName'))
+                $LinkStates = @(Get-FieldValues -Object $Detail -PropertyNames @('linkState','state','status'))
+                $SlaveSpeeds = @(Get-FieldValues -Object $Detail -PropertyNames @('speed'))
+                $MacAddresses = @(Get-FieldValues -Object $Detail -PropertyNames @('macAddr','mac','macAddress','mac_address'))
+                $SlotTypes = @(Get-FieldValues -Object $Detail -PropertyNames @('slotType','slot'))
+                $Uplinks = @($Detail.uplinkSwitchInfo)
 
-                foreach ($Uplink in @($Detail.uplinkSwitchInfo)) {
-                    if ($null -eq $Uplink) { continue }
+                $DetailCount = @(
+                    $BondSlaves.Count,
+                    $LinkStates.Count,
+                    $SlaveSpeeds.Count,
+                    $MacAddresses.Count,
+                    $SlotTypes.Count,
+                    $Uplinks.Count
+                ) | Measure-Object -Maximum | Select-Object -ExpandProperty Maximum
 
-                    $SwitchFqdn = Get-FirstPropertyValue $Uplink @('sysName','name') ''
-                    $PortNames = @(Get-UplinkPortNames -Uplink $Uplink)
+                if (-not $DetailCount -or $DetailCount -lt 1) { $DetailCount = 1 }
 
-                    if (-not $SwitchFqdn -and $PortNames.Count -eq 0) { continue }
+                for ($i = 0; $i -lt $DetailCount; $i++) {
+                    $BondSlave = Get-IndexedValue -Values $BondSlaves -Index $i
+                    $LinkState = Get-IndexedValue -Values $LinkStates -Index $i
+                    $SlaveSpeed = Get-IndexedValue -Values $SlaveSpeeds -Index $i
+                    $MacAddress = Get-IndexedValue -Values $MacAddresses -Index $i
+                    $SlotType = Get-IndexedValue -Values $SlotTypes -Index $i
 
-                    # IMPORTANT: one row per actual ifname. Do not stringify the
-                    # complete portId object/array into one unusable PortId value.
-                    foreach ($PortName in $PortNames) {
+                    $BondName = Get-IndexedValue -Values $BondNames -Index $i
+                    $Mtu = Get-IndexedValue -Values $Mtus -Index $i
+                    $BondingMode = Get-IndexedValue -Values $BondModes -Index $i
+                    $ActiveSlave = Get-IndexedValue -Values $ActiveSlaves -Index $i
+
+                    $Uplink = $null
+                    if ($Uplinks.Count -eq 1) { $Uplink = $Uplinks[0] }
+                    elseif ($i -lt $Uplinks.Count) { $Uplink = $Uplinks[$i] }
+
+                    $Pairs = @(Get-UplinkPairs -Uplink $Uplink)
+                    foreach ($Pair in $Pairs) {
                         $AllRows.Add([pscustomobject]@{
                             Cluster = $ClusterName
-                            ClusterId = [string]$ClusterId
-                            NodeID = [string](Get-FirstPropertyValue $Node @('nodeId','id') '')
-                            NodeName = [string](Get-FirstPropertyValue $Node @('nodeName','name','hostname','hostName') '')
-                            NodeIP = [string](Get-FirstPropertyValue $Node @('nodeIp','ip') '')
-                            ChassisSerial = [string](Get-FirstPropertyValue $Node @('chassisSerial') '')
-                            Bond = [string]$BondName
-                            BondingMode = [string]$BondingMode
-                            ActiveSlave = [string]$ActiveSlave
-                            BondSlave = [string]$BondSlave
-                            LinkState = [string]$LinkState
+                            ClusterId = $ClusterId
+                            NodeID = $NodeID
+                            NodeName = $NodeName
+                            NodeIP = $NodeIP
+                            ChassisSerial = $ChassisSerial
+                            Bond = $BondName
+                            BondingMode = $BondingMode
+                            ActiveSlave = $ActiveSlave
+                            BondSlave = $BondSlave
+                            LinkState = $LinkState
                             SlaveSpeed = $SlaveSpeed
-                            MTU = $MTU
-                            MAC = [string]$MacAddress
-                            SlotType = [string]$SlotType
-                            SwitchFQDN = [string]$SwitchFqdn
-                            SwitchShort = Get-ShortHostName $SwitchFqdn
-                            PortId = [string]$PortName
+                            MTU = $Mtu
+                            MAC = $MacAddress
+                            SlotType = $SlotType
+                            SwitchFQDN = $Pair.SwitchFQDN
+                            SwitchShort = Get-ShortHostName $Pair.SwitchFQDN
+                            PortId = $Pair.PortId
                             RxPkts = $RxPkts
                             RxBytes = $RxBytes
                             RxErrors = $RxErrors
@@ -303,13 +414,13 @@ foreach ($Cluster in ($Clusters | Sort-Object clusterName)) {
 }
 
 if ($AllRows.Count -eq 0) {
-    Write-Host 'No usable uplinkSwitchInfo/portId records were returned by the interface endpoint.' -ForegroundColor Yellow
+    Write-Host 'No usable scalar uplinkSwitchInfo records were returned by the interface endpoint.' -ForegroundColor Yellow
     if ($Failures.Count -gt 0) { $Failures | Format-Table Cluster, ClusterId, Error -AutoSize }
     return
 }
 
 # ============================================================================
-# 4) Search collected data by switch + actual ifname
+# 4) Search collected scalar rows by switch + interface
 # ============================================================================
 $Results = [System.Collections.Generic.List[object]]::new()
 
@@ -347,7 +458,7 @@ foreach ($Target in $Targets) {
     })
 
     if ($PortRows.Count -eq 0) {
-        $ActualSwitch = @($SwitchRows.SwitchFQDN | Sort-Object -Unique) -join '; '
+        $ActualSwitch = @($SwitchRows.SwitchFQDN | Where-Object { $_ } | Sort-Object -Unique) -join '; '
         $ActualPorts = @($SwitchRows.PortId | Where-Object { $_ } | Sort-Object -Unique) -join '; '
 
         $Results.Add([pscustomobject]@{
@@ -355,7 +466,7 @@ foreach ($Target in $Targets) {
             RequestedInterface = $Target.Interface
             SwitchFQDN = $ActualSwitch
             PortId = $ActualPorts
-            Cluster = (@($SwitchRows.Cluster | Sort-Object -Unique) -join '; ')
+            Cluster = (@($SwitchRows.Cluster | Where-Object { $_ } | Sort-Object -Unique) -join '; ')
             NodeName = ''
             NodeID = ''
             NodeIP = ''
@@ -379,7 +490,7 @@ foreach ($Target in $Targets) {
             RequestedInterface = $Target.Interface
             SwitchFQDN = $Row.SwitchFQDN
             PortId = $Row.PortId
-            Cluster = $Row.Cluster
+            Cluster = (To-DisplayValue $Row.Cluster)
             NodeName = (To-DisplayValue $Row.NodeName)
             NodeID = (To-DisplayValue $Row.NodeID)
             NodeIP = (To-DisplayValue $Row.NodeIP)
