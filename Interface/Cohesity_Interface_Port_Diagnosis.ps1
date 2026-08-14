@@ -248,7 +248,9 @@ $DisplayRows = $Matches | Select-Object `
     TxErrors,
     TxDropped
 
-$DisplayRows | Format-Table -AutoSize
+# Render at a wide fixed width so PowerShell does not silently omit later columns
+# just because the interactive console is narrow.
+$DisplayRows | Format-Table -AutoSize | Out-String -Width 4096 | Write-Host
 Write-Host "`nMatched rows: $($Matches.Count)" -ForegroundColor Green
 
 if ($Failures.Count -gt 0) {
