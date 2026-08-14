@@ -64,10 +64,12 @@ function Test-SwitchMatch {
 function Get-PortName {
     param([AllowNull()][object]$PortValue)
     if ($null -eq $PortValue) { return '' }
+
     $IfNameProperty = $PortValue.PSObject.Properties['ifname']
     if ($null -ne $IfNameProperty -and $null -ne $IfNameProperty.Value) {
         return ([string]$IfNameProperty.Value).Trim()
     }
+
     $Text = ([string]$PortValue).Trim()
     if ($Text -match '^ifname\s+(.+)$') { return $Matches[1].Trim() }
     return $Text
@@ -83,38 +85,73 @@ function Test-PortMatch {
 function Get-StatValue {
     param([AllowNull()][object]$Stats,[Parameter(Mandatory)][string[]]$Names)
     if ($null -eq $Stats) { return 'NOT RETURNED' }
+
     foreach ($Name in $Names) {
         $Property = $Stats.PSObject.Properties[$Name]
-        if ($null -ne $Property -and $null -ne $Property.Value -and "$($Property.Value)" -ne '') { return "$($Property.Value)" }
+        if ($null -ne $Property -and $null -ne $Property.Value -and "$($Property.Value)" -ne '') {
+            return "$($Property.Value)"
+        }
     }
+
+    return 'NOT RETURNED'
+}
+
+function Get-AutoNegotiationValue {
+    param([AllowNull()][object]$BondSlaveDetail)
+
+    if ($null -eq $BondSlaveDetail) { return 'NOT RETURNED' }
+
+    # Do not assume a Cohesity field name. Use only a property that is actually
+    # present in the returned bondSlavesDetails object and clearly describes
+    # auto-negotiation.
+    foreach ($Property in @($BondSlaveDetail.PSObject.Properties)) {
+        $Name = [string]$Property.Name
+        if ($Name -match '(?i)auto.*(neg|negotiat)|(neg|negotiat).*auto') {
+            if ($null -ne $Property.Value -and "$($Property.Value)" -ne '') {
+                return "$($Property.Value)"
+            }
+        }
+    }
+
     return 'NOT RETURNED'
 }
 
 if (-not (Test-Path -LiteralPath $TargetsFile)) { throw "Targets file not found: $TargetsFile" }
 
-$TargetLine = Get-Content -LiteralPath $TargetsFile |
+# Read every valid target. Format: <switch> <ethernet/interface>
+$TargetLines = @(Get-Content -LiteralPath $TargetsFile |
     ForEach-Object { $_.Trim() } |
-    Where-Object { $_ -and -not $_.StartsWith('#') } |
-    Select-Object -First 1
+    Where-Object { $_ -and -not $_.StartsWith('#') })
 
-if (-not $TargetLine) { throw "No valid target found in $TargetsFile" }
+if ($TargetLines.Count -eq 0) { throw "No valid targets found in $TargetsFile" }
 
-$Parts = @($TargetLine -split '\s+', 2)
-if ($Parts.Count -lt 2) { throw 'Target must contain both switch and interface.' }
+$Targets = @()
+foreach ($TargetLine in $TargetLines) {
+    $Parts = @($TargetLine -split '\s+', 2)
+    if ($Parts.Count -lt 2) {
+        Write-Host "Skipping invalid target line: $TargetLine" -ForegroundColor Yellow
+        continue
+    }
 
-$RequestedSwitch = $Parts[0].Trim()
-$RequestedInterface = $Parts[1].Trim()
+    $Targets += [pscustomobject]@{
+        Switch    = $Parts[0].Trim()
+        Interface = $Parts[1].Trim()
+    }
+}
+
+if ($Targets.Count -eq 0) { throw 'No valid switch + interface target pairs were found.' }
 
 Write-Host "`nCOHESITY INTERFACE DIAGNOSIS" -ForegroundColor Cyan
-Write-Host "Switch    : $RequestedSwitch"
-Write-Host "Interface : $RequestedInterface"
+Write-Host "Targets loaded : $($Targets.Count)"
 
+# Cluster discovery - GET only.
 $clusterUrl = "$BaseUrl/v2/mcm/cluster-mgmt/info"
 $commonHeaders = @{ apiKey = $ApiKey }
 $clusterResponse = Invoke-RestMethod -Method Get -Uri $clusterUrl -Headers $commonHeaders
 $clusters = @($clusterResponse.cohesityClusters)
 if ($clusters.Count -eq 0) { throw 'No clusters were returned by Helios.' }
 
+# Known-good /public/interface collector - GET only.
 $url = "$BaseUrl/irisservices/api/v1/public/interface"
 $body = @{
     bondInterfaceOnly       = 'true'
@@ -127,6 +164,7 @@ $body = @{
 $AllRows = @()
 $Failures = @()
 
+# Collect the estate once. Do not re-query Cohesity for every target line.
 foreach ($cluster in ($clusters | Sort-Object clusterName)) {
     $clusterName = [string]$cluster.clusterName
     $clusterId = $cluster.clusterId
@@ -148,7 +186,7 @@ foreach ($cluster in ($clusters | Sort-Object clusterName)) {
         foreach ($iface in @($node.interfaces)) {
             if ($null -eq $iface) { continue }
 
-            $mtu = if ($null -ne $iface.mtu) { "$($iface.mtu)" } else { '' }
+            $mtu = if ($null -ne $iface.mtu) { "$($iface.mtu)" } else { 'NOT RETURNED' }
             $slotTypes = @($iface.bondSlavesSlotTypes | ForEach-Object { "$_" })
 
             $rxErrors  = Get-StatValue -Stats $iface.stats -Names @('rxErr','rxErrs','rxErrors')
@@ -159,10 +197,11 @@ foreach ($cluster in ($clusters | Sort-Object clusterName)) {
             foreach ($bsd in @($iface.bondSlavesDetails)) {
                 if ($null -eq $bsd) { continue }
 
-                $linkState = if ($null -ne $bsd.linkState) { "$($bsd.linkState)" } else { '' }
-                $mac = if ($null -ne $bsd.macAddr) { "$($bsd.macAddr)" } else { '' }
-                $speed = if ($null -ne $bsd.speed) { "$($bsd.speed)" } else { '' }
-                $slaveName = if ($null -ne $bsd.name) { "$($bsd.name)" } else { '' }
+                $linkState = if ($null -ne $bsd.linkState -and "$($bsd.linkState)" -ne '') { "$($bsd.linkState)" } else { 'NOT RETURNED' }
+                $mac = if ($null -ne $bsd.macAddr -and "$($bsd.macAddr)" -ne '') { "$($bsd.macAddr)" } else { 'NOT RETURNED' }
+                $speed = if ($null -ne $bsd.speed -and "$($bsd.speed)" -ne '') { "$($bsd.speed)" } else { 'NOT RETURNED' }
+                $slaveName = if ($null -ne $bsd.name -and "$($bsd.name)" -ne '') { "$($bsd.name)" } else { 'NOT RETURNED' }
+                $autoNegotiation = Get-AutoNegotiationValue -BondSlaveDetail $bsd
 
                 foreach ($usi in @($bsd.uplinkSwitchInfo)) {
                     if ($null -eq $usi) { continue }
@@ -182,6 +221,7 @@ foreach ($cluster in ($clusters | Sort-Object clusterName)) {
                             SlaveInterfaceStatus = $linkState
                             MAC                  = $mac
                             SlaveSpeed           = $speed
+                            AutoNegotiation      = $autoNegotiation
                             SlotType             = $slotTypes
                             SwitchInfo           = $switchInfo
                             PortId               = $portName
@@ -203,54 +243,66 @@ if (-not $AllRows -or $AllRows.Count -eq 0) {
     return
 }
 
-# Match BOTH the requested switch and requested Ethernet/interface.
-$Matches = @($AllRows | Where-Object {
-    (Test-SwitchMatch -Requested $RequestedSwitch -Actual $_.SwitchInfo) -and
-    (Test-PortMatch -Requested $RequestedInterface -Actual $_.PortId)
-})
+# Match every requested Switch + Ethernet pair against the one collected dataset.
+$Matches = @()
+$NotFound = @()
+
+foreach ($Target in $Targets) {
+    $TargetMatches = @($AllRows | Where-Object {
+        (Test-SwitchMatch -Requested $Target.Switch -Actual $_.SwitchInfo) -and
+        (Test-PortMatch -Requested $Target.Interface -Actual $_.PortId)
+    })
+
+    if ($TargetMatches.Count -gt 0) {
+        $Matches += $TargetMatches
+    }
+    else {
+        $NotFound += [pscustomobject]@{
+            Switch    = $Target.Switch
+            Ethernet  = $Target.Interface
+        }
+    }
+}
 
 Write-Host "`nRESULT" -ForegroundColor Cyan
 Write-Host '======' -ForegroundColor Cyan
 
-if ($Matches.Count -eq 0) {
-    $SwitchRows = @($AllRows | Where-Object { Test-SwitchMatch -Requested $RequestedSwitch -Actual $_.SwitchInfo })
-    if ($SwitchRows.Count -eq 0) {
-        Write-Host "Switch '$RequestedSwitch' was NOT found." -ForegroundColor Yellow
-    }
-    else {
-        Write-Host "Switch found, but interface '$RequestedInterface' was NOT found." -ForegroundColor Yellow
-        Write-Host 'Actual ports returned for this switch:' -ForegroundColor DarkGray
-        $SwitchRows.PortId | Where-Object { $_ } | Sort-Object -Unique | Format-Table -HideTableHeaders
-    }
-    return
+if ($Matches.Count -gt 0) {
+    $DisplayRows = $Matches | Select-Object `
+        @{n='Switch';e={$_.SwitchInfo}},
+        @{n='Ethernet';e={$_.PortId}},
+        Cluster,
+        NodeID,
+        NodeIP,
+        ChassisSerial,
+        BondSlave,
+        SlaveInterfaceStatus,
+        MAC,
+        SlaveSpeed,
+        AutoNegotiation,
+        MTU,
+        @{n='SlotType';e={To-CsvList $_.SlotType}},
+        RxErrors,
+        RxDropped,
+        TxErrors,
+        TxDropped
+
+    # One console table. Deliberately wide rendering preserves later columns.
+    $DisplayRows |
+        Format-Table -Property * -AutoSize |
+        Out-String -Width 1200 |
+        Write-Host
+
+    Write-Host "Matched rows: $($Matches.Count)" -ForegroundColor Green
+}
+else {
+    Write-Host 'No requested switch + Ethernet pairs were matched.' -ForegroundColor Yellow
 }
 
-# One console table. The formatter is rendered to a deliberately wide string so
-# PowerShell does not drop the later columns because of the host's normal width.
-$DisplayRows = $Matches | Select-Object `
-    @{n='Switch';e={$_.SwitchInfo}},
-    @{n='Ethernet';e={$_.PortId}},
-    Cluster,
-    NodeID,
-    NodeIP,
-    ChassisSerial,
-    BondSlave,
-    SlaveInterfaceStatus,
-    MAC,
-    SlaveSpeed,
-    MTU,
-    @{n='SlotType';e={To-CsvList $_.SlotType}},
-    RxErrors,
-    RxDropped,
-    TxErrors,
-    TxDropped
-
-$DisplayRows |
-    Format-Table -Property * -AutoSize |
-    Out-String -Width 1000 |
-    Write-Host
-
-Write-Host "`nMatched rows: $($Matches.Count)" -ForegroundColor Green
+if ($NotFound.Count -gt 0) {
+    Write-Host "`nTargets not found:" -ForegroundColor Yellow
+    $NotFound | Format-Table Switch, Ethernet -AutoSize
+}
 
 if ($Failures.Count -gt 0) {
     Write-Host "`nClusters that could not be queried:" -ForegroundColor Yellow
