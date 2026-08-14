@@ -3,15 +3,12 @@
 # PowerShell 5.1 compatible
 #
 # BASE: Cohesity_Interface_Health_Stats.ps1
-# This script intentionally keeps that working collector's endpoint, hierarchy,
-# and direct field access. It only adds:
-#   - encrypted API-key loading
-#   - uplinkSwitchInfo.sysName + portId.ifname extraction
-#   - filtering from Interface_Diagnosis_Targets.txt
-#   - timestamped CSV output
+# This script keeps that working collector's endpoint, hierarchy, statistics
+# scope and direct field access. It only adds encrypted auth, switch/port lookup,
+# target filtering and CSV history.
 
 param(
-    [string]$TargetsFile = 'X:\PowerShell\Cohesity_Automations\Interface\Interface_Diagnosis_Targets.txt',
+    [string]$TargetsFile = 'X:\PowerShell\Cohesity_API_Scripts\Interface_Diagnosis_Targets.txt',
     [string]$HistoryDir  = 'X:\PowerShell\Data\Cohesity\InterfaceDiagnosis'
 )
 
@@ -25,18 +22,12 @@ $EncryptedKeyFile = 'X:\PowerShell\Cohesity_API_Scripts\Common\Secure\cohesity_a
 # ============================================================================
 # 0) Existing encrypted API-key flow
 # ============================================================================
-if (-not (Test-Path -LiteralPath $AesHelper)) {
-    throw "AES helper not found: $AesHelper"
-}
-if (-not (Test-Path -LiteralPath $EncryptedKeyFile)) {
-    throw "Encrypted API key not found: $EncryptedKeyFile"
-}
+if (-not (Test-Path -LiteralPath $AesHelper)) { throw "AES helper not found: $AesHelper" }
+if (-not (Test-Path -LiteralPath $EncryptedKeyFile)) { throw "Encrypted API key not found: $EncryptedKeyFile" }
 
 . $AesHelper
 $ApiKey = Get-CohesityApiKeyFromAes -EncryptedFile $EncryptedKeyFile
-if ([string]::IsNullOrWhiteSpace([string]$ApiKey)) {
-    throw 'Empty Cohesity API key returned by AES helper.'
-}
+if ([string]::IsNullOrWhiteSpace([string]$ApiKey)) { throw 'Empty Cohesity API key returned by AES helper.' }
 
 # ============================================================================
 # Helpers
@@ -103,8 +94,7 @@ function Test-SwitchMatch {
     return (Get-ShortHostName $RequestedFull) -eq (Get-ShortHostName $ActualFull)
 }
 
-# portId is not always a plain string. In the observed response it contains
-# objects whose actual switch-interface name is in .ifname.
+# portId can be a string or an object/array whose actual switch interface is .ifname.
 function Get-PortNames {
     param([AllowNull()][object]$PortId)
 
@@ -115,12 +105,8 @@ function Get-PortNames {
 
         if ($Port -is [string]) {
             $Text = $Port.Trim()
-            if ($Text -match '^(?i)ifname\s+(.+)$') {
-                $Names += $Matches[1].Trim()
-            }
-            elseif ($Text) {
-                $Names += $Text
-            }
+            if ($Text -match '^(?i)ifname\s+(.+)$') { $Names += $Matches[1].Trim() }
+            elseif ($Text) { $Names += $Text }
             continue
         }
 
@@ -145,12 +131,44 @@ function Get-PortNames {
     return @($Names | Where-Object { $_ } | Select-Object -Unique)
 }
 
+function Add-ResultFromRow {
+    param(
+        [Parameter(Mandatory)][System.Collections.Generic.List[object]]$List,
+        [Parameter(Mandatory)][object]$Target,
+        [Parameter(Mandatory)][object]$Row,
+        [Parameter(Mandatory)][string]$Status
+    )
+
+    $List.Add([pscustomobject]@{
+        RequestedSwitch    = $Target.Switch
+        RequestedInterface = $Target.Interface
+        SwitchFQDN         = $Row.SwitchFQDN
+        PortId             = $Row.PortId
+        Cluster            = $Row.Cluster
+        NodeID             = $Row.NodeID
+        NodeIP             = $Row.NodeIP
+        ChassisSerial      = $Row.ChassisSerial
+        Bond               = $Row.Bond
+        BondingMode        = $Row.BondingMode
+        ActiveSlave        = $Row.ActiveSlave
+        BondSlave          = $Row.BondSlave
+        LinkState          = $Row.SlaveInterfaceStatus
+        SlaveSpeed         = $Row.SlaveSpeed
+        MTU                = $Row.MTU
+        MacAddress         = $Row.MacAddress
+        SlotType           = $Row.SlotType
+        RxErrors           = $Row.RxErrors
+        RxDropped          = $Row.RxDropped
+        TxErrors           = $Row.TxErrors
+        TxDropped          = $Row.TxDropped
+        Status             = $Status
+    })
+}
+
 # ============================================================================
 # 1) Load targets: <switch><space/tab><interface>
 # ============================================================================
-if (-not (Test-Path -LiteralPath $TargetsFile)) {
-    throw "Targets file not found: $TargetsFile"
-}
+if (-not (Test-Path -LiteralPath $TargetsFile)) { throw "Targets file not found: $TargetsFile" }
 
 $Targets = @()
 foreach ($RawLine in @(Get-Content -LiteralPath $TargetsFile)) {
@@ -169,9 +187,7 @@ foreach ($RawLine in @(Get-Content -LiteralPath $TargetsFile)) {
     }
 }
 
-if ($Targets.Count -eq 0) {
-    throw "No valid targets found in $TargetsFile"
-}
+if ($Targets.Count -eq 0) { throw "No valid targets found in $TargetsFile" }
 
 # ============================================================================
 # 2) SAME cluster discovery as Cohesity_Interface_Health_Stats.ps1
@@ -179,10 +195,7 @@ if ($Targets.Count -eq 0) {
 $ClusterUrl = "$BaseUrl/v2/mcm/cluster-mgmt/info"
 $ClusterResponse = Invoke-CohesityGet -Uri $ClusterUrl -Headers @{ apiKey = $ApiKey }
 $Clusters = @($ClusterResponse.cohesityClusters)
-
-if ($Clusters.Count -eq 0) {
-    throw 'No clusters were returned by Helios.'
-}
+if ($Clusters.Count -eq 0) { throw 'No clusters were returned by Helios.' }
 
 # ============================================================================
 # 3) SAME /public/interface request as Cohesity_Interface_Health_Stats.ps1
@@ -225,9 +238,8 @@ foreach ($Cluster in ($Clusters | Sort-Object clusterName)) {
         foreach ($Iface in @($Node.interfaces)) {
             if ($null -eq $Iface) { continue }
 
-            # EXACTLY the same statistics scope as the working health script.
+            # EXACT statistics scope and names from the working health collector.
             $Stats = $Iface.stats
-
             $RxPkts    = Get-FirstPropertyValue -InputObject $Stats -PropertyNames @('rxPkts','rxPackets')
             $RxBytes   = Get-FirstPropertyValue -InputObject $Stats -PropertyNames @('rxBytes')
             $RxErrors  = Get-FirstPropertyValue -InputObject $Stats -PropertyNames @('rxErr','rxErrs','rxErrors')
@@ -242,7 +254,7 @@ foreach ($Cluster in ($Clusters | Sort-Object clusterName)) {
             $BondingMode     = Get-FirstPropertyValue -InputObject $Iface -PropertyNames @('bondingMode') -DefaultValue ''
             $ActiveBondSlave = [string](Get-FirstPropertyValue -InputObject $Iface -PropertyNames @('activeBondSlave') -DefaultValue '')
 
-            # EXACT same per-slave loop used by the working health script.
+            # EXACT direct per-slave fields from the working health collector.
             foreach ($Detail in @($Iface.bondSlavesDetails)) {
                 if ($null -eq $Detail) { continue }
 
@@ -252,8 +264,7 @@ foreach ($Cluster in ($Clusters | Sort-Object clusterName)) {
                 $SlotType   = Get-FirstPropertyValue -InputObject $Detail -PropertyNames @('slotType','slot') -DefaultValue ''
                 $MacAddress = $Detail.macAddr
 
-                # ONLY extension: add switch + switch-port fields already returned
-                # under this exact bond-slave record.
+                # ONLY extension: switch/port fields from this bond-slave record.
                 foreach ($Uplink in @($Detail.uplinkSwitchInfo)) {
                     if ($null -eq $Uplink) { continue }
 
@@ -292,8 +303,6 @@ foreach ($Cluster in ($Clusters | Sort-Object clusterName)) {
                         }
                     }
                     else {
-                        # If both switch names and ports are arrays, preserve their
-                        # returned position rather than inventing a cross-product.
                         $Count = [Math]::Min($SwitchNames.Count, $PortNames.Count)
                         for ($i = 0; $i -lt $Count; $i++) {
                             $AllRows.Add([pscustomobject]@{
@@ -331,14 +340,12 @@ foreach ($Cluster in ($Clusters | Sort-Object clusterName)) {
 
 if ($AllRows.Count -eq 0) {
     Write-Host 'No usable uplink switch/interface rows were returned.' -ForegroundColor Yellow
-    if ($Failures.Count -gt 0) {
-        $Failures | Format-Table Cluster, ClusterId, Error -AutoSize
-    }
+    if ($Failures.Count -gt 0) { $Failures | Format-Table Cluster, ClusterId, Error -AutoSize }
     return
 }
 
 # ============================================================================
-# 4) Filter the clean rows using the TXT
+# 4) Filter clean rows using TXT targets
 # ============================================================================
 $Results = [System.Collections.Generic.List[object]]::new()
 
@@ -356,11 +363,16 @@ foreach ($Target in $Targets) {
             Cluster            = ''
             NodeID             = ''
             NodeIP             = ''
+            ChassisSerial      = ''
             Bond               = ''
+            BondingMode        = ''
+            ActiveSlave        = ''
             BondSlave          = ''
             LinkState          = ''
             SlaveSpeed         = ''
             MTU                = ''
+            MacAddress         = ''
+            SlotType           = ''
             RxErrors           = ''
             RxDropped          = ''
             TxErrors           = ''
@@ -375,65 +387,36 @@ foreach ($Target in $Targets) {
     })
 
     if ($PortRows.Count -eq 0) {
-        # Keep failure output concise; do not aggregate every returned field into
-        # giant cells. Show only the available clean port names for this switch.
-        $AvailablePorts = @($SwitchRows.PortId | Where-Object { $_ } | Sort-Object -Unique) -join ', '
-
-        $Results.Add([pscustomobject]@{
-            RequestedSwitch    = $Target.Switch
-            RequestedInterface = $Target.Interface
-            SwitchFQDN         = [string](@($SwitchRows.SwitchFQDN | Select-Object -First 1)[0])
-            PortId             = $AvailablePorts
-            Cluster            = ''
-            NodeID             = ''
-            NodeIP             = ''
-            Bond               = ''
-            BondSlave          = ''
-            LinkState          = ''
-            SlaveSpeed         = ''
-            MTU                = ''
-            RxErrors           = ''
-            RxDropped          = ''
-            TxErrors           = ''
-            TxDropped          = ''
-            Status             = 'SWITCH FOUND - INTERFACE NOT FOUND'
-        })
+        # IMPORTANT: do NOT blank the useful data. Show every actual row returned
+        # for the matched switch so the exact port mapping is visible.
+        foreach ($Row in ($SwitchRows | Sort-Object Cluster, NodeID, Bond, BondSlave, PortId)) {
+            Add-ResultFromRow -List $Results -Target $Target -Row $Row -Status 'PORT MISMATCH'
+        }
         continue
     }
 
     foreach ($Row in $PortRows) {
-        $Results.Add([pscustomobject]@{
-            RequestedSwitch    = $Target.Switch
-            RequestedInterface = $Target.Interface
-            SwitchFQDN         = $Row.SwitchFQDN
-            PortId             = $Row.PortId
-            Cluster            = $Row.Cluster
-            NodeID             = $Row.NodeID
-            NodeIP             = $Row.NodeIP
-            Bond               = $Row.Bond
-            BondSlave          = $Row.BondSlave
-            LinkState          = $Row.SlaveInterfaceStatus
-            SlaveSpeed         = $Row.SlaveSpeed
-            MTU                = $Row.MTU
-            RxErrors           = $Row.RxErrors
-            RxDropped          = $Row.RxDropped
-            TxErrors           = $Row.TxErrors
-            TxDropped          = $Row.TxDropped
-            Status             = if ((Normalize-Text $Row.SlaveInterfaceStatus) -match '^(up|active|connected)$') { 'UP' } else { 'CHECK LINK' }
-        })
+        $Status = if ((Normalize-Text $Row.SlaveInterfaceStatus) -match '^(up|active|connected)$') {
+            'UP'
+        }
+        else {
+            'CHECK LINK'
+        }
+
+        Add-ResultFromRow -List $Results -Target $Target -Row $Row -Status $Status
     }
 }
 
 # ============================================================================
-# 5) Concise output
+# 5) NOC-friendly output
 # ============================================================================
 Write-Host "`nCOHESITY INTERFACE DIAGNOSIS" -ForegroundColor Cyan
 Write-Host '============================' -ForegroundColor Cyan
 
 $Results |
     Format-Table RequestedSwitch, RequestedInterface, SwitchFQDN, PortId,
-        Cluster, NodeID, NodeIP, Bond, BondSlave, LinkState, SlaveSpeed,
-        MTU, RxErrors, RxDropped, TxErrors, TxDropped, Status -AutoSize
+        Cluster, NodeID, NodeIP, Bond, BondSlave, LinkState, SlaveSpeed, MTU,
+        RxErrors, RxDropped, TxErrors, TxDropped, Status -AutoSize
 
 if (-not (Test-Path -LiteralPath $HistoryDir)) {
     New-Item -Path $HistoryDir -ItemType Directory -Force | Out-Null
