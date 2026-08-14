@@ -24,15 +24,6 @@ if (-not (Test-Path -LiteralPath $EncryptedKeyFile)) { throw "Encrypted API key 
 $ApiKey = Get-CohesityApiKeyFromAes -EncryptedFile $EncryptedKeyFile
 if ([string]::IsNullOrWhiteSpace([string]$ApiKey)) { throw 'Empty Cohesity API key returned by AES helper.' }
 
-function To-CsvList {
-    param([object]$v)
-    if ($null -eq $v) { return '' }
-    $arr = @($v | ForEach-Object { "$_" } | Where-Object { $_ -ne '' })
-    if ($arr.Count -eq 0) { return '' }
-    if ($arr.Count -eq 1) { return $arr[0] }
-    return ($arr -join ' ; ')
-}
-
 function Normalize-Text {
     param([AllowNull()][object]$Value)
     if ($null -eq $Value) { return '' }
@@ -90,23 +81,6 @@ function Get-StatValue {
         $Property = $Stats.PSObject.Properties[$Name]
         if ($null -ne $Property -and $null -ne $Property.Value -and "$($Property.Value)" -ne '') {
             return "$($Property.Value)"
-        }
-    }
-
-    return 'NOT RETURNED'
-}
-
-function Get-AutoNegotiationValue {
-    param([AllowNull()][object]$BondSlaveDetail)
-
-    if ($null -eq $BondSlaveDetail) { return 'NOT RETURNED' }
-
-    foreach ($Property in @($BondSlaveDetail.PSObject.Properties)) {
-        $Name = [string]$Property.Name
-        if ($Name -match '(?i)auto.*(neg|negotiat)|(neg|negotiat).*auto') {
-            if ($null -ne $Property.Value -and "$($Property.Value)" -ne '') {
-                return "$($Property.Value)"
-            }
         }
     }
 
@@ -178,7 +152,8 @@ foreach ($cluster in ($clusters | Sort-Object clusterName)) {
         foreach ($iface in @($node.interfaces)) {
             if ($null -eq $iface) { continue }
 
-            $mtu = if ($null -ne $iface.mtu) { "$($iface.mtu)" } else { 'NOT RETURNED' }
+            $mtu = if ($null -ne $iface.mtu -and "$($iface.mtu)" -ne '') { "$($iface.mtu)" } else { 'NOT RETURNED' }
+            $bondingMode = if ($null -ne $iface.bondingMode -and "$($iface.bondingMode)" -ne '') { "$($iface.bondingMode)" } else { 'NOT RETURNED' }
 
             $rxErrors  = Get-StatValue -Stats $iface.stats -Names @('rxErr','rxErrs','rxErrors')
             $rxDropped = Get-StatValue -Stats $iface.stats -Names @('rxDropped','rxDrop','rxDrops')
@@ -193,7 +168,6 @@ foreach ($cluster in ($clusters | Sort-Object clusterName)) {
                 $speed = if ($null -ne $bsd.speed -and "$($bsd.speed)" -ne '') { "$($bsd.speed)" } else { 'NOT RETURNED' }
                 $slaveName = if ($null -ne $bsd.name -and "$($bsd.name)" -ne '') { "$($bsd.name)" } else { 'NOT RETURNED' }
                 $slot = if ($null -ne $bsd.slot -and "$($bsd.slot)" -ne '') { "$($bsd.slot)" } else { 'NOT RETURNED' }
-                $autoNegotiation = Get-AutoNegotiationValue -BondSlaveDetail $bsd
 
                 foreach ($usi in @($bsd.uplinkSwitchInfo)) {
                     if ($null -eq $usi) { continue }
@@ -208,12 +182,12 @@ foreach ($cluster in ($clusters | Sort-Object clusterName)) {
                             NodeID               = "$($node.nodeId)"
                             NodeIP               = $node.nodeIp
                             ChassisSerial        = $node.chassisSerial
+                            BondingMode          = $bondingMode
                             MTU                  = $mtu
                             BondSlave            = $slaveName
                             SlaveInterfaceStatus = $linkState
                             MAC                  = $mac
                             SlaveSpeed           = $speed
-                            AutoNegotiation      = $autoNegotiation
                             SlotType             = $slot
                             SwitchInfo           = $switchInfo
                             PortId               = $portName
@@ -249,8 +223,8 @@ foreach ($Target in $Targets) {
     }
     else {
         $NotFound += [pscustomobject]@{
-            Switch    = $Target.Switch
-            Ethernet  = $Target.Interface
+            Switch   = $Target.Switch
+            Ethernet = $Target.Interface
         }
     }
 }
@@ -267,10 +241,10 @@ if ($Matches.Count -gt 0) {
         NodeIP,
         ChassisSerial,
         BondSlave,
+        BondingMode,
         SlaveInterfaceStatus,
         MAC,
         SlaveSpeed,
-        AutoNegotiation,
         MTU,
         SlotType,
         RxErrors,
