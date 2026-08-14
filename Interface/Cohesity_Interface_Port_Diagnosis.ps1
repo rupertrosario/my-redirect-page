@@ -63,20 +63,13 @@ function Test-SwitchMatch {
 
 function Get-PortName {
     param([AllowNull()][object]$PortValue)
-
     if ($null -eq $PortValue) { return '' }
-
-    # Cohesity may return portId as a simple string or as an object containing ifname.
     $IfNameProperty = $PortValue.PSObject.Properties['ifname']
     if ($null -ne $IfNameProperty -and $null -ne $IfNameProperty.Value) {
         return ([string]$IfNameProperty.Value).Trim()
     }
-
     $Text = ([string]$PortValue).Trim()
-    if ($Text -match '^ifname\s+(.+)$') {
-        return $Matches[1].Trim()
-    }
-
+    if ($Text -match '^ifname\s+(.+)$') { return $Matches[1].Trim() }
     return $Text
 }
 
@@ -214,7 +207,6 @@ if (-not $AllRows -or $AllRows.Count -eq 0) {
     return
 }
 
-# Match BOTH switch and requested Ethernet/interface.
 $Matches = @($AllRows | Where-Object {
     (Test-SwitchMatch -Requested $RequestedSwitch -Actual $_.SwitchInfo) -and
     (Test-PortMatch -Requested $RequestedInterface -Actual $_.PortId)
@@ -225,7 +217,6 @@ Write-Host '======' -ForegroundColor Cyan
 
 if ($Matches.Count -eq 0) {
     $SwitchRows = @($AllRows | Where-Object { Test-SwitchMatch -Requested $RequestedSwitch -Actual $_.SwitchInfo })
-
     if ($SwitchRows.Count -eq 0) {
         Write-Host "Switch '$RequestedSwitch' was NOT found." -ForegroundColor Yellow
     }
@@ -239,6 +230,7 @@ if ($Matches.Count -eq 0) {
 
 $DisplayRows = $Matches | Select-Object `
     Cluster,
+    NodeID,
     NodeIP,
     ChassisSerial,
     BondName,
