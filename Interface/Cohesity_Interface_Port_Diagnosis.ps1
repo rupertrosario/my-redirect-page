@@ -6,18 +6,23 @@
 #   SWITCH-NAME WEC11
 #   SWITCH-NAME WEC12
 #
+# Switch matching is DNS-aware:
+#   TXT: switch01
+#   API: switch01.example.company.com
+# are treated as the same switch. The actual FQDN returned by Cohesity is kept
+# in the output.
+#
 # Design:
 #   1. Decrypt Cohesity API key using the existing AES helper.
 #   2. GET all accessible clusters.
 #   3. GET /irisservices/api/v1/public/interface for each cluster.
 #   4. Flatten interfaces[].bondSlavesDetails[].uplinkSwitchInfo[].
-#   5. Match target Switch -> sysName and Interface -> portId.
-#   6. Report the Cohesity node/bond/NIC details, MTU, speed, link state,
-#      RX/TX errors/drops, and a short counter delta.
+#   5. Match target Switch -> sysName (FQDN-aware) and Interface -> portId.
+#   6. Report node/bond/NIC, link, speed, MTU and RX/TX counters.
 #
 # NOTE: Interface counters are cumulative current counters. This API does not
-# provide previous-day/week snapshots by itself. This script also saves each
-# run to CSV so future runs can be compared historically.
+# provide previous-day/week snapshots by itself. Each run is saved to CSV so
+# future runs can be compared historically.
 
 param(
     [string]$TargetsFile = "$PSScriptRoot\Interface_Diagnosis_Targets.txt",
@@ -92,6 +97,41 @@ function Normalize-Text {
     return ([string]$Value).Trim().ToLowerInvariant()
 }
 
+function Normalize-SwitchFull {
+    param([AllowNull()][object]$Value)
+    $Text = Normalize-Text $Value
+    return $Text.TrimEnd('.')
+}
+
+function Normalize-SwitchShort {
+    param([AllowNull()][object]$Value)
+    $Text = Normalize-SwitchFull $Value
+    if ([string]::IsNullOrWhiteSpace($Text)) { return '' }
+    return ($Text -split '\.', 2)[0]
+}
+
+function Test-SwitchMatch {
+    param(
+        [AllowNull()][object]$Requested,
+        [AllowNull()][object]$Actual
+    )
+
+    $RequestedFull = Normalize-SwitchFull $Requested
+    $ActualFull    = Normalize-SwitchFull $Actual
+
+    if ([string]::IsNullOrWhiteSpace($RequestedFull) -or
+        [string]::IsNullOrWhiteSpace($ActualFull)) {
+        return $false
+    }
+
+    # Exact FQDN/name match first.
+    if ($RequestedFull -eq $ActualFull) { return $true }
+
+    # Then compare short DNS hostname. This intentionally handles:
+    # switch01  <-> switch01.company.example.com
+    return (Normalize-SwitchShort $RequestedFull) -eq (Normalize-SwitchShort $ActualFull)
+}
+
 function Get-CounterValue {
     param(
         [AllowNull()][object]$Stats,
@@ -100,6 +140,20 @@ function Get-CounterValue {
 
     $Value = Get-FirstValue -Object $Stats -Names $Names -Default 0
     try { return [uint64]$Value } catch { return [uint64]0 }
+}
+
+function Get-SafeDelta {
+    param(
+        [uint64]$Current,
+        [uint64]$Previous
+    )
+
+    # Counters can reset after reboot/interface reset. Do not report a huge
+    # negative/overflow delta in that case.
+    if ($Current -ge $Previous) {
+        return [int64]($Current - $Previous)
+    }
+    return [int64]0
 }
 
 # -----------------------------------------------------------------------------
@@ -193,8 +247,8 @@ function Get-DiagnosticSnapshot {
             foreach ($Iface in @($Node.interfaces)) {
                 if ($null -eq $Iface) { continue }
 
-                $BondName = Get-FirstValue $Iface @('name','interfaceName') 'UNKNOWN'
-                $Mtu      = Get-FirstValue $Iface @('mtu') 'UNKNOWN'
+                $BondName  = Get-FirstValue $Iface @('name','interfaceName') 'UNKNOWN'
+                $Mtu       = Get-FirstValue $Iface @('mtu') 'UNKNOWN'
                 $BondStats = $Iface.stats
 
                 foreach ($Member in @($Iface.bondSlavesDetails)) {
@@ -206,8 +260,8 @@ function Get-DiagnosticSnapshot {
                     $Mac        = Get-FirstValue $Member @('macAddr','macAddress','mac') 'UNKNOWN'
                     $Slot       = Get-FirstValue $Member @('slot','slotType') 'UNKNOWN'
 
-                    # Some releases expose member stats; older/proven payloads expose
-                    # stats on the parent interface. Prefer member stats when present.
+                    # Prefer physical-member counters when returned. Fall back to
+                    # parent bond counters on releases where member stats are absent.
                     $Stats = $Member.stats
                     $StatsScope = 'MEMBER'
                     if ($null -eq $Stats) {
@@ -240,6 +294,7 @@ function Get-DiagnosticSnapshot {
                             MAC           = [string]$Mac
                             Slot          = [string]$Slot
                             Switch        = [string]$SwitchName
+                            SwitchShort   = Normalize-SwitchShort $SwitchName
                             PortId        = [string]$PortId
                             StatsScope    = $StatsScope
                             RxErrors      = Get-CounterValue $Stats @('rxErrors','rxErr','rxErrs')
@@ -275,33 +330,71 @@ $SecondAll = @(Get-DiagnosticSnapshot)
 $Results = [System.Collections.Generic.List[object]]::new()
 
 foreach ($Target in $Targets) {
-    $Matches = @($SecondAll | Where-Object {
-        (Normalize-Text $_.Switch) -eq (Normalize-Text $Target.Switch) -and
+    # First find the switch. FQDN and short hostname are treated as equivalent.
+    $SwitchMatches = @($SecondAll | Where-Object {
+        Test-SwitchMatch -Requested $Target.Switch -Actual $_.Switch
+    })
+
+    if ($SwitchMatches.Count -eq 0) {
+        $Results.Add([pscustomobject]@{
+            RequestedSwitch = $Target.Switch
+            Switch          = 'NOT FOUND'
+            PortId          = $Target.PortId
+            AvailablePorts  = ''
+            Cluster         = ''
+            NodeId          = ''
+            NodeIp          = ''
+            Bond            = ''
+            Nic             = ''
+            Link            = ''
+            Speed           = ''
+            MTU             = ''
+            RxErrors        = ''
+            RxErrDelta      = ''
+            RxDropped       = ''
+            RxDropDelta     = ''
+            TxErrors        = ''
+            TxErrDelta      = ''
+            TxDropped       = ''
+            TxDropDelta     = ''
+            StatsScope      = ''
+            Status          = 'SWITCH NOT FOUND'
+        })
+        continue
+    }
+
+    # Once the switch is found, match the exact returned portId.
+    $Matches = @($SwitchMatches | Where-Object {
         (Normalize-Text $_.PortId) -eq (Normalize-Text $Target.PortId)
     })
 
     if ($Matches.Count -eq 0) {
+        $ActualSwitches = @($SwitchMatches.Switch | Sort-Object -Unique)
+        $AvailablePorts = @($SwitchMatches.PortId | Sort-Object -Unique)
+
         $Results.Add([pscustomobject]@{
-            Switch      = $Target.Switch
-            PortId      = $Target.PortId
-            Cluster     = 'NOT FOUND'
-            NodeId      = 'UNKNOWN'
-            NodeIp      = 'UNKNOWN'
-            Bond        = 'UNKNOWN'
-            Nic         = 'UNKNOWN'
-            Link        = 'UNKNOWN'
-            Speed       = 'UNKNOWN'
-            MTU         = 'UNKNOWN'
-            RxErrors    = 'UNKNOWN'
-            RxErrDelta  = 'UNKNOWN'
-            RxDropped   = 'UNKNOWN'
-            RxDropDelta = 'UNKNOWN'
-            TxErrors    = 'UNKNOWN'
-            TxErrDelta  = 'UNKNOWN'
-            TxDropped   = 'UNKNOWN'
-            TxDropDelta = 'UNKNOWN'
-            StatsScope  = 'UNKNOWN'
-            Status      = 'NOT FOUND'
+            RequestedSwitch = $Target.Switch
+            Switch          = ($ActualSwitches -join '; ')
+            PortId          = $Target.PortId
+            AvailablePorts  = ($AvailablePorts -join '; ')
+            Cluster         = ''
+            NodeId          = ''
+            NodeIp          = ''
+            Bond            = ''
+            Nic             = ''
+            Link            = ''
+            Speed           = ''
+            MTU             = ''
+            RxErrors        = ''
+            RxErrDelta      = ''
+            RxDropped       = ''
+            RxDropDelta     = ''
+            TxErrors        = ''
+            TxErrDelta      = ''
+            TxDropped       = ''
+            TxDropDelta     = ''
+            StatsScope      = ''
+            Status          = 'SWITCH FOUND - PORT NOT FOUND'
         })
         continue
     }
@@ -312,14 +405,14 @@ foreach ($Target in $Targets) {
             $_.NodeId -eq $Row.NodeId -and
             $_.Bond -eq $Row.Bond -and
             $_.Nic -eq $Row.Nic -and
-            (Normalize-Text $_.Switch) -eq (Normalize-Text $Row.Switch) -and
+            (Normalize-SwitchFull $_.Switch) -eq (Normalize-SwitchFull $Row.Switch) -and
             (Normalize-Text $_.PortId) -eq (Normalize-Text $Row.PortId)
         } | Select-Object -First 1
 
-        $RxErrDelta  = if ($Previous) { [int64]$Row.RxErrors  - [int64]$Previous.RxErrors  } else { 0 }
-        $RxDropDelta = if ($Previous) { [int64]$Row.RxDropped - [int64]$Previous.RxDropped } else { 0 }
-        $TxErrDelta  = if ($Previous) { [int64]$Row.TxErrors  - [int64]$Previous.TxErrors  } else { 0 }
-        $TxDropDelta = if ($Previous) { [int64]$Row.TxDropped - [int64]$Previous.TxDropped } else { 0 }
+        $RxErrDelta  = if ($Previous) { Get-SafeDelta $Row.RxErrors  $Previous.RxErrors  } else { 0 }
+        $RxDropDelta = if ($Previous) { Get-SafeDelta $Row.RxDropped $Previous.RxDropped } else { 0 }
+        $TxErrDelta  = if ($Previous) { Get-SafeDelta $Row.TxErrors  $Previous.TxErrors  } else { 0 }
+        $TxDropDelta = if ($Previous) { Get-SafeDelta $Row.TxDropped $Previous.TxDropped } else { 0 }
 
         $Status = if ((Normalize-Text $Row.Link) -ne 'up') {
             'LINK DOWN'
@@ -333,26 +426,28 @@ foreach ($Target in $Targets) {
         }
 
         $Results.Add([pscustomobject]@{
-            Switch      = $Row.Switch
-            PortId      = $Row.PortId
-            Cluster     = $Row.Cluster
-            NodeId      = $Row.NodeId
-            NodeIp      = $Row.NodeIp
-            Bond        = $Row.Bond
-            Nic         = $Row.Nic
-            Link        = $Row.Link
-            Speed       = $Row.Speed
-            MTU         = $Row.MTU
-            RxErrors    = $Row.RxErrors
-            RxErrDelta  = $RxErrDelta
-            RxDropped   = $Row.RxDropped
-            RxDropDelta = $RxDropDelta
-            TxErrors    = $Row.TxErrors
-            TxErrDelta  = $TxErrDelta
-            TxDropped   = $Row.TxDropped
-            TxDropDelta = $TxDropDelta
-            StatsScope  = $Row.StatsScope
-            Status      = $Status
+            RequestedSwitch = $Target.Switch
+            Switch          = $Row.Switch
+            PortId          = $Row.PortId
+            AvailablePorts  = ''
+            Cluster         = $Row.Cluster
+            NodeId          = $Row.NodeId
+            NodeIp          = $Row.NodeIp
+            Bond            = $Row.Bond
+            Nic             = $Row.Nic
+            Link            = $Row.Link
+            Speed           = $Row.Speed
+            MTU             = $Row.MTU
+            RxErrors        = $Row.RxErrors
+            RxErrDelta      = $RxErrDelta
+            RxDropped       = $Row.RxDropped
+            RxDropDelta     = $RxDropDelta
+            TxErrors        = $Row.TxErrors
+            TxErrDelta      = $TxErrDelta
+            TxDropped       = $Row.TxDropped
+            TxDropDelta     = $TxDropDelta
+            StatsScope      = $Row.StatsScope
+            Status          = $Status
         })
     }
 }
@@ -364,9 +459,17 @@ Write-Host "`nCOHESITY INTERFACE DIAGNOSIS" -ForegroundColor Cyan
 Write-Host "============================" -ForegroundColor Cyan
 
 $Results |
-    Format-Table Switch, PortId, Cluster, NodeId, NodeIp, Bond, Nic, Link, Speed, MTU,
-        RxErrors, RxErrDelta, RxDropped, TxErrors, TxErrDelta, TxDropped,
-        StatsScope, Status -AutoSize
+    Format-Table RequestedSwitch, Switch, PortId, Cluster, NodeId, NodeIp, Bond, Nic,
+        Link, Speed, MTU, RxErrors, RxErrDelta, RxDropped,
+        TxErrors, TxErrDelta, TxDropped, StatsScope, Status -AutoSize
+
+# Show useful lookup diagnostics only when a requested port was not found.
+$PortMisses = @($Results | Where-Object { $_.Status -eq 'SWITCH FOUND - PORT NOT FOUND' })
+if ($PortMisses.Count -gt 0) {
+    Write-Host "`nPORT LOOKUP DETAILS" -ForegroundColor Yellow
+    Write-Host "===================" -ForegroundColor Yellow
+    $PortMisses | Select-Object RequestedSwitch, Switch, PortId, AvailablePorts | Format-Table -AutoSize
+}
 
 # -----------------------------------------------------------------------------
 # 5. Save a timestamped snapshot for future day/week comparisons
