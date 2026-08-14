@@ -148,9 +148,7 @@ foreach ($cluster in ($clusters | Sort-Object clusterName)) {
         foreach ($iface in @($node.interfaces)) {
             if ($null -eq $iface) { continue }
 
-            $bondName = if ($null -ne $iface.name) { "$($iface.name)" } else { '' }
             $mtu = if ($null -ne $iface.mtu) { "$($iface.mtu)" } else { '' }
-            $bondSlaves = @($iface.bondSlaves | ForEach-Object { "$_" })
             $slotTypes = @($iface.bondSlavesSlotTypes | ForEach-Object { "$_" })
 
             $rxErrors  = Get-StatValue -Stats $iface.stats -Names @('rxErr','rxErrs','rxErrors')
@@ -179,9 +177,7 @@ foreach ($cluster in ($clusters | Sort-Object clusterName)) {
                             NodeID               = "$($node.nodeId)"
                             NodeIP               = $node.nodeIp
                             ChassisSerial        = $node.chassisSerial
-                            BondName             = $bondName
                             MTU                  = $mtu
-                            BondSlaves           = $bondSlaves
                             BondSlave            = $slaveName
                             SlaveInterfaceStatus = $linkState
                             MAC                  = $mac
@@ -207,6 +203,7 @@ if (-not $AllRows -or $AllRows.Count -eq 0) {
     return
 }
 
+# Match BOTH the requested switch and requested Ethernet/interface.
 $Matches = @($AllRows | Where-Object {
     (Test-SwitchMatch -Requested $RequestedSwitch -Actual $_.SwitchInfo) -and
     (Test-PortMatch -Requested $RequestedInterface -Actual $_.PortId)
@@ -228,28 +225,28 @@ if ($Matches.Count -eq 0) {
     return
 }
 
+# NOC table: show the exact matched switch/port first, then the node and the
+# single physical bond slave associated with that returned uplink record.
+# Do not show BondName/bond0.VLAN or the complete BondSlaves list.
 $DisplayRows = $Matches | Select-Object `
+    @{n='Switch';e={$_.SwitchInfo}},
+    @{n='Ethernet';e={$_.PortId}},
     Cluster,
     NodeID,
     NodeIP,
     ChassisSerial,
-    BondName,
-    MTU,
-    @{n='BondSlaves';e={To-CsvList $_.BondSlaves}},
     BondSlave,
     SlaveInterfaceStatus,
     MAC,
     SlaveSpeed,
+    MTU,
     @{n='SlotType';e={To-CsvList $_.SlotType}},
-    SwitchInfo,
-    PortId,
     RxErrors,
     RxDropped,
     TxErrors,
     TxDropped
 
-# Render at a wide fixed width so PowerShell does not silently omit later columns
-# just because the interactive console is narrow.
+# Render at a wide fixed width so PowerShell does not omit later columns.
 $DisplayRows | Format-Table -AutoSize | Out-String -Width 4096 | Write-Host
 Write-Host "`nMatched rows: $($Matches.Count)" -ForegroundColor Green
 
