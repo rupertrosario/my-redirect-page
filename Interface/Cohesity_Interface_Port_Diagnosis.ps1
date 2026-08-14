@@ -101,9 +101,6 @@ function Get-AutoNegotiationValue {
 
     if ($null -eq $BondSlaveDetail) { return 'NOT RETURNED' }
 
-    # Do not assume a Cohesity field name. Use only a property that is actually
-    # present in the returned bondSlavesDetails object and clearly describes
-    # auto-negotiation.
     foreach ($Property in @($BondSlaveDetail.PSObject.Properties)) {
         $Name = [string]$Property.Name
         if ($Name -match '(?i)auto.*(neg|negotiat)|(neg|negotiat).*auto') {
@@ -118,7 +115,6 @@ function Get-AutoNegotiationValue {
 
 if (-not (Test-Path -LiteralPath $TargetsFile)) { throw "Targets file not found: $TargetsFile" }
 
-# Read every valid target. Format: <switch> <ethernet/interface>
 $TargetLines = @(Get-Content -LiteralPath $TargetsFile |
     ForEach-Object { $_.Trim() } |
     Where-Object { $_ -and -not $_.StartsWith('#') })
@@ -144,14 +140,12 @@ if ($Targets.Count -eq 0) { throw 'No valid switch + interface target pairs were
 Write-Host "`nCOHESITY INTERFACE DIAGNOSIS" -ForegroundColor Cyan
 Write-Host "Targets loaded : $($Targets.Count)"
 
-# Cluster discovery - GET only.
 $clusterUrl = "$BaseUrl/v2/mcm/cluster-mgmt/info"
 $commonHeaders = @{ apiKey = $ApiKey }
 $clusterResponse = Invoke-RestMethod -Method Get -Uri $clusterUrl -Headers $commonHeaders
 $clusters = @($clusterResponse.cohesityClusters)
 if ($clusters.Count -eq 0) { throw 'No clusters were returned by Helios.' }
 
-# Known-good /public/interface collector - GET only.
 $url = "$BaseUrl/irisservices/api/v1/public/interface"
 $body = @{
     bondInterfaceOnly       = 'true'
@@ -164,14 +158,12 @@ $body = @{
 $AllRows = @()
 $Failures = @()
 
-# Collect the estate once. Do not re-query Cohesity for every target line.
 foreach ($cluster in ($clusters | Sort-Object clusterName)) {
     $clusterName = [string]$cluster.clusterName
     $clusterId = $cluster.clusterId
     $headers = @{ apiKey = $ApiKey; accessClusterId = $clusterId }
 
     try {
-        # STRICTLY GET.
         $responseIF = Invoke-WebRequest -Method Get -Uri $url -Headers $headers -Body $body
         $jsonIF = $responseIF.Content | ConvertFrom-Json
     }
@@ -187,7 +179,6 @@ foreach ($cluster in ($clusters | Sort-Object clusterName)) {
             if ($null -eq $iface) { continue }
 
             $mtu = if ($null -ne $iface.mtu) { "$($iface.mtu)" } else { 'NOT RETURNED' }
-            $slotTypes = @($iface.bondSlavesSlotTypes | ForEach-Object { "$_" })
 
             $rxErrors  = Get-StatValue -Stats $iface.stats -Names @('rxErr','rxErrs','rxErrors')
             $rxDropped = Get-StatValue -Stats $iface.stats -Names @('rxDropped','rxDrop','rxDrops')
@@ -201,6 +192,7 @@ foreach ($cluster in ($clusters | Sort-Object clusterName)) {
                 $mac = if ($null -ne $bsd.macAddr -and "$($bsd.macAddr)" -ne '') { "$($bsd.macAddr)" } else { 'NOT RETURNED' }
                 $speed = if ($null -ne $bsd.speed -and "$($bsd.speed)" -ne '') { "$($bsd.speed)" } else { 'NOT RETURNED' }
                 $slaveName = if ($null -ne $bsd.name -and "$($bsd.name)" -ne '') { "$($bsd.name)" } else { 'NOT RETURNED' }
+                $slot = if ($null -ne $bsd.slot -and "$($bsd.slot)" -ne '') { "$($bsd.slot)" } else { 'NOT RETURNED' }
                 $autoNegotiation = Get-AutoNegotiationValue -BondSlaveDetail $bsd
 
                 foreach ($usi in @($bsd.uplinkSwitchInfo)) {
@@ -222,7 +214,7 @@ foreach ($cluster in ($clusters | Sort-Object clusterName)) {
                             MAC                  = $mac
                             SlaveSpeed           = $speed
                             AutoNegotiation      = $autoNegotiation
-                            SlotType             = $slotTypes
+                            SlotType             = $slot
                             SwitchInfo           = $switchInfo
                             PortId               = $portName
                             RxErrors             = $rxErrors
@@ -243,7 +235,6 @@ if (-not $AllRows -or $AllRows.Count -eq 0) {
     return
 }
 
-# Match every requested Switch + Ethernet pair against the one collected dataset.
 $Matches = @()
 $NotFound = @()
 
@@ -281,13 +272,12 @@ if ($Matches.Count -gt 0) {
         SlaveSpeed,
         AutoNegotiation,
         MTU,
-        @{n='SlotType';e={To-CsvList $_.SlotType}},
+        SlotType,
         RxErrors,
         RxDropped,
         TxErrors,
         TxDropped
 
-    # One console table. Deliberately wide rendering preserves later columns.
     $DisplayRows |
         Format-Table -Property * -AutoSize |
         Out-String -Width 1200 |
