@@ -225,8 +225,8 @@ if ($Matches.Count -eq 0) {
     return
 }
 
-# Single full-width NOC table. Out-GridView avoids the console host width limit
-# and keeps every requested column in one horizontally scrollable table.
+# One console table. The formatter is rendered to a deliberately wide string so
+# PowerShell does not drop the later columns because of the host's normal width.
 $DisplayRows = $Matches | Select-Object `
     @{n='Switch';e={$_.SwitchInfo}},
     @{n='Ethernet';e={$_.PortId}},
@@ -245,7 +245,11 @@ $DisplayRows = $Matches | Select-Object `
     TxErrors,
     TxDropped
 
-$DisplayRows | Out-GridView -Title 'Cohesity Interface Diagnosis'
+$DisplayRows |
+    Format-Table -Property * -AutoSize |
+    Out-String -Width 1000 |
+    Write-Host
+
 Write-Host "`nMatched rows: $($Matches.Count)" -ForegroundColor Green
 
 if ($Failures.Count -gt 0) {
