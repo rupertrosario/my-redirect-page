@@ -24,9 +24,26 @@ If additional information is required, add fields already present in the returne
 - Never use POST, PUT, PATCH, DELETE, or configuration-changing operations.
 - Never remediate.
 
+## Local path convention
+
+For PowerShell defaults in this project, use the explicit local X: drive paths rather than `$PSScriptRoot` unless the user explicitly asks for portable paths.
+
+Use:
+
+```powershell
+param(
+    [string]$TargetsFile = 'X:\PowerShell\Cohesity_Automations\Interface\Interface_Diagnosis_Targets.txt',
+    [string]$HistoryDir  = 'X:\PowerShell\Data\Cohesity\InterfaceDiagnosis'
+)
+```
+
+Do not omit the `\Interface\` directory from the target-file path.
+
 ## Input
 
-Use `Interface/Interface_Diagnosis_Targets.txt` beside the diagnosis script.
+Use:
+
+`X:\PowerShell\Cohesity_Automations\Interface\Interface_Diagnosis_Targets.txt`
 
 One target per line:
 
