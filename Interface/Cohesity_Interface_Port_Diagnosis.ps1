@@ -87,29 +87,6 @@ function Get-StatValue {
     return 'NOT RETURNED'
 }
 
-function Get-ClusterVipValue {
-    param([AllowNull()][object]$Cluster)
-
-    if ($null -eq $Cluster) { return 'NOT RETURNED' }
-
-    # Do not assume a Cohesity VIP field name. Use only properties actually
-    # returned by /v2/mcm/cluster-mgmt/info whose names identify them as VIPs.
-    $VipValues = @()
-    foreach ($Property in @($Cluster.PSObject.Properties)) {
-        if ([string]$Property.Name -match '(?i)vip') {
-            foreach ($Value in @($Property.Value)) {
-                if ($null -ne $Value -and "$Value" -ne '') {
-                    $VipValues += "$Value"
-                }
-            }
-        }
-    }
-
-    $VipValues = @($VipValues | Where-Object { $_ } | Sort-Object -Unique)
-    if ($VipValues.Count -eq 0) { return 'NOT RETURNED' }
-    return ($VipValues -join ' ; ')
-}
-
 if (-not (Test-Path -LiteralPath $TargetsFile)) { throw "Targets file not found: $TargetsFile" }
 
 $TargetLines = @(Get-Content -LiteralPath $TargetsFile |
@@ -158,7 +135,6 @@ $Failures = @()
 foreach ($cluster in ($clusters | Sort-Object clusterName)) {
     $clusterName = [string]$cluster.clusterName
     $clusterId = $cluster.clusterId
-    $clusterVip = Get-ClusterVipValue -Cluster $cluster
     $headers = @{ apiKey = $ApiKey; accessClusterId = $clusterId }
 
     try {
@@ -203,7 +179,6 @@ foreach ($cluster in ($clusters | Sort-Object clusterName)) {
 
                         $AllRows += [pscustomobject]@{
                             Cluster              = $clusterName
-                            ClusterVIP           = $clusterVip
                             NodeID               = "$($node.nodeId)"
                             NodeIP               = $node.nodeIp
                             ChassisSerial        = $node.chassisSerial
@@ -262,7 +237,6 @@ if ($Matches.Count -gt 0) {
         @{n='Switch';e={$_.SwitchInfo}},
         @{n='Ethernet';e={$_.PortId}},
         Cluster,
-        ClusterVIP,
         NodeID,
         NodeIP,
         ChassisSerial,
