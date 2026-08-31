@@ -7,6 +7,8 @@
 //   authMode: "vault-name" | "vault-id" | "manual",
 //   count: <number>,
 //   failures: [ { ... } ],
+//   clusterWarningCount: <number>,
+//   clusterWarnings: [ { Cluster, Message, Detail } ],
 //   incidentText_create: "<plain text, NO FailedMessage>",
 //   incidentText_update: "<plain text, WITH FailedMessage>",
 //   markdownTable: "<markdown string including intro + table (NO Environment col, FULL Message)>",
@@ -59,14 +61,48 @@ export default async function () {
   // ------------------------------
   // 2) Helpers (GET-only)
   // ------------------------------
+  const REQUEST_TIMEOUT_MS = 30000;
+  const clusterWarnings = [];
+  const clusterWarningKeys = new Set();
+
+  function addClusterWarning(clusterName, detail) {
+    const name = String(clusterName || "Unknown cluster").trim() || "Unknown cluster";
+    if (clusterWarningKeys.has(name)) return;
+
+    clusterWarningKeys.add(name);
+    clusterWarnings.push({
+      Cluster: name,
+      Message: "Cluster could not be reached or fully queried during this workflow run. Manually check this cluster for backup failures.",
+      Detail: detail ? String(detail).replace(/[\r\n]+/g, " ").trim() : ""
+    });
+  }
+
   async function getJson(url, headers) {
-    const resp = await fetch(url, { method: "GET", headers: headers });
-    if (!resp.ok) {
-      let txt = "";
-      try { txt = await resp.text(); } catch (e) {}
-      throw new Error("GET " + url + " -> HTTP " + resp.status + " " + txt);
+    const controller = new AbortController();
+    const timeoutId = setTimeout(function () { controller.abort(); }, REQUEST_TIMEOUT_MS);
+
+    try {
+      const resp = await fetch(url, {
+        method: "GET",
+        headers: headers,
+        signal: controller.signal
+      });
+
+      if (!resp.ok) {
+        let txt = "";
+        try { txt = await resp.text(); } catch (e) {}
+        throw new Error("GET " + url + " -> HTTP " + resp.status + " " + txt);
+      }
+
+      return await resp.json();
+    } catch (e) {
+      if (e && e.name === "AbortError") {
+        throw new Error("GET timeout after " + (REQUEST_TIMEOUT_MS / 1000) + " seconds: " + url);
+      }
+      throw e;
+    } finally {
+      clearTimeout(timeoutId);
     }
-    return resp.json();
   }
 
   // Time in US Eastern (ET) WITHOUT appending EST/EDT in the value
@@ -232,6 +268,7 @@ export default async function () {
         headers
       );
     } catch (e) {
+      addClusterWarning(clusterName, "Protection Group " + pgName + ": " + (e && e.message ? e.message : String(e)));
       return [];
     }
 
@@ -473,6 +510,7 @@ export default async function () {
     try {
       pgData = await getJson(baseUrl + "/v2/data-protect/protection-groups?" + pgQuery, headers);
     } catch (e) {
+      addClusterWarning(clusterName, e && e.message ? e.message : String(e));
       return [];
     }
 
@@ -480,12 +518,21 @@ export default async function () {
     if (!pgs.length) return [];
 
     const pgPromises = pgs.map(function (pg) { return collectPgFailure(clusterName, headers, pg); });
-    const results = await Promise.all(pgPromises);
+    const results = await Promise.allSettled(pgPromises);
 
     const allRows = [];
     for (let i = 0; i < results.length; i++) {
-      const arr = results[i];
-      if (arr && arr.length) for (let j = 0; j < arr.length; j++) allRows.push(arr[j]);
+      const result = results[i];
+      if (result.status === "fulfilled") {
+        const arr = result.value;
+        if (arr && arr.length) {
+          for (let j = 0; j < arr.length; j++) allRows.push(arr[j]);
+        }
+      } else {
+        const pgName = pgs[i] && pgs[i].name ? pgs[i].name : "Unknown PG";
+        const reason = result.reason && result.reason.message ? result.reason.message : String(result.reason || "Unknown error");
+        addClusterWarning(clusterName, "Protection Group " + pgName + ": " + reason);
+      }
     }
     return allRows;
   }
@@ -494,17 +541,35 @@ export default async function () {
   // 5) Collect all clusters, flatten, sort
   // ------------------------------
   async function collectAllFailures() {
-    const clusterData = await getJson(baseUrl + "/v2/mcm/cluster-mgmt/info", commonHeaders);
+    let clusterData;
+    try {
+      clusterData = await getJson(baseUrl + "/v2/mcm/cluster-mgmt/info", commonHeaders);
+    } catch (e) {
+      addClusterWarning("ALL CLUSTERS", e && e.message ? e.message : String(e));
+      return [];
+    }
+
     const clusters = clusterData.cohesityClusters || [];
     if (!clusters.length) return [];
 
     const clusterPromises = clusters.map(function (cluster) { return collectClusterFailures(cluster); });
-    const clusterResults = await Promise.all(clusterPromises);
+    const clusterResults = await Promise.allSettled(clusterPromises);
 
     const allRows = [];
     for (let i = 0; i < clusterResults.length; i++) {
-      const arr = clusterResults[i];
-      if (arr && arr.length) for (let j = 0; j < arr.length; j++) allRows.push(arr[j]);
+      const result = clusterResults[i];
+      if (result.status === "fulfilled") {
+        const arr = result.value;
+        if (arr && arr.length) {
+          for (let j = 0; j < arr.length; j++) allRows.push(arr[j]);
+        }
+      } else {
+        const cluster = clusters[i] || {};
+        const clusterName =
+          cluster.name || cluster.clusterName || cluster.displayName || ("Unknown-" + cluster.clusterId);
+        const reason = result.reason && result.reason.message ? result.reason.message : String(result.reason || "Unknown error");
+        addClusterWarning(clusterName, reason);
+      }
     }
 
     // Sort by end time (usecs) desc
@@ -515,13 +580,49 @@ export default async function () {
     return allRows;
   }
 
+  function appendManualCheckWarning(lines) {
+    if (!clusterWarnings.length) return;
+
+    lines.push("WARNING - MANUAL CHECK REQUIRED");
+    lines.push("The following Cohesity cluster(s) could not be reached or fully queried. Backup failure results may be incomplete:");
+    for (let i = 0; i < clusterWarnings.length; i++) {
+      lines.push("- " + clusterWarnings[i].Cluster + " - manually check this cluster for backup failures.");
+    }
+    lines.push("");
+  }
+
+  function toWarningMarkdown() {
+    if (!clusterWarnings.length) return "";
+
+    const lines = [
+      "> ⚠️ **MANUAL CHECK REQUIRED**",
+      "> The following Cohesity cluster(s) could not be reached or fully queried. Backup failure results may be incomplete."
+    ];
+
+    for (let i = 0; i < clusterWarnings.length; i++) {
+      const clusterName = String(clusterWarnings[i].Cluster || "Unknown cluster").replace(/\|/g, " ");
+      lines.push("> - **" + clusterName + "** — manually check this cluster for backup failures.");
+    }
+
+    return lines.join("\n");
+  }
+
   // ------------------------------
   // 6) Incident text (create/update)
   // ------------------------------
   function toIncidentTextCreate(rows) {
-    if (!rows || rows.length === 0) return "✅ No FAILED backup runs without a later successful run.";
+    if ((!rows || rows.length === 0) && clusterWarnings.length === 0) {
+      return "✅ No FAILED backup runs without a later successful run.";
+    }
 
     const lines = [];
+    appendManualCheckWarning(lines);
+
+    if (!rows || rows.length === 0) {
+      lines.push("No FAILED backup runs were returned from the clusters that were successfully checked.");
+      return lines.join("\n");
+    }
+
     lines.push("=== Backup Failures Without a Later Successful Run ===");
     lines.push("");
     lines.push("Count: " + rows.length);
@@ -538,9 +639,18 @@ export default async function () {
   }
 
   function toIncidentTextUpdate(rows) {
-    if (!rows || rows.length === 0) return "✅ No FAILED backup runs without a later successful run.";
+    if ((!rows || rows.length === 0) && clusterWarnings.length === 0) {
+      return "✅ No FAILED backup runs without a later successful run.";
+    }
 
     const lines = [];
+    appendManualCheckWarning(lines);
+
+    if (!rows || rows.length === 0) {
+      lines.push("No FAILED backup runs were returned from the clusters that were successfully checked.");
+      return lines.join("\n");
+    }
+
     lines.push("=== Backup Failures Without a Later Successful Run ===");
     lines.push("");
     lines.push("Count: " + rows.length);
@@ -562,8 +672,14 @@ export default async function () {
   // 7) Email markdown table (NO Environment col, FULL Message)
   // ------------------------------
   function toMarkdownTable(rows) {
+    const warningMarkdown = toWarningMarkdown();
+
     if (!rows || rows.length === 0) {
-      return "✅ No FAILED backup runs without a later successful run.";
+      const noFailuresText = clusterWarnings.length
+        ? "✅ No FAILED backup runs were returned from the clusters that were successfully checked."
+        : "✅ No FAILED backup runs without a later successful run.";
+
+      return warningMarkdown ? warningMarkdown + "\n\n" + noFailuresText : noFailuresText;
     }
 
     // Markdown tables break if cells contain '|'
@@ -607,7 +723,8 @@ export default async function () {
       ""
     ];
 
-    return introLines.join("\n") + "\n" + [headerRow, separator].concat(bodyRows).join("\n");
+    const report = introLines.join("\n") + "\n" + [headerRow, separator].concat(bodyRows).join("\n");
+    return warningMarkdown ? warningMarkdown + "\n\n" + report : report;
   }
 
   // ------------------------------
@@ -620,6 +737,8 @@ export default async function () {
     authMode: authMode,
     count: failures.length,
     failures: failures,
+    clusterWarningCount: clusterWarnings.length,
+    clusterWarnings: clusterWarnings,
     incidentText_create: toIncidentTextCreate(failures),
     incidentText_update: toIncidentTextUpdate(failures),
     markdownTable: markdownTable,
