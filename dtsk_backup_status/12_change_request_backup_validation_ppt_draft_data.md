@@ -18,10 +18,19 @@
 ### Solution Overview
 
 - Enhanced Backup Status Report provides detailed read-only validation.
+- Runs through PowerShell and Cohesity Helios GET-only APIs.
 - Covers FS, SQL, Oracle, Hyper-V, Nutanix/AHV, and VM backups.
 - Captures ServerName, BackupType, ObjectName, SourceName, ClusterName, ProtectionGroup, and LastBackupTime.
 - Generates TXT and CSV outputs that can be attached to the Change Request.
 - Helps confirm backup coverage and identify gaps before Change Request approval.
+
+### How It Works
+
+- User provides the Change Request number and CI/server input file.
+- PowerShell reads the input and connects to Cohesity Helios using an API key.
+- GET-only API calls collect cluster information and search backup objects/protected objects.
+- Script applies workload-specific logic for FS, SQL, Oracle, Hyper-V, Nutanix/AHV, and VM results.
+- Final TXT and CSV reports are generated for Change Request review and attachment.
 
 ---
 
@@ -41,7 +50,7 @@
 | Criteria | Manual Process | Enhanced Process | Saving |
 |---|---:|---:|---:|
 | Scope | 1 Change Request / CI | 1 Change Request / CI | Same |
-| Cluster coverage | Up to 23 manual checks | Script-driven search | Manual lookup removed |
+| Cluster coverage | Up to 23 manual checks | PowerShell + API search | Manual lookup removed |
 | Time per cluster | 3-5 min | API-driven | Per-cluster effort avoided |
 | Time per request | 69-115 min | ~5-10 min review | ~59-110 min saved |
 | Output | Basic status | TXT + CSV details | Cleaner attachment support |
@@ -61,6 +70,7 @@
 
 - This is for Change Request backup validation, not backup-failure incident handling.
 - The validation is performed before Change Request approval or processing.
+- The implementation uses PowerShell with Cohesity Helios GET-only APIs.
 - The key improvement is detailed backup visibility in one report.
 - The report shows server, backup type, object, source, cluster, protection group, and last backup time.
 - TXT and CSV outputs can be attached to the Change Request as validation support.
