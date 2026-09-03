@@ -17,20 +17,12 @@
 
 ### Solution Overview
 
-- Enhanced Backup Status Report provides detailed read-only validation.
-- Runs through PowerShell and Cohesity Helios GET-only APIs.
+- Enhanced Backup Status Report provides detailed read-only validation through PowerShell.
+- Uses Cohesity Helios GET-only APIs to collect cluster information and search backup objects/protected objects.
 - Covers FS, SQL, Oracle, Hyper-V, Nutanix/AHV, and VM backups.
 - Captures ServerName, BackupType, ObjectName, SourceName, ClusterName, ProtectionGroup, and LastBackupTime.
 - Generates TXT and CSV outputs that can be attached to the Change Request.
 - Helps confirm backup coverage and identify gaps before Change Request approval.
-
-### How It Works
-
-- User provides the Change Request number and CI/server input file.
-- PowerShell reads the input and connects to Cohesity Helios using an API key.
-- GET-only API calls collect cluster information and search backup objects/protected objects.
-- Script applies workload-specific logic for FS, SQL, Oracle, Hyper-V, Nutanix/AHV, and VM results.
-- Final TXT and CSV reports are generated for Change Request review and attachment.
 
 ---
 
@@ -39,7 +31,7 @@
 ### Automation Benefits
 
 - Gives richer Change Request validation than basic backup-status output.
-- Reduces manual cluster-by-cluster checks.
+- Reduces manual cluster-by-cluster checks through PowerShell and Cohesity API validation.
 - Helps identify backup gaps before Change Request approval.
 - Supports faster validation decisions before the Change Request is processed.
 - Provides consistent TXT and CSV support files for Change Request attachment.
