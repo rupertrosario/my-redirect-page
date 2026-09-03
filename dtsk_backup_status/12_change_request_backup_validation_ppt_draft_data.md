@@ -11,8 +11,8 @@
 
 - Backup validation is required before a Change Request is approved or processed.
 - Earlier validation provided only basic backup-present or backup-status information.
-- The team still had to manually check backup type, object, source, cluster, protection group, and last backup time.
-- Manual validation across Cohesity clusters increased effort and delayed Change Request approval.
+- Backup type, source mapping, cluster, protection group, and last backup time were not always clear in one view.
+- Limited detail created ambiguity and follow-up review effort for unclear or gap-related validation cases.
 - Backup gaps were harder to identify early without a detailed validation report.
 
 ### Solution Overview
@@ -30,23 +30,22 @@
 
 ### Automation Benefits
 
-- Gives richer Change Request validation than basic backup-status output.
-- Reduces manual cluster-by-cluster checks through PowerShell and Cohesity API validation.
+- Improves CR validation from basic backup-status output to detailed backup coverage reporting.
+- Uses PowerShell with Cohesity Helios GET-only APIs for safe read-only validation.
 - Helps identify backup gaps before Change Request approval.
-- Supports faster validation decisions before the Change Request is processed.
-- Provides consistent TXT and CSV support files for Change Request attachment.
-- Keeps validation safe with GET-only/read-only execution.
+- Reduces ambiguity where backup exists but backup type, source mapping, cluster, protection group, or latest backup time is unclear.
+- Provides clearer details for validation decisions before the Change Request is processed.
+- Supports faster follow-up only for unclear or gap-related backup validation cases.
 
-### Manual vs Enhanced Validation Time Saving
+### Earlier vs Enhanced Validation Efficiency
 
-| Criteria | Manual Process | Enhanced Process | Saving |
-|---|---:|---:|---:|
-| Scope | 1 Change Request / CI | 1 Change Request / CI | Same |
-| Cluster coverage | Up to 23 manual checks | PowerShell + API search | Manual lookup removed |
-| Time per cluster | 3-5 min | API-driven | Per-cluster effort avoided |
-| Time per request | 69-115 min | ~5-10 min review | ~59-110 min saved |
-| Output | Basic status | TXT + CSV details | Cleaner attachment support |
-| Gap review | Manual interpretation | Backup details shown | Faster action |
+| Criteria | Earlier Script-Based Process | Enhanced CR Backup Validation | Estimated Benefit |
+|---|---|---|---|
+| Validation method | Basic backup-status script output | Enhanced PowerShell + Cohesity Helios GET-only API validation | Improved validation clarity |
+| Successful backup cases | Shows backup is present/successful | Shows backup is present with object, source, cluster, protection group, and last backup time | No major time saving; ambiguity reduced |
+| Ambiguous backup cases | Backup may exist, but the relationship or details may not be clear | Backup type, source mapping, cluster, protection group, and last backup time are clearly shown | ~5-15 minutes saved per ambiguous CI |
+| Backup-gap review | Missing or partial coverage may require additional checking | Backup gaps are easier to identify before Change Request approval | Faster validation decision |
+| Output detail | Limited backup-status detail | ServerName, BackupType, ObjectName, SourceName, ClusterName, ProtectionGroup, LastBackupTime | Less interpretation required |
 
 ### Future Enhancements
 
@@ -63,7 +62,7 @@
 - This is for Change Request backup validation, not backup-failure incident handling.
 - The validation is performed before Change Request approval or processing.
 - The implementation uses PowerShell with Cohesity Helios GET-only APIs.
-- The key improvement is detailed backup visibility in one report.
-- The report shows server, backup type, object, source, cluster, protection group, and last backup time.
-- TXT and CSV outputs can be attached to the Change Request as validation support.
+- Clear successful backup cases do not have major direct time saving; the main benefit is better detail and reduced ambiguity.
+- Time saving applies mainly to ambiguous or gap-related CIs where follow-up review would otherwise be required.
+- Estimated efficiency gain: number of ambiguous CIs x 5-15 minutes.
 - The script remains GET-only and does not modify Cohesity, ServiceNow, or the Change Request.
