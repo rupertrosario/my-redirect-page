@@ -3,7 +3,8 @@ param(
     [string]$Path
 )
 
-# Read Cohesity Siren / CI diagnostic JSON and export only operationally useful fields.
+# Read Cohesity Siren / CI diagnostic JSON.
+# Keep the raw JSON untouched so it can also be consumed later by Claude or other analysis tooling.
 $json = Get-Content -Path $Path -Raw | ConvertFrom-Json
 
 if (-not $json.results) {
@@ -11,7 +12,6 @@ if (-not $json.results) {
     return
 }
 
-# Convert nested strings/arrays/objects into readable CSV text instead of JSON such as ["..."] or {"..."}.
 function ConvertTo-ReadableText {
     param($Value)
 
@@ -30,7 +30,7 @@ function ConvertTo-ReadableText {
                 "$key: $text"
             }
         }
-        return ($parts -join '; ')
+        return ($parts -join "`n")
     }
 
     if ($Value -is [System.Management.Automation.PSCustomObject]) {
@@ -40,7 +40,7 @@ function ConvertTo-ReadableText {
                 "$($property.Name): $text"
             }
         }
-        return ($parts -join '; ')
+        return ($parts -join "`n")
     }
 
     if ($Value -is [System.Collections.IEnumerable]) {
@@ -50,18 +50,15 @@ function ConvertTo-ReadableText {
                 $text
             }
         }
-        return (($parts | Select-Object -Unique) -join '; ')
+        return (($parts | Select-Object -Unique) -join "`n")
     }
 
     return [string]$Value
 }
 
-# Use the source JSON file timestamp for the report date/time.
-$sourceFile = Get-Item -Path $Path
-$reportDate = $sourceFile.LastWriteTime.ToString('yyyy-MM-dd')
-$reportTime = $sourceFile.LastWriteTime.ToString('HH:mm:ss')
-
-$rawResults = $json.results |
+# Only show checks requiring attention. Passed checks are intentionally excluded.
+$results = $json.results |
+    Where-Object { $_.state -ne 'Pass' } |
     Select-Object `
         @{Name='Test #'; Expression={$_.testNumber}},
         @{Name='Test Name'; Expression={$_.testName}},
@@ -70,59 +67,24 @@ $rawResults = $json.results |
         @{Name='Module'; Expression={$_.module}},
         @{Name='Code'; Expression={$_.code}},
         @{Name='Result'; Expression={
-            if ($null -ne $_.out -and "$($_.out)".Trim()) {
-                if ($_.out -is [string]) { $_.out }
-                else { $_.out | ConvertTo-Json -Depth 10 -Compress }
+            if ($null -ne $_.data) {
+                ConvertTo-ReadableText $_.data
             }
-            elseif ($null -ne $_.data) {
-                if ($_.data -is [string]) { $_.data }
-                else { $_.data | ConvertTo-Json -Depth 10 -Compress }
+            elseif ($null -ne $_.out) {
+                ConvertTo-ReadableText $_.out
             }
             else {
                 ''
             }
         }},
-        @{Name='Remediation'; Expression={ ConvertTo-ReadableText $_.remediation }}
+        @{Name='Remediation'; Expression={
+            ConvertTo-ReadableText $_.remediation
+        }}
 
-# Consolidate duplicate tests so the same issue is not repeated for multiple nodes/instances.
-# Unique Result/Remediation values are retained and combined when they differ.
-$results = $rawResults |
-    Group-Object -Property 'Test #','Test Name','State','Severity','Module','Code' |
-    ForEach-Object {
-        $first = $_.Group[0]
+if (-not $results) {
+    Write-Host 'No non-Pass CI checks found.'
+    return
+}
 
-        $uniqueResults = $_.Group.Result |
-            Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) } |
-            Select-Object -Unique
-
-        $uniqueRemediation = $_.Group.Remediation |
-            Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) } |
-            Select-Object -Unique
-
-        [PSCustomObject]@{
-            'Date'        = $reportDate
-            'Time'        = $reportTime
-            'Test #'      = $first.'Test #'
-            'Test Name'   = $first.'Test Name'
-            'State'       = $first.State
-            'Severity'    = $first.Severity
-            'Module'      = $first.Module
-            'Code'        = $first.Code
-            'Occurrences' = $_.Count
-            'Result'      = ($uniqueResults -join ' | ')
-            'Remediation' = ($uniqueRemediation -join ' | ')
-        }
-    } |
-    Sort-Object @{Expression={
-        $number = 0
-        if ([int]::TryParse([string]$_.'Test #', [ref]$number)) { $number } else { [int]::MaxValue }
-    }}, 'Test #'
-
-# Export to a timestamped CSV so existing results are never overwritten.
-$timestamp = Get-Date -Format 'yyyyMMdd_HHmmss'
-$sourceName = [System.IO.Path]::GetFileNameWithoutExtension($Path)
-$outputDir = Split-Path -Parent (Resolve-Path $Path)
-$csvPath = Join-Path $outputDir ("{0}_CI_Results_{1}.csv" -f $sourceName, $timestamp)
-
-$results | Export-Csv -Path $csvPath -NoTypeInformation -Encoding UTF8
-Write-Host "CSV exported to: $csvPath"
+# Human-readable console table. Remediation entries remain on separate lines.
+$results | Format-Table -AutoSize -Wrap
