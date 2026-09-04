@@ -4,7 +4,7 @@
 #
 # Purpose:
 #   1. Retrieve currently open alerts from every Helios-managed cluster.
-#   2. Exclude Backup and Restore Alerts from this review.
+#   2. Exclude only ProtectionGroupFailed from this review.
 #   3. Match remaining live alerts against the local Cohesity alert catalog CSV.
 #   4. Add catalog Reason and Action for later Claude Code review.
 #   5. Export the complete review to CSV only; alert rows are not displayed.
@@ -13,7 +13,8 @@
 #   - This script does NOT resolve alerts.
 #   - This script does NOT use POST, PUT, PATCH, or DELETE.
 #   - All Cohesity API requests are GET only.
-#   - ProtectionGroupFailed is explicitly excluded as an additional safeguard.
+#   - Only ProtectionGroupFailed is explicitly excluded.
+#   - Other Backup and Restore alerts remain included.
 #   - A cluster GET failure or timeout does NOT stop the remaining clusters.
 #   - Numeric API alertType values are NOT written to the report.
 #
@@ -39,9 +40,6 @@ $helperPath          = "X:\PowerShell\Cohesity_API_Scripts\Common\ApiKeyAesHelpe
 $encryptedApiKeyPath = "X:\PowerShell\Cohesity_API_Scripts\Common\Secure\cohesity_apikey.enc"
 $maxAlerts           = 1000
 $requestTimeoutSec   = 30
-
-# Alert category intentionally excluded from this review.
-$excludedCatalogAlertType = "Backup and Restore Alerts"
 
 # ------------------------------------------------------------
 # Validate local files
@@ -311,27 +309,16 @@ foreach ($requiredColumn in $requiredColumns) {
 #   2. Alert Name + normalized Severity
 #   3. Alert Code only when unique in the catalog
 #   4. Alert Name only when unique in the catalog
-#
-# Also build exclusion lookups from every row categorized as
-# "Backup and Restore Alerts" so these alerts never enter the review output.
 
 $catalogByCodeSeverity = @{}
 $catalogByNameSeverity = @{}
 $catalogRowsByCode = @{}
 $catalogRowsByName = @{}
-$excludedAlertCodes = @{}
-$excludedAlertNames = @{}
 
 foreach ($catalogRow in $catalog) {
-    $catalogAlertType = ([string]$catalogRow.'Alert Type').Trim()
     $catalogCode = ([string]$catalogRow.'Alert Code').Trim().ToUpperInvariant()
     $catalogName = ([string]$catalogRow.'Alert Name').Trim().ToUpperInvariant()
     $catalogSeverity = Normalize-Severity $catalogRow.Severity
-
-    if ($catalogAlertType -ieq $excludedCatalogAlertType) {
-        if ($catalogCode) { $excludedAlertCodes[$catalogCode] = $true }
-        if ($catalogName) { $excludedAlertNames[$catalogName] = $true }
-    }
 
     if ($catalogCode) {
         $catalogByCodeSeverity["$catalogCode|$catalogSeverity"] = $catalogRow
@@ -360,7 +347,7 @@ Write-Host "`n==============================================" -ForegroundColor C
 Write-Host "   COHESITY OPEN ALERT REVIEW - GET ONLY" -ForegroundColor White
 Write-Host "==============================================" -ForegroundColor Cyan
 Write-Host "Catalog    : $alertsCsv"
-Write-Host "Exclude    : $excludedCatalogAlertType"
+Write-Host "Exclude    : ProtectionGroupFailed only"
 Write-Host "GET timeout: $requestTimeoutSec seconds"
 
 try {
@@ -450,26 +437,11 @@ foreach ($cluster in ($clusters | Sort-Object clusterName)) {
         $normalizedAlertName = $liveAlertName.ToUpperInvariant()
 
         # ----------------------------------------------------
-        # Exclude Backup and Restore Alerts
+        # Exclude only ProtectionGroupFailed
         # ----------------------------------------------------
-        # Exclusion is derived from the local catalog by Alert Type.
-        # ProtectionGroupFailed is also explicitly checked as a safeguard.
-
-        $excludeAlert = $false
-
-        if ($normalizedAlertCode -and $excludedAlertCodes.ContainsKey($normalizedAlertCode)) {
-            $excludeAlert = $true
-        }
-
-        if ($normalizedAlertName -and $excludedAlertNames.ContainsKey($normalizedAlertName)) {
-            $excludeAlert = $true
-        }
+        # Other Backup and Restore alerts are intentionally retained.
 
         if ($liveAlertName -ieq "ProtectionGroupFailed") {
-            $excludeAlert = $true
-        }
-
-        if ($excludeAlert) {
             $excludedCount++
             continue
         }
@@ -504,12 +476,6 @@ foreach ($cluster in ($clusters | Sort-Object clusterName)) {
             if ($catalogRowsByName.ContainsKey($normalizedAlertName) -and @($catalogRowsByName[$normalizedAlertName]).Count -eq 1) {
                 $matchedCatalogRow = @($catalogRowsByName[$normalizedAlertName])[0]
             }
-        }
-
-        # Final safeguard: exclude anything that resolves to Backup and Restore.
-        if ($matchedCatalogRow -and ([string]$matchedCatalogRow.'Alert Type').Trim() -ieq $excludedCatalogAlertType) {
-            $excludedCount++
-            continue
         }
 
         if (-not $matchedCatalogRow) {
@@ -589,8 +555,8 @@ if (-not (Test-Path $csvFile -PathType Leaf)) {
 Write-Host "`n==============================================" -ForegroundColor Cyan
 Write-Host "   ALERT REVIEW COMPLETE" -ForegroundColor White
 Write-Host "==============================================" -ForegroundColor Cyan
-Write-Host "Open alerts included   : $($results.Count)"
-Write-Host "Backup/restore excluded: $excludedCount"
-Write-Host "Catalog unmatched      : $unmatchedCount"
-Write-Host "Cluster GET failures   : $($failures.Count)"
-Write-Host "Saved CSV report at    : $csvFile" -ForegroundColor Green
+Write-Host "Open alerts included          : $($results.Count)"
+Write-Host "ProtectionGroupFailed excluded: $excludedCount"
+Write-Host "Catalog unmatched             : $unmatchedCount"
+Write-Host "Cluster GET failures          : $($failures.Count)"
+Write-Host "Saved CSV report at           : $csvFile" -ForegroundColor Green
