@@ -6,16 +6,16 @@
 #   1. Retrieve currently open alerts from every Helios-managed cluster.
 #   2. Exclude Backup and Restore Alerts from this review.
 #   3. Match remaining live alerts against the local Cohesity alert catalog CSV.
-#   4. Add catalog Reason and Action for review.
-#   5. Export the complete review to CSV for later Claude Code analysis.
+#   4. Add catalog Reason and Action for later Claude Code review.
+#   5. Export the complete review to CSV only; alert rows are not displayed.
 #
 # IMPORTANT:
 #   - This script does NOT resolve alerts.
 #   - This script does NOT use POST, PUT, PATCH, or DELETE.
 #   - All Cohesity API requests are GET only.
 #   - ProtectionGroupFailed is explicitly excluded as an additional safeguard.
-#   - Alert rows are NOT displayed in the PowerShell console.
 #   - A cluster GET failure or timeout does NOT stop the remaining clusters.
+#   - Numeric API alertType values are NOT written to the report.
 #
 # APIs used:
 #   GET /v2/mcm/cluster-mgmt/info
@@ -182,39 +182,62 @@ function Get-AlertProperty {
 }
 
 # ------------------------------------------------------------
-# Helper: retrieve occurrence count only when returned by API
+# Helper: normalize API/catalog severity for reliable matching
 # ------------------------------------------------------------
 
-function Get-AlertCount {
+function Normalize-Severity {
+    param($Severity)
+
+    $value = ([string]$Severity).Trim()
+
+    switch -Regex ($value) {
+        '^(?i:k)?critical$'      { return "CRITICAL" }
+        '^(?i:k)?warning$'       { return "WARNING" }
+        '^(?i:k)?info$'          { return "INFORMATIONAL" }
+        '^(?i:k)?informational$' { return "INFORMATIONAL" }
+        default                  { return $value.ToUpperInvariant() }
+    }
+}
+
+# ------------------------------------------------------------
+# Helper: get live alert code from known API locations
+# ------------------------------------------------------------
+
+function Get-LiveAlertCode {
     param($Alert)
 
-    foreach ($name in @(
-        "occurrenceCount",
-        "occurrencesCount",
-        "numOccurrences",
-        "numberOfOccurrences",
-        "alertCount",
-        "count"
+    foreach ($value in @(
+        $Alert.alertCode,
+        $Alert.alertDocument.alertCode,
+        (Get-AlertProperty -PropertyList $Alert.propertyList -Names @("alert_code", "alertCode"))
     )) {
-        $property = $Alert.PSObject.Properties[$name]
-        if ($property -and $null -ne $property.Value -and [string]$property.Value -match "^\d+$") {
-            return [int64]$property.Value
+        if (-not [string]::IsNullOrWhiteSpace([string]$value)) {
+            return ([string]$value).Trim()
         }
     }
 
-    $propertyCount = Get-AlertProperty -PropertyList $Alert.propertyList -Names @(
-        "occurrence_count",
-        "occurrenceCount",
-        "num_occurrences",
-        "numOccurrences",
-        "numberOfOccurrences"
-    )
+    return ""
+}
 
-    if ($propertyCount -match "^\d+$") {
-        return [int64]$propertyCount
+# ------------------------------------------------------------
+# Helper: get live alert name from known API locations
+# ------------------------------------------------------------
+
+function Get-LiveAlertName {
+    param($Alert)
+
+    foreach ($value in @(
+        $Alert.alertName,
+        $Alert.name,
+        $Alert.alertDocument.alertName,
+        $Alert.alertDocument.name,
+        (Get-AlertProperty -PropertyList $Alert.propertyList -Names @("alert_name", "alertName", "alertname"))
+    )) {
+        if (-not [string]::IsNullOrWhiteSpace([string]$value)) {
+            return ([string]$value).Trim()
+        }
     }
 
-    # Do not invent a count when the API does not return one.
     return ""
 }
 
@@ -231,7 +254,10 @@ function Get-AlertDetails {
         foreach ($value in @(
             $Alert.alertDocument.alertDescription,
             $Alert.alertDocument.alertSummary,
-            $Alert.alertDocument.alertCause
+            $Alert.alertDocument.alertCause,
+            $Alert.alertDocument.description,
+            $Alert.alertDocument.cause,
+            $Alert.alertDocument.occurrence
         )) {
             if (-not [string]::IsNullOrWhiteSpace([string]$value)) {
                 $details += ([string]$value).Trim()
@@ -239,8 +265,13 @@ function Get-AlertDetails {
         }
     }
 
-    if ($Alert.PSObject.Properties["description"] -and -not [string]::IsNullOrWhiteSpace([string]$Alert.description)) {
-        $details += ([string]$Alert.description).Trim()
+    foreach ($value in @(
+        $Alert.description,
+        $Alert.cause
+    )) {
+        if (-not [string]::IsNullOrWhiteSpace([string]$value)) {
+            $details += ([string]$value).Trim()
+        }
     }
 
     return (@($details | Select-Object -Unique) -join " | ")
@@ -275,8 +306,11 @@ foreach ($requiredColumn in $requiredColumns) {
 # ------------------------------------------------------------
 # Build alert catalog lookups
 # ------------------------------------------------------------
-# Primary match   : Alert Code + Severity
-# Secondary match : Alert Name + Severity
+# Match order:
+#   1. Alert Code + normalized Severity
+#   2. Alert Name + normalized Severity
+#   3. Alert Code only when unique in the catalog
+#   4. Alert Name only when unique in the catalog
 #
 # Also build exclusion lookups from every row categorized as
 # "Backup and Restore Alerts" so these alerts never enter the review output.
@@ -284,6 +318,7 @@ foreach ($requiredColumn in $requiredColumns) {
 $catalogByCodeSeverity = @{}
 $catalogByNameSeverity = @{}
 $catalogRowsByCode = @{}
+$catalogRowsByName = @{}
 $excludedAlertCodes = @{}
 $excludedAlertNames = @{}
 
@@ -291,7 +326,7 @@ foreach ($catalogRow in $catalog) {
     $catalogAlertType = ([string]$catalogRow.'Alert Type').Trim()
     $catalogCode = ([string]$catalogRow.'Alert Code').Trim().ToUpperInvariant()
     $catalogName = ([string]$catalogRow.'Alert Name').Trim().ToUpperInvariant()
-    $catalogSeverity = ([string]$catalogRow.Severity).Trim().ToUpperInvariant()
+    $catalogSeverity = Normalize-Severity $catalogRow.Severity
 
     if ($catalogAlertType -ieq $excludedCatalogAlertType) {
         if ($catalogCode) { $excludedAlertCodes[$catalogCode] = $true }
@@ -309,6 +344,11 @@ foreach ($catalogRow in $catalog) {
 
     if ($catalogName) {
         $catalogByNameSeverity["$catalogName|$catalogSeverity"] = $catalogRow
+
+        if (-not $catalogRowsByName.ContainsKey($catalogName)) {
+            $catalogRowsByName[$catalogName] = @()
+        }
+        $catalogRowsByName[$catalogName] = @($catalogRowsByName[$catalogName]) + $catalogRow
     }
 }
 
@@ -319,8 +359,8 @@ foreach ($catalogRow in $catalog) {
 Write-Host "`n==============================================" -ForegroundColor Cyan
 Write-Host "   COHESITY OPEN ALERT REVIEW - GET ONLY" -ForegroundColor White
 Write-Host "==============================================" -ForegroundColor Cyan
-Write-Host "Catalog : $alertsCsv"
-Write-Host "Exclude : $excludedCatalogAlertType"
+Write-Host "Catalog    : $alertsCsv"
+Write-Host "Exclude    : $excludedCatalogAlertType"
 Write-Host "GET timeout: $requestTimeoutSec seconds"
 
 try {
@@ -344,7 +384,7 @@ if ($clusters.Count -eq 0) {
     throw "No clusters were returned by Helios."
 }
 
-Write-Host "Clusters: $($clusters.Count)"
+Write-Host "Clusters   : $($clusters.Count)"
 
 # ------------------------------------------------------------
 # Get open alerts from every cluster
@@ -353,6 +393,7 @@ Write-Host "Clusters: $($clusters.Count)"
 $results = @()
 $failures = @()
 $excludedCount = 0
+$unmatchedCount = 0
 
 foreach ($cluster in ($clusters | Sort-Object clusterName)) {
 
@@ -401,22 +442,17 @@ foreach ($cluster in ($clusters | Sort-Object clusterName)) {
     foreach ($alert in $alerts) {
         if ($null -eq $alert) { continue }
 
-        $alertCode = ([string]$alert.alertCode).Trim()
+        $alertCode = Get-LiveAlertCode $alert
+        $liveAlertName = Get-LiveAlertName $alert
         $severity = ([string]$alert.severity).Trim()
-        $liveAlertType = ([string]$alert.alertType).Trim()
-        $liveAlertName = ""
-
-        if ($alert.alertDocument -and $alert.alertDocument.PSObject.Properties["alertName"]) {
-            $liveAlertName = ([string]$alert.alertDocument.alertName).Trim()
-        }
-
+        $normalizedSeverity = Normalize-Severity $severity
         $normalizedAlertCode = $alertCode.ToUpperInvariant()
         $normalizedAlertName = $liveAlertName.ToUpperInvariant()
 
         # ----------------------------------------------------
         # Exclude Backup and Restore Alerts
         # ----------------------------------------------------
-        # Exclusion is derived from the local alert catalog by Alert Type.
+        # Exclusion is derived from the local catalog by Alert Type.
         # ProtectionGroupFailed is also explicitly checked as a safeguard.
 
         $excludeAlert = $false
@@ -443,72 +479,60 @@ foreach ($cluster in ($clusters | Sort-Object clusterName)) {
         # ----------------------------------------------------
 
         $matchedCatalogRow = $null
-        $codeKey = "{0}|{1}" -f $normalizedAlertCode, $severity.ToUpperInvariant()
 
-        if ($alertCode -and $catalogByCodeSeverity.ContainsKey($codeKey)) {
-            $matchedCatalogRow = $catalogByCodeSeverity[$codeKey]
+        if ($normalizedAlertCode) {
+            $codeSeverityKey = "$normalizedAlertCode|$normalizedSeverity"
+            if ($catalogByCodeSeverity.ContainsKey($codeSeverityKey)) {
+                $matchedCatalogRow = $catalogByCodeSeverity[$codeSeverityKey]
+            }
         }
-        elseif ($alertCode) {
-            # Safe fallback only when this alert code exists once in the catalog.
+
+        if (-not $matchedCatalogRow -and $normalizedAlertName) {
+            $nameSeverityKey = "$normalizedAlertName|$normalizedSeverity"
+            if ($catalogByNameSeverity.ContainsKey($nameSeverityKey)) {
+                $matchedCatalogRow = $catalogByNameSeverity[$nameSeverityKey]
+            }
+        }
+
+        if (-not $matchedCatalogRow -and $normalizedAlertCode) {
             if ($catalogRowsByCode.ContainsKey($normalizedAlertCode) -and @($catalogRowsByCode[$normalizedAlertCode]).Count -eq 1) {
                 $matchedCatalogRow = @($catalogRowsByCode[$normalizedAlertCode])[0]
             }
         }
 
-        if (-not $matchedCatalogRow -and $liveAlertName) {
-            $nameKey = "{0}|{1}" -f $normalizedAlertName, $severity.ToUpperInvariant()
-
-            if ($catalogByNameSeverity.ContainsKey($nameKey)) {
-                $matchedCatalogRow = $catalogByNameSeverity[$nameKey]
+        if (-not $matchedCatalogRow -and $normalizedAlertName) {
+            if ($catalogRowsByName.ContainsKey($normalizedAlertName) -and @($catalogRowsByName[$normalizedAlertName]).Count -eq 1) {
+                $matchedCatalogRow = @($catalogRowsByName[$normalizedAlertName])[0]
             }
         }
 
-        # Final catalog safeguard: if a row resolves to Backup and Restore,
-        # exclude it even if the code/name exclusion lookup did not catch it.
+        # Final safeguard: exclude anything that resolves to Backup and Restore.
         if ($matchedCatalogRow -and ([string]$matchedCatalogRow.'Alert Type').Trim() -ieq $excludedCatalogAlertType) {
             $excludedCount++
             continue
         }
 
-        # ----------------------------------------------------
-        # Extract node context from the live alert propertyList
-        # ----------------------------------------------------
-
-        $nodeId = Get-AlertProperty -PropertyList $alert.propertyList -Names @(
-            "node_id",
-            "nodeId"
-        )
-
-        $nodeIp = Get-AlertProperty -PropertyList $alert.propertyList -Names @(
-            "node_ip",
-            "nodeIp",
-            "ip",
-            "ipAddress",
-            "host_ip",
-            "source_ip",
-            "sourceIp",
-            "remote_ip",
-            "remoteIp"
-        )
+        if (-not $matchedCatalogRow) {
+            $unmatchedCount++
+        }
 
         # ----------------------------------------------------
         # Build final review row
         # ----------------------------------------------------
+        # Alert Type is taken ONLY from the catalog. Numeric API alertType IDs
+        # are deliberately not written because they are not useful for review.
 
         $results += [pscustomobject][ordered]@{
             "Cluster"              = $clusterName
             "First Occurrence ET"  = Convert-UsecsToET $alert.firstTimestampUsecs
             "Latest Occurrence ET" = Convert-UsecsToET $alert.latestTimestampUsecs
-            "Count"                = Get-AlertCount $alert
-            "Alert Type"           = if ($matchedCatalogRow) { $matchedCatalogRow.'Alert Type' } else { $liveAlertType }
+            "Alert Type"           = if ($matchedCatalogRow) { $matchedCatalogRow.'Alert Type' } else { "UNMATCHED" }
             "Alert Code"           = $alertCode
             "Alert Name"           = if ($matchedCatalogRow) { $matchedCatalogRow.'Alert Name' } else { $liveAlertName }
             "Severity"             = $severity
-            "Node ID"              = $nodeId
-            "Node IP"              = $nodeIp
             "Alert Details"        = Get-AlertDetails $alert
-            "Reason"               = if ($matchedCatalogRow) { $matchedCatalogRow.Reason } else { "" }
-            "Action"               = if ($matchedCatalogRow) { $matchedCatalogRow.Action } else { "" }
+            "Reason"               = if ($matchedCatalogRow) { $matchedCatalogRow.Reason } else { "No matching row found in Cohesity_alerts.csv." }
+            "Action"               = if ($matchedCatalogRow) { $matchedCatalogRow.Action } else { "Review manually." }
         }
     }
 }
@@ -527,17 +551,15 @@ if (-not (Test-Path $csvDir)) {
 
 $csvFile = Join-Path $csvDir "Cohesity_Open_Alert_Review_${reportdate}.csv"
 
+# Exact CSV format used for later Claude Code review.
 $csvColumns = @(
     "Cluster",
     "First Occurrence ET",
     "Latest Occurrence ET",
-    "Count",
     "Alert Type",
     "Alert Code",
     "Alert Name",
     "Severity",
-    "Node ID",
-    "Node IP",
     "Alert Details",
     "Reason",
     "Action"
@@ -569,5 +591,6 @@ Write-Host "   ALERT REVIEW COMPLETE" -ForegroundColor White
 Write-Host "==============================================" -ForegroundColor Cyan
 Write-Host "Open alerts included   : $($results.Count)"
 Write-Host "Backup/restore excluded: $excludedCount"
+Write-Host "Catalog unmatched      : $unmatchedCount"
 Write-Host "Cluster GET failures   : $($failures.Count)"
 Write-Host "Saved CSV report at    : $csvFile" -ForegroundColor Green
