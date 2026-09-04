@@ -3,7 +3,7 @@ param(
     [string]$Path
 )
 
-# Read Cohesity Siren / CI diagnostic JSON and show/export only operationally useful fields.
+# Read Cohesity Siren / CI diagnostic JSON and export only operationally useful fields.
 $json = Get-Content -Path $Path -Raw | ConvertFrom-Json
 
 if (-not $json.results) {
@@ -38,9 +38,6 @@ $results = $json.results |
             else { $_.remediation | ConvertTo-Json -Depth 10 -Compress }
         }}
 
-# Show the cleaned results on screen.
-$results | Format-Table -AutoSize -Wrap
-
 # Export to a timestamped CSV so existing results are never overwritten.
 $timestamp = Get-Date -Format 'yyyyMMdd_HHmmss'
 $sourceName = [System.IO.Path]::GetFileNameWithoutExtension($Path)
@@ -48,4 +45,4 @@ $outputDir = Split-Path -Parent (Resolve-Path $Path)
 $csvPath = Join-Path $outputDir ("{0}_CI_Results_{1}.csv" -f $sourceName, $timestamp)
 
 $results | Export-Csv -Path $csvPath -NoTypeInformation -Encoding UTF8
-Write-Host "`nCSV exported to: $csvPath"
+Write-Host "CSV exported to: $csvPath"
