@@ -11,7 +11,7 @@ if (-not $json.results) {
     return
 }
 
-$results = $json.results |
+$rawResults = $json.results |
     Select-Object `
         @{Name='Test #'; Expression={$_.testNumber}},
         @{Name='Test Name'; Expression={$_.testName}},
@@ -37,6 +37,38 @@ $results = $json.results |
             elseif ($_.remediation -is [string]) { $_.remediation }
             else { $_.remediation | ConvertTo-Json -Depth 10 -Compress }
         }}
+
+# Consolidate duplicate tests so the same issue is not repeated for multiple nodes/instances.
+# Unique Result/Remediation values are retained and combined when they differ.
+$results = $rawResults |
+    Group-Object -Property 'Test #','Test Name','State','Severity','Module','Code' |
+    ForEach-Object {
+        $first = $_.Group[0]
+
+        $uniqueResults = $_.Group.Result |
+            Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) } |
+            Select-Object -Unique
+
+        $uniqueRemediation = $_.Group.Remediation |
+            Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) } |
+            Select-Object -Unique
+
+        [PSCustomObject]@{
+            'Test #'      = $first.'Test #'
+            'Test Name'   = $first.'Test Name'
+            'State'       = $first.State
+            'Severity'    = $first.Severity
+            'Module'      = $first.Module
+            'Code'        = $first.Code
+            'Occurrences' = $_.Count
+            'Result'      = ($uniqueResults -join ' | ')
+            'Remediation' = ($uniqueRemediation -join ' | ')
+        }
+    } |
+    Sort-Object @{Expression={
+        $number = 0
+        if ([int]::TryParse([string]$_.'Test #', [ref]$number)) { $number } else { [int]::MaxValue }
+    }}, 'Test #'
 
 # Export to a timestamped CSV so existing results are never overwritten.
 $timestamp = Get-Date -Format 'yyyyMMdd_HHmmss'
