@@ -7,13 +7,14 @@
 #   2. Exclude Backup and Restore Alerts from this review.
 #   3. Match remaining live alerts against the local Cohesity alert catalog CSV.
 #   4. Add catalog Reason and Action for review.
-#   5. Export the complete review to CSV for later reference.
+#   5. Export the complete review to CSV for later Claude Code analysis.
 #
 # IMPORTANT:
 #   - This script does NOT resolve alerts.
 #   - This script does NOT use POST, PUT, PATCH, or DELETE.
 #   - All Cohesity API requests are GET only.
 #   - ProtectionGroupFailed is explicitly excluded as an additional safeguard.
+#   - Alert rows are NOT displayed in the PowerShell console.
 #
 # APIs used:
 #   GET /v2/mcm/cluster-mgmt/info
@@ -37,7 +38,7 @@ $helperPath          = "X:\PowerShell\Cohesity_API_Scripts\Common\ApiKeyAesHelpe
 $encryptedApiKeyPath = "X:\PowerShell\Cohesity_API_Scripts\Common\Secure\cohesity_apikey.enc"
 $maxAlerts           = 1000
 
-# Alert catalog category intentionally excluded from this review.
+# Alert category intentionally excluded from this review.
 $excludedCatalogAlertType = "Backup and Restore Alerts"
 
 # ------------------------------------------------------------
@@ -477,28 +478,10 @@ foreach ($cluster in ($clusters | Sort-Object clusterName)) {
     }
 }
 
-if (-not $results -or $results.Count -eq 0) {
-    Write-Host "No open alerts remained after exclusions." -ForegroundColor Green
-}
-
-# ------------------------------------------------------------
-# Console output
-# ------------------------------------------------------------
-# Keep console output compact. The complete review is written to CSV below.
-
-if ($results.Count -gt 0) {
-    Write-Host "`nALERT SUMMARY" -ForegroundColor Cyan
-
-    $results |
-        Sort-Object Cluster, "Alert Code" |
-        Select-Object Cluster, "Latest Occurrence ET", Count, "Alert Code", "Alert Name", Severity, "Node ID", "Node IP" |
-        Format-Table -AutoSize
-}
-
 # ------------------------------------------------------------
 # CSV Export
 # ------------------------------------------------------------
-# Uses the same CSV-output pattern as the existing Cohesity scripts.
+# Same output pattern used by the existing Cohesity scripts.
 
 $reportdate = Get-Date -Format "yyyy-MM-dd_HHmm"
 
@@ -529,6 +512,10 @@ $csvRows |
     Sort-Object Cluster, "Alert Code" |
     Export-Csv -Path $csvFile -NoTypeInformation -Encoding UTF8
 
+# ------------------------------------------------------------
+# Final status only - no alert data is displayed in the console
+# ------------------------------------------------------------
+
 Write-Host "`n==============================================" -ForegroundColor Cyan
 Write-Host "   ALERT REVIEW COMPLETE" -ForegroundColor White
 Write-Host "==============================================" -ForegroundColor Cyan
@@ -537,8 +524,9 @@ Write-Host "Backup/restore excluded: $excludedCount"
 
 if ($failures.Count -gt 0) {
     Write-Host "GET failures           : $($failures.Count)" -ForegroundColor Yellow
-    $failures | Format-Table Cluster, Error -AutoSize
+    foreach ($failure in $failures) {
+        Write-Warning "$($failure.Cluster): $($failure.Error)"
+    }
 }
 
-Write-Host ""
 Write-Host "Saved CSV report at: $csvFile" -ForegroundColor Green
