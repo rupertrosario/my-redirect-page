@@ -11,6 +11,11 @@ if (-not $json.results) {
     return
 }
 
+# Use the source JSON file timestamp for the report date/time.
+$sourceFile = Get-Item -Path $Path
+$reportDate = $sourceFile.LastWriteTime.ToString('yyyy-MM-dd')
+$reportTime = $sourceFile.LastWriteTime.ToString('HH:mm:ss')
+
 $rawResults = $json.results |
     Select-Object `
         @{Name='Test #'; Expression={$_.testNumber}},
@@ -54,6 +59,8 @@ $results = $rawResults |
             Select-Object -Unique
 
         [PSCustomObject]@{
+            'Date'        = $reportDate
+            'Time'        = $reportTime
             'Test #'      = $first.'Test #'
             'Test Name'   = $first.'Test Name'
             'State'       = $first.State
