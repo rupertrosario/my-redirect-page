@@ -4,8 +4,8 @@
 #
 # Purpose:
 #   1. Retrieve currently open alerts from every Helios-managed cluster.
-#   2. Exclude only ProtectionGroupFailed from this review.
-#   3. Match remaining live alerts against the local Cohesity alert catalog CSV.
+#   2. Include all open alerts; no alert type or alert name is excluded.
+#   3. Match live alerts against the local Cohesity alert catalog CSV.
 #   4. Add catalog Reason and Action for later Claude Code review.
 #   5. Export the complete review to CSV only; alert rows are not displayed.
 #
@@ -13,8 +13,8 @@
 #   - This script does NOT resolve alerts.
 #   - This script does NOT use POST, PUT, PATCH, or DELETE.
 #   - All Cohesity API requests are GET only.
-#   - Only ProtectionGroupFailed is explicitly excluded.
-#   - Other Backup and Restore alerts remain included.
+#   - No alerts are excluded in the current version.
+#   - If exclusions are added later, they must be based on exact Alert Name only.
 #   - A cluster GET failure or timeout does NOT stop the remaining clusters.
 #   - Numeric API alertType values are NOT written to the report.
 #
@@ -347,7 +347,7 @@ Write-Host "`n==============================================" -ForegroundColor C
 Write-Host "   COHESITY OPEN ALERT REVIEW - GET ONLY" -ForegroundColor White
 Write-Host "==============================================" -ForegroundColor Cyan
 Write-Host "Catalog    : $alertsCsv"
-Write-Host "Exclude    : ProtectionGroupFailed only"
+Write-Host "Exclude    : None"
 Write-Host "GET timeout: $requestTimeoutSec seconds"
 
 try {
@@ -379,7 +379,6 @@ Write-Host "Clusters   : $($clusters.Count)"
 
 $results = @()
 $failures = @()
-$excludedCount = 0
 $unmatchedCount = 0
 
 foreach ($cluster in ($clusters | Sort-Object clusterName)) {
@@ -435,16 +434,6 @@ foreach ($cluster in ($clusters | Sort-Object clusterName)) {
         $normalizedSeverity = Normalize-Severity $severity
         $normalizedAlertCode = $alertCode.ToUpperInvariant()
         $normalizedAlertName = $liveAlertName.ToUpperInvariant()
-
-        # ----------------------------------------------------
-        # Exclude only ProtectionGroupFailed
-        # ----------------------------------------------------
-        # Other Backup and Restore alerts are intentionally retained.
-
-        if ($liveAlertName -ieq "ProtectionGroupFailed") {
-            $excludedCount++
-            continue
-        }
 
         # ----------------------------------------------------
         # Match live alert to the spreadsheet catalog
@@ -555,8 +544,7 @@ if (-not (Test-Path $csvFile -PathType Leaf)) {
 Write-Host "`n==============================================" -ForegroundColor Cyan
 Write-Host "   ALERT REVIEW COMPLETE" -ForegroundColor White
 Write-Host "==============================================" -ForegroundColor Cyan
-Write-Host "Open alerts included          : $($results.Count)"
-Write-Host "ProtectionGroupFailed excluded: $excludedCount"
-Write-Host "Catalog unmatched             : $unmatchedCount"
-Write-Host "Cluster GET failures          : $($failures.Count)"
-Write-Host "Saved CSV report at           : $csvFile" -ForegroundColor Green
+Write-Host "Open alerts included   : $($results.Count)"
+Write-Host "Catalog unmatched      : $unmatchedCount"
+Write-Host "Cluster GET failures   : $($failures.Count)"
+Write-Host "Saved CSV report at    : $csvFile" -ForegroundColor Green
