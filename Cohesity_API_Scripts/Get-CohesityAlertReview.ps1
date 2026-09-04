@@ -6,7 +6,7 @@
 #   1. Retrieve currently open alerts from every Helios-managed cluster.
 #   2. Exclude Backup and Restore Alerts from this review.
 #   3. Match remaining live alerts against the local Cohesity alert catalog CSV.
-#   4. Add the catalog Reason and Action for review.
+#   4. Add catalog Reason and Action for review.
 #   5. Export the complete review to a timestamped CSV for later reference.
 #
 # IMPORTANT:
@@ -32,7 +32,7 @@ $FormatEnumerationLimit = -1
 # ------------------------------------------------------------
 
 $baseUrl             = "https://helios.cohesity.com"
-$alertsCsv           = "X:\PowerShell\Cohesity_API_Scripts\cohesit_alerts.csv"
+$alertsCsv           = "X:\PowerShell\Cohesity_API_Scripts\Cohesity_alerts.csv"
 $helperPath          = "X:\PowerShell\Cohesity_API_Scripts\Common\ApiKeyAesHelper.ps1"
 $encryptedApiKeyPath = "X:\PowerShell\Cohesity_API_Scripts\Common\Secure\cohesity_apikey.enc"
 $maxAlerts           = 1000
