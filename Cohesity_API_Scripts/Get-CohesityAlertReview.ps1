@@ -7,7 +7,7 @@
 #   2. Exclude Backup and Restore Alerts from this review.
 #   3. Match remaining live alerts against the local Cohesity alert catalog CSV.
 #   4. Add catalog Reason and Action for review.
-#   5. Export the complete review to a timestamped CSV for later reference.
+#   5. Export the complete review to CSV for later reference.
 #
 # IMPORTANT:
 #   - This script does NOT resolve alerts.
@@ -36,7 +36,6 @@ $alertsCsv           = "X:\PowerShell\Cohesity_API_Scripts\Cohesity_alerts.csv"
 $helperPath          = "X:\PowerShell\Cohesity_API_Scripts\Common\ApiKeyAesHelper.ps1"
 $encryptedApiKeyPath = "X:\PowerShell\Cohesity_API_Scripts\Common\Secure\cohesity_apikey.enc"
 $maxAlerts           = 1000
-$outputCsv           = "X:\PowerShell\Cohesity_API_Scripts\cohesit_alert_review_{0}.csv" -f (Get-Date -Format "yyyyMMdd_HHmmss")
 
 # Alert catalog category intentionally excluded from this review.
 $excludedCatalogAlertType = "Backup and Restore Alerts"
@@ -478,63 +477,68 @@ foreach ($cluster in ($clusters | Sort-Object clusterName)) {
     }
 }
 
-# ------------------------------------------------------------
-# Export complete review to CSV
-# ------------------------------------------------------------
-
-$results = @($results | Sort-Object -Property @{ Expression = "Latest Occurrence ET"; Descending = $true }, Cluster, "Alert Code")
-
-# The CSV intentionally contains ALL 13 review columns.
-# This is the persistent output to reference later.
-$results | Export-Csv -Path $outputCsv -NoTypeInformation -Encoding UTF8
+if (-not $results -or $results.Count -eq 0) {
+    Write-Host "No open alerts remained after exclusions." -ForegroundColor Green
+}
 
 # ------------------------------------------------------------
 # Console output
 # ------------------------------------------------------------
-# PowerShell console tables become unreadable when all 13 fields are shown
-# together. Display the same review in two smaller tables while keeping the
-# exported CSV complete.
+# Keep console output compact. The complete review is written to CSV below.
+
+if ($results.Count -gt 0) {
+    Write-Host "`nALERT SUMMARY" -ForegroundColor Cyan
+
+    $results |
+        Sort-Object Cluster, "Alert Code" |
+        Select-Object Cluster, "Latest Occurrence ET", Count, "Alert Code", "Alert Name", Severity, "Node ID", "Node IP" |
+        Format-Table -AutoSize
+}
+
+# ------------------------------------------------------------
+# CSV Export
+# ------------------------------------------------------------
+# Uses the same CSV-output pattern as the existing Cohesity scripts.
+
+$reportdate = Get-Date -Format "yyyy-MM-dd_HHmm"
+
+$csvDir = "X:\PowerShell\Data\Cohesity\Alerts"
+if (-not (Test-Path $csvDir)) {
+    New-Item -ItemType Directory -Path $csvDir | Out-Null
+}
+
+$csvFile = Join-Path $csvDir "Cohesity_Open_Alert_Review_${reportdate}.csv"
+
+# These are the exact columns written to the review CSV.
+$csvRows = $results | Select-Object `
+    Cluster,
+    "First Occurrence ET",
+    "Latest Occurrence ET",
+    Count,
+    "Alert Type",
+    "Alert Code",
+    "Alert Name",
+    Severity,
+    "Node ID",
+    "Node IP",
+    "Alert Details",
+    Reason,
+    Action
+
+$csvRows |
+    Sort-Object Cluster, "Alert Code" |
+    Export-Csv -Path $csvFile -NoTypeInformation -Encoding UTF8
 
 Write-Host "`n==============================================" -ForegroundColor Cyan
 Write-Host "   ALERT REVIEW COMPLETE" -ForegroundColor White
 Write-Host "==============================================" -ForegroundColor Cyan
 Write-Host "Open alerts included   : $($results.Count)"
 Write-Host "Backup/restore excluded: $excludedCount"
-Write-Host "Output CSV             : $outputCsv"
 
 if ($failures.Count -gt 0) {
     Write-Host "GET failures           : $($failures.Count)" -ForegroundColor Yellow
     $failures | Format-Table Cluster, Error -AutoSize
 }
 
-if ($results.Count -gt 0) {
-
-    Write-Host "`nALERT SUMMARY" -ForegroundColor Cyan
-    $summaryColumns = @(
-        "Cluster",
-        "First Occurrence ET",
-        "Latest Occurrence ET",
-        "Count",
-        "Alert Type",
-        "Alert Code",
-        "Alert Name",
-        "Severity",
-        "Node ID",
-        "Node IP"
-    )
-    $results | Select-Object -Property $summaryColumns | Format-Table -AutoSize
-
-    Write-Host "`nALERT DETAILS / CATALOG GUIDANCE" -ForegroundColor Cyan
-    $detailColumns = @(
-        "Cluster",
-        "Alert Code",
-        "Alert Name",
-        "Alert Details",
-        "Reason",
-        "Action"
-    )
-    $results | Select-Object -Property $detailColumns | Format-Table -Wrap -AutoSize
-}
-else {
-    Write-Host "No open alerts remained after exclusions." -ForegroundColor Green
-}
+Write-Host ""
+Write-Host "Saved CSV report at: $csvFile" -ForegroundColor Green
