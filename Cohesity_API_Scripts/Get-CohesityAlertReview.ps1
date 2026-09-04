@@ -498,42 +498,42 @@ $results | Export-Csv -Path $outputCsv -NoTypeInformation -Encoding UTF8
 Write-Host "`n==============================================" -ForegroundColor Cyan
 Write-Host "   ALERT REVIEW COMPLETE" -ForegroundColor White
 Write-Host "==============================================" -ForegroundColor Cyan
-Write-Host "Open alerts included : $($results.Count)"
+Write-Host "Open alerts included   : $($results.Count)"
 Write-Host "Backup/restore excluded: $excludedCount"
-Write-Host "Output CSV           : $outputCsv"
+Write-Host "Output CSV             : $outputCsv"
 
 if ($failures.Count -gt 0) {
-    Write-Host "GET failures         : $($failures.Count)" -ForegroundColor Yellow
+    Write-Host "GET failures           : $($failures.Count)" -ForegroundColor Yellow
     $failures | Format-Table Cluster, Error -AutoSize
 }
 
 if ($results.Count -gt 0) {
 
     Write-Host "`nALERT SUMMARY" -ForegroundColor Cyan
-    $results |
-        Select-Object \
-            "Cluster", \
-            "First Occurrence ET", \
-            "Latest Occurrence ET", \
-            "Count", \
-            "Alert Type", \
-            "Alert Code", \
-            "Alert Name", \
-            "Severity", \
-            "Node ID", \
-            "Node IP" |
-        Format-Table -AutoSize
+    $summaryColumns = @(
+        "Cluster",
+        "First Occurrence ET",
+        "Latest Occurrence ET",
+        "Count",
+        "Alert Type",
+        "Alert Code",
+        "Alert Name",
+        "Severity",
+        "Node ID",
+        "Node IP"
+    )
+    $results | Select-Object -Property $summaryColumns | Format-Table -AutoSize
 
     Write-Host "`nALERT DETAILS / CATALOG GUIDANCE" -ForegroundColor Cyan
-    $results |
-        Select-Object \
-            "Cluster", \
-            "Alert Code", \
-            "Alert Name", \
-            "Alert Details", \
-            "Reason", \
-            "Action" |
-        Format-Table -Wrap -AutoSize
+    $detailColumns = @(
+        "Cluster",
+        "Alert Code",
+        "Alert Name",
+        "Alert Details",
+        "Reason",
+        "Action"
+    )
+    $results | Select-Object -Property $detailColumns | Format-Table -Wrap -AutoSize
 }
 else {
     Write-Host "No open alerts remained after exclusions." -ForegroundColor Green
