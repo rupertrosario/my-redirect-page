@@ -15,6 +15,7 @@
 #   - All Cohesity API requests are GET only.
 #   - ProtectionGroupFailed is explicitly excluded as an additional safeguard.
 #   - Alert rows are NOT displayed in the PowerShell console.
+#   - A cluster GET failure or timeout does NOT stop the remaining clusters.
 #
 # APIs used:
 #   GET /v2/mcm/cluster-mgmt/info
@@ -37,6 +38,7 @@ $alertsCsv           = "X:\PowerShell\Cohesity_API_Scripts\Cohesity_alerts.csv"
 $helperPath          = "X:\PowerShell\Cohesity_API_Scripts\Common\ApiKeyAesHelper.ps1"
 $encryptedApiKeyPath = "X:\PowerShell\Cohesity_API_Scripts\Common\Secure\cohesity_apikey.enc"
 $maxAlerts           = 1000
+$requestTimeoutSec   = 30
 
 # Alert category intentionally excluded from this review.
 $excludedCatalogAlertType = "Backup and Restore Alerts"
@@ -94,18 +96,31 @@ function New-CohesityHeaders {
 function Invoke-CohesityGet {
     param(
         [Parameter(Mandatory)][string]$Uri,
-        [Parameter(Mandatory)][hashtable]$Headers
+        [Parameter(Mandatory)][hashtable]$Headers,
+        [int]$TimeoutSec = $requestTimeoutSec
     )
 
     # SAFETY: HTTP method is intentionally hard-coded to GET.
+    # Timeout prevents one unreachable/hung cluster from blocking the run.
     if ($PSVersionTable.PSVersion.Major -lt 6) {
-        $response = Invoke-WebRequest -Uri $Uri -Headers $Headers -Method Get -UseBasicParsing -ErrorAction Stop
+        $response = Invoke-WebRequest `
+            -Uri $Uri `
+            -Headers $Headers `
+            -Method Get `
+            -TimeoutSec $TimeoutSec `
+            -UseBasicParsing `
+            -ErrorAction Stop
     }
     else {
-        $response = Invoke-WebRequest -Uri $Uri -Headers $Headers -Method Get -ErrorAction Stop
+        $response = Invoke-WebRequest `
+            -Uri $Uri `
+            -Headers $Headers `
+            -Method Get `
+            -TimeoutSec $TimeoutSec `
+            -ErrorAction Stop
     }
 
-    if (-not $response -or [string]::IsNullOrWhiteSpace($response.Content)) {
+    if (-not $response -or [string]::IsNullOrWhiteSpace([string]$response.Content)) {
         return $null
     }
 
@@ -306,13 +321,21 @@ Write-Host "   COHESITY OPEN ALERT REVIEW - GET ONLY" -ForegroundColor White
 Write-Host "==============================================" -ForegroundColor Cyan
 Write-Host "Catalog : $alertsCsv"
 Write-Host "Exclude : $excludedCatalogAlertType"
+Write-Host "GET timeout: $requestTimeoutSec seconds"
 
 try {
     # GET only: retrieve Helios-managed clusters.
-    $clusterResponse = Invoke-CohesityGet -Uri "$baseUrl/v2/mcm/cluster-mgmt/info" -Headers (New-CohesityHeaders)
+    $clusterResponse = Invoke-CohesityGet `
+        -Uri "$baseUrl/v2/mcm/cluster-mgmt/info" `
+        -Headers (New-CohesityHeaders) `
+        -TimeoutSec $requestTimeoutSec
 }
 catch {
     throw "Unable to retrieve Helios clusters: $($_.Exception.Message)"
+}
+
+if ($null -eq $clusterResponse) {
+    throw "Helios cluster list returned no response content."
 }
 
 $clusters = @($clusterResponse.cohesityClusters)
@@ -351,13 +374,25 @@ foreach ($cluster in ($clusters | Sort-Object clusterName)) {
 
     try {
         # GET only: retrieve currently open alerts for this cluster.
-        $alertResponse = Invoke-CohesityGet -Uri $alertsUrl -Headers $headers
+        # If the cluster is unreachable or the request exceeds the timeout,
+        # record the failure and continue with the next cluster.
+        $alertResponse = Invoke-CohesityGet `
+            -Uri $alertsUrl `
+            -Headers $headers `
+            -TimeoutSec $requestTimeoutSec
+
+        if ($null -eq $alertResponse) {
+            throw "No response content returned within the GET request."
+        }
     }
     catch {
         $failures += [pscustomobject]@{
-            Cluster = $clusterName
-            Error   = $_.Exception.Message
+            Cluster   = $clusterName
+            ClusterId = $clusterId
+            Error     = $_.Exception.Message
         }
+
+        Write-Warning "Skipping cluster '$clusterName': $($_.Exception.Message)"
         continue
     }
 
@@ -492,25 +527,38 @@ if (-not (Test-Path $csvDir)) {
 
 $csvFile = Join-Path $csvDir "Cohesity_Open_Alert_Review_${reportdate}.csv"
 
-# These are the exact columns written to the review CSV.
-$csvRows = $results | Select-Object `
-    Cluster,
+$csvColumns = @(
+    "Cluster",
     "First Occurrence ET",
     "Latest Occurrence ET",
-    Count,
+    "Count",
     "Alert Type",
     "Alert Code",
     "Alert Name",
-    Severity,
+    "Severity",
     "Node ID",
     "Node IP",
     "Alert Details",
-    Reason,
-    Action
+    "Reason",
+    "Action"
+)
 
-$csvRows |
-    Sort-Object Cluster, "Alert Code" |
-    Export-Csv -Path $csvFile -NoTypeInformation -Encoding UTF8
+$csvRows = @($results | Select-Object -Property $csvColumns)
+
+if ($csvRows.Count -gt 0) {
+    $csvRows |
+        Sort-Object Cluster, "Alert Code" |
+        Export-Csv -Path $csvFile -NoTypeInformation -Encoding UTF8
+}
+else {
+    # Still create a header-only CSV so the output file always exists.
+    $headerLine = ($csvColumns | ForEach-Object { '"' + ($_ -replace '"','""') + '"' }) -join ','
+    Set-Content -Path $csvFile -Value $headerLine -Encoding UTF8
+}
+
+if (-not (Test-Path $csvFile -PathType Leaf)) {
+    throw "CSV export failed: $csvFile was not created."
+}
 
 # ------------------------------------------------------------
 # Final status only - no alert data is displayed in the console
@@ -521,12 +569,5 @@ Write-Host "   ALERT REVIEW COMPLETE" -ForegroundColor White
 Write-Host "==============================================" -ForegroundColor Cyan
 Write-Host "Open alerts included   : $($results.Count)"
 Write-Host "Backup/restore excluded: $excludedCount"
-
-if ($failures.Count -gt 0) {
-    Write-Host "GET failures           : $($failures.Count)" -ForegroundColor Yellow
-    foreach ($failure in $failures) {
-        Write-Warning "$($failure.Cluster): $($failure.Error)"
-    }
-}
-
-Write-Host "Saved CSV report at: $csvFile" -ForegroundColor Green
+Write-Host "Cluster GET failures   : $($failures.Count)"
+Write-Host "Saved CSV report at    : $csvFile" -ForegroundColor Green
