@@ -11,6 +11,51 @@ if (-not $json.results) {
     return
 }
 
+# Convert nested strings/arrays/objects into readable CSV text instead of JSON such as ["..."] or {"..."}.
+function ConvertTo-ReadableText {
+    param($Value)
+
+    if ($null -eq $Value) {
+        return ''
+    }
+
+    if ($Value -is [string]) {
+        return $Value.Trim()
+    }
+
+    if ($Value -is [System.Collections.IDictionary]) {
+        $parts = foreach ($key in $Value.Keys) {
+            $text = ConvertTo-ReadableText $Value[$key]
+            if (-not [string]::IsNullOrWhiteSpace($text)) {
+                "$key: $text"
+            }
+        }
+        return ($parts -join '; ')
+    }
+
+    if ($Value -is [System.Management.Automation.PSCustomObject]) {
+        $parts = foreach ($property in $Value.PSObject.Properties) {
+            $text = ConvertTo-ReadableText $property.Value
+            if (-not [string]::IsNullOrWhiteSpace($text)) {
+                "$($property.Name): $text"
+            }
+        }
+        return ($parts -join '; ')
+    }
+
+    if ($Value -is [System.Collections.IEnumerable]) {
+        $parts = foreach ($item in $Value) {
+            $text = ConvertTo-ReadableText $item
+            if (-not [string]::IsNullOrWhiteSpace($text)) {
+                $text
+            }
+        }
+        return (($parts | Select-Object -Unique) -join '; ')
+    }
+
+    return [string]$Value
+}
+
 # Use the source JSON file timestamp for the report date/time.
 $sourceFile = Get-Item -Path $Path
 $reportDate = $sourceFile.LastWriteTime.ToString('yyyy-MM-dd')
@@ -37,11 +82,7 @@ $rawResults = $json.results |
                 ''
             }
         }},
-        @{Name='Remediation'; Expression={
-            if ($null -eq $_.remediation) { '' }
-            elseif ($_.remediation -is [string]) { $_.remediation }
-            else { $_.remediation | ConvertTo-Json -Depth 10 -Compress }
-        }}
+        @{Name='Remediation'; Expression={ ConvertTo-ReadableText $_.remediation }}
 
 # Consolidate duplicate tests so the same issue is not repeated for multiple nodes/instances.
 # Unique Result/Remediation values are retained and combined when they differ.
