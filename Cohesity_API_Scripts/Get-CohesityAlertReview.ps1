@@ -3,15 +3,17 @@
 # PowerShell 5.1 compatible
 #
 # Purpose:
-#   1. Retrieve all currently open alerts from every Helios-managed cluster.
-#   2. Match each live alert against the local Cohesity alert catalog CSV.
-#   3. Add the catalog Reason and Action for review.
-#   4. Export the combined result to CSV.
+#   1. Retrieve currently open alerts from every Helios-managed cluster.
+#   2. Exclude Backup and Restore Alerts from this review.
+#   3. Match remaining live alerts against the local Cohesity alert catalog CSV.
+#   4. Add the catalog Reason and Action for review.
+#   5. Export the complete review to a timestamped CSV for later reference.
 #
 # IMPORTANT:
 #   - This script does NOT resolve alerts.
 #   - This script does NOT use POST, PUT, PATCH, or DELETE.
 #   - All Cohesity API requests are GET only.
+#   - ProtectionGroupFailed is explicitly excluded as an additional safeguard.
 #
 # APIs used:
 #   GET /v2/mcm/cluster-mgmt/info
@@ -35,6 +37,9 @@ $helperPath          = "X:\PowerShell\Cohesity_API_Scripts\Common\ApiKeyAesHelpe
 $encryptedApiKeyPath = "X:\PowerShell\Cohesity_API_Scripts\Common\Secure\cohesity_apikey.enc"
 $maxAlerts           = 1000
 $outputCsv           = "X:\PowerShell\Cohesity_API_Scripts\cohesit_alert_review_{0}.csv" -f (Get-Date -Format "yyyyMMdd_HHmmss")
+
+# Alert catalog category intentionally excluded from this review.
+$excludedCatalogAlertType = "Backup and Restore Alerts"
 
 # ------------------------------------------------------------
 # Validate local files
@@ -83,7 +88,7 @@ function New-CohesityHeaders {
 }
 
 # ------------------------------------------------------------
-# Helper: GET only API wrapper
+# Helper: GET-only API wrapper
 # ------------------------------------------------------------
 
 function Invoke-CohesityGet {
@@ -92,7 +97,7 @@ function Invoke-CohesityGet {
         [Parameter(Mandatory)][hashtable]$Headers
     )
 
-    # SAFETY: this function is intentionally hard-coded to GET.
+    # SAFETY: HTTP method is intentionally hard-coded to GET.
     if ($PSVersionTable.PSVersion.Major -lt 6) {
         $response = Invoke-WebRequest -Uri $Uri -Headers $Headers -Method Get -UseBasicParsing -ErrorAction Stop
     }
@@ -252,17 +257,31 @@ foreach ($requiredColumn in $requiredColumns) {
     }
 }
 
-# Build lookups once so every alert does not repeatedly scan all 512 catalog rows.
-# Primary match = Alert Code + Severity.
-# Secondary match = Alert Name + Severity.
+# ------------------------------------------------------------
+# Build alert catalog lookups
+# ------------------------------------------------------------
+# Primary match   : Alert Code + Severity
+# Secondary match : Alert Name + Severity
+#
+# Also build exclusion lookups from every row categorized as
+# "Backup and Restore Alerts" so these alerts never enter the review output.
+
 $catalogByCodeSeverity = @{}
 $catalogByNameSeverity = @{}
 $catalogRowsByCode = @{}
+$excludedAlertCodes = @{}
+$excludedAlertNames = @{}
 
 foreach ($catalogRow in $catalog) {
+    $catalogAlertType = ([string]$catalogRow.'Alert Type').Trim()
     $catalogCode = ([string]$catalogRow.'Alert Code').Trim().ToUpperInvariant()
     $catalogName = ([string]$catalogRow.'Alert Name').Trim().ToUpperInvariant()
     $catalogSeverity = ([string]$catalogRow.Severity).Trim().ToUpperInvariant()
+
+    if ($catalogAlertType -ieq $excludedCatalogAlertType) {
+        if ($catalogCode) { $excludedAlertCodes[$catalogCode] = $true }
+        if ($catalogName) { $excludedAlertNames[$catalogName] = $true }
+    }
 
     if ($catalogCode) {
         $catalogByCodeSeverity["$catalogCode|$catalogSeverity"] = $catalogRow
@@ -286,6 +305,7 @@ Write-Host "`n==============================================" -ForegroundColor C
 Write-Host "   COHESITY OPEN ALERT REVIEW - GET ONLY" -ForegroundColor White
 Write-Host "==============================================" -ForegroundColor Cyan
 Write-Host "Catalog : $alertsCsv"
+Write-Host "Exclude : $excludedCatalogAlertType"
 
 try {
     # GET only: retrieve Helios-managed clusters.
@@ -309,6 +329,7 @@ Write-Host "Clusters: $($clusters.Count)"
 
 $results = @()
 $failures = @()
+$excludedCount = 0
 
 foreach ($cluster in ($clusters | Sort-Object clusterName)) {
 
@@ -347,10 +368,39 @@ foreach ($cluster in ($clusters | Sort-Object clusterName)) {
 
         $alertCode = ([string]$alert.alertCode).Trim()
         $severity = ([string]$alert.severity).Trim()
+        $liveAlertType = ([string]$alert.alertType).Trim()
         $liveAlertName = ""
 
         if ($alert.alertDocument -and $alert.alertDocument.PSObject.Properties["alertName"]) {
             $liveAlertName = ([string]$alert.alertDocument.alertName).Trim()
+        }
+
+        $normalizedAlertCode = $alertCode.ToUpperInvariant()
+        $normalizedAlertName = $liveAlertName.ToUpperInvariant()
+
+        # ----------------------------------------------------
+        # Exclude Backup and Restore Alerts
+        # ----------------------------------------------------
+        # Exclusion is derived from the local alert catalog by Alert Type.
+        # ProtectionGroupFailed is also explicitly checked as a safeguard.
+
+        $excludeAlert = $false
+
+        if ($normalizedAlertCode -and $excludedAlertCodes.ContainsKey($normalizedAlertCode)) {
+            $excludeAlert = $true
+        }
+
+        if ($normalizedAlertName -and $excludedAlertNames.ContainsKey($normalizedAlertName)) {
+            $excludeAlert = $true
+        }
+
+        if ($liveAlertName -ieq "ProtectionGroupFailed") {
+            $excludeAlert = $true
+        }
+
+        if ($excludeAlert) {
+            $excludedCount++
+            continue
         }
 
         # ----------------------------------------------------
@@ -358,26 +408,31 @@ foreach ($cluster in ($clusters | Sort-Object clusterName)) {
         # ----------------------------------------------------
 
         $matchedCatalogRow = $null
-        $codeKey = "{0}|{1}" -f $alertCode.ToUpperInvariant(), $severity.ToUpperInvariant()
+        $codeKey = "{0}|{1}" -f $normalizedAlertCode, $severity.ToUpperInvariant()
 
         if ($alertCode -and $catalogByCodeSeverity.ContainsKey($codeKey)) {
             $matchedCatalogRow = $catalogByCodeSeverity[$codeKey]
         }
         elseif ($alertCode) {
-            $normalizedCode = $alertCode.ToUpperInvariant()
-
             # Safe fallback only when this alert code exists once in the catalog.
-            if ($catalogRowsByCode.ContainsKey($normalizedCode) -and @($catalogRowsByCode[$normalizedCode]).Count -eq 1) {
-                $matchedCatalogRow = @($catalogRowsByCode[$normalizedCode])[0]
+            if ($catalogRowsByCode.ContainsKey($normalizedAlertCode) -and @($catalogRowsByCode[$normalizedAlertCode]).Count -eq 1) {
+                $matchedCatalogRow = @($catalogRowsByCode[$normalizedAlertCode])[0]
             }
         }
 
         if (-not $matchedCatalogRow -and $liveAlertName) {
-            $nameKey = "{0}|{1}" -f $liveAlertName.ToUpperInvariant(), $severity.ToUpperInvariant()
+            $nameKey = "{0}|{1}" -f $normalizedAlertName, $severity.ToUpperInvariant()
 
             if ($catalogByNameSeverity.ContainsKey($nameKey)) {
                 $matchedCatalogRow = $catalogByNameSeverity[$nameKey]
             }
+        }
+
+        # Final catalog safeguard: if a row resolves to Backup and Restore,
+        # exclude it even if the code/name exclusion lookup did not catch it.
+        if ($matchedCatalogRow -and ([string]$matchedCatalogRow.'Alert Type').Trim() -ieq $excludedCatalogAlertType) {
+            $excludedCount++
+            continue
         }
 
         # ----------------------------------------------------
@@ -410,7 +465,7 @@ foreach ($cluster in ($clusters | Sort-Object clusterName)) {
             "First Occurrence ET"  = Convert-UsecsToET $alert.firstTimestampUsecs
             "Latest Occurrence ET" = Convert-UsecsToET $alert.latestTimestampUsecs
             "Count"                = Get-AlertCount $alert
-            "Alert Type"           = if ($matchedCatalogRow) { $matchedCatalogRow.'Alert Type' } else { [string]$alert.alertType }
+            "Alert Type"           = if ($matchedCatalogRow) { $matchedCatalogRow.'Alert Type' } else { $liveAlertType }
             "Alert Code"           = $alertCode
             "Alert Name"           = if ($matchedCatalogRow) { $matchedCatalogRow.'Alert Name' } else { $liveAlertName }
             "Severity"             = $severity
@@ -424,27 +479,62 @@ foreach ($cluster in ($clusters | Sort-Object clusterName)) {
 }
 
 # ------------------------------------------------------------
-# Export and display results
+# Export complete review to CSV
 # ------------------------------------------------------------
 
 $results = @($results | Sort-Object -Property @{ Expression = "Latest Occurrence ET"; Descending = $true }, Cluster, "Alert Code")
 
+# The CSV intentionally contains ALL 13 review columns.
+# This is the persistent output to reference later.
 $results | Export-Csv -Path $outputCsv -NoTypeInformation -Encoding UTF8
+
+# ------------------------------------------------------------
+# Console output
+# ------------------------------------------------------------
+# PowerShell console tables become unreadable when all 13 fields are shown
+# together. Display the same review in two smaller tables while keeping the
+# exported CSV complete.
 
 Write-Host "`n==============================================" -ForegroundColor Cyan
 Write-Host "   ALERT REVIEW COMPLETE" -ForegroundColor White
 Write-Host "==============================================" -ForegroundColor Cyan
-Write-Host "Open alerts : $($results.Count)"
-Write-Host "Output      : $outputCsv"
+Write-Host "Open alerts included : $($results.Count)"
+Write-Host "Backup/restore excluded: $excludedCount"
+Write-Host "Output CSV           : $outputCsv"
 
 if ($failures.Count -gt 0) {
-    Write-Host "GET failures: $($failures.Count)" -ForegroundColor Yellow
+    Write-Host "GET failures         : $($failures.Count)" -ForegroundColor Yellow
     $failures | Format-Table Cluster, Error -AutoSize
 }
 
 if ($results.Count -gt 0) {
-    $results | Format-Table -AutoSize
+
+    Write-Host "`nALERT SUMMARY" -ForegroundColor Cyan
+    $results |
+        Select-Object \
+            "Cluster", \
+            "First Occurrence ET", \
+            "Latest Occurrence ET", \
+            "Count", \
+            "Alert Type", \
+            "Alert Code", \
+            "Alert Name", \
+            "Severity", \
+            "Node ID", \
+            "Node IP" |
+        Format-Table -AutoSize
+
+    Write-Host "`nALERT DETAILS / CATALOG GUIDANCE" -ForegroundColor Cyan
+    $results |
+        Select-Object \
+            "Cluster", \
+            "Alert Code", \
+            "Alert Name", \
+            "Alert Details", \
+            "Reason", \
+            "Action" |
+        Format-Table -Wrap -AutoSize
 }
 else {
-    Write-Host "No open alerts returned." -ForegroundColor Green
+    Write-Host "No open alerts remained after exclusions." -ForegroundColor Green
 }
