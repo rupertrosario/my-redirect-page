@@ -27,7 +27,7 @@ function ConvertTo-ReadableText {
         $parts = foreach ($key in $Value.Keys) {
             $text = ConvertTo-ReadableText $Value[$key]
             if (-not [string]::IsNullOrWhiteSpace($text)) {
-                "$key: $text"
+                "$($key): $text"
             }
         }
         return ($parts -join "`n")
