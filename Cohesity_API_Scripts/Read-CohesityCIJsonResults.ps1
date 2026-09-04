@@ -56,8 +56,8 @@ function ConvertTo-ReadableText {
     return [string]$Value
 }
 
-# Only show checks requiring attention. Passed checks are intentionally excluded.
-$results = $json.results |
+# Build only non-Pass checks.
+$rawResults = $json.results |
     Where-Object { $_.state -ne 'Pass' } |
     Select-Object `
         @{Name='Test #'; Expression={$_.testNumber}},
@@ -81,10 +81,45 @@ $results = $json.results |
             ConvertTo-ReadableText $_.remediation
         }}
 
-if (-not $results) {
+if (-not $rawResults) {
     Write-Host 'No non-Pass CI checks found.'
     return
 }
 
-# Human-readable console table. Remediation entries remain on separate lines.
-$results | Format-Table -AutoSize -Wrap
+# Consolidate repeated checks so the same issue is not written again and again.
+# Preserve unique Result and Remediation text when duplicate rows contain different details.
+$results = $rawResults |
+    Group-Object -Property 'Test #','Test Name','State','Severity','Module','Code' |
+    ForEach-Object {
+        $first = $_.Group[0]
+
+        $uniqueResults = $_.Group.Result |
+            Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) } |
+            Select-Object -Unique
+
+        $uniqueRemediation = $_.Group.Remediation |
+            Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) } |
+            Select-Object -Unique
+
+        [PSCustomObject]@{
+            'Test #'      = $first.'Test #'
+            'Test Name'   = $first.'Test Name'
+            'State'       = $first.State
+            'Severity'    = $first.Severity
+            'Module'      = $first.Module
+            'Code'        = $first.Code
+            'Occurrences' = $_.Count
+            'Result'      = ($uniqueResults -join "`n")
+            'Remediation' = ($uniqueRemediation -join "`n")
+        }
+    } |
+    Sort-Object 'Test #','Test Name'
+
+# Export only to CSV; do not print the result table in the PowerShell window.
+$timestamp = Get-Date -Format 'yyyyMMdd_HHmmss'
+$sourceName = [System.IO.Path]::GetFileNameWithoutExtension($Path)
+$outputDir = Split-Path -Parent (Resolve-Path $Path)
+$csvPath = Join-Path $outputDir ("{0}_CI_Results_{1}.csv" -f $sourceName, $timestamp)
+
+$results | Export-Csv -Path $csvPath -NoTypeInformation -Encoding UTF8
+Write-Host "CSV exported to: $csvPath"
