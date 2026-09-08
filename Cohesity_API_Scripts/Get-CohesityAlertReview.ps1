@@ -6,15 +6,14 @@
 #   2. Match live alerts against the local Cohesity alert catalog CSV.
 #   3. Export the review to CSV; alert rows are not displayed in the console.
 #   4. Optionally preview or resolve:
-#        - alerts older than X days
-#        - approved non-actionable alerts
+#        - alerts whose latest occurrence is older than X days
+#        - approved non-actionable alerts by exact Alert Name
 #
 # SAFETY - CURRENT LAB PHASE:
 #   - Default mode is Review. Running this script with no parameters performs GETs only.
-#   - Resolution is allowed ONLY for a cluster name containing DET3.
-#   - Every other cluster is blocked from write operations.
+#   - Resolution is allowed ONLY for the single discovered cluster whose name contains DET3.
+#   - Every other cluster is unavailable for write operations.
 #   - Resolve modes are preview-only unless -Execute is explicitly supplied.
-#   - -Execute is blocked until $labDomain is configured below.
 #   - No alert type/category exclusion is used.
 #   - Any future exclusion must be based on exact Alert Name only.
 #   - One cluster GET failure/timeout does not stop the remaining clusters.
@@ -22,8 +21,8 @@
 # APIs used:
 #   GET  https://helios.cohesity.com/v2/mcm/cluster-mgmt/info
 #   GET  https://helios.cohesity.com/v2/alerts?maxAlerts=1000&alertStates=kOpen
-#   POST https://<DET3-LAB-CLUSTER>/irisservices/api/v1/public/alertResolutions
-#        POST is reachable only when -Execute is explicitly supplied.
+#   POST https://helios.cohesity.com/v2/mcm/alerts/resolutions
+#        POST is reachable only in a resolve mode with explicit -Execute.
 #
 # Authentication:
 #   Uses the existing AES-encrypted Cohesity API key method.
@@ -50,16 +49,13 @@ $alertsCsv           = "X:\PowerShell\Cohesity_API_Scripts\Cohesity_alerts.csv"
 $nonActionableCsv    = "X:\PowerShell\Cohesity_API_Scripts\Cohesity_NonActionable_Alerts.csv"
 $helperPath          = "X:\PowerShell\Cohesity_API_Scripts\Common\ApiKeyAesHelper.ps1"
 $encryptedApiKeyPath = "X:\PowerShell\Cohesity_API_Scripts\Common\Secure\cohesity_apikey.enc"
+$csvDir              = "X:\PowerShell\Data\Cohesity\Alerts"
 $maxAlerts           = 1000
 $requestTimeoutSec   = 30
 
-# LAB SAFETY: only a cluster whose name contains DET3 can be resolved.
+# HARD LAB SAFETY: only the single discovered cluster whose name contains
+# this text is eligible for any resolution operation.
 $labClusterPattern   = "DET3"
-
-# LAB DNS suffix used only for the direct-cluster alert resolution POST.
-# Example only: "lab.example.com"
-# DO NOT enable -Execute until this is replaced with the real DET3 lab domain.
-$labDomain           = "CHANGE_ME"
 
 # ------------------------------------------------------------
 # Validate mode / safety inputs
@@ -73,10 +69,6 @@ if (($Mode -eq "ResolveOlderThanDays" -or $Mode -eq "ResolveAll") -and $OlderTha
 
 if ($Execute -and -not $isResolveMode) {
     throw "-Execute is valid only with a resolve mode."
-}
-
-if ($Execute -and ([string]::IsNullOrWhiteSpace($labDomain) -or $labDomain -eq "CHANGE_ME")) {
-    throw "LAB SAFETY BLOCK: Configure `$labDomain before using -Execute. No alert was resolved."
 }
 
 # ------------------------------------------------------------
@@ -97,6 +89,10 @@ if (-not (Test-Path $encryptedApiKeyPath -PathType Leaf)) {
 
 if (($Mode -eq "ResolveNonActionable" -or $Mode -eq "ResolveAll") -and -not (Test-Path $nonActionableCsv -PathType Leaf)) {
     throw "Non-actionable alert CSV not found: $nonActionableCsv"
+}
+
+if (-not (Test-Path $csvDir)) {
+    New-Item -ItemType Directory -Path $csvDir | Out-Null
 }
 
 # ------------------------------------------------------------
@@ -166,43 +162,47 @@ function Invoke-CohesityGet {
 }
 
 # ------------------------------------------------------------
-# Helper: controlled direct-cluster alert resolution POST
+# Helper: controlled Helios alert resolution POST
 # ------------------------------------------------------------
 
 function Invoke-CohesityAlertResolution {
     param(
         [Parameter(Mandatory)][string]$ClusterName,
-        [Parameter(Mandatory)][string[]]$AlertIds,
+        [Parameter(Mandatory)][string]$ApprovedLabClusterName,
+        [Parameter(Mandatory)][object[]]$ResolvedAlerts,
         [Parameter(Mandatory)][string]$ResolutionText
     )
 
-    # HARD SAFETY GATE: DET3 is the only writable lab target at this stage.
+    # HARD SAFETY GATE: the exact discovered DET3 cluster is the only writable target.
+    if ([string]::IsNullOrWhiteSpace($ApprovedLabClusterName) -or $ClusterName -ine $ApprovedLabClusterName) {
+        throw "WRITE BLOCKED: Cluster '$ClusterName' is not the approved DET3 lab cluster."
+    }
+
     if ($ClusterName -notmatch "(?i)$([regex]::Escape($labClusterPattern))") {
-        throw "WRITE BLOCKED: Cluster '$ClusterName' is not an approved DET3 lab cluster."
+        throw "WRITE BLOCKED: Cluster '$ClusterName' does not contain '$labClusterPattern'."
     }
 
     if (-not $Execute) {
         throw "Internal safety check: resolution POST called without -Execute."
     }
 
-    if ([string]::IsNullOrWhiteSpace($labDomain) -or $labDomain -eq "CHANGE_ME") {
-        throw "WRITE BLOCKED: `$labDomain is not configured."
+    if ($ResolvedAlerts.Count -eq 0) {
+        throw "Internal safety check: no alerts were supplied for resolution."
     }
 
-    $clusterHost = $ClusterName
-    if ($clusterHost -notmatch '\.') {
-        $clusterHost = "$ClusterName.$labDomain"
+    if ([string]::IsNullOrWhiteSpace($ResolutionText)) {
+        throw "Internal safety check: resolution text is empty."
     }
 
-    $resolutionUrl = "https://$clusterHost/irisservices/api/v1/public/alertResolutions"
+    $resolutionUrl = "$baseUrl/v2/mcm/alerts/resolutions"
 
-    $body = @{
-        alertIdList = @($AlertIds)
-        resolutionDetails = @{
-            resolutionDetails = $ResolutionText
-            resolutionSummary = $ResolutionText
-        }
-    } | ConvertTo-Json -Depth 5
+    $bodyObject = [ordered]@{
+        resolutionName = $ResolutionText
+        description    = $ResolutionText
+        resolvedAlerts = @($ResolvedAlerts)
+    }
+
+    $body = $bodyObject | ConvertTo-Json -Depth 6
 
     $headers = @{
         accept         = "application/json"
@@ -228,6 +228,10 @@ function Invoke-CohesityAlertResolution {
             -Body $body `
             -TimeoutSec $requestTimeoutSec `
             -ErrorAction Stop
+    }
+
+    if ($response.StatusCode -lt 200 -or $response.StatusCode -ge 300) {
+        throw "Alert resolution returned HTTP $($response.StatusCode)."
     }
 
     return $response
@@ -256,20 +260,23 @@ function Convert-UsecsToET {
 }
 
 # ------------------------------------------------------------
-# Helper: calculate alert age in days
+# Helper: calculate age from latest occurrence
 # ------------------------------------------------------------
+# OlderThanDays is intentionally based on latestTimestampUsecs, not the first
+# occurrence. An alert that first appeared long ago but is still occurring now
+# must not be treated as stale simply because its first occurrence is old.
 
-function Get-AlertAgeDays {
-    param($FirstTimestampUsecs)
+function Get-LatestAlertAgeDays {
+    param($LatestTimestampUsecs)
 
-    if ($null -eq $FirstTimestampUsecs -or [string]::IsNullOrWhiteSpace([string]$FirstTimestampUsecs)) {
+    if ($null -eq $LatestTimestampUsecs -or [string]::IsNullOrWhiteSpace([string]$LatestTimestampUsecs)) {
         return $null
     }
 
     try {
-        $milliseconds = [int64]([decimal]$FirstTimestampUsecs / 1000)
-        $firstUtc = [DateTimeOffset]::FromUnixTimeMilliseconds($milliseconds).UtcDateTime
-        return [math]::Floor(((Get-Date).ToUniversalTime() - $firstUtc).TotalDays)
+        $milliseconds = [int64]([decimal]$LatestTimestampUsecs / 1000)
+        $latestUtc = [DateTimeOffset]::FromUnixTimeMilliseconds($milliseconds).UtcDateTime
+        return [math]::Floor(((Get-Date).ToUniversalTime() - $latestUtc).TotalDays)
     }
     catch {
         return $null
@@ -485,9 +492,21 @@ if ($Mode -eq "ResolveNonActionable" -or $Mode -eq "ResolveAll") {
         $name = ([string]$row.AlertName).Trim()
         $resolution = ([string]$row.Resolution).Trim()
 
-        if (-not [string]::IsNullOrWhiteSpace($name)) {
-            $nonActionableByName[$name.ToUpperInvariant()] = $resolution
+        if ([string]::IsNullOrWhiteSpace($name)) {
+            continue
         }
+
+        if ([string]::IsNullOrWhiteSpace($resolution)) {
+            throw "Non-actionable alert '$name' has an empty Resolution value."
+        }
+
+        $normalizedName = $name.ToUpperInvariant()
+
+        if ($nonActionableByName.ContainsKey($normalizedName)) {
+            throw "Duplicate non-actionable AlertName found: $name"
+        }
+
+        $nonActionableByName[$normalizedName] = $resolution
     }
 }
 
@@ -526,7 +545,11 @@ if ($clusters.Count -eq 0) {
 
 Write-Host "Clusters   : $($clusters.Count)"
 
-$det3Clusters = @($clusters | Where-Object { ([string]$_.clusterName) -match "(?i)$([regex]::Escape($labClusterPattern))" })
+$det3Clusters = @($clusters | Where-Object {
+    ([string]$_.clusterName) -match "(?i)$([regex]::Escape($labClusterPattern))"
+})
+
+$approvedLabClusterName = ""
 
 if ($isResolveMode) {
     if ($det3Clusters.Count -eq 0) {
@@ -537,7 +560,13 @@ if ($isResolveMode) {
         throw "LAB SAFETY BLOCK: More than one cluster containing '$labClusterPattern' was found. Resolve mode requires exactly one DET3 lab target."
     }
 
-    Write-Host "Lab target : $($det3Clusters[0].clusterName)" -ForegroundColor Yellow
+    $approvedLabClusterName = ([string]$det3Clusters[0].clusterName).Trim()
+
+    if ([string]::IsNullOrWhiteSpace($approvedLabClusterName)) {
+        throw "LAB SAFETY BLOCK: DET3 cluster name is empty."
+    }
+
+    Write-Host "Lab target : $approvedLabClusterName" -ForegroundColor Yellow
 }
 
 # ------------------------------------------------------------
@@ -547,10 +576,11 @@ if ($isResolveMode) {
 $results = @()
 $rawAlerts = @()
 $failures = @()
+$unmatchedRows = @()
 $unmatchedCount = 0
 
 # Review mode reads all clusters exactly as before.
-# Resolve modes read ONLY the discovered DET3 lab cluster.
+# Resolve modes read ONLY the single discovered DET3 lab cluster.
 $clustersToRead = if ($isResolveMode) { $det3Clusters } else { $clusters }
 
 foreach ($cluster in ($clustersToRead | Sort-Object clusterName)) {
@@ -582,7 +612,7 @@ foreach ($cluster in ($clustersToRead | Sort-Object clusterName)) {
         }
     }
     catch {
-        $failures += [pscustomobject]@{
+        $failures += [pscustomobject][ordered]@{
             Cluster   = $clusterName
             ClusterId = $clusterId
             Error     = $_.Exception.Message
@@ -632,23 +662,35 @@ foreach ($cluster in ($clustersToRead | Sort-Object clusterName)) {
             }
         }
 
+        $alertDetails = Get-AlertDetails $alert
+
         if (-not $matchedCatalogRow) {
             $unmatchedCount++
+
+            $unmatchedRows += [pscustomobject][ordered]@{
+                Cluster          = $clusterName
+                "Raw Alert Type" = ([string]$alert.alertType).Trim()
+                "Alert Code"     = $alertCode
+                "Alert Name"     = $liveAlertName
+                Severity          = $severity
+                "Alert Details"  = $alertDetails
+            }
         }
 
-        $alertAgeDays = Get-AlertAgeDays $alert.firstTimestampUsecs
+        $latestAgeDays = Get-LatestAlertAgeDays $alert.latestTimestampUsecs
+        $alertIdStr = ([string]$alert.id).Trim()
 
         $rawAlerts += [pscustomobject]@{
-            ClusterName       = $clusterName
-            ClusterId         = $clusterId
-            Alert             = $alert
-            AlertId           = ([string]$alert.id).Trim()
-            AlertCode         = $alertCode
-            AlertName         = $liveAlertName
-            NormalizedName    = $normalizedAlertName
-            Severity          = $severity
-            AgeDays           = $alertAgeDays
-            FirstTimestampUsecs = $alert.firstTimestampUsecs
+            ClusterName          = $clusterName
+            ClusterId            = $clusterId
+            AlertIdStr           = $alertIdStr
+            AlertCode            = $alertCode
+            AlertName            = $liveAlertName
+            NormalizedName       = $normalizedAlertName
+            Severity             = $severity
+            LatestAgeDays        = $latestAgeDays
+            FirstTimestampUsecs  = $alert.firstTimestampUsecs
+            LatestTimestampUsecs = $alert.latestTimestampUsecs
         }
 
         $results += [pscustomobject][ordered]@{
@@ -659,24 +701,22 @@ foreach ($cluster in ($clustersToRead | Sort-Object clusterName)) {
             "Alert Code"           = $alertCode
             "Alert Name"           = if ($matchedCatalogRow) { $matchedCatalogRow.'Alert Name' } else { $liveAlertName }
             "Severity"             = $severity
-            "Alert Details"        = Get-AlertDetails $alert
+            "Alert Details"        = $alertDetails
             "Reason"               = if ($matchedCatalogRow) { $matchedCatalogRow.Reason } else { "No matching row found in Cohesity_alerts.csv." }
             "Action"               = if ($matchedCatalogRow) { $matchedCatalogRow.Action } else { "Review manually." }
         }
     }
 }
 
+# Resolve mode must never proceed when the DET3 GET failed.
+# Delay the terminating error until after review/diagnostic CSVs are written.
+$resolveGetFailed = $isResolveMode -and $failures.Count -gt 0
+
 # ------------------------------------------------------------
 # Main review CSV export
 # ------------------------------------------------------------
 
 $reportdate = Get-Date -Format "yyyy-MM-dd_HHmm"
-
-$csvDir = "X:\PowerShell\Data\Cohesity\Alerts"
-if (-not (Test-Path $csvDir)) {
-    New-Item -ItemType Directory -Path $csvDir | Out-Null
-}
-
 $csvFile = Join-Path $csvDir "Cohesity_Open_Alert_Review_${reportdate}.csv"
 
 $csvColumns = @(
@@ -709,6 +749,32 @@ if (-not (Test-Path $csvFile -PathType Leaf)) {
 }
 
 # ------------------------------------------------------------
+# Diagnostics CSVs
+# ------------------------------------------------------------
+
+$unmatchedCsvFile = $null
+$failureCsvFile = $null
+
+if ($unmatchedRows.Count -gt 0) {
+    $unmatchedCsvFile = Join-Path $csvDir "Cohesity_Alert_Unmatched_${reportdate}.csv"
+    $unmatchedRows |
+        Sort-Object Cluster, "Alert Code", "Alert Name" |
+        Export-Csv -Path $unmatchedCsvFile -NoTypeInformation -Encoding UTF8
+}
+
+if ($failures.Count -gt 0) {
+    $failureCsvFile = Join-Path $csvDir "Cohesity_Alert_GET_Failures_${reportdate}.csv"
+    $failures |
+        Sort-Object Cluster |
+        Export-Csv -Path $failureCsvFile -NoTypeInformation -Encoding UTF8
+}
+
+if ($resolveGetFailed) {
+    Write-Warning "DET3 alert retrieval failed. Review and failure CSVs were saved; no resolution operation was attempted."
+    throw "LAB SAFETY BLOCK: Unable to retrieve DET3 alerts. No alert was resolved."
+}
+
+# ------------------------------------------------------------
 # Resolve candidate selection - DET3 only
 # ------------------------------------------------------------
 
@@ -717,8 +783,8 @@ $resolveCandidates = @()
 if ($isResolveMode) {
     foreach ($item in $rawAlerts) {
 
-        # Redundant hard guard: never classify another cluster for resolution.
-        if ($item.ClusterName -notmatch "(?i)$([regex]::Escape($labClusterPattern))") {
+        # Exact full-name guard after DET3 discovery.
+        if ($item.ClusterName -ine $approvedLabClusterName) {
             continue
         }
 
@@ -726,11 +792,11 @@ if ($isResolveMode) {
         $resolutionText = ""
 
         if (($Mode -eq "ResolveOlderThanDays" -or $Mode -eq "ResolveAll") -and
-            $null -ne $item.AgeDays -and
-            $item.AgeDays -ge $OlderThanDays) {
+            $null -ne $item.LatestAgeDays -and
+            $item.LatestAgeDays -ge $OlderThanDays) {
 
             $selectedReasons += "OlderThanDays"
-            $resolutionText = "AutoResolve: Alert older than $OlderThanDays days."
+            $resolutionText = "NoActReq: Alert latest occurrence is older than $OlderThanDays days."
         }
 
         if (($Mode -eq "ResolveNonActionable" -or $Mode -eq "ResolveAll") -and
@@ -738,54 +804,70 @@ if ($isResolveMode) {
             $nonActionableByName.ContainsKey($item.NormalizedName)) {
 
             $selectedReasons += "NonActionable"
-
-            $configuredResolution = [string]$nonActionableByName[$item.NormalizedName]
-            if (-not [string]::IsNullOrWhiteSpace($configuredResolution)) {
-                $resolutionText = $configuredResolution
-            }
+            $resolutionText = [string]$nonActionableByName[$item.NormalizedName]
         }
 
-        if ($selectedReasons.Count -gt 0) {
-            if ([string]::IsNullOrWhiteSpace($item.AlertId)) {
-                Write-Warning "Skipping '$($item.AlertName)' on '$($item.ClusterName)' because alert id is empty."
-                continue
-            }
+        if ($selectedReasons.Count -eq 0) {
+            continue
+        }
 
-            $resolveCandidates += [pscustomobject]@{
-                Cluster        = $item.ClusterName
-                AlertId        = $item.AlertId
-                AlertName      = $item.AlertName
-                Severity       = $item.Severity
-                AgeDays        = $item.AgeDays
-                ReasonSelected = ($selectedReasons -join "+")
-                Resolution     = $resolutionText
-                Result         = if ($Execute) { "Pending" } else { "Would Resolve" }
-                Error          = ""
-            }
+        if ([string]::IsNullOrWhiteSpace($item.AlertIdStr)) {
+            Write-Warning "Skipping '$($item.AlertName)' on '$($item.ClusterName)' because alertIdStr is empty."
+            continue
+        }
+
+        if ([string]::IsNullOrWhiteSpace($item.AlertName)) {
+            Write-Warning "Skipping alert '$($item.AlertIdStr)' on '$($item.ClusterName)' because Alert Name is empty."
+            continue
+        }
+
+        if ([string]::IsNullOrWhiteSpace($resolutionText)) {
+            Write-Warning "Skipping '$($item.AlertName)' on '$($item.ClusterName)' because resolution text is empty."
+            continue
+        }
+
+        $resolveCandidates += [pscustomobject]@{
+            Cluster                 = $item.ClusterName
+            AlertIdStr              = $item.AlertIdStr
+            AlertName               = $item.AlertName
+            Severity                = $item.Severity
+            LatestOccurrenceAgeDays = $item.LatestAgeDays
+            ReasonSelected          = ($selectedReasons -join "+")
+            Resolution              = $resolutionText
+            Result                  = if ($Execute) { "Pending" } else { "Would Resolve" }
+            Error                   = ""
         }
     }
 }
 
 # ------------------------------------------------------------
-# Execute resolution - DET3 only and explicit -Execute only
+# Execute resolution - exact DET3 target and explicit -Execute only
 # ------------------------------------------------------------
 
 if ($isResolveMode -and $Execute -and $resolveCandidates.Count -gt 0) {
 
-    # Group by cluster + resolution text because the direct API accepts
-    # multiple alert IDs under one resolution message.
-    $groups = $resolveCandidates | Group-Object { "$($_.Cluster)|$($_.Resolution)" }
+    # Group alerts by resolution text so each Helios resolution request uses
+    # one deterministic resolutionName/description.
+    $groups = $resolveCandidates | Group-Object { $_.Resolution }
 
     foreach ($group in $groups) {
         $groupRows = @($group.Group)
         $clusterName = $groupRows[0].Cluster
         $resolutionText = $groupRows[0].Resolution
-        $alertIds = @($groupRows.AlertId)
+
+        $resolvedAlerts = @()
+        foreach ($row in $groupRows) {
+            $resolvedAlerts += [ordered]@{
+                alertIdStr = [string]$row.AlertIdStr
+                alertName  = [string]$row.AlertName
+            }
+        }
 
         try {
             $null = Invoke-CohesityAlertResolution `
                 -ClusterName $clusterName `
-                -AlertIds $alertIds `
+                -ApprovedLabClusterName $approvedLabClusterName `
+                -ResolvedAlerts $resolvedAlerts `
                 -ResolutionText $resolutionText
 
             foreach ($row in $groupRows) {
@@ -814,10 +896,10 @@ if ($isResolveMode) {
 
     $resolveColumns = @(
         "Cluster",
-        "AlertId",
+        "AlertIdStr",
         "AlertName",
         "Severity",
-        "AgeDays",
+        "LatestOccurrenceAgeDays",
         "ReasonSelected",
         "Resolution",
         "Result",
@@ -850,12 +932,24 @@ Write-Host "Catalog unmatched       : $unmatchedCount"
 Write-Host "Cluster GET failures    : $($failures.Count)"
 Write-Host "Saved review CSV        : $csvFile" -ForegroundColor Green
 
+if ($unmatchedCsvFile) {
+    Write-Host "Saved unmatched CSV     : $unmatchedCsvFile" -ForegroundColor Yellow
+}
+
+if ($failureCsvFile) {
+    Write-Host "Saved GET failures CSV  : $failureCsvFile" -ForegroundColor Yellow
+}
+
 if ($isResolveMode) {
+    Write-Host "Approved lab target     : $approvedLabClusterName" -ForegroundColor Yellow
     Write-Host "DET3 candidates         : $($resolveCandidates.Count)"
     Write-Host "Execute requested       : $Execute"
     Write-Host "Saved resolution CSV    : $resolveCsvFile" -ForegroundColor Green
 
     if (-not $Execute) {
         Write-Host "Resolution status       : PREVIEW ONLY - no POST was sent" -ForegroundColor Yellow
+    }
+    elseif ($resolveCandidates.Count -eq 0) {
+        Write-Host "Resolution status       : No matching alerts - no POST was sent" -ForegroundColor Yellow
     }
 }
