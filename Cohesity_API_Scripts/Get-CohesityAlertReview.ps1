@@ -7,16 +7,16 @@
 #   3. Export the review to CSV; alert rows are not displayed in the console.
 #   4. Optionally preview or resolve:
 #        - alerts whose latest occurrence is older than X days
-#        - approved non-actionable alerts by exact Alert Name
+#        - approved non-actionable alerts from Cohesity_NonActionable_Alerts.csv
 #
 # SAFETY - CURRENT LAB PHASE:
 #   - Default mode is Review. Running this script with no parameters performs GETs only.
 #   - Resolution is allowed ONLY for the single discovered cluster whose name contains DET3.
 #   - Every other cluster is unavailable for write operations.
 #   - Resolve modes are preview-only unless -Execute is explicitly supplied.
-#   - No alert type/category exclusion is used.
-#   - Any future exclusion must be based on exact Alert Name only.
-#   - One cluster GET failure/timeout does not stop the remaining clusters.
+#   - No alert type/category exclusion is used for the review report.
+#   - Any future review exclusion must be based on exact Alert Name only.
+#   - One cluster GET failure/timeout does not stop the remaining clusters in Review mode.
 #
 # APIs used:
 #   GET  https://helios.cohesity.com/v2/mcm/cluster-mgmt/info
@@ -62,8 +62,10 @@ $labClusterPattern   = "DET3"
 # ------------------------------------------------------------
 
 $isResolveMode = $Mode -ne "Review"
+$usesOldAgeRule = $Mode -eq "ResolveOlderThanDays" -or $Mode -eq "ResolveAll"
+$usesNonActionableRules = $Mode -eq "ResolveNonActionable" -or $Mode -eq "ResolveAll"
 
-if (($Mode -eq "ResolveOlderThanDays" -or $Mode -eq "ResolveAll") -and $OlderThanDays -le 0) {
+if ($usesOldAgeRule -and $OlderThanDays -le 0) {
     throw "-OlderThanDays must be greater than 0 for mode '$Mode'."
 }
 
@@ -87,7 +89,7 @@ if (-not (Test-Path $encryptedApiKeyPath -PathType Leaf)) {
     throw "Encrypted API key file not found: $encryptedApiKeyPath"
 }
 
-if (($Mode -eq "ResolveNonActionable" -or $Mode -eq "ResolveAll") -and -not (Test-Path $nonActionableCsv -PathType Leaf)) {
+if ($usesNonActionableRules -and -not (Test-Path $nonActionableCsv -PathType Leaf)) {
     throw "Non-actionable alert CSV not found: $nonActionableCsv"
 }
 
@@ -173,7 +175,7 @@ function Invoke-CohesityAlertResolution {
         [Parameter(Mandatory)][string]$ResolutionText
     )
 
-    # HARD SAFETY GATE: the exact discovered DET3 cluster is the only writable target.
+    # HARD SAFETY GATE: exact discovered DET3 cluster only.
     if ([string]::IsNullOrWhiteSpace($ApprovedLabClusterName) -or $ClusterName -ine $ApprovedLabClusterName) {
         throw "WRITE BLOCKED: Cluster '$ClusterName' is not the approved DET3 lab cluster."
     }
@@ -196,13 +198,11 @@ function Invoke-CohesityAlertResolution {
 
     $resolutionUrl = "$baseUrl/v2/mcm/alerts/resolutions"
 
-    $bodyObject = [ordered]@{
+    $body = [ordered]@{
         resolutionName = $ResolutionText
         description    = $ResolutionText
         resolvedAlerts = @($ResolvedAlerts)
-    }
-
-    $body = $bodyObject | ConvertTo-Json -Depth 6
+    } | ConvertTo-Json -Depth 6
 
     $headers = @{
         accept         = "application/json"
@@ -412,6 +412,98 @@ function Get-AlertDetails {
 }
 
 # ------------------------------------------------------------
+# Helper: find best non-actionable rule
+# ------------------------------------------------------------
+# Supported RuleType values:
+#   AlertName   - exact case-insensitive Alert Name
+#   AlertType   - exact API alertType value
+#   MatchString - literal case-insensitive text in Alert Details
+#   Severity    - normalized severity match (for example KInfo/Info)
+#
+# Priority prevents a broad Severity rule from overriding a specific rule:
+#   AlertName > AlertType > MatchString > Severity
+# If multiple rules match at the same highest priority with different
+# resolution text, the alert is marked ambiguous and is NOT resolved.
+
+function Get-NonActionableRuleMatch {
+    param(
+        [Parameter(Mandatory)]$Item,
+        [Parameter(Mandatory)][object[]]$Rules
+    )
+
+    $matches = @()
+
+    foreach ($rule in $Rules) {
+        $ruleType = ([string]$rule.RuleType).Trim()
+        $ruleValue = ([string]$rule.RuleValue).Trim()
+        $resolution = ([string]$rule.Resolution).Trim()
+
+        if ([string]::IsNullOrWhiteSpace($ruleType) -or
+            [string]::IsNullOrWhiteSpace($ruleValue) -or
+            [string]::IsNullOrWhiteSpace($resolution)) {
+            continue
+        }
+
+        $matched = $false
+        $priority = 0
+
+        switch -Regex ($ruleType) {
+            '^(?i)AlertName$' {
+                $priority = 4
+                $matched = $Item.AlertName -ieq $ruleValue
+            }
+            '^(?i)AlertType$' {
+                $priority = 3
+                $matched = $Item.AlertType -ieq $ruleValue
+            }
+            '^(?i)MatchString$' {
+                $priority = 2
+                if (-not [string]::IsNullOrWhiteSpace($Item.AlertDetails)) {
+                    $matched = $Item.AlertDetails.IndexOf($ruleValue, [System.StringComparison]::OrdinalIgnoreCase) -ge 0
+                }
+            }
+            '^(?i)Severity$' {
+                $priority = 1
+                $matched = (Normalize-Severity $Item.Severity) -eq (Normalize-Severity $ruleValue)
+            }
+        }
+
+        if ($matched) {
+            $matches += [pscustomobject]@{
+                RuleType   = $ruleType
+                RuleValue  = $ruleValue
+                Resolution = $resolution
+                Priority   = $priority
+            }
+        }
+    }
+
+    if ($matches.Count -eq 0) {
+        return $null
+    }
+
+    $highestPriority = ($matches | Measure-Object -Property Priority -Maximum).Maximum
+    $bestMatches = @($matches | Where-Object { $_.Priority -eq $highestPriority })
+    $uniqueResolutions = @($bestMatches.Resolution | Sort-Object -Unique)
+
+    if ($uniqueResolutions.Count -gt 1) {
+        return [pscustomobject]@{
+            Ambiguous  = $true
+            RuleType   = ($bestMatches.RuleType | Sort-Object -Unique) -join "+"
+            RuleValue  = ($bestMatches.RuleValue | Sort-Object -Unique) -join "+"
+            Resolution = ""
+        }
+    }
+
+    return [pscustomobject]@{
+        Ambiguous  = $false
+        RuleType   = ($bestMatches.RuleType | Sort-Object -Unique) -join "+"
+        RuleValue  = ($bestMatches.RuleValue | Sort-Object -Unique) -join "+"
+        Resolution = $uniqueResolutions[0]
+    }
+}
+
+# ------------------------------------------------------------
 # Load Cohesity alert catalog CSV
 # ------------------------------------------------------------
 
@@ -471,42 +563,40 @@ foreach ($catalogRow in $catalog) {
 }
 
 # ------------------------------------------------------------
-# Load approved non-actionable alert names when requested
+# Load approved non-actionable rules when requested
 # ------------------------------------------------------------
 
-$nonActionableByName = @{}
+$nonActionableRules = @()
 
-if ($Mode -eq "ResolveNonActionable" -or $Mode -eq "ResolveAll") {
-    $nonActionableRows = @(Import-Csv -Path $nonActionableCsv)
+if ($usesNonActionableRules) {
+    $nonActionableRules = @(Import-Csv -Path $nonActionableCsv)
 
-    if ($nonActionableRows.Count -eq 0) {
+    if ($nonActionableRules.Count -eq 0) {
         throw "Non-actionable alert CSV is empty: $nonActionableCsv"
     }
 
-    if ("AlertName" -notin $nonActionableRows[0].PSObject.Properties.Name -or
-        "Resolution" -notin $nonActionableRows[0].PSObject.Properties.Name) {
-        throw "Non-actionable CSV must contain AlertName and Resolution columns."
+    foreach ($column in @("RuleType", "RuleValue", "Resolution")) {
+        if ($column -notin $nonActionableRules[0].PSObject.Properties.Name) {
+            throw "Non-actionable CSV must contain RuleType, RuleValue, and Resolution columns."
+        }
     }
 
-    foreach ($row in $nonActionableRows) {
-        $name = ([string]$row.AlertName).Trim()
-        $resolution = ([string]$row.Resolution).Trim()
+    $allowedRuleTypes = @("AlertName", "AlertType", "MatchString", "Severity")
 
-        if ([string]::IsNullOrWhiteSpace($name)) {
-            continue
+    foreach ($rule in $nonActionableRules) {
+        $ruleType = ([string]$rule.RuleType).Trim()
+        $ruleValue = ([string]$rule.RuleValue).Trim()
+        $resolution = ([string]$rule.Resolution).Trim()
+
+        if ([string]::IsNullOrWhiteSpace($ruleType) -or
+            [string]::IsNullOrWhiteSpace($ruleValue) -or
+            [string]::IsNullOrWhiteSpace($resolution)) {
+            throw "Non-actionable CSV contains a blank RuleType, RuleValue, or Resolution."
         }
 
-        if ([string]::IsNullOrWhiteSpace($resolution)) {
-            throw "Non-actionable alert '$name' has an empty Resolution value."
+        if ($allowedRuleTypes -notcontains $ruleType) {
+            throw "Unsupported non-actionable RuleType '$ruleType'. Allowed values: $($allowedRuleTypes -join ', ')."
         }
-
-        $normalizedName = $name.ToUpperInvariant()
-
-        if ($nonActionableByName.ContainsKey($normalizedName)) {
-            throw "Duplicate non-actionable AlertName found: $name"
-        }
-
-        $nonActionableByName[$normalizedName] = $resolution
     }
 }
 
@@ -579,7 +669,7 @@ $failures = @()
 $unmatchedRows = @()
 $unmatchedCount = 0
 
-# Review mode reads all clusters exactly as before.
+# Review mode reads all clusters.
 # Resolve modes read ONLY the single discovered DET3 lab cluster.
 $clustersToRead = if ($isResolveMode) { $det3Clusters } else { $clusters }
 
@@ -629,6 +719,7 @@ foreach ($cluster in ($clustersToRead | Sort-Object clusterName)) {
 
         $alertCode = Get-LiveAlertCode $alert
         $liveAlertName = Get-LiveAlertName $alert
+        $alertType = ([string]$alert.alertType).Trim()
         $severity = ([string]$alert.severity).Trim()
         $normalizedSeverity = Normalize-Severity $severity
         $normalizedAlertCode = $alertCode.ToUpperInvariant()
@@ -669,7 +760,7 @@ foreach ($cluster in ($clustersToRead | Sort-Object clusterName)) {
 
             $unmatchedRows += [pscustomobject][ordered]@{
                 Cluster          = $clusterName
-                "Raw Alert Type" = ([string]$alert.alertType).Trim()
+                "Raw Alert Type" = $alertType
                 "Alert Code"     = $alertCode
                 "Alert Name"     = $liveAlertName
                 Severity          = $severity
@@ -684,10 +775,11 @@ foreach ($cluster in ($clustersToRead | Sort-Object clusterName)) {
             ClusterName          = $clusterName
             ClusterId            = $clusterId
             AlertIdStr           = $alertIdStr
+            AlertType            = $alertType
             AlertCode            = $alertCode
             AlertName            = $liveAlertName
-            NormalizedName       = $normalizedAlertName
             Severity             = $severity
+            AlertDetails         = $alertDetails
             LatestAgeDays        = $latestAgeDays
             FirstTimestampUsecs  = $alert.firstTimestampUsecs
             LatestTimestampUsecs = $alert.latestTimestampUsecs
@@ -708,8 +800,6 @@ foreach ($cluster in ($clustersToRead | Sort-Object clusterName)) {
     }
 }
 
-# Resolve mode must never proceed when the DET3 GET failed.
-# Delay the terminating error until after review/diagnostic CSVs are written.
 $resolveGetFailed = $isResolveMode -and $failures.Count -gt 0
 
 # ------------------------------------------------------------
@@ -779,19 +869,21 @@ if ($resolveGetFailed) {
 # ------------------------------------------------------------
 
 $resolveCandidates = @()
+$skippedCandidates = @()
 
 if ($isResolveMode) {
     foreach ($item in $rawAlerts) {
 
-        # Exact full-name guard after DET3 discovery.
         if ($item.ClusterName -ine $approvedLabClusterName) {
             continue
         }
 
         $selectedReasons = @()
         $resolutionText = ""
+        $ruleType = ""
+        $ruleValue = ""
 
-        if (($Mode -eq "ResolveOlderThanDays" -or $Mode -eq "ResolveAll") -and
+        if ($usesOldAgeRule -and
             $null -ne $item.LatestAgeDays -and
             $item.LatestAgeDays -ge $OlderThanDays) {
 
@@ -799,12 +891,34 @@ if ($isResolveMode) {
             $resolutionText = "NoActReq: Alert latest occurrence is older than $OlderThanDays days."
         }
 
-        if (($Mode -eq "ResolveNonActionable" -or $Mode -eq "ResolveAll") -and
-            $item.NormalizedName -and
-            $nonActionableByName.ContainsKey($item.NormalizedName)) {
+        if ($usesNonActionableRules) {
+            $ruleMatch = Get-NonActionableRuleMatch -Item $item -Rules $nonActionableRules
 
-            $selectedReasons += "NonActionable"
-            $resolutionText = [string]$nonActionableByName[$item.NormalizedName]
+            if ($ruleMatch) {
+                if ($ruleMatch.Ambiguous) {
+                    $skippedCandidates += [pscustomobject]@{
+                        Cluster                 = $item.ClusterName
+                        AlertIdStr              = $item.AlertIdStr
+                        AlertName               = $item.AlertName
+                        AlertType               = $item.AlertType
+                        Severity                = $item.Severity
+                        LatestOccurrenceAgeDays = $item.LatestAgeDays
+                        ReasonSelected          = "NonActionable"
+                        RuleType                = $ruleMatch.RuleType
+                        RuleValue               = $ruleMatch.RuleValue
+                        Resolution              = ""
+                        Result                  = "Skipped - Ambiguous Rule"
+                        Error                   = "Multiple highest-priority rules matched with different resolution text."
+                    }
+
+                    continue
+                }
+
+                $selectedReasons += "NonActionable"
+                $resolutionText = $ruleMatch.Resolution
+                $ruleType = $ruleMatch.RuleType
+                $ruleValue = $ruleMatch.RuleValue
+            }
         }
 
         if ($selectedReasons.Count -eq 0) {
@@ -830,9 +944,12 @@ if ($isResolveMode) {
             Cluster                 = $item.ClusterName
             AlertIdStr              = $item.AlertIdStr
             AlertName               = $item.AlertName
+            AlertType               = $item.AlertType
             Severity                = $item.Severity
             LatestOccurrenceAgeDays = $item.LatestAgeDays
             ReasonSelected          = ($selectedReasons -join "+")
+            RuleType                = $ruleType
+            RuleValue               = $ruleValue
             Resolution              = $resolutionText
             Result                  = if ($Execute) { "Pending" } else { "Would Resolve" }
             Error                   = ""
@@ -846,8 +963,6 @@ if ($isResolveMode) {
 
 if ($isResolveMode -and $Execute -and $resolveCandidates.Count -gt 0) {
 
-    # Group alerts by resolution text so each Helios resolution request uses
-    # one deterministic resolutionName/description.
     $groups = $resolveCandidates | Group-Object { $_.Resolution }
 
     foreach ($group in $groups) {
@@ -898,15 +1013,21 @@ if ($isResolveMode) {
         "Cluster",
         "AlertIdStr",
         "AlertName",
+        "AlertType",
         "Severity",
         "LatestOccurrenceAgeDays",
         "ReasonSelected",
+        "RuleType",
+        "RuleValue",
         "Resolution",
         "Result",
         "Error"
     )
 
-    $resolveRows = @($resolveCandidates | Select-Object -Property $resolveColumns)
+    $resolveRows = @(
+        @($resolveCandidates) + @($skippedCandidates) |
+        Select-Object -Property $resolveColumns
+    )
 
     if ($resolveRows.Count -gt 0) {
         $resolveRows |
@@ -942,7 +1063,8 @@ if ($failureCsvFile) {
 
 if ($isResolveMode) {
     Write-Host "Approved lab target     : $approvedLabClusterName" -ForegroundColor Yellow
-    Write-Host "DET3 candidates         : $($resolveCandidates.Count)"
+    Write-Host "Resolve candidates      : $($resolveCandidates.Count)"
+    Write-Host "Ambiguous rules skipped : $($skippedCandidates.Count)"
     Write-Host "Execute requested       : $Execute"
     Write-Host "Saved resolution CSV    : $resolveCsvFile" -ForegroundColor Green
 
