@@ -9,16 +9,22 @@ export default async function () {
 
   for (let i = 0; i < (groups || []).length; i++) {
     const groupList = groups[i] || [];
-    const cr = crs?.[i] || {};
 
-    for (const row of groupList) {
-      if (row?.assignment_group?.value === BACKUP_GROUP_SYS_ID) {
-        matches.push({
-          crSysId: row?.parent?.value || "",
-          crNumber: cr?.number?.value || cr?.number || "",
-          groupSysId: row?.assignment_group?.value || ""
-        });
-      }
+    const isBackupRequested = groupList.some(
+      row => row?.assignment_group?.value === BACKUP_GROUP_SYS_ID
+    );
+
+    if (!isBackupRequested) continue;
+
+    const cr = crs?.[i] || {};
+    const crNumber =
+      cr?.number?.display_value ||
+      cr?.number?.value ||
+      cr?.number ||
+      "";
+
+    if (crNumber) {
+      matches.push({ crNumber });
     }
   }
 
