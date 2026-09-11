@@ -1,18 +1,16 @@
-import { execution, result } from "@dynatrace-sdk/automation-utils";
+import { result } from "@dynatrace-sdk/automation-utils";
 
 export default async function () {
-  // This script now runs inside the per-CR sub-workflow.
-  // The parent workflow passes exactly one CR into each sub-workflow execution.
-  const ex = await execution();
-  const workflowInput = await ex.input();
-  const crNumber = workflowInput?.crNumber;
+  // This script runs inside the per-CR sub-workflow.
+  // The parent workflow passes exactly one CR number into this execution.
+  const crNumber = input().crNumber;
 
-  // get_cis is NOT looped in the sub-workflow.
-  // It runs once for the current CR and returns only that CR's CI records.
-  let cis = await result("get_cis");
+  // get_cis runs once for this CR and returns only this CR's CI records.
+  const getCis = await result("get_cis");
 
-  // Normally get_cis should already be an array.
-  // Keep these fallbacks in case ServiceNow/Dynatrace wraps the response.
+  let cis = getCis;
+
+  // Handle ServiceNow/Dynatrace wrappers if the response is not already an array.
   if (!Array.isArray(cis)) {
     cis = cis?.result ?? cis?.body?.result ?? [];
   }
@@ -24,7 +22,7 @@ export default async function () {
   for (const ci of cis) {
     const value = ci?.ci_item?.value;
 
-    if (crNumber && value) {
+    if (value) {
       output.push({
         crNumber,
         value
