@@ -3,16 +3,18 @@
 // Task name: cr_backup_email_report
 // Purpose:
 // - Runs after cr_backup_validate_one_ci loop
-// - Aggregates all validation rows for the current CR
-// - Produces ONE email row per CI/server
-// - Consolidates multiple Cohesity clusters / protection groups into cells
-// - Adds serial number for readability
-// - Does not call ServiceNow or Cohesity
+// - Builds the final Markdown email body for the current CR
+// - One row per CI + backup type
+// - Same backup type across multiple clusters is consolidated into one row
+// - Different backup types remain separate rows
+// - All rows for the same CI keep the SAME Sl No
+// - No Cohesity or ServiceNow writes
 // ==========================================================
 
 import { result } from "@dynatrace-sdk/automation-utils";
 
 export default async function () {
+  const PROTECTED_TYPES = ["FS", "VM", "HyperV", "Nutanix", "SQL", "Oracle"];
 
   function asArray(value) {
     if (Array.isArray(value)) return value;
@@ -36,7 +38,7 @@ export default async function () {
 
     for (const value of values || []) {
       const text = String(value ?? "").trim();
-      if (!text || ["N/A", "-", "NoBackupFound", "NoBackup", "NoBackupTime"].includes(text)) continue;
+      if (!text || ["N/A", "-", "NoBackupFound", "NoBackup", "NoBackupTime", "ValidationError"].includes(text)) continue;
       const key = text.toLowerCase();
       if (seen.has(key)) continue;
       seen.add(key);
@@ -46,8 +48,6 @@ export default async function () {
     return out.length ? out.join(", ") : fallback;
   }
 
-  // Dynatrace loop outputs can be wrapped in arrays/objects. Find every
-  // validator result containing a rows array without assuming one wrapper shape.
   function extractValidationOutputs(value, out = [], depth = 0, seen = new Set()) {
     if (depth > 12 || value === null || value === undefined) return out;
     if (typeof value !== "object") return out;
@@ -71,55 +71,60 @@ export default async function () {
     return out;
   }
 
-  function normalizeStatus(row, validationState) {
-    const type = safeText(row?.BackupType, "Unknown");
-
-    if (validationState === "ValidationError" || type === "ValidationError") return "Unable to Validate";
-    if (type === "NoObject") return "No Backup Found";
-    if (type === "NoFSBackupFound") return "DB Only / No Server Backup";
-    if (type === "NoDBBackupFound") return "Review Required";
-    if (["FS", "VM", "HyperV", "Nutanix", "SQL", "Oracle"].includes(type)) return "Protected";
-    return safeText(validationState, "Unknown");
-  }
-
-  function backupTypeDisplay(value) {
-    const type = safeText(value, "Unknown");
+  function displayType(type) {
     const map = {
       HyperV: "Hyper-V",
       Nutanix: "Nutanix/AHV",
       NoObject: "-",
       NoFSBackupFound: "DB Only",
       NoDBBackupFound: "Server Backup Only",
-      ValidationError: "-"
+      ValidationError: "-",
+      Unknown: "-"
     };
     return map[type] || type;
   }
 
-  function overallStatus(statuses) {
-    const set = new Set(statuses || []);
-    if (set.has("Unable to Validate")) return "Unable to Validate";
-    if (set.has("Review Required")) return "Review Required";
-    if (set.has("DB Only / No Server Backup")) return "DB Only / No Server Backup";
-    if (set.has("Protected")) return "Protected";
-    if (set.has("No Backup Found")) return "No Backup Found";
-    return "Unknown";
+  function rowStatus(type, validationState) {
+    if (validationState === "ValidationError" || type === "ValidationError") return "Unable to Validate";
+    if (type === "NoObject") return "No Backup Found";
+    if (type === "NoFSBackupFound") return "DB Only / No Server Backup";
+    if (type === "NoDBBackupFound") return "Review Required";
+    if (PROTECTED_TYPES.includes(type)) return "Protected";
+    return safeText(validationState, "Unknown");
+  }
+
+  function statusPriority(status) {
+    const rank = {
+      "Unable to Validate": 1,
+      "Review Required": 2,
+      "DB Only / No Server Backup": 3,
+      "Protected": 4,
+      "No Backup Found": 5,
+      "Unknown": 9
+    };
+    return rank[status] ?? 9;
+  }
+
+  function overallCiStatus(rows) {
+    const statuses = [...new Set((rows || []).map(r => r.Status))];
+    if (statuses.length === 0) return "Unknown";
+    statuses.sort((a, b) => statusPriority(a) - statusPriority(b));
+    return statuses[0];
   }
 
   function latestBackupValue(rows) {
-    // Keep the newest valid backup timestamp if the CI has multiple rows.
-    // Current validator emits MM/DD/YYYY HH:mm:ss ET-style text.
     let bestText = "-";
-    let bestTime = -1;
+    let bestUsecs = 0;
 
     for (const row of rows || []) {
+      const usecs = Number(row?.LastBackupUsecs || 0);
       const text = String(row?.LastBackupTime || "").trim();
       if (!text || ["N/A", "-", "NoBackupFound", "NoBackup", "NoBackupTime", "ValidationError"].includes(text)) continue;
 
-      const parsed = Date.parse(text);
-      if (Number.isFinite(parsed) && parsed > bestTime) {
-        bestTime = parsed;
+      if (Number.isFinite(usecs) && usecs > bestUsecs) {
+        bestUsecs = usecs;
         bestText = text;
-      } else if (bestTime < 0 && bestText === "-") {
+      } else if (bestUsecs === 0 && bestText === "-") {
         bestText = text;
       }
     }
@@ -136,31 +141,33 @@ export default async function () {
   for (const output of validationOutputs) {
     const validationState = safeText(output?.validationState, "Unknown");
     const summaryCiName = safeText(output?.summary?.ciName, "N/A");
+    const outputRows = asArray(output?.rows);
 
-    for (const row of asArray(output?.rows)) {
+    for (const row of outputRows) {
+      const type = safeText(row?.BackupType, "Unknown");
       rawRows.push({
         ServerName: safeText(row?.ServerName, summaryCiName),
-        BackupType: safeText(row?.BackupType, "Unknown"),
-        BackupTypeDisplay: backupTypeDisplay(row?.BackupType),
-        ObjectName: safeText(row?.ObjectName),
+        BackupType: type,
+        BackupTypeDisplay: displayType(type),
         ClusterName: safeText(row?.ClusterName),
         ProtectionGroup: safeText(row?.ProtectionGroup, "-"),
         LastBackupTime: safeText(row?.LastBackupTime),
-        Status: normalizeStatus(row, validationState)
+        LastBackupUsecs: Number(row?.LastBackupUsecs || 0),
+        Status: rowStatus(type, validationState)
       });
     }
 
-    // Defensive fallback: if a validator result has no rows, still represent the CI.
-    if (asArray(output?.rows).length === 0 && summaryCiName !== "N/A") {
+    if (outputRows.length === 0 && summaryCiName !== "N/A") {
+      const type = validationState === "ValidationError" ? "ValidationError" : "Unknown";
       rawRows.push({
         ServerName: summaryCiName,
-        BackupType: validationState === "ValidationError" ? "ValidationError" : "Unknown",
+        BackupType: type,
         BackupTypeDisplay: "-",
-        ObjectName: summaryCiName,
         ClusterName: "N/A",
         ProtectionGroup: "-",
         LastBackupTime: "N/A",
-        Status: validationState === "ValidationError" ? "Unable to Validate" : validationState
+        LastBackupUsecs: 0,
+        Status: rowStatus(type, validationState)
       });
     }
 
@@ -170,40 +177,91 @@ export default async function () {
     }
   }
 
-  // One row per CI/server. Multiple Cohesity findings are consolidated into
-  // comma-separated values rather than producing repeated server rows.
-  const byServer = new Map();
+  // Group by CI + backup type.
+  // Example:
+  // server01 VM on clusterA + clusterB => ONE VM row with both clusters.
+  // server01 SQL                       => separate SQL row.
+  const groups = new Map();
 
   for (const row of rawRows) {
-    const server = safeText(row.ServerName, "N/A");
-    const key = server.toLowerCase();
-    if (!byServer.has(key)) byServer.set(key, { ServerName: server, rows: [] });
-    byServer.get(key).rows.push(row);
+    const serverKey = row.ServerName.toLowerCase();
+    const typeKey = row.BackupType.toLowerCase();
+    const key = `${serverKey}|${typeKey}`;
+
+    if (!groups.has(key)) {
+      groups.set(key, {
+        ServerName: row.ServerName,
+        BackupType: row.BackupType,
+        BackupTypeDisplay: row.BackupTypeDisplay,
+        rows: []
+      });
+    }
+
+    groups.get(key).rows.push(row);
   }
 
-  const finalRows = [...byServer.values()]
-    .map(group => {
-      const status = overallStatus(group.rows.map(r => r.Status));
-      const noBackup = status === "No Backup Found";
-      const unable = status === "Unable to Validate";
+  let finalRows = [...groups.values()].map(group => {
+    const status = overallCiStatus(group.rows);
+    const noBackupOrError = ["No Backup Found", "Unable to Validate"].includes(status);
 
-      return {
-        ServerName: group.ServerName,
-        BackupType: (noBackup || unable) ? "-" : uniqueText(group.rows.map(r => r.BackupTypeDisplay), "-"),
-        Clusters: (noBackup || unable) ? "-" : uniqueText(group.rows.map(r => r.ClusterName), "-"),
-        ProtectionGroups: (noBackup || unable) ? "-" : uniqueText(group.rows.map(r => r.ProtectionGroup), "-"),
-        LatestBackup: (noBackup || unable) ? "-" : latestBackupValue(group.rows),
-        Status: status
-      };
-    })
-    .sort((a, b) => String(a.ServerName).localeCompare(String(b.ServerName)));
+    return {
+      ServerName: group.ServerName,
+      BackupTypeRaw: group.BackupType,
+      BackupType: noBackupOrError ? "-" : group.BackupTypeDisplay,
+      Clusters: noBackupOrError ? "-" : uniqueText(group.rows.map(r => r.ClusterName), "-"),
+      ProtectionGroups: noBackupOrError ? "-" : uniqueText(group.rows.map(r => r.ProtectionGroup), "-"),
+      LatestBackup: noBackupOrError ? "-" : latestBackupValue(group.rows),
+      Status: status
+    };
+  });
+
+  const typeRank = {
+    FS: 10,
+    VM: 20,
+    HyperV: 30,
+    Nutanix: 40,
+    SQL: 50,
+    Oracle: 60,
+    NoFSBackupFound: 900,
+    NoDBBackupFound: 910,
+    NoObject: 950,
+    ValidationError: 990,
+    Unknown: 999
+  };
+
+  finalRows.sort((a, b) => {
+    const serverCompare = a.ServerName.localeCompare(b.ServerName);
+    if (serverCompare !== 0) return serverCompare;
+    return (typeRank[a.BackupTypeRaw] ?? 500) - (typeRank[b.BackupTypeRaw] ?? 500);
+  });
+
+  // Stable Sl No per CI. Different type rows for the same CI reuse the same number.
+  const serverSerial = new Map();
+  let nextSerial = 1;
+
+  for (const row of finalRows) {
+    const key = row.ServerName.toLowerCase();
+    if (!serverSerial.has(key)) serverSerial.set(key, nextSerial++);
+    row.SlNo = serverSerial.get(key);
+  }
+
+  // Summary counts are CI counts, not row counts.
+  const byServer = new Map();
+  for (const row of finalRows) {
+    const key = row.ServerName.toLowerCase();
+    if (!byServer.has(key)) byServer.set(key, []);
+    byServer.get(key).push(row);
+  }
+
+  const ciStatuses = [...byServer.values()].map(rows => overallCiStatus(rows));
 
   const summary = {
-    ciCount: finalRows.length,
-    protectedCiCount: finalRows.filter(r => r.Status === "Protected").length,
-    noBackupCiCount: finalRows.filter(r => r.Status === "No Backup Found").length,
-    reviewRequiredCiCount: finalRows.filter(r => ["Review Required", "DB Only / No Server Backup"].includes(r.Status)).length,
-    unableToValidateCiCount: finalRows.filter(r => r.Status === "Unable to Validate").length,
+    ciCount: byServer.size,
+    detailRowCount: finalRows.length,
+    protectedCiCount: ciStatuses.filter(s => s === "Protected").length,
+    noBackupCiCount: ciStatuses.filter(s => s === "No Backup Found").length,
+    reviewRequiredCiCount: ciStatuses.filter(s => ["Review Required", "DB Only / No Server Backup"].includes(s)).length,
+    unableToValidateCiCount: ciStatuses.filter(s => s === "Unable to Validate").length,
     warningCount: [...new Set(warnings)].length
   };
 
@@ -228,15 +286,16 @@ export default async function () {
   if (finalRows.length === 0) {
     lines.push("| 1 | N/A | - | - | - | - | No validation rows returned |");
   } else {
-    finalRows.forEach((row, index) => {
-      lines.push(`| ${index + 1} | ${markdownEscape(row.ServerName)} | ${markdownEscape(row.BackupType)} | ${markdownEscape(row.Clusters)} | ${markdownEscape(row.ProtectionGroups)} | ${markdownEscape(row.LatestBackup)} | ${markdownEscape(row.Status)} |`);
-    });
+    for (const row of finalRows) {
+      lines.push(`| ${row.SlNo} | ${markdownEscape(row.ServerName)} | ${markdownEscape(row.BackupType)} | ${markdownEscape(row.Clusters)} | ${markdownEscape(row.ProtectionGroups)} | ${markdownEscape(row.LatestBackup)} | ${markdownEscape(row.Status)} |`);
+    }
   }
 
   lines.push("");
   lines.push("NOTE:");
-  lines.push("- One row is shown per CI/server.");
-  lines.push("- If a CI is protected on multiple Cohesity clusters or protection groups, they are consolidated in the same row.");
+  lines.push("- The same Sl No is retained for all backup types belonging to the same CI/server.");
+  lines.push("- Multiple clusters/protection groups for the same backup type are consolidated into that type's row.");
+  lines.push("- Different backup types for the same CI are shown on separate rows.");
   lines.push("- NAS backups are excluded from this server validation.");
   lines.push("- No Backup Found is reported only when the Cohesity search completed without a validation-system failure.");
   lines.push("- Unable to Validate indicates a Cohesity/cluster/API validation issue and must not be interpreted as no backup.");
