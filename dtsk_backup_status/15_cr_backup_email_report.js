@@ -7,7 +7,7 @@
 // - One row per CI + backup type
 // - Same backup type across multiple clusters is consolidated into one row
 // - Different backup types remain separate rows
-// - All rows for the same CI keep the SAME Sl No
+// - Sl No is shown only on the first row for each CI; following type rows are blank
 // - No Cohesity or ServiceNow writes
 // ==========================================================
 
@@ -178,7 +178,6 @@ export default async function () {
   }
 
   // Group by CI + backup type.
-  // Example:
   // server01 VM on clusterA + clusterB => ONE VM row with both clusters.
   // server01 SQL                       => separate SQL row.
   const groups = new Map();
@@ -235,14 +234,19 @@ export default async function () {
     return (typeRank[a.BackupTypeRaw] ?? 500) - (typeRank[b.BackupTypeRaw] ?? 500);
   });
 
-  // Stable Sl No per CI. Different type rows for the same CI reuse the same number.
-  const serverSerial = new Map();
+  // Serial number advances once per CI.
+  // Additional backup-type rows for the same CI deliberately leave Sl No blank.
+  const seenServers = new Set();
   let nextSerial = 1;
 
   for (const row of finalRows) {
     const key = row.ServerName.toLowerCase();
-    if (!serverSerial.has(key)) serverSerial.set(key, nextSerial++);
-    row.SlNo = serverSerial.get(key);
+    if (!seenServers.has(key)) {
+      seenServers.add(key);
+      row.SlNo = nextSerial++;
+    } else {
+      row.SlNo = "";
+    }
   }
 
   // Summary counts are CI counts, not row counts.
@@ -293,7 +297,7 @@ export default async function () {
 
   lines.push("");
   lines.push("NOTE:");
-  lines.push("- The same Sl No is retained for all backup types belonging to the same CI/server.");
+  lines.push("- Sl No is shown only on the first row for each CI/server; additional backup-type rows for that CI are left blank.");
   lines.push("- Multiple clusters/protection groups for the same backup type are consolidated into that type's row.");
   lines.push("- Different backup types for the same CI are shown on separate rows.");
   lines.push("- NAS backups are excluded from this server validation.");
