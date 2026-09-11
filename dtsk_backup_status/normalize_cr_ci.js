@@ -1,36 +1,31 @@
 import { result } from "@dynatrace-sdk/automation-utils";
 
 export default async function () {
-  const validatedCrs = await result("validate_groups");
-  const getCis = await result("get_cis");
+  const crs = await result("validate_groups");
+  const ciGroups = await result("get_cis");
+
   const output = [];
 
-  // get_cis loops over validate_groups with concurrency 1, so each
-  // get_cis result maps to the CR at the same position in validate_groups.
-  for (let i = 0; i < getCis.length; i++) {
-    const crNumber = validatedCrs?.[i]?.crNumber;
-    let body = getCis[i]?.body ?? getCis[i];
+  for (let i = 0; i < ciGroups.length; i++) {
+    const crNumber = crs?.[i]?.crNumber;
 
-    if (typeof body === "string") {
-      body = JSON.parse(body);
+    let cis = ciGroups[i];
+
+    if (!Array.isArray(cis)) {
+      cis = cis?.result ?? cis?.body?.result ?? [];
     }
 
-    const rows = body?.result ?? [];
+    for (const ci of cis) {
+      const value = ci?.ci_item?.value;
 
-    for (const row of rows) {
-      const ciSysId = row?.ci_item?.value ?? row?.ci_item;
-
-      if (crNumber && ciSysId) {
+      if (crNumber && value) {
         output.push({
           crNumber,
-          ciSysId
+          value
         });
       }
     }
   }
 
-  return {
-    items: output,
-    count: output.length
-  };
+  return output;
 }
