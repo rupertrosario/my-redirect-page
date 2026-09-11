@@ -1,11 +1,12 @@
-import { result } from "@dynatrace-sdk/automation-utils";
+import { execution, result } from "@dynatrace-sdk/automation-utils";
 
 export default async function () {
-  // get_cis runs once for a single CR inside the sub-workflow.
-  // Configure get_cis to return these fields from task_ci:
-  //   sysparm_fields=task.number,ci_item
-  // The dot-walked task.number preserves the CR number in every returned row,
-  // while ci_item.value is the CI sys_id required by the next workflow step.
+  // This script runs inside the per-CR sub-workflow.
+  // The parent workflow passes exactly one CR number into the sub-workflow.
+  const ex = await execution();
+  const crNumber = ex.input?.crNumber;
+
+  // get_cis runs once for this CR and returns only this CR's CI records.
   let cis = await result("get_cis");
 
   // Normally get_cis should already be an array.
@@ -14,12 +15,11 @@ export default async function () {
     cis = cis?.result ?? cis?.body?.result ?? [];
   }
 
-  // Return only the two values needed downstream:
-  //   crNumber = ServiceNow task.number
-  //   value    = ServiceNow ci_item sys_id
+  // Add the current CR number to every CI sys_id so downstream tasks
+  // always retain the CR -> CI relationship.
   const output = cis
     .map(ci => ({
-      crNumber: ci?.["task.number"],
+      crNumber,
       value: ci?.ci_item?.value
     }))
     .filter(item => item.crNumber && item.value);
