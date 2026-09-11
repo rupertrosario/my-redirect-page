@@ -1,44 +1,41 @@
-import { result } from "@dynatrace-sdk/automation-utils";
+import { execution, result } from "@dynatrace-sdk/automation-utils";
 
 export default async function () {
-  // CRs returned by validate_groups.
-  // Example: [{ crNumber: "CR0566689" }, { crNumber: "CR0566670" }]
-  const crs = await result("validate_groups");
+  // This script now runs inside the per-CR sub-workflow.
+  // The parent workflow passes exactly one CR into each sub-workflow execution.
+  const ex = await execution();
+  const workflowInput = await ex.input();
+  const crNumber = workflowInput?.crNumber;
 
-  // get_cis runs once per CR and returns a nested array:
-  // get_cis[0] = all CI records for crs[0]
-  // get_cis[1] = all CI records for crs[1]
-  // and so on.
-  const ciGroups = await result("get_cis");
+  // get_cis is NOT looped in the sub-workflow.
+  // It runs once for the current CR and returns only that CR's CI records.
+  let cis = await result("get_cis");
+
+  // Normally get_cis should already be an array.
+  // Keep these fallbacks in case ServiceNow/Dynatrace wraps the response.
+  if (!Array.isArray(cis)) {
+    cis = cis?.result ?? cis?.body?.result ?? [];
+  }
 
   const output = [];
 
-  // Preserve CR -> CI mapping by matching both arrays by index.
-  for (let i = 0; i < ciGroups.length; i++) {
-    const crNumber = crs?.[i]?.crNumber;
+  // Preserve the current CR number with every CI sys_id so the next task
+  // always knows exactly which CR each CI belongs to.
+  for (const ci of cis) {
+    const value = ci?.ci_item?.value;
 
-    let cis = ciGroups[i];
-
-    // Normally each get_cis iteration is already an array.
-    // Keep these fallbacks in case Dynatrace/ServiceNow wraps it in result/body.result.
-    if (!Array.isArray(cis)) {
-      cis = cis?.result ?? cis?.body?.result ?? [];
-    }
-
-    // Extract only the ServiceNow CI sys_id value needed by the next workflow step.
-    for (const ci of cis) {
-      const value = ci?.ci_item?.value;
-
-      if (crNumber && value) {
-        output.push({
-          crNumber,
-          value
-        });
-      }
+    if (crNumber && value) {
+      output.push({
+        crNumber,
+        value
+      });
     }
   }
 
-  // Final output is a flat list ready for the next workflow:
-  // [{ crNumber: "CR0566689", value: "<ci sys_id>" }, ...]
+  // Example output:
+  // [
+  //   { crNumber: "CR0566689", value: "<ci_sys_id_1>" },
+  //   { crNumber: "CR0566689", value: "<ci_sys_id_2>" }
+  // ]
   return output;
 }
