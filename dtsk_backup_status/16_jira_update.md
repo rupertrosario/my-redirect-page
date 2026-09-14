@@ -1,0 +1,5 @@
+- Dynatrace workflow implemented for ServiceNow CR backup validation.
+- Validates affected CIs against Cohesity and generates one email report per CR.
+- Multiple clusters and backup types per CI are handled in the report.
+- Sample email reports attached for review.
+- Next step: test with more CR/CI scenarios for correctness, collect feedback on the report format, then schedule the workflow for regular execution.
