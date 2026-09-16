@@ -1,7 +1,7 @@
 // ==========================================================
 // Dynatrace JS Task
 // Task name: dtsk_validate_one_ci
-// Phase: Real Cohesity validation - version 9
+// Phase: Real Cohesity validation - version 10
 //
 // Corrected to match PowerShell logic:
 // - Uses protected-objects search as source of protected object rows
@@ -10,8 +10,8 @@
 // - Adds DB/CN fallback search for SQL/Oracle objects across all clusters
 // - Keeps assignment ownership fields from ServiceNow work item
 // - Does not place diagnostic cluster-count text in the email Cluster column
-// - Generic NAS / NAS Mount Points do not count as server-level backup
-// - Generic NAS-only matches are returned as ManualCheckNAS, not No Backup Found
+// - Generic NAS / NAS Mount Points / Isilon do not count as server-level backup
+// - NAS-only matches are returned as ManualCheckNAS, not No Backup Found
 // - GET only
 // ==========================================================
 
@@ -386,7 +386,7 @@ export default async function (input = {}) {
       flatObject?.ParentName
     ].map(v => String(v || "")).join(" ");
 
-    return /kGenericNas|GenericNas|Generic\s+NAS|NAS\s+Mount\s+Points/i.test(text);
+    return /kGenericNas|GenericNas|Generic\s+NAS|NAS\s+Mount\s+Points|kIsilon|Isilon/i.test(text);
   }
 
   function getBackupType(flatObject) {
