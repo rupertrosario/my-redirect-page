@@ -12,6 +12,7 @@
 // - Keeps cluster diagnostics out of the Cluster column
 // - Clearly reports when there are no active decommission DTSKs
 // - Explicitly reports DB-named servers that have server backup but no DB backup
+// - Generic NAS / NAS Mount Points are shown as manual-check items, not No Backup Found
 //
 // Strictly read/aggregate only. No HTTP calls. No writes.
 // ==========================================================
@@ -87,6 +88,7 @@ export default async function () {
       NoObject: "No Backup Found",
       NoFSBackupFound: "DB Only / No Server Backup",
       NoDBBackupFound: "Server Backup / No DB Backup",
+      ManualCheckNAS: "Please Check Manually (NAS)",
       HyperV: "Hyper-V",
       Nutanix: "Nutanix/AHV"
     };
@@ -148,6 +150,7 @@ export default async function () {
       Nutanix: 40,
       SQL: 50,
       Oracle: 60,
+      ManualCheckNAS: 880,
       NoFSBackupFound: 900,
       NoDBBackupFound: 910,
       NoObject: 950,
@@ -263,6 +266,7 @@ export default async function () {
       `| **Total validation rows** | **${summary.totalRows}** |`,
       `| **Server-level protected CIs** | **${summary.serverLevelProtectedCiCount}** |`,
       `| **DB-protected CIs** | **${summary.dbProtectedCiCount}** |`,
+      `| **Manual check required (NAS)** | **${summary.manualCheckNasRowCount}** |`,
       `| **No backup found** | **${summary.noObjectRowCount}** |`,
       `| **DB backup found but no server-level backup** | **${summary.noFsBackupFoundRowCount}** |`,
       `| **DB-named server backup found but no DB backup** | **${summary.noDbBackupFoundRowCount}** |`,
@@ -280,6 +284,7 @@ export default async function () {
       `| Nutanix/AHV | ${summary.nutanixRowCount} |`,
       `| SQL | ${summary.sqlRowCount} |`,
       `| Oracle | ${summary.oracleRowCount} |`,
+      `| **Please Check Manually (NAS)** | **${summary.manualCheckNasRowCount}** |`,
       `| **No Backup Found** | **${summary.noObjectRowCount}** |`,
       `| **DB Only / No Server Backup** | **${summary.noFsBackupFoundRowCount}** |`,
       `| **Server Backup / No DB Backup** | **${summary.noDbBackupFoundRowCount}** |`,
@@ -289,9 +294,9 @@ export default async function () {
 
   function makeNoteMarkdown() {
     return [
-      "- NAS backups are excluded from this server decommission validation.",
+      "- **Generic NAS / NAS Mount Points are not treated as No Backup Found. They require manual validation before the DTSK is acted on.**",
       "- **SLA Status** is calculated as 2 days from `sys_created_on`.",
-      "- **No Backup Found** means no supported Cohesity backup was found for the CI.",
+      "- **No Backup Found** means no supported Cohesity backup and no Generic NAS manual-check match was found for the CI.",
       "- **DB Only / No Server Backup** means SQL/Oracle backup was found, but no server-level backup was found.",
       "- **Server Backup / No DB Backup** means the DB/CN server has server-level backup, but no SQL/Oracle backup was found after checking all Cohesity clusters."
     ].join("\n");
@@ -369,6 +374,7 @@ export default async function () {
     nutanixRowCount: countRows(finalRows, "Nutanix"),
     sqlRowCount: countRows(finalRows, "SQL"),
     oracleRowCount: countRows(finalRows, "Oracle"),
+    manualCheckNasRowCount: countRows(finalRows, "ManualCheckNAS"),
     noFsBackupFoundRowCount: countRows(finalRows, "NoFSBackupFound"),
     noDbBackupFoundRowCount: countRows(finalRows, "NoDBBackupFound"),
     noObjectRowCount: countRows(finalRows, "NoObject"),
@@ -376,6 +382,7 @@ export default async function () {
 
     serverLevelProtectedCiCount: distinctCount(finalRows, r => ["FS", "VM", "HyperV", "Nutanix"].includes(r.BackupType), "ServerName"),
     dbProtectedCiCount: distinctCount(finalRows, r => ["SQL", "Oracle"].includes(r.BackupType), "ServerName"),
+    manualCheckNasCiCount: distinctCount(finalRows, r => r.BackupType === "ManualCheckNAS", "ServerName"),
 
     dbNamedServerCount,
     dbCnFallbackAppliedCount,
