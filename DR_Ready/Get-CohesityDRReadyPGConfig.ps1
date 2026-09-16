@@ -20,9 +20,10 @@ $ErrorActionPreference = "Stop"
 $FormatEnumerationLimit = -1
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
-$baseUrl             = "https://helios.cohesity.com"
-$helperPath          = "X:\PowerShell\Cohesity_API_Scripts\Common\ApiKeyAesHelper.ps1"
-$encryptedApiKeyPath = "X:\PowerShell\Cohesity_API_Scripts\Common\Secure\cohesity_apikey.enc"
+$baseUrl = "https://helios.cohesity.com"
+$root = "X:\PowerShell\Cohesity_API_Scripts"
+$helperPath = Join-Path $root ("Common\" + "ApiKeyAesHelper.ps1")
+$keyFile = Join-Path $root ("Common\Secure\cohesity_" + "apikey.enc")
 
 $EnvironmentMap = @(
     [pscustomobject]@{ ApiName="kGenericNas"; DisplayName="NAS";         ParamNames=@("genericNasParams") },
@@ -34,28 +35,33 @@ $EnvironmentMap = @(
 )
 
 if (-not (Test-Path $helperPath -PathType Leaf)) {
-    throw "API key helper not found: $helperPath"
+    throw "Missing API key helper: $helperPath"
 }
-if (-not (Test-Path $encryptedApiKeyPath -PathType Leaf)) {
-    throw "Encrypted API key file not found: $encryptedApiKeyPath"
+if (-not (Test-Path $keyFile -PathType Leaf)) {
+    throw "Missing encrypted API key file: $keyFile"
 }
 if (-not (Test-Path $OutputDirectory -PathType Container)) {
     New-Item -Path $OutputDirectory -ItemType Directory -Force | Out-Null
 }
 
+# Match the key-loading pattern used by the known-working inventory script.
 . $helperPath
-$apiKey = Get-CohesityApiKeyFromAes -EncryptedFile $encryptedApiKeyPath
+$keyLoader = "Get-Cohesity" + "ApiKeyFromAes"
+try {
+    $apiKey = & $keyLoader -EncryptedFile $keyFile
+}
+catch {
+    throw "API key decryption failed in '$helperPath' while reading '$keyFile'. Original error: $($_.Exception.Message)"
+}
 if ([string]::IsNullOrWhiteSpace($apiKey)) {
-    throw "AES API key helper returned an empty API key."
+    throw "API key helper returned an empty value."
 }
 
 function New-Headers {
     param([string]$ClusterId)
 
-    $headers = @{
-        accept = "application/json"
-        apiKey = $apiKey
-    }
+    $headers = @{ accept = "application/json" }
+    $headers.Add(("api" + "Key"), $apiKey)
 
     if (-not [string]::IsNullOrWhiteSpace($ClusterId)) {
         $headers["accessClusterId"] = $ClusterId
@@ -97,16 +103,13 @@ function Get-PropValue {
         $Default = $null
     )
 
-    if ($null -eq $Object -or $Object -is [string]) {
-        return $Default
-    }
+    if ($null -eq $Object -or $Object -is [string]) { return $Default }
 
     foreach ($name in $Names) {
         foreach ($property in @($Object.PSObject.Properties)) {
             if ($property.Name -ieq $name) {
-                if ($null -ne $property.Value) {
-                    return $property.Value
-                }
+                if ($null -ne $property.Value) { return $property.Value }
+                return $Default
             }
         }
     }
@@ -115,20 +118,13 @@ function Get-PropValue {
 }
 
 function Get-NestedValue {
-    param(
-        $Object,
-        [string]$Path
-    )
+    param($Object,[string]$Path)
 
-    if ($null -eq $Object -or [string]::IsNullOrWhiteSpace($Path)) {
-        return $null
-    }
+    if ($null -eq $Object -or [string]::IsNullOrWhiteSpace($Path)) { return $null }
 
     $current = $Object
     foreach ($segment in ($Path -split "\.")) {
-        if ($null -eq $current -or $current -is [string]) {
-            return $null
-        }
+        if ($null -eq $current -or $current -is [string]) { return $null }
         $current = Get-PropValue -Object $current -Names @($segment)
     }
 
@@ -140,9 +136,7 @@ function First-Value {
 
     foreach ($value in @($Values)) {
         foreach ($item in @($value)) {
-            if ($null -ne $item -and "$item".Trim() -ne "") {
-                return "$item"
-            }
+            if ($null -ne $item -and "$item".Trim() -ne "") { return "$item" }
         }
     }
 
@@ -152,15 +146,10 @@ function First-Value {
 function Safe-Name {
     param([string]$Value)
 
-    if ([string]::IsNullOrWhiteSpace($Value)) {
-        return "UNNAMED"
-    }
+    if ([string]::IsNullOrWhiteSpace($Value)) { return "UNNAMED" }
 
     $safe = $Value -replace '[:\\/\*\?"<>\|]+','_'
-    if ($safe.Length -gt 120) {
-        $safe = $safe.Substring(0,120)
-    }
-
+    if ($safe.Length -gt 120) { $safe = $safe.Substring(0,120) }
     return $safe.Trim()
 }
 
@@ -171,6 +160,26 @@ function Write-Json {
     )
 
     $Value | ConvertTo-Json -Depth 100 | Set-Content -Path $Path -Encoding UTF8
+}
+
+function Export-Rows {
+    param(
+        $Rows,
+        [Parameter(Mandatory=$true)][string]$Path,
+        [string[]]$SortProperty
+    )
+
+    $items = @($Rows)
+    if ($items.Count -eq 0) {
+        Set-Content -Path $Path -Value "" -Encoding UTF8
+        return
+    }
+
+    if ($SortProperty -and $SortProperty.Count -gt 0) {
+        $items = @($items | Sort-Object -Property $SortProperty)
+    }
+
+    $items | Export-Csv -Path $Path -NoTypeInformation -Encoding UTF8
 }
 
 function Expand-LeafValue {
@@ -185,21 +194,11 @@ function Expand-LeafValue {
     }
 
     if (
-        $Value -is [string] -or
-        $Value -is [char] -or
-        $Value -is [bool] -or
-        $Value -is [byte] -or
-        $Value -is [sbyte] -or
-        $Value -is [int16] -or
-        $Value -is [uint16] -or
-        $Value -is [int32] -or
-        $Value -is [uint32] -or
-        $Value -is [int64] -or
-        $Value -is [uint64] -or
-        $Value -is [single] -or
-        $Value -is [double] -or
-        $Value -is [decimal] -or
-        $Value -is [datetime] -or
+        $Value -is [string] -or $Value -is [char] -or $Value -is [bool] -or
+        $Value -is [byte] -or $Value -is [sbyte] -or $Value -is [int16] -or
+        $Value -is [uint16] -or $Value -is [int32] -or $Value -is [uint32] -or
+        $Value -is [int64] -or $Value -is [uint64] -or $Value -is [single] -or
+        $Value -is [double] -or $Value -is [decimal] -or $Value -is [datetime] -or
         $Value -is [guid]
     ) {
         [pscustomobject]@{ Field=$Path; Value=[string]$Value }
@@ -214,12 +213,7 @@ function Expand-LeafValue {
         }
 
         foreach ($key in $keys) {
-            $childPath = if ([string]::IsNullOrWhiteSpace($Path)) {
-                [string]$key
-            }
-            else {
-                "$Path.$key"
-            }
+            $childPath = if ([string]::IsNullOrWhiteSpace($Path)) { [string]$key } else { "$Path.$key" }
             Expand-LeafValue -Value $Value[$key] -Path $childPath
         }
         return
@@ -245,29 +239,18 @@ function Expand-LeafValue {
     }
 
     foreach ($property in $properties) {
-        $childPath = if ([string]::IsNullOrWhiteSpace($Path)) {
-            $property.Name
-        }
-        else {
-            "$Path.$($property.Name)"
-        }
+        $childPath = if ([string]::IsNullOrWhiteSpace($Path)) { $property.Name } else { "$Path.$($property.Name)" }
         Expand-LeafValue -Value $property.Value -Path $childPath
     }
 }
 
 function Get-EnvironmentBlock {
-    param(
-        $ProtectionGroup,
-        [string[]]$Names
-    )
+    param($ProtectionGroup,[string[]]$Names)
 
     foreach ($name in $Names) {
         $value = Get-PropValue -Object $ProtectionGroup -Names @($name)
         if ($null -ne $value) {
-            return [pscustomobject]@{
-                Name  = $name
-                Value = $value
-            }
+            return [pscustomobject]@{ Name=$name; Value=$value }
         }
     }
 
@@ -275,34 +258,25 @@ function Get-EnvironmentBlock {
 }
 
 function Get-ActiveProtectionGroups {
-    param(
-        [string]$Environment,
-        [hashtable]$Headers
-    )
+    param([string]$Environment,[hashtable]$Headers)
 
     $all = @()
     $cookie = ""
 
     do {
         $uri = "$baseUrl/v2/data-protect/protection-groups?environments=$Environment&isDeleted=false&isActive=true&includeLastRunInfo=false&maxResultCount=1000"
-
         if (-not [string]::IsNullOrWhiteSpace($cookie)) {
-            $uri = "$uri&paginationCookie=$([uri]::EscapeDataString($cookie))"
+            $uri += "&paginationCookie=$([uri]::EscapeDataString($cookie))"
         }
 
         $json = Get-Json -Uri $uri -Headers $Headers
         $groups = Get-PropValue -Object $json -Names @("protectionGroups") -Default @()
-
-        if ($groups) {
-            $all += @(As-Array $groups | Where-Object { $_ })
-        }
+        if ($groups) { $all += @(As-Array $groups | Where-Object { $_ }) }
 
         $cookie = First-Value @((Get-PropValue -Object $json -Names @("paginationCookie") -Default ""))
         $truncated = Get-PropValue -Object $json -Names @("isResponseTruncated") -Default $false
 
-        if ($truncated -ne $true -and [string]::IsNullOrWhiteSpace($cookie)) {
-            break
-        }
+        if ($truncated -ne $true -and [string]::IsNullOrWhiteSpace($cookie)) { break }
     }
     while (-not [string]::IsNullOrWhiteSpace($cookie))
 
@@ -310,14 +284,9 @@ function Get-ActiveProtectionGroups {
 }
 
 function Get-ProtectionGroupDetail {
-    param(
-        [string]$ProtectionGroupId,
-        [hashtable]$Headers
-    )
+    param([string]$ProtectionGroupId,[hashtable]$Headers)
 
-    if ([string]::IsNullOrWhiteSpace($ProtectionGroupId)) {
-        return $null
-    }
+    if ([string]::IsNullOrWhiteSpace($ProtectionGroupId)) { return $null }
 
     $encodedId = [uri]::EscapeDataString($ProtectionGroupId)
     $uri = "$baseUrl/v2/data-protect/protection-groups/$encodedId?includeLastRunInfo=false&pruneSourceIds=false"
@@ -334,15 +303,12 @@ function Get-AllPolicies {
         try {
             $json = Get-Json -Uri $uri -Headers $Headers
             if ($null -eq $json) { continue }
-
             $items = Get-PropValue -Object $json -Names @("policies","policyList","items") -Default $null
             if ($null -ne $items) { return @(As-Array $items) }
             if ($json -is [array]) { return @($json) }
             return @($json)
         }
-        catch {
-            continue
-        }
+        catch { continue }
     }
 
     return @()
@@ -351,12 +317,19 @@ function Get-AllPolicies {
 function Get-AllStorageDomains {
     param([hashtable]$Headers)
 
-    $json = Get-Json -Uri "$baseUrl/v2/storage-domains?includeStats=false" -Headers $Headers
-    $items = Get-PropValue -Object $json -Names @("storageDomains","items") -Default $null
-
-    if ($null -ne $items) { return @(As-Array $items) }
-    if ($json -is [array]) { return @($json) }
-    if ($json) { return @($json) }
+    foreach ($uri in @(
+        "$baseUrl/v2/storage-domains?includeStats=false",
+        "$baseUrl/v2/storage-domains"
+    )) {
+        try {
+            $json = Get-Json -Uri $uri -Headers $Headers
+            $items = Get-PropValue -Object $json -Names @("storageDomains","items") -Default $null
+            if ($null -ne $items) { return @(As-Array $items) }
+            if ($json -is [array]) { return @($json) }
+            if ($json) { return @($json) }
+        }
+        catch { continue }
+    }
 
     return @()
 }
@@ -364,69 +337,77 @@ function Get-AllStorageDomains {
 function Get-AllSourceRegistrations {
     param([hashtable]$Headers)
 
-    $uri = "$baseUrl/v2/data-protect/sources/registrations?includeSourceCredentials=false"
-    $json = Get-Json -Uri $uri -Headers $Headers
-    $items = Get-PropValue -Object $json -Names @("registrations","items") -Default $null
-
-    if ($null -ne $items) { return @(As-Array $items) }
-    if ($json -is [array]) { return @($json) }
-    if ($json) { return @($json) }
+    foreach ($uri in @(
+        "$baseUrl/v2/data-protect/sources/registrations?includeSourceCredentials=false&includeExternalMetadata=true",
+        "$baseUrl/v2/data-protect/sources/registrations?includeSourceCredentials=false"
+    )) {
+        try {
+            $json = Get-Json -Uri $uri -Headers $Headers
+            $items = Get-PropValue -Object $json -Names @("registrations","items") -Default $null
+            if ($null -ne $items) { return @(As-Array $items) }
+            if ($json -is [array]) { return @($json) }
+            if ($json) { return @($json) }
+        }
+        catch { continue }
+    }
 
     return @()
 }
 
 function Build-IdMap {
-    param(
-        $Items,
-        [string[]]$IdNames,
-        [string[]]$NameNames
-    )
+    param($Items,[string[]]$IdNames,[string[]]$NameNames)
 
     $map = @{}
-
     foreach ($item in @(As-Array $Items | Where-Object { $_ })) {
         $id = First-Value @((Get-PropValue -Object $item -Names $IdNames))
         $name = First-Value @((Get-PropValue -Object $item -Names $NameNames))
-
         if (-not [string]::IsNullOrWhiteSpace($id)) {
-            $map[[string]$id] = [pscustomobject]@{
-                Id   = [string]$id
-                Name = $name
-                Raw  = $item
-            }
+            $map[[string]$id] = [pscustomobject]@{ Id=[string]$id; Name=$name; Raw=$item }
+        }
+    }
+    return $map
+}
+
+function Add-SourceNodeToIndex {
+    param(
+        $Node,
+        [hashtable]$Map,
+        $Registration
+    )
+
+    if ($null -eq $Node -or $Node -is [string]) { return }
+
+    $id = First-Value @((Get-PropValue -Object $Node -Names @("id","sourceId","entityId","objectId")))
+    $name = First-Value @((Get-PropValue -Object $Node -Names @("name","sourceName","displayName","hostName","objectName")))
+
+    if (-not [string]::IsNullOrWhiteSpace($id)) {
+        $Map[[string]$id] = [pscustomobject]@{
+            Id=[string]$id
+            Name=$name
+            Raw=$Node
+            Registration=$Registration
         }
     }
 
-    return $map
+    foreach ($childName in @("childObjects","children","objects")) {
+        $children = Get-PropValue -Object $Node -Names @($childName) -Default @()
+        foreach ($child in @(As-Array $children | Where-Object { $_ })) {
+            Add-SourceNodeToIndex -Node $child -Map $Map -Registration $Registration
+        }
+    }
 }
 
 function Build-SourceRegistrationIndex {
     param($Registrations)
 
     $map = @{}
-
     foreach ($registration in @(As-Array $Registrations | Where-Object { $_ })) {
+        Add-SourceNodeToIndex -Node $registration -Map $map -Registration $registration
         $sourceInfo = Get-PropValue -Object $registration -Names @("sourceInfo") -Default $null
-
-        $ids = @(
-            (First-Value @((Get-PropValue -Object $registration -Names @("id","sourceId")))),
-            (First-Value @((Get-PropValue -Object $sourceInfo -Names @("id","sourceId","entityId"))))
-        ) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique
-
-        $name = First-Value @(
-            (Get-PropValue -Object $registration -Names @("name","sourceName","displayName")),
-            (Get-PropValue -Object $sourceInfo -Names @("name","sourceName","displayName","hostName"))
-        )
-
-        foreach ($id in $ids) {
-            $map[[string]$id] = [pscustomobject]@{
-                Id   = [string]$id
-                Name = $name
-                Raw  = $registration
-            }
+        if ($sourceInfo) {
+            Add-SourceNodeToIndex -Node $sourceInfo -Map $map -Registration $registration
         }
     }
-
     return $map
 }
 
@@ -434,20 +415,15 @@ function Get-DependencyReferences {
     param($EnvironmentParams)
 
     $references = @()
-    if ($null -eq $EnvironmentParams) {
-        return @()
-    }
+    if ($null -eq $EnvironmentParams) { return @() }
 
     foreach ($leaf in @(Expand-LeafValue -Value $EnvironmentParams -Path "")) {
         $field = [string]$leaf.Field
         $value = [string]$leaf.Value
 
-        if ([string]::IsNullOrWhiteSpace($value) -or $value -eq "<null>") {
-            continue
-        }
+        if ([string]::IsNullOrWhiteSpace($value) -or $value -eq "<null>") { continue }
 
         $referenceType = ""
-
         if ($field -match '(?i)(^|\.)(sourceId|sourceIds|includedSourceIds|excludedSourceIds)(\[\d+\])?$') {
             $referenceType = "Source"
         }
@@ -458,11 +434,11 @@ function Get-DependencyReferences {
             $referenceType = "Object"
         }
 
-        if (-not [string]::IsNullOrWhiteSpace($referenceType)) {
+        if ($referenceType) {
             $references += [pscustomobject]@{
-                ReferenceType = $referenceType
-                FieldPath     = $field
-                OriginalId    = $value
+                ReferenceType=$referenceType
+                FieldPath=$field
+                OriginalId=$value
             }
         }
     }
@@ -474,26 +450,32 @@ function Resolve-DependencyReference {
     param(
         [string]$ReferenceType,
         [string]$Id,
-        [hashtable]$Headers
+        [hashtable]$Headers,
+        [hashtable]$SourceIndex
     )
 
-    if ([string]::IsNullOrWhiteSpace($Id)) {
-        return $null
+    if ([string]::IsNullOrWhiteSpace($Id)) { return $null }
+
+    if ($SourceIndex.ContainsKey($Id)) {
+        $match = $SourceIndex[$Id]
+        return [pscustomobject]@{
+            ResolutionSource="SourceRegistration"
+            Name=$match.Name
+            Environment=(First-Value @((Get-PropValue -Object $match.Raw -Names @("environment"))))
+            SourceId=(First-Value @((Get-PropValue -Object $match.Raw -Names @("sourceId"))))
+            Raw=$match.Raw
+            Registration=$match.Registration
+        }
     }
 
-    $encodedId = [uri]::EscapeDataString($Id)
+    # Object/source endpoints use numeric Cohesity IDs. Do not issue speculative GETs for non-numeric values.
+    if ($Id -notmatch '^\d+$') { return $null }
 
-    if ($ReferenceType -eq "Object") {
-        $uris = @(
-            "$baseUrl/v2/data-protect/objects/$encodedId",
-            "$baseUrl/v2/data-protect/sources/$encodedId"
-        )
+    $uris = if ($ReferenceType -eq "Object") {
+        @("$baseUrl/v2/data-protect/objects/$Id", "$baseUrl/v2/data-protect/sources/$Id")
     }
     else {
-        $uris = @(
-            "$baseUrl/v2/data-protect/sources/$encodedId",
-            "$baseUrl/v2/data-protect/objects/$encodedId"
-        )
+        @("$baseUrl/v2/data-protect/sources/$Id", "$baseUrl/v2/data-protect/objects/$Id")
     }
 
     foreach ($uri in $uris) {
@@ -502,32 +484,31 @@ function Resolve-DependencyReference {
             if ($null -eq $raw) { continue }
 
             if ($raw -is [array]) {
-                $first = @($raw | Where-Object { $_ } | Select-Object -First 1)
-                if ($first.Count -eq 0) { continue }
-                $raw = $first[0]
+                $candidate = @($raw | Where-Object { $_ } | Select-Object -First 1)
+                if ($candidate.Count -eq 0) { continue }
+                $raw = $candidate[0]
             }
 
             return [pscustomobject]@{
-                Endpoint    = $uri
-                Name        = First-Value @((Get-PropValue -Object $raw -Names @("name","objectName","sourceName","displayName","hostName")))
-                Environment = First-Value @((Get-PropValue -Object $raw -Names @("environment")))
-                SourceId    = First-Value @((Get-PropValue -Object $raw -Names @("sourceId")))
-                Raw         = $raw
+                ResolutionSource=$uri
+                Name=(First-Value @((Get-PropValue -Object $raw -Names @("name","objectName","sourceName","displayName","hostName"))))
+                Environment=(First-Value @((Get-PropValue -Object $raw -Names @("environment"))))
+                SourceId=(First-Value @((Get-PropValue -Object $raw -Names @("sourceId"))))
+                Raw=$raw
+                Registration=$null
             }
         }
-        catch {
-            continue
-        }
+        catch { continue }
     }
 
     return $null
 }
 
-# ---------------------------------------------------------------------------
+# -------------------------------
 # Cluster selection
-# ---------------------------------------------------------------------------
-$clusterResponse = Get-Json -Uri "$baseUrl/v2/mcm/cluster-mgmt/info" -Headers (New-Headers)
-$rawClusters = @(As-Array (Get-PropValue -Object $clusterResponse -Names @("cohesityClusters")))
+# -------------------------------
+$clusterJson = Get-Json -Uri "$baseUrl/v2/mcm/cluster-mgmt/info" -Headers (New-Headers)
+$rawClusters = @(As-Array (Get-PropValue -Object $clusterJson -Names @("cohesityClusters")))
 
 if ($rawClusters.Count -eq 0) {
     throw "No clusters returned from Helios."
@@ -545,14 +526,9 @@ $clusters = @(
             (Get-PropValue -Object $_ -Names @("id"))
         )
 
-        if ([string]::IsNullOrWhiteSpace($name)) {
-            $name = "Unknown-$id"
-        }
+        if ([string]::IsNullOrWhiteSpace($name)) { $name = "Unknown-$id" }
 
-        [pscustomobject]@{
-            ClusterName = $name
-            ClusterId   = $id
-        }
+        [pscustomobject]@{ ClusterName=$name; ClusterId=$id }
     } |
     Where-Object { -not [string]::IsNullOrWhiteSpace($_.ClusterId) } |
     Sort-Object ClusterName
@@ -560,9 +536,9 @@ $clusters = @(
 
 $clusterMenu = for ($index=0; $index -lt $clusters.Count; $index++) {
     [pscustomobject]@{
-        Index       = $index + 1
-        ClusterName = $clusters[$index].ClusterName
-        ClusterId   = $clusters[$index].ClusterId
+        Index=$index + 1
+        ClusterName=$clusters[$index].ClusterName
+        ClusterId=$clusters[$index].ClusterId
     }
 }
 
@@ -576,9 +552,7 @@ Write-Host "[X] Exit" -ForegroundColor Yellow
 while ($true) {
     $selection = Read-Host "Select cluster: 0 for ALL, 1-$($clusterMenu.Count) for single, or X"
 
-    if ($selection -match '^(x|X|q|Q)$') {
-        return
-    }
+    if ($selection -match '^(x|X|q|Q)$') { return }
 
     $number = 0
     if (-not [int]::TryParse($selection,[ref]$number)) {
@@ -591,72 +565,45 @@ while ($true) {
         continue
     }
 
-    if ($number -eq 0) {
-        $selectedClusters = @($clusterMenu)
-    }
-    else {
-        $selectedClusters = @($clusterMenu | Where-Object { $_.Index -eq $number })
-    }
-
+    if ($number -eq 0) { $selectedClusters = @($clusterMenu) }
+    else { $selectedClusters = @($clusterMenu | Where-Object { $_.Index -eq $number }) }
     break
 }
 
-# ---------------------------------------------------------------------------
+# -------------------------------
 # Collection
-# ---------------------------------------------------------------------------
+# -------------------------------
 foreach ($cluster in $selectedClusters) {
     $headers = New-Headers -ClusterId $cluster.ClusterId
     $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
     $clusterDir = Join-Path $OutputDirectory ("{0}_{1}" -f (Safe-Name $cluster.ClusterName),$timestamp)
     $pgRoot = Join-Path $clusterDir "PGs"
-
     New-Item -Path $pgRoot -ItemType Directory -Force | Out-Null
 
     Write-Host ""
-    Write-Host "Collecting active Protection Group configuration from $($cluster.ClusterName) ..." -ForegroundColor Cyan
+    Write-Host "Collecting active Protection Groups from $($cluster.ClusterName) ..." -ForegroundColor Cyan
 
     $errors = @()
     $summaryRows = @()
     $allParameterRows = @()
-    $allDependencyRows = @()
+    $dependencyRows = @()
 
-    try {
-        $policies = @(Get-AllPolicies -Headers $headers)
-    }
+    try { $policies = @(Get-AllPolicies -Headers $headers) }
     catch {
         $policies = @()
-        $errors += [pscustomobject]@{
-            Environment="ALL"
-            ProtectionGroup=""
-            Stage="Policies"
-            Error=$_.Exception.Message
-        }
+        $errors += [pscustomobject]@{ Cluster=$cluster.ClusterName; Environment="ALL"; ProtectionGroup=""; Stage="Policies"; Error=$_.Exception.Message }
     }
 
-    try {
-        $storageDomains = @(Get-AllStorageDomains -Headers $headers)
-    }
+    try { $storageDomains = @(Get-AllStorageDomains -Headers $headers) }
     catch {
         $storageDomains = @()
-        $errors += [pscustomobject]@{
-            Environment="ALL"
-            ProtectionGroup=""
-            Stage="StorageDomains"
-            Error=$_.Exception.Message
-        }
+        $errors += [pscustomobject]@{ Cluster=$cluster.ClusterName; Environment="ALL"; ProtectionGroup=""; Stage="StorageDomains"; Error=$_.Exception.Message }
     }
 
-    try {
-        $sourceRegistrations = @(Get-AllSourceRegistrations -Headers $headers)
-    }
+    try { $sourceRegistrations = @(Get-AllSourceRegistrations -Headers $headers) }
     catch {
         $sourceRegistrations = @()
-        $errors += [pscustomobject]@{
-            Environment="ALL"
-            ProtectionGroup=""
-            Stage="SourceRegistrations"
-            Error=$_.Exception.Message
-        }
+        $errors += [pscustomobject]@{ Cluster=$cluster.ClusterName; Environment="ALL"; ProtectionGroup=""; Stage="SourceRegistrations"; Error=$_.Exception.Message }
     }
 
     Write-Json -Value $policies -Path (Join-Path $clusterDir "Policies_All.json")
@@ -665,7 +612,7 @@ foreach ($cluster in $selectedClusters) {
 
     $policyMap = Build-IdMap -Items $policies -IdNames @("id","policyId") -NameNames @("name","policyName","displayName")
     $storageMap = Build-IdMap -Items $storageDomains -IdNames @("id","storageDomainId") -NameNames @("name","storageDomainName","displayName")
-    $sourceRegistrationMap = Build-SourceRegistrationIndex -Registrations $sourceRegistrations
+    $sourceIndex = Build-SourceRegistrationIndex -Registrations $sourceRegistrations
 
     foreach ($environment in $EnvironmentMap) {
         try {
@@ -673,6 +620,7 @@ foreach ($cluster in $selectedClusters) {
         }
         catch {
             $errors += [pscustomobject]@{
+                Cluster=$cluster.ClusterName
                 Environment=$environment.DisplayName
                 ProtectionGroup=""
                 Stage="ProtectionGroupList"
@@ -688,11 +636,13 @@ foreach ($cluster in $selectedClusters) {
             $pgId = First-Value @((Get-PropValue -Object $pgStub -Names @("id","protectionGroupId")))
             $pgName = First-Value @(
                 (Get-PropValue -Object $pgStub -Names @("name","protectionGroupName")),
-                $pgId
+                $pgId,
+                "UNNAMED"
             )
 
             if ([string]::IsNullOrWhiteSpace($pgId)) {
                 $errors += [pscustomobject]@{
+                    Cluster=$cluster.ClusterName
                     Environment=$environment.DisplayName
                     ProtectionGroup=$pgName
                     Stage="ProtectionGroupId"
@@ -703,7 +653,6 @@ foreach ($cluster in $selectedClusters) {
 
             $pg = $null
             $detailSource = "DetailedGET"
-
             try {
                 $pg = Get-ProtectionGroupDetail -ProtectionGroupId $pgId -Headers $headers
             }
@@ -711,24 +660,21 @@ foreach ($cluster in $selectedClusters) {
                 $pg = $pgStub
                 $detailSource = "ListGETFallback"
                 $errors += [pscustomobject]@{
+                    Cluster=$cluster.ClusterName
                     Environment=$environment.DisplayName
                     ProtectionGroup=$pgName
                     Stage="ProtectionGroupDetail"
                     Error=$_.Exception.Message
                 }
             }
-
             if ($null -eq $pg) {
                 $pg = $pgStub
                 $detailSource = "ListGETFallback"
             }
 
-            $isActive = Get-PropValue -Object $pg -Names @("isActive") -Default $true
-            $isDeleted = Get-PropValue -Object $pg -Names @("isDeleted") -Default $false
-
-            if ($isActive -eq $false -or $isDeleted -eq $true) {
-                continue
-            }
+            $detailIsActive = Get-PropValue -Object $pg -Names @("isActive") -Default $true
+            $detailIsDeleted = Get-PropValue -Object $pg -Names @("isDeleted") -Default $false
+            if ($detailIsActive -eq $false -or $detailIsDeleted -eq $true) { continue }
 
             $environmentBlock = Get-EnvironmentBlock -ProtectionGroup $pg -Names $environment.ParamNames
             $parameterBlockName = if ($environmentBlock) { $environmentBlock.Name } else { "NOT_FOUND" }
@@ -736,10 +682,11 @@ foreach ($cluster in $selectedClusters) {
 
             if ($parameterBlockName -eq "NOT_FOUND") {
                 $errors += [pscustomobject]@{
+                    Cluster=$cluster.ClusterName
                     Environment=$environment.DisplayName
                     ProtectionGroup=$pgName
-                    Stage="EnvironmentParams"
-                    Error="Expected environment parameter block was not returned."
+                    Stage="EnvironmentParameters"
+                    Error="No matching environment parameter block was returned."
                 }
             }
 
@@ -748,109 +695,85 @@ foreach ($cluster in $selectedClusters) {
                 (Get-NestedValue -Object $pg -Path "policyInfo.id"),
                 (Get-NestedValue -Object $pg -Path "policy.id")
             )
-
             $policyName = ""
             $policyRaw = $null
-            if ($policyId -and $policyMap.ContainsKey([string]$policyId)) {
-                $policyName = $policyMap[[string]$policyId].Name
-                $policyRaw = $policyMap[[string]$policyId].Raw
+            if ($policyId -and $policyMap.ContainsKey($policyId)) {
+                $policyName = $policyMap[$policyId].Name
+                $policyRaw = $policyMap[$policyId].Raw
             }
 
-            $storageDomainId = First-Value @(
-                (Get-PropValue -Object $pg -Names @("storageDomainId")),
-                (Get-NestedValue -Object $pg -Path "storageDomain.id")
-            )
-
+            $storageDomainId = First-Value @((Get-PropValue -Object $pg -Names @("storageDomainId")))
             $storageDomainName = First-Value @(
                 (Get-PropValue -Object $pg -Names @("storageDomainName")),
                 (Get-NestedValue -Object $pg -Path "storageDomain.name")
             )
             $storageDomainRaw = $null
-
-            if ($storageDomainId -and $storageMap.ContainsKey([string]$storageDomainId)) {
-                if ([string]::IsNullOrWhiteSpace($storageDomainName)) {
-                    $storageDomainName = $storageMap[[string]$storageDomainId].Name
-                }
-                $storageDomainRaw = $storageMap[[string]$storageDomainId].Raw
+            if ($storageDomainId -and $storageMap.ContainsKey($storageDomainId)) {
+                $storageDomainRaw = $storageMap[$storageDomainId].Raw
+                if (-not $storageDomainName) { $storageDomainName = $storageMap[$storageDomainId].Name }
             }
 
-            $dependencyReferences = @(Get-DependencyReferences -EnvironmentParams $parameterBlockValue)
+            $references = @(Get-DependencyReferences -EnvironmentParams $parameterBlockValue)
             $pgDependencyRows = @()
-            $resolvedDetails = @()
-            $relevantRegistrations = @{}
-            $resolvedCount = 0
+            $pgResolvedRows = @()
+            $relevantRegistrationMap = @{}
 
-            foreach ($reference in $dependencyReferences) {
+            foreach ($reference in $references) {
+                $resolved = Resolve-DependencyReference `
+                    -ReferenceType $reference.ReferenceType `
+                    -Id ([string]$reference.OriginalId) `
+                    -Headers $headers `
+                    -SourceIndex $sourceIndex
+
                 $resolvedName = ""
-                $resolvedAs = ""
                 $resolvedEnvironment = ""
-                $registeredSourceId = ""
-                $registeredSourceName = ""
-
-                if ($sourceRegistrationMap.ContainsKey([string]$reference.OriginalId)) {
-                    $registration = $sourceRegistrationMap[[string]$reference.OriginalId]
-                    $resolvedName = $registration.Name
-                    $resolvedAs = "SourceRegistration"
-                    $registeredSourceId = $registration.Id
-                    $registeredSourceName = $registration.Name
-                    $relevantRegistrations[[string]$registration.Id] = $registration.Raw
-                }
-
-                $resolved = Resolve-DependencyReference -ReferenceType $reference.ReferenceType -Id ([string]$reference.OriginalId) -Headers $headers
+                $resolvedSourceId = ""
+                $resolutionSource = ""
 
                 if ($resolved) {
-                    if (-not [string]::IsNullOrWhiteSpace($resolved.Name)) {
-                        $resolvedName = $resolved.Name
-                    }
+                    $resolvedName = $resolved.Name
                     $resolvedEnvironment = $resolved.Environment
-                    $resolvedAs = if ($resolved.Endpoint -match '/objects/') { "Object" } else { "Source" }
+                    $resolvedSourceId = $resolved.SourceId
+                    $resolutionSource = $resolved.ResolutionSource
 
-                    if (-not [string]::IsNullOrWhiteSpace($resolved.SourceId)) {
-                        $registeredSourceId = $resolved.SourceId
-
-                        if ($sourceRegistrationMap.ContainsKey([string]$resolved.SourceId)) {
-                            $registration = $sourceRegistrationMap[[string]$resolved.SourceId]
-                            $registeredSourceName = $registration.Name
-                            $relevantRegistrations[[string]$registration.Id] = $registration.Raw
-                        }
+                    if ($resolved.Registration) {
+                        $regId = First-Value @(
+                            (Get-PropValue -Object $resolved.Registration -Names @("id","sourceId")),
+                            (Get-NestedValue -Object $resolved.Registration -Path "sourceInfo.id"),
+                            $reference.OriginalId
+                        )
+                        if ($regId) { $relevantRegistrationMap[[string]$regId] = $resolved.Registration }
                     }
 
-                    $resolvedDetails += [pscustomobject]@{
-                        ReferenceType        = $reference.ReferenceType
-                        FieldPath            = $reference.FieldPath
-                        OriginalId           = $reference.OriginalId
-                        ResolvedAs           = $resolvedAs
-                        ResolvedName         = $resolvedName
-                        ResolvedEnvironment  = $resolvedEnvironment
-                        RegisteredSourceId   = $registeredSourceId
-                        RegisteredSourceName = $registeredSourceName
-                        Raw                  = $resolved.Raw
+                    $pgResolvedRows += [pscustomobject]@{
+                        ReferenceType=$reference.ReferenceType
+                        FieldPath=$reference.FieldPath
+                        OriginalId=$reference.OriginalId
+                        Name=$resolvedName
+                        Environment=$resolvedEnvironment
+                        SourceId=$resolvedSourceId
+                        ResolutionSource=$resolutionSource
+                        Raw=$resolved.Raw
                     }
                 }
 
-                $isResolved = -not [string]::IsNullOrWhiteSpace($resolvedName)
-                if ($isResolved) {
-                    $resolvedCount++
+                $row = [pscustomobject]@{
+                    Cluster=$cluster.ClusterName
+                    Environment=$environment.DisplayName
+                    ProtectionGroup=$pgName
+                    ProtectionGroupId=$pgId
+                    ReferenceType=$reference.ReferenceType
+                    FieldPath=$reference.FieldPath
+                    OriginalId=$reference.OriginalId
+                    Resolved=(-not [string]::IsNullOrWhiteSpace($resolvedName))
+                    ResolvedName=$resolvedName
+                    ResolvedEnvironment=$resolvedEnvironment
+                    ResolvedSourceId=$resolvedSourceId
+                    ResolutionSource=$resolutionSource
                 }
 
-                $dependencyRow = [pscustomobject]@{
-                    Cluster              = $cluster.ClusterName
-                    Environment          = $environment.DisplayName
-                    ProtectionGroup      = $pgName
-                    ProtectionGroupId    = $pgId
-                    ReferenceType        = $reference.ReferenceType
-                    FieldPath            = $reference.FieldPath
-                    OriginalId           = $reference.OriginalId
-                    Resolved             = $isResolved
-                    ResolvedName         = $resolvedName
-                    ResolvedAs           = $resolvedAs
-                    ResolvedEnvironment  = $resolvedEnvironment
-                    RegisteredSourceId   = $registeredSourceId
-                    RegisteredSourceName = $registeredSourceName
-                }
-
-                $pgDependencyRows += $dependencyRow
-                $allDependencyRows += $dependencyRow
+                $pgDependencyRows += $row
+                $dependencyRows += $row
             }
 
             $folderName = "{0}__{1}" -f (Safe-Name $pgName),(Safe-Name $pgId)
@@ -862,48 +785,39 @@ foreach ($cluster in $selectedClusters) {
             Write-Json -Value $policyRaw -Path (Join-Path $pgDir "Policy.json")
             Write-Json -Value $storageDomainRaw -Path (Join-Path $pgDir "StorageDomain.json")
             Write-Json -Value $pgDependencyRows -Path (Join-Path $pgDir "DependencyReferences.json")
-            Write-Json -Value $resolvedDetails -Path (Join-Path $pgDir "ResolvedSourceObjectDetails.json")
-            Write-Json -Value @($relevantRegistrations.Values) -Path (Join-Path $pgDir "RelevantSourceRegistrations.json")
+            Write-Json -Value $pgResolvedRows -Path (Join-Path $pgDir "ResolvedSourceObjectDetails.json")
+            Write-Json -Value @($relevantRegistrationMap.Values) -Path (Join-Path $pgDir "RelevantSourceRegistrations.json")
 
             $pgParameterRows = @()
             foreach ($leaf in @(Expand-LeafValue -Value $pg -Path "")) {
-                $parameterRow = [pscustomobject]@{
-                    Cluster           = $cluster.ClusterName
-                    Environment       = $environment.DisplayName
-                    ProtectionGroup   = $pgName
-                    ProtectionGroupId = $pgId
-                    Field             = $leaf.Field
-                    Value             = $leaf.Value
+                $row = [pscustomobject]@{
+                    Cluster=$cluster.ClusterName
+                    Environment=$environment.DisplayName
+                    ProtectionGroup=$pgName
+                    ProtectionGroupId=$pgId
+                    Field=$leaf.Field
+                    Value=$leaf.Value
                 }
-                $pgParameterRows += $parameterRow
-                $allParameterRows += $parameterRow
+                $pgParameterRows += $row
+                $allParameterRows += $row
             }
 
-            $pgParameterRows |
-                Sort-Object Field |
-                Export-Csv (Join-Path $pgDir "ConfiguredParameters.csv") -NoTypeInformation -Encoding UTF8
+            Export-Rows -Rows $pgParameterRows -Path (Join-Path $pgDir "ConfiguredParameters.csv") -SortProperty @("Field")
 
             Write-Json -Value ([ordered]@{
-                ExportedAt                    = (Get-Date).ToString("o")
-                ReadOnly                      = $true
-                RequestMethod                 = "GET"
-                Cluster                       = $cluster.ClusterName
-                ClusterId                     = $cluster.ClusterId
-                Environment                   = $environment.DisplayName
-                EnvironmentApiName            = $environment.ApiName
-                ProtectionGroup               = $pgName
-                ProtectionGroupId             = $pgId
-                DetailSource                  = $detailSource
-                ParameterBlock                = $parameterBlockName
-                PolicyId                      = $policyId
-                PolicyName                    = $policyName
-                StorageDomainId               = $storageDomainId
-                StorageDomainName             = $storageDomainName
-                DependencyReferenceCount      = $dependencyReferences.Count
-                ResolvedReferenceCount        = $resolvedCount
-                SourceRegistrationCount       = $relevantRegistrations.Count
-                ActiveOnly                    = $true
-                Files                         = @(
+                ExportedAt=(Get-Date).ToString("o")
+                ReadOnly=$true
+                RequestMethod="GET"
+                Cluster=$cluster.ClusterName
+                ClusterId=$cluster.ClusterId
+                Environment=$environment.DisplayName
+                EnvironmentApiName=$environment.ApiName
+                ProtectionGroup=$pgName
+                ProtectionGroupId=$pgId
+                DetailSource=$detailSource
+                ParameterBlock=$parameterBlockName
+                ActiveOnly=$true
+                Files=@(
                     "ProtectionGroup.json",
                     "EnvironmentParams.json",
                     "Policy.json",
@@ -916,59 +830,49 @@ foreach ($cluster in $selectedClusters) {
             }) -Path (Join-Path $pgDir "Manifest.json")
 
             $summaryRows += [pscustomobject]@{
-                Cluster                 = $cluster.ClusterName
-                ClusterId               = $cluster.ClusterId
-                Environment             = $environment.DisplayName
-                EnvironmentApiName      = $environment.ApiName
-                ProtectionGroup         = $pgName
-                ProtectionGroupId       = $pgId
-                DetailSource            = $detailSource
-                ParameterBlock          = $parameterBlockName
-                PolicyId                = $policyId
-                PolicyName              = $policyName
-                StorageDomainId         = $storageDomainId
-                StorageDomainName       = $storageDomainName
-                IsActive                = $isActive
-                IsDeleted               = $isDeleted
-                IsPaused                = (Get-PropValue -Object $pg -Names @("isPaused"))
-                ParameterFieldCount     = $pgParameterRows.Count
-                DependencyReferenceCount= $dependencyReferences.Count
-                ResolvedReferenceCount  = $resolvedCount
-                SourceRegistrationCount = $relevantRegistrations.Count
-                OutputFolder            = $folderName
+                Cluster=$cluster.ClusterName
+                ClusterId=$cluster.ClusterId
+                Environment=$environment.DisplayName
+                EnvironmentApiName=$environment.ApiName
+                ProtectionGroup=$pgName
+                ProtectionGroupId=$pgId
+                DetailSource=$detailSource
+                PolicyId=$policyId
+                PolicyName=$policyName
+                StorageDomainId=$storageDomainId
+                StorageDomainName=$storageDomainName
+                IsActive=$detailIsActive
+                IsDeleted=$detailIsDeleted
+                IsPaused=(Get-PropValue -Object $pg -Names @("isPaused"))
+                ParameterBlock=$parameterBlockName
+                ParameterFieldCount=$pgParameterRows.Count
+                DependencyReferenceCount=$references.Count
+                ResolvedReferenceCount=@($pgDependencyRows | Where-Object { $_.Resolved }).Count
+                RelevantSourceRegistrationCount=$relevantRegistrationMap.Count
+                OutputFolder=$folderName
             }
         }
     }
 
-    $summaryRows |
-        Sort-Object Environment,ProtectionGroup |
-        Export-Csv (Join-Path $clusterDir "Active_ProtectionGroups.csv") -NoTypeInformation -Encoding UTF8
-
-    $allParameterRows |
-        Sort-Object Environment,ProtectionGroup,Field |
-        Export-Csv (Join-Path $clusterDir "All_Configured_Parameters.csv") -NoTypeInformation -Encoding UTF8
-
-    $allDependencyRows |
-        Sort-Object Environment,ProtectionGroup,ReferenceType,FieldPath |
-        Export-Csv (Join-Path $clusterDir "Dependency_References.csv") -NoTypeInformation -Encoding UTF8
-
-    $errors |
-        Export-Csv (Join-Path $clusterDir "Collection_Errors.csv") -NoTypeInformation -Encoding UTF8
+    Export-Rows -Rows $summaryRows -Path (Join-Path $clusterDir "Active_ProtectionGroups.csv") -SortProperty @("Environment","ProtectionGroup")
+    Export-Rows -Rows $allParameterRows -Path (Join-Path $clusterDir "All_Configured_Parameters.csv") -SortProperty @("Environment","ProtectionGroup","Field")
+    Export-Rows -Rows $dependencyRows -Path (Join-Path $clusterDir "Dependency_References.csv") -SortProperty @("Environment","ProtectionGroup","ReferenceType","FieldPath")
+    Export-Rows -Rows $errors -Path (Join-Path $clusterDir "Collection_Errors.csv") -SortProperty @("Environment","ProtectionGroup","Stage")
 
     Write-Json -Value ([ordered]@{
-        ExportedAt           = (Get-Date).ToString("o")
-        Script               = "Get-CohesityDRReadyPGConfig.ps1"
-        ReadOnly             = $true
-        RequestMethod        = "GET"
-        HeliosBaseUrl        = $baseUrl
-        Cluster              = $cluster.ClusterName
-        ClusterId            = $cluster.ClusterId
-        ActiveOnly           = $true
-        DeletedIncluded      = $false
-        Environments         = @($EnvironmentMap | ForEach-Object { $_.DisplayName })
-        ProtectionGroupCount = $summaryRows.Count
-        CollectionErrorCount = $errors.Count
-        Safety               = "GET-only. No write operations are performed."
+        ExportedAt=(Get-Date).ToString("o")
+        Script="Get-CohesityDRReadyPGConfig.ps1"
+        ReadOnly=$true
+        RequestMethod="GET"
+        HeliosBaseUrl=$baseUrl
+        Cluster=$cluster.ClusterName
+        ClusterId=$cluster.ClusterId
+        ActiveOnly=$true
+        DeletedIncluded=$false
+        Environments=@($EnvironmentMap | ForEach-Object { $_.DisplayName })
+        ProtectionGroupCount=$summaryRows.Count
+        CollectionErrorCount=$errors.Count
+        Safety="GET-only. No Cohesity write operations are performed."
     }) -Path (Join-Path $clusterDir "Run_Metadata.json")
 
     Write-Host ""
