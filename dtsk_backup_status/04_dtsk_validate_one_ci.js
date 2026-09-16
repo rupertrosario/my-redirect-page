@@ -1,7 +1,7 @@
 // ==========================================================
 // Dynatrace JS Task
 // Task name: dtsk_validate_one_ci
-// Phase: Real Cohesity validation - version 7
+// Phase: Real Cohesity validation - version 8
 //
 // Corrected to match PowerShell logic:
 // - Uses protected-objects search as source of protected object rows
@@ -10,6 +10,7 @@
 // - Adds DB/CN fallback search for SQL/Oracle objects across all clusters
 // - Keeps assignment ownership fields from ServiceNow work item
 // - Does not place diagnostic cluster-count text in the email Cluster column
+// - Excludes Generic NAS / NAS Mount Points from DTSK server-level backup validation
 // - GET only
 // ==========================================================
 
@@ -372,6 +373,20 @@ export default async function (input = {}) {
     return testOracleContainerName(flatObject?.ObjectName) || testOracleContainerName(flatObject?.SourceName);
   }
 
+  function isExcludedGenericNas(flatObject) {
+    const text = [
+      flatObject?.Environment,
+      flatObject?.ObjectType,
+      flatObject?.ObjectName,
+      flatObject?.SourceName,
+      flatObject?.SourceInfoName,
+      flatObject?.GenericSourceName,
+      flatObject?.ParentName
+    ].map(v => String(v || "")).join(" ");
+
+    return /kGenericNas|GenericNas|Generic\s+NAS|NAS\s+Mount\s+Points/i.test(text);
+  }
+
   function getBackupType(flatObject) {
     if (testNonDisplayObject(flatObject)) return "Container";
     if (flatObject?.SqlHostName) return "SQL";
@@ -434,6 +449,8 @@ export default async function (input = {}) {
   }
 
   function convertFlatObjectToBackupRow(flatObject, ci, candidateCluster) {
+    if (isExcludedGenericNas(flatObject)) return null;
+
     const obj = flatObject.Object;
     const snap = getBestSnapshot(obj);
     const backupType = getBackupType(flatObject);
@@ -520,7 +537,7 @@ export default async function (input = {}) {
         if (protectedObjects.length === 0) continue;
         let flatObjects = [];
         for (const obj of protectedObjects) flatObjects.push(...getFlatProtectedObjects(obj));
-        flatObjects = flatObjects.filter(f => !testNonDisplayObject(f));
+        flatObjects = flatObjects.filter(f => !testNonDisplayObject(f) && !isExcludedGenericNas(f));
         if (flatObjects.length === 0) continue;
         let objectsToCheck = [];
         if (dbOnly) {
@@ -533,7 +550,7 @@ export default async function (input = {}) {
           if (objectsToCheck.length === 0) objectsToCheck = flatObjects;
         }
         for (const flat of objectsToCheck) {
-          if (testNonDisplayObject(flat)) continue;
+          if (testNonDisplayObject(flat) || isExcludedGenericNas(flat)) continue;
           const row = convertFlatObjectToBackupRow(flat, ci, { ...clu, workItem });
           if (!row) continue;
           if (!IN_SCOPE_BACKUP_TYPES.includes(row.BackupType)) continue;
