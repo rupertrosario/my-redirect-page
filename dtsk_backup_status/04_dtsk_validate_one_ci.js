@@ -1,7 +1,7 @@
 // ==========================================================
 // Dynatrace JS Task
 // Task name: dtsk_validate_one_ci
-// Phase: Real Cohesity validation - version 8
+// Phase: Real Cohesity validation - version 9
 //
 // Corrected to match PowerShell logic:
 // - Uses protected-objects search as source of protected object rows
@@ -10,7 +10,8 @@
 // - Adds DB/CN fallback search for SQL/Oracle objects across all clusters
 // - Keeps assignment ownership fields from ServiceNow work item
 // - Does not place diagnostic cluster-count text in the email Cluster column
-// - Excludes Generic NAS / NAS Mount Points from DTSK server-level backup validation
+// - Generic NAS / NAS Mount Points do not count as server-level backup
+// - Generic NAS-only matches are returned as ManualCheckNAS, not No Backup Found
 // - GET only
 // ==========================================================
 
@@ -28,6 +29,7 @@ export default async function (input = {}) {
   const SERVER_LEVEL_BACKUP_TYPES = ["FS", "VM", "HyperV", "Nutanix"];
   const DB_BACKUP_TYPES = ["SQL", "Oracle"];
   const IN_SCOPE_BACKUP_TYPES = ["FS", "VM", "HyperV", "Nutanix", "SQL", "Oracle"];
+  const MANUAL_CHECK_BACKUP_TYPES = ["ManualCheckNAS"];
 
   function asArray(value) {
     if (Array.isArray(value)) return value;
@@ -448,6 +450,25 @@ export default async function (input = {}) {
     return { DTSK: safeText(workItem?.dtsk), DecomRequest: safeText(workItem?.decomRequest), AssignedTo: getAssignedTo(workItem), AssignmentGroup: getAssignmentGroup(workItem), AssignmentAction: getAssignmentAction(workItem) };
   }
 
+  function convertGenericNasToManualRow(flatObject, ci, candidateCluster) {
+    const obj = flatObject.Object;
+    const snap = getBestSnapshot(obj);
+    const ownership = getWorkItemFields(candidateCluster.workItem);
+    const objectNameOut = getDisplayObjectName(flatObject.ObjectName);
+    const sourceNameOut = resolveSourceName("FS", flatObject.ObjectName, flatObject.ParentName, flatObject.SqlHostName, flatObject.OracleHostName, flatObject.GenericSourceName, flatObject.SourceName);
+    let usecs = 0;
+    let lastBackupTime = "Manual Check Required";
+    let pg = "-";
+    if (snap) {
+      usecs = getSnapshotUsecs(snap);
+      if (usecs > 0) lastBackupTime = usecsToEt(usecs);
+      pg = getProtectionGroupName(obj, snap);
+    } else {
+      pg = getProtectionGroupName(obj, null);
+    }
+    return { ...ownership, ServerName: ci, BackupType: "ManualCheckNAS", ObjectName: objectNameOut, SourceName: sourceNameOut || "NAS Mount Points", ClusterName: String(candidateCluster.clusterName || "N/A"), ProtectionGroup: pg || "-", LastBackupTime: lastBackupTime, LastBackupUsecs: usecs || 0, ClustersChecked: "N/A" };
+  }
+
   function convertFlatObjectToBackupRow(flatObject, ci, candidateCluster) {
     if (isExcludedGenericNas(flatObject)) return null;
 
@@ -537,6 +558,14 @@ export default async function (input = {}) {
         if (protectedObjects.length === 0) continue;
         let flatObjects = [];
         for (const obj of protectedObjects) flatObjects.push(...getFlatProtectedObjects(obj));
+
+        if (!dbOnly) {
+          const manualNasObjects = dedupeFlatObjects(
+            flatObjects.filter(f => !testNonDisplayObject(f) && isExcludedGenericNas(f) && objectMatchesCiAliasesFlat(f, ciAliases))
+          );
+          for (const flat of manualNasObjects) rows.push(convertGenericNasToManualRow(flat, ci, { ...clu, workItem }));
+        }
+
         flatObjects = flatObjects.filter(f => !testNonDisplayObject(f) && !isExcludedGenericNas(f));
         if (flatObjects.length === 0) continue;
         let objectsToCheck = [];
@@ -575,7 +604,7 @@ export default async function (input = {}) {
   }
 
   function sortRows(rows) {
-    const rank = { FS: 10, HyperV: 20, Nutanix: 30, VM: 40, SQL: 50, Oracle: 60, NoFSBackupFound: 900, NoObject: 950, Unknown: 999 };
+    const rank = { FS: 10, HyperV: 20, Nutanix: 30, VM: 40, SQL: 50, Oracle: 60, ManualCheckNAS: 880, NoFSBackupFound: 900, NoObject: 950, Unknown: 999 };
     return [...rows].sort((a, b) => {
       const ra = rank[a.BackupType] ?? 500;
       const rb = rank[b.BackupType] ?? 500;
@@ -634,16 +663,30 @@ export default async function (input = {}) {
   }
 
   let rows = sortRows(dedupeRows(workingRows));
-  const hasDbBackup = rows.some(r => DB_BACKUP_TYPES.includes(r.BackupType));
-  const hasServerLevelBackup = rows.some(r => SERVER_LEVEL_BACKUP_TYPES.includes(r.BackupType));
+  let hasDbBackup = rows.some(r => DB_BACKUP_TYPES.includes(r.BackupType));
+  let hasServerLevelBackup = rows.some(r => SERVER_LEVEL_BACKUP_TYPES.includes(r.BackupType));
 
-  if (hasDbBackup && !hasServerLevelBackup) rows.push(makeSpecialRow(workItem, "NoFSBackupFound", workItem.ciName, workItem.ciName, "N/A", "-", "NoFSBackupFound", clustersCheckedText));
+  if (hasServerLevelBackup) {
+    rows = rows.filter(r => !MANUAL_CHECK_BACKUP_TYPES.includes(r.BackupType));
+  }
+
+  let hasManualNas = rows.some(r => r.BackupType === "ManualCheckNAS");
+  hasDbBackup = rows.some(r => DB_BACKUP_TYPES.includes(r.BackupType));
+  hasServerLevelBackup = rows.some(r => SERVER_LEVEL_BACKUP_TYPES.includes(r.BackupType));
+
+  if (hasDbBackup && !hasServerLevelBackup && !hasManualNas) rows.push(makeSpecialRow(workItem, "NoFSBackupFound", workItem.ciName, workItem.ciName, "N/A", "-", "NoFSBackupFound", clustersCheckedText));
   if (rows.length === 0) rows = [makeSpecialRow(workItem, "NoObject", workItem.ciName, "N/A", "N/A", "-", "NoBackupFound", clustersCheckedText)];
 
   rows = sortRows(rows);
+  hasManualNas = rows.some(r => r.BackupType === "ManualCheckNAS");
+  hasDbBackup = rows.some(r => DB_BACKUP_TYPES.includes(r.BackupType));
+  hasServerLevelBackup = rows.some(r => SERVER_LEVEL_BACKUP_TYPES.includes(r.BackupType));
+
   const pgNamePopulatedCount = rows.filter(r => r.ProtectionGroup && !["-", "N/A"].includes(r.ProtectionGroup)).length;
   const pgNameMissingCount = rows.filter(r => !r.ProtectionGroup || ["-", "N/A"].includes(r.ProtectionGroup)).length;
-  const validationState = rows.some(r => IN_SCOPE_BACKUP_TYPES.includes(r.BackupType)) ? "Validated" : "NoBackupFound";
+
+  let validationState = rows.some(r => IN_SCOPE_BACKUP_TYPES.includes(r.BackupType)) ? "Validated" : "NoBackupFound";
+  if (hasManualNas && !hasServerLevelBackup) validationState = "ManualCheckRequired";
 
   const output = {
     validationState,
@@ -661,8 +704,10 @@ export default async function (input = {}) {
       nutanixRowCount: rows.filter(r => r.BackupType === "Nutanix").length,
       sqlRowCount: rows.filter(r => r.BackupType === "SQL").length,
       oracleRowCount: rows.filter(r => r.BackupType === "Oracle").length,
-      serverLevelBackupFound: rows.some(r => SERVER_LEVEL_BACKUP_TYPES.includes(r.BackupType)),
-      dbBackupFound: rows.some(r => DB_BACKUP_TYPES.includes(r.BackupType)),
+      manualCheckNasRowCount: rows.filter(r => r.BackupType === "ManualCheckNAS").length,
+      manualCheckRequired: hasManualNas && !hasServerLevelBackup,
+      serverLevelBackupFound: hasServerLevelBackup,
+      dbBackupFound: hasDbBackup,
       noFsBackupFound: rows.some(r => r.BackupType === "NoFSBackupFound"),
       dbNamedServer,
       dbCnFallbackApplied,
