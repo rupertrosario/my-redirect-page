@@ -12,7 +12,7 @@
 // - Keeps cluster diagnostics out of the Cluster column
 // - Clearly reports when there are no active decommission DTSKs
 // - Explicitly reports DB-named servers that have server backup but no DB backup
-// - Generic NAS / NAS Mount Points are shown as manual-check items, not No Backup Found
+// - Generic NAS / NAS Mount Points / Isilon are shown as manual-check items, not No Backup Found
 //
 // Strictly read/aggregate only. No HTTP calls. No writes.
 // ==========================================================
@@ -294,9 +294,9 @@ export default async function () {
 
   function makeNoteMarkdown() {
     return [
-      "- **Generic NAS / NAS Mount Points are not treated as No Backup Found. They require manual validation before the DTSK is acted on.**",
+      "- **Generic NAS / NAS Mount Points / Isilon are not treated as No Backup Found. They require manual validation before the DTSK is acted on.**",
       "- **SLA Status** is calculated as 2 days from `sys_created_on`.",
-      "- **No Backup Found** means no supported Cohesity backup and no Generic NAS manual-check match was found for the CI.",
+      "- **No Backup Found** means no supported Cohesity backup and no NAS/Isilon manual-check match was found for the CI.",
       "- **DB Only / No Server Backup** means SQL/Oracle backup was found, but no server-level backup was found.",
       "- **Server Backup / No DB Backup** means the DB/CN server has server-level backup, but no SQL/Oracle backup was found after checking all Cohesity clusters."
     ].join("\n");
