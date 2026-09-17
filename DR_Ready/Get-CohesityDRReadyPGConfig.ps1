@@ -52,7 +52,6 @@ if (-not (Test-Path $OutputDirectory -PathType Container)) {
     New-Item -Path $OutputDirectory -ItemType Directory -Force | Out-Null
 }
 
-# Match the key-loading pattern used by the known-working inventory script.
 . $helperPath
 $keyLoader = "Get-Cohesity" + "ApiKeyFromAes"
 try {
@@ -215,6 +214,10 @@ function Get-ActiveProtectionGroups {
         }
 
         $json = Get-Json -Uri $uri -Headers $Headers
+        if ($null -eq $json) {
+            throw "Protection Group list GET returned no JSON content for environment '$Environment'."
+        }
+
         $groups = Get-PropValue -Object $json -Names @("protectionGroups") -Default @()
         if ($groups) { $all += @(As-Array $groups | Where-Object { $_ }) }
 
@@ -249,6 +252,14 @@ function Invoke-FirstSuccessfulGet {
     foreach ($uri in $Uris) {
         try {
             $data = Get-Json -Uri $uri -Headers $Headers
+            if ($null -eq $data) {
+                $attemptErrors += [pscustomobject]@{
+                    Uri=$uri
+                    Error="GET returned no JSON content."
+                }
+                continue
+            }
+
             return [pscustomobject][ordered]@{
                 Status="SUCCESS"
                 Uri=$uri
@@ -329,6 +340,54 @@ function Get-StorageDomainEvidence {
     }
 }
 
+function Test-SensitiveFieldName {
+    param([string]$Name)
+
+    if ([string]::IsNullOrWhiteSpace($Name)) { return $false }
+
+    $normalized = $Name.Trim().ToLowerInvariant()
+    return @(
+        "password",
+        "secret",
+        "secretkey",
+        "privatekey",
+        "apikey",
+        "accesskeysecret",
+        "secretaccesskey",
+        "token",
+        "authtoken",
+        "refreshtoken",
+        "bearertoken",
+        "credential",
+        "credentials",
+        "sourcecredentials"
+    ) -contains $normalized
+}
+
+function Test-MeaningfulValue {
+    param($Value)
+
+    if ($null -eq $Value) { return $false }
+
+    if ($Value -is [string]) {
+        return (-not [string]::IsNullOrWhiteSpace($Value))
+    }
+
+    if ($Value -is [System.Collections.IDictionary]) {
+        return ($Value.Count -gt 0)
+    }
+
+    if ($Value -is [System.Collections.IEnumerable] -and $Value -isnot [string]) {
+        return (@($Value).Count -gt 0)
+    }
+
+    if ($Value -isnot [string] -and @($Value.PSObject.Properties).Count -gt 0) {
+        return (@($Value.PSObject.Properties).Count -gt 0)
+    }
+
+    return $true
+}
+
 function Test-ContainsSensitiveValue {
     param($Value)
 
@@ -337,8 +396,8 @@ function Test-ContainsSensitiveValue {
     if ($Value -is [System.Collections.IDictionary]) {
         foreach ($key in @($Value.Keys)) {
             $child = $Value[$key]
-            if ([string]$key -match '(?i)(password|credential|secret|privateKey|accessKey|apiKey|token)') {
-                if ($null -ne $child -and "$child".Trim() -ne "") { return $true }
+            if ((Test-SensitiveFieldName -Name ([string]$key)) -and (Test-MeaningfulValue -Value $child)) {
+                return $true
             }
             if (Test-ContainsSensitiveValue -Value $child) { return $true }
         }
@@ -354,8 +413,8 @@ function Test-ContainsSensitiveValue {
 
     if ($Value -isnot [string]) {
         foreach ($property in @($Value.PSObject.Properties)) {
-            if ($property.Name -match '(?i)(password|credential|secret|privateKey|accessKey|apiKey|token)') {
-                if ($null -ne $property.Value -and "$($property.Value)".Trim() -ne "") { return $true }
+            if ((Test-SensitiveFieldName -Name $property.Name) -and (Test-MeaningfulValue -Value $property.Value)) {
+                return $true
             }
             if (Test-ContainsSensitiveValue -Value $property.Value) { return $true }
         }
@@ -367,11 +426,19 @@ function Test-ContainsSensitiveValue {
 function Get-SourceRegistrationEvidence {
     param([hashtable]$Headers)
 
-    # Never fall back to a request that could include credentials.
     $uri = "$baseUrl/v2/data-protect/sources/registrations?includeSourceCredentials=false"
 
     try {
         $data = Get-Json -Uri $uri -Headers $Headers
+        if ($null -eq $data) {
+            return [pscustomobject][ordered]@{
+                Status="FAILED"
+                Uri=$uri
+                Items=@()
+                Error="GET returned no JSON content."
+            }
+        }
+
         $items = @(Convert-ToItemArray -Data $data -ContainerNames @("registrations","sourceRegistrations","items"))
 
         if (Test-ContainsSensitiveValue -Value $items) {
@@ -509,12 +576,12 @@ function Expand-LeafValue {
 }
 
 function Get-DependencyReferences {
-    param($EnvironmentParams)
+    param($EvidenceObject)
 
     $references = @()
-    if ($null -eq $EnvironmentParams) { return @() }
+    if ($null -eq $EvidenceObject) { return @() }
 
-    foreach ($leaf in @(Expand-LeafValue -Value $EnvironmentParams -Path "")) {
+    foreach ($leaf in @(Expand-LeafValue -Value $EvidenceObject -Path "")) {
         $field = [string]$leaf.Field
         $value = [string]$leaf.Value
 
@@ -665,9 +732,6 @@ function Write-Sha256File {
     Set-Content -Path $checksumPath -Value $lines -Encoding UTF8
 }
 
-# -------------------------------
-# Cluster selection
-# -------------------------------
 $clusterJson = Get-Json -Uri "$baseUrl/v2/mcm/cluster-mgmt/info" -Headers (New-Headers)
 $rawClusters = @(As-Array (Get-PropValue -Object $clusterJson -Names @("cohesityClusters")))
 
@@ -735,9 +799,6 @@ while ($true) {
     break
 }
 
-# -------------------------------
-# Collection
-# -------------------------------
 foreach ($cluster in $selectedClusters) {
     $headers = New-Headers -ClusterId $cluster.ClusterId
     $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
@@ -867,7 +928,6 @@ foreach ($cluster in $selectedClusters) {
                 }
             }
 
-            # Detail is authoritative. If unavailable, list data may be used only as supplemental evidence.
             $supplementalRecord = if ($detailStatus -eq "SUCCESS") { $detail } else { $pgStub }
 
             $environmentBlock = Get-EnvironmentBlock -ProtectionGroup $supplementalRecord -Names $environment.ParamNames
@@ -931,7 +991,7 @@ foreach ($cluster in $selectedClusters) {
 
             Write-Json -Value $storageDomainRaw -Path (Join-Path $pgDir "05_StorageDomain.json")
 
-            $references = @(Get-DependencyReferences -EnvironmentParams $parameterBlockValue)
+            $references = @(Get-DependencyReferences -EvidenceObject $supplementalRecord)
             Write-Json -Value $references -Path (Join-Path $pgDir "06_DependencyReferences.json")
 
             $resolvedRows = @()
@@ -990,10 +1050,12 @@ foreach ($cluster in $selectedClusters) {
             Write-Json -Value $resolvedRows -Path (Join-Path $pgDir "07_ResolvedReferences.json")
             Write-Json -Value @($relevantRegistrationMap.Values) -Path (Join-Path $pgDir "08_SourceRegistrations.json")
 
+            $issueList = @($issues | Select-Object -Unique)
+
             $status = if ([string]::IsNullOrWhiteSpace($pgId)) {
                 "FAILED"
             }
-            elseif ($issues.Count -gt 0) {
+            elseif ($issueList.Count -gt 0) {
                 "PARTIAL"
             }
             else {
@@ -1014,8 +1076,8 @@ foreach ($cluster in $selectedClusters) {
                 SourceRegistrationCollectionStatus=$sourceEvidence.Status
                 DependencyReferenceCount=$references.Count
                 UnresolvedReferenceCount=$unresolvedReferenceCount
-                IssueCount=$issues.Count
-                Issues=@($issues)
+                IssueCount=$issueList.Count
+                Issues=@($issueList)
             }
 
             Write-Json -Value $validation -Path (Join-Path $pgDir "09_Validation.json")
