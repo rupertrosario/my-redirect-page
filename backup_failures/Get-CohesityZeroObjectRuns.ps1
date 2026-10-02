@@ -18,8 +18,8 @@ param(
     [ValidateRange(1,600)][int]$RequestTimeoutSec = 120
 )
 $ErrorActionPreference = 'Stop'
-# Initial scan: 30 runs per PG. Change to 10 when running daily.
-$NumRuns = 30
+# Daily scan: latest 10 runs per protection group.
+$NumRuns = 10
 $BaseUrl = $BaseUrl.TrimEnd('/')
 
 function Get-Prop($ObjectValue, [string]$Name, $DefaultValue = $null) {
