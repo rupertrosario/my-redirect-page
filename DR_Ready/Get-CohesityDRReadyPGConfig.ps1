@@ -8,12 +8,15 @@
 #   - Protection Policies
 #   - Storage Domains
 #
+# Source credentials are NEVER requested.
+# Username/user fields returned by Cohesity are retained.
+# Secret/password fields are removed before JSON is written.
+#
 # No Cohesity POST, PUT, PATCH, or DELETE operation is implemented.
 
 [CmdletBinding()]
 param(
-    [string]$OutputDirectory = "X:\PowerShell\Cohesity_API_Scripts\DR_Ready",
-    [string]$SourceCredentialEncryptionKey = ""
+    [string]$OutputDirectory = "X:\PowerShell\Cohesity_API_Scripts\DR_Ready"
 )
 
 $ErrorActionPreference = "Stop"
@@ -33,6 +36,29 @@ $EnvironmentMap = @(
     [pscustomobject]@{ ApiName="kAcropolis";  DisplayName="Nutanix AHV"; FileName="AHV.json" },
     [pscustomobject]@{ ApiName="kOracle";     DisplayName="Oracle";      FileName="Oracle.json" },
     [pscustomobject]@{ ApiName="kPhysical";   DisplayName="Physical";    FileName="Physical.json" }
+)
+
+$SensitiveFieldNames = @(
+    "password",
+    "encryptedPassword",
+    "passwd",
+    "passphrase",
+    "secret",
+    "secretKey",
+    "clientSecret",
+    "apiKey",
+    "privateKey",
+    "sshPrivateKey",
+    "accessKey",
+    "accessToken",
+    "refreshToken",
+    "sessionToken",
+    "authToken",
+    "bearerToken",
+    "token",
+    "encryptedCredential",
+    "encryptedCredentials",
+    "communityString"
 )
 
 if (-not (Test-Path $helperPath -PathType Leaf)) { throw "Missing API key helper: $helperPath" }
@@ -74,9 +100,53 @@ function Get-Json {
     return ($response.Content | ConvertFrom-Json)
 }
 
+function Test-SensitiveFieldName {
+    param([string]$Name)
+
+    if ([string]::IsNullOrWhiteSpace($Name)) { return $false }
+    return ($SensitiveFieldNames -contains $Name)
+}
+
+function Remove-SensitiveValues {
+    param($Value)
+
+    if ($null -eq $Value) { return $null }
+
+    if ($Value -is [string] -or $Value -is [char] -or $Value.GetType().IsValueType) {
+        return $Value
+    }
+
+    if ($Value -is [System.Collections.IDictionary]) {
+        $clean = [ordered]@{}
+        foreach ($key in @($Value.Keys)) {
+            $name = [string]$key
+            if (Test-SensitiveFieldName -Name $name) { continue }
+            $clean[$name] = Remove-SensitiveValues -Value $Value[$key]
+        }
+        return [pscustomobject]$clean
+    }
+
+    if ($Value -is [System.Collections.IEnumerable] -and $Value -isnot [string]) {
+        $items = @()
+        foreach ($item in @($Value)) {
+            $items += ,(Remove-SensitiveValues -Value $item)
+        }
+        return @($items)
+    }
+
+    $cleanObject = [ordered]@{}
+    foreach ($property in @($Value.PSObject.Properties)) {
+        if (Test-SensitiveFieldName -Name $property.Name) { continue }
+        $cleanObject[$property.Name] = Remove-SensitiveValues -Value $property.Value
+    }
+    return [pscustomobject]$cleanObject
+}
+
 function Write-Json {
     param([AllowNull()]$Value,[Parameter(Mandatory=$true)][string]$Path)
-    ConvertTo-Json -InputObject $Value -Depth 100 | Set-Content -Path $Path -Encoding UTF8
+
+    $safeValue = Remove-SensitiveValues -Value $Value
+    ConvertTo-Json -InputObject $safeValue -Depth 100 | Set-Content -Path $Path -Encoding UTF8
 }
 
 function As-Array {
@@ -230,19 +300,11 @@ function Get-RootNodeIds {
     return @($ids.Keys)
 }
 
-function Add-CredentialQuery {
+function Add-NoCredentialQuery {
     param([string]$Uri)
 
-    if ([string]::IsNullOrWhiteSpace($SourceCredentialEncryptionKey)) {
-        if ($Uri.Contains("?")) { return ($Uri + "&includeSourceCredentials=false") }
-        return ($Uri + "?includeSourceCredentials=false")
-    }
-
-    $encodedKey = Url-Encode $SourceCredentialEncryptionKey
-    if ($Uri.Contains("?")) {
-        return ($Uri + "&includeSourceCredentials=true&encryptionKey=$encodedKey")
-    }
-    return ($Uri + "?includeSourceCredentials=true&encryptionKey=$encodedKey")
+    if ($Uri.Contains("?")) { return ($Uri + "&includeSourceCredentials=false") }
+    return ($Uri + "?includeSourceCredentials=false")
 }
 
 # Cluster selection
@@ -325,13 +387,7 @@ foreach ($cluster in $selectedClusters) {
 
     Write-Host ""
     Write-Host "Collecting DR configuration from $($cluster.ClusterName) ..." -ForegroundColor Cyan
-
-    if ([string]::IsNullOrWhiteSpace($SourceCredentialEncryptionKey)) {
-        Write-Host "Source credentials: not requested (no encryption key supplied)." -ForegroundColor DarkYellow
-    }
-    else {
-        Write-Host "Source credentials: encrypted credential fields requested from supported GET APIs." -ForegroundColor Yellow
-    }
+    Write-Host "Source credentials are not requested. Username/user fields returned by the API are retained." -ForegroundColor DarkYellow
 
     # 1. Complete Protection Group objects for all six environments.
     Write-Host ""
@@ -401,12 +457,12 @@ foreach ($cluster in $selectedClusters) {
         Write-Host "  V1 policies GET failed" -ForegroundColor Red
     }
 
-    # 3. V2 Protection Source list.
+    # 3. V2 Protection Source list. Source credentials explicitly disabled.
     Write-Host ""
     Write-Host "Protection Sources" -ForegroundColor Cyan
 
     try {
-        $sourceListUri = Add-CredentialQuery -Uri "$baseUrl/v2/data-protect/sources?includeTenants=true"
+        $sourceListUri = Add-NoCredentialQuery -Uri "$baseUrl/v2/data-protect/sources?includeTenants=true"
         $v2Sources = Get-Json -Uri $sourceListUri -Headers $headers
         Write-Json -Value $v2Sources -Path (Join-Path $sourceDir "V2_Sources.json")
 
@@ -424,13 +480,14 @@ foreach ($cluster in $selectedClusters) {
     }
 
     # 4. V2 source registrations: full list plus each registration detail.
+    #    Credentials are not requested. includeHosts/external metadata remain enabled.
     try {
         $registrationsUri = "$baseUrl/v2/data-protect/sources/registrations" +
                             "?includeTenants=true" +
                             "&includeExternalMetadata=true" +
                             "&includeHosts=true" +
                             "&useCachedData=false"
-        $registrationsUri = Add-CredentialQuery -Uri $registrationsUri
+        $registrationsUri = Add-NoCredentialQuery -Uri $registrationsUri
         $registrations = Get-Json -Uri $registrationsUri -Headers $headers
         Write-Json -Value $registrations -Path (Join-Path $sourceDir "V2_Registrations.json")
 
@@ -458,8 +515,8 @@ foreach ($cluster in $selectedClusters) {
     }
 
     # 5. V1 source trees, root nodes, and registration/application information.
-    #    These are intentionally retained because they expose workload-specific
-    #    source information that is not always present in the V2 source list.
+    #    These are retained because they expose workload-specific source information
+    #    that is not always present in the V2 source list.
     foreach ($environment in $EnvironmentMap) {
         $environmentName = $environment.ApiName
         $safeEnvironment = Safe-Name $environment.DisplayName
@@ -472,7 +529,7 @@ foreach ($cluster in $selectedClusters) {
                             "&pruneNonCriticalInfo=false" +
                             "&pruneAggregationInfo=false" +
                             "&useCachedData=false"
-            $v1SourcesUri = Add-CredentialQuery -Uri $v1SourcesUri
+            $v1SourcesUri = Add-NoCredentialQuery -Uri $v1SourcesUri
             $v1Sources = Get-Json -Uri $v1SourcesUri -Headers $headers
             Write-Json -Value $v1Sources -Path (Join-Path $v1SourceDir ("ProtectionSources_{0}.json" -f $safeEnvironment))
         }
@@ -507,7 +564,7 @@ foreach ($cluster in $selectedClusters) {
                 $registrationInfoUri += "&includeDBApplicationInfo=true&allUnderHierarchy=true&includeData=true"
             }
 
-            $registrationInfoUri = Add-CredentialQuery -Uri $registrationInfoUri
+            $registrationInfoUri = Add-NoCredentialQuery -Uri $registrationInfoUri
             $registrationInfo = Get-Json -Uri $registrationInfoUri -Headers $headers
             Write-Json -Value $registrationInfo -Path (Join-Path $v1SourceDir ("RegistrationInfo_{0}.json" -f $safeEnvironment))
 
