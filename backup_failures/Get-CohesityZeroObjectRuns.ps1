@@ -20,6 +20,8 @@ param(
 $ErrorActionPreference = 'Stop'
 # Daily scan: latest 10 runs per protection group.
 $NumRuns = 10
+# NAS environments are skipped before fetching run details.
+$ExcludedNasEnvironments = @('kGenericNas','kNetapp','kIsilon','kFlashBlade','kNutanixFS','kQumulo','kElastifile')
 $BaseUrl = $BaseUrl.TrimEnd('/')
 
 function Get-Prop($ObjectValue, [string]$Name, $DefaultValue = $null) {
@@ -108,6 +110,7 @@ $Rows = @()
 $ReviewRows = @()
 $CheckedPgs = 0
 $CheckedRuns = 0
+$SkippedNasPgs = 0
 foreach ($Cluster in $SelectedClusters) {
     $DisplayName = Get-ClusterDisplayName $Cluster
     $ClusterId = [string]$Cluster.clusterId
@@ -117,9 +120,11 @@ foreach ($Cluster in $SelectedClusters) {
     try {
         $PgJson = Invoke-HeliosGetJson -Uri "$BaseUrl/v2/data-protect/protection-groups?isDeleted=false" -Headers $Headers
         if (!$PgJson.PSObject.Properties['protectionGroups']) { throw 'PG response missing protectionGroups.' }
-        $Pgs = @(As-Array $PgJson.protectionGroups)
+        $AllPgs = @(As-Array $PgJson.protectionGroups)
+        $SkippedNasPgs += @($AllPgs | Where-Object { $_.environment -in $ExcludedNasEnvironments }).Count
+        $Pgs = @($AllPgs | Where-Object { $_.environment -notin $ExcludedNasEnvironments })
         if ($ProtectionGroupName) { $Pgs = @($Pgs | Where-Object { $_.name -eq $ProtectionGroupName }) }
-        if ($ProtectionGroupName -and $Pgs.Count -eq 0) { throw "PG not found: $ProtectionGroupName" }
+        if ($ProtectionGroupName -and $Pgs.Count -eq 0) { throw "PG not found or excluded as NAS: $ProtectionGroupName" }
     } catch {
         $ReviewRows += [pscustomobject]@{ Cluster=$DisplayName; ProtectionGroup=''; RunId=''; Reason=$_.Exception.Message }
         Write-Warning "PG lookup failed on $DisplayName; collection incomplete."
@@ -174,7 +179,7 @@ Write-CsvRows -Rows @($Rows | Sort-Object Cluster,ProtectionGroup,RunStartET) -P
 Write-CsvRows -Rows $ReviewRows -Path $ReviewPath -Columns @('Cluster','ProtectionGroup','RunId','Reason')
 $CollectionStatus = 'Complete'
 if ($ReviewRows.Count -gt 0) { $CollectionStatus = 'Incomplete - review required' }
-Write-Host "Collection: $CollectionStatus | PGs: $CheckedPgs | Runs: $CheckedRuns | Zero-object runs: $($Rows.Count) | Review items: $($ReviewRows.Count)"
+Write-Host "Collection: $CollectionStatus | PGs: $CheckedPgs | NAS PGs skipped: $SkippedNasPgs | Runs: $CheckedRuns | Zero-object runs: $($Rows.Count) | Review items: $($ReviewRows.Count)"
 Write-Host "CSV: $CsvPath"
 Write-Host "Review CSV: $ReviewPath"
 # No-run PGs produce no zero-object rows. Running/missed/canceled runs are retained
