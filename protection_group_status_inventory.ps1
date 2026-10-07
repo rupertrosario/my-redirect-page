@@ -21,23 +21,25 @@
 $ErrorActionPreference = "Stop"
 
 # -------------------------------------------------------------
-# 0) API key - encrypted file supported
+# 0) Existing AES/master-password API-key flow
 # -------------------------------------------------------------
-$apikeypath = "X:\PowerShell\Cohesity_API_Scripts\DO_NOT_Delete\apikey.txt"
+$Helper  = "X:\PowerShell\Cohesity_API_Scripts\Common\ApiKeyAesHelper.ps1"
+$KeyFile = "X:\PowerShell\Cohesity_API_Scripts\Common\Secure\cohesity_apikey.enc"
 
-if (-not (Test-Path $apikeypath)) {
-    throw "API key file not found at $apikeypath"
+if (-not (Test-Path -LiteralPath $Helper)) {
+    throw "AES helper not found: $Helper"
 }
 
-$apiKeyFileText = (Get-Content -Path $apikeypath -Raw).Trim()
-
-try {
-    $secureApiKey = $apiKeyFileText | ConvertTo-SecureString -ErrorAction Stop
-    $apiKey = [System.Net.NetworkCredential]::new("", $secureApiKey).Password
+if (-not (Test-Path -LiteralPath $KeyFile)) {
+    throw "Encrypted Cohesity API key not found: $KeyFile"
 }
-catch {
-    # Backward-compatible fallback for an existing plain-text key file.
-    $apiKey = $apiKeyFileText
+
+. $Helper
+
+$apiKey = Get-CohesityApiKeyFromAes -EncryptedFile $KeyFile
+
+if ([string]::IsNullOrWhiteSpace([string]$apiKey)) {
+    throw "Empty Cohesity API key returned by AES helper."
 }
 
 $baseUrl = "https://helios.cohesity.com"
