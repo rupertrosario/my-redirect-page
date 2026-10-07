@@ -10,8 +10,7 @@
 //     { ClusterName, Environment, ProtectionGroupName, Status }
 //   ],
 //   clusterWarningCount,
-//   clusterWarnings,
-//   csvText
+//   clusterWarnings
 // }
 
 import { credentialVaultClient } from "@dynatrace-sdk/client-classic-environment-v2";
@@ -169,21 +168,6 @@ export default async function () {
     }
 
     return env;
-  }
-
-  function csvValue(value) {
-    const text = String(value ?? "");
-
-    if (
-      text.includes(",") ||
-      text.includes('"') ||
-      text.includes("\n") ||
-      text.includes("\r")
-    ) {
-      return '"' + text.replace(/"/g, '""') + '"';
-    }
-
-    return text;
   }
 
   // -------------------------------------------------------------
@@ -349,7 +333,6 @@ export default async function () {
     count: finalRows.length,
     rows: finalRows,
     clusterWarningCount: clusterWarnings.length,
-    clusterWarnings: clusterWarnings,
-    csvText: csvText
+    clusterWarnings: clusterWarnings
   };
 }
