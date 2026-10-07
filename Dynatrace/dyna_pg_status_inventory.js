@@ -6,9 +6,6 @@
 // {
 //   authMode,
 //   count,
-//   activeCount,
-//   pausedCount,
-//   deletedCount,
 //   rows: [
 //     { ClusterName, Environment, ProtectionGroupName, Status }
 //   ],
@@ -210,25 +207,10 @@ export default async function () {
   });
 
   // -------------------------------------------------------------
-  // 5) Status queries
-  //
-  // Status is assigned from the explicit query scope.
-  // All calls below remain GET-only.
+  // 5) Active Protection Groups only
   // -------------------------------------------------------------
-  const statusQueries = [
-    {
-      status: "Active",
-      query: "isDeleted=false&isPaused=false&isActive=true"
-    },
-    {
-      status: "Paused",
-      query: "isDeleted=false&isPaused=true"
-    },
-    {
-      status: "Deleted",
-      query: "isDeleted=true"
-    }
-  ];
+  const activePgQuery =
+    "isDeleted=false&isPaused=false&isActive=true";
 
   const rows = [];
   const clusterWarnings = [];
@@ -253,60 +235,53 @@ export default async function () {
 
     console.log("Processing cluster: " + clusterName);
 
-    for (const item of statusQueries) {
-      const url =
-        baseUrl +
-        "/v2/data-protect/protection-groups?" +
-        item.query;
+    const url =
+      baseUrl +
+      "/v2/data-protect/protection-groups?" +
+      activePgQuery;
 
-      let pgJson;
+    let pgJson;
 
-      try {
-        pgJson = await getJson(url, headers);
-      }
-      catch (e) {
-        clusterWarnings.push({
-          Cluster: clusterName,
-          Status: item.status,
-          Message: e?.message || String(e)
-        });
+    try {
+      pgJson = await getJson(url, headers);
+    }
+    catch (e) {
+      clusterWarnings.push({
+        Cluster: clusterName,
+        Message: e?.message || String(e)
+      });
 
-        console.log(
-          "Failed " +
-          item.status +
-          " PG query for " +
-          clusterName
-        );
+      console.log(
+        "Failed active PG query for " +
+        clusterName
+      );
 
+      continue;
+    }
+
+    const pgs = Array.isArray(pgJson?.protectionGroups)
+      ? pgJson.protectionGroups
+      : [];
+
+    console.log(
+      clusterName +
+      " - Active: " +
+      pgs.length
+    );
+
+    for (const pg of pgs) {
+      const pgName = String(pg?.name || "").trim();
+
+      if (!pgName) {
         continue;
       }
 
-      const pgs = Array.isArray(pgJson?.protectionGroups)
-        ? pgJson.protectionGroups
-        : [];
-
-      console.log(
-        clusterName +
-        " - " +
-        item.status +
-        ": " +
-        pgs.length
-      );
-
-      for (const pg of pgs) {
-        const pgName = String(pg?.name || "").trim();
-
-        if (!pgName) {
-          continue;
-        }
-
-        rows.push({
-          ClusterName: clusterName,
-          Environment: getEnvironment(pg),
-          ProtectionGroupName: pgName,
-          Status: item.status
-        });
-      }
+      rows.push({
+        ClusterName: clusterName,
+        Environment: getEnvironment(pg),
+        ProtectionGroupName: pgName,
+        Status: "Active"
+      });
     }
   }
 
@@ -340,19 +315,9 @@ export default async function () {
   });
 
   // -------------------------------------------------------------
-  // 7) Counts
+  // 7) Count
   // -------------------------------------------------------------
-  const activeCount = finalRows.filter(function (r) {
-    return r.Status === "Active";
-  }).length;
-
-  const pausedCount = finalRows.filter(function (r) {
-    return r.Status === "Paused";
-  }).length;
-
-  const deletedCount = finalRows.filter(function (r) {
-    return r.Status === "Deleted";
-  }).length;
+  const activeCount = finalRows.length;
 
   // -------------------------------------------------------------
   // 8) CSV text for downstream workflow step
@@ -375,22 +340,13 @@ export default async function () {
   const csvText = csvLines.join("\n");
 
   console.log(
-    "PG inventory complete. Total=" +
-    finalRows.length +
-    " Active=" +
-    activeCount +
-    " Paused=" +
-    pausedCount +
-    " Deleted=" +
-    deletedCount
+    "Active PG inventory complete. Total=" +
+    finalRows.length
   );
 
   return {
     authMode: authMode,
     count: finalRows.length,
-    activeCount: activeCount,
-    pausedCount: pausedCount,
-    deletedCount: deletedCount,
     rows: finalRows,
     clusterWarningCount: clusterWarnings.length,
     clusterWarnings: clusterWarnings,
