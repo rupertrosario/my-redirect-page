@@ -1,32 +1,28 @@
 // ==========================================================
 // Dynatrace JS Task
-// Purpose: Proof-of-concept to verify whether a workflow can
-// read previous workflow execution history using the Automation SDK.
-//
-// Run this in a NEW test workflow. Run the workflow at least twice.
-// The second run should be able to see the first completed execution
-// if execution history is available to the workflow.
-//
-// Required permission/scope: automation:workflows:read
+// Purpose: Read execution history for ONE specific workflow only.
+// Read-only proof of concept.
+// Required permission: automation:workflows:read
 // ==========================================================
 
 import { executionsClient } from "@dynatrace-sdk/client-automation";
 
-export default async function ({ executionId }) {
-  const currentExecution = await executionsClient.getExecution({
-    id: executionId
-  });
+// Replace with the exact UUID of the child workflow you want to inspect.
+const TARGET_WORKFLOW_ID = "PUT_CHILD_WORKFLOW_UUID_HERE";
+
+export default async function () {
+  if (!TARGET_WORKFLOW_ID || TARGET_WORKFLOW_ID === "PUT_CHILD_WORKFLOW_UUID_HERE") {
+    throw new Error("Replace TARGET_WORKFLOW_ID with the child workflow UUID before running.");
+  }
 
   const history = await executionsClient.getExecutions({
-    limit: 20
+    workflow: [TARGET_WORKFLOW_ID],
+    state: ["SUCCESS"],
+    limit: 5
   });
 
-  // Keep the response mostly untouched for this first test so we can
-  // confirm the exact schema returned by YOUR Dynatrace tenant before
-  // writing the final CR-filtering logic.
   return {
-    currentExecutionId: executionId,
-    currentExecution,
+    targetWorkflowId: TARGET_WORKFLOW_ID,
     history
   };
 }
