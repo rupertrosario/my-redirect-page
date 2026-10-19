@@ -149,8 +149,7 @@ function Get-ActiveV1ProtectionJobs {
                "&includeLastRunAndStats=false" +
                "&pruneExcludedSourceIds=false" +
                "&includeSourceNames=true" +
-               "&allUnderHierarchy=true" +
-               "&maxResultCount=1000"
+               "&allUnderHierarchy=true"
 
         $json = Get-Json -Uri $uri -Headers $Headers
         if ($null -eq $json) { throw "V1 Protection Jobs GET returned no JSON for $environment." }
@@ -375,19 +374,21 @@ foreach ($cluster in $selectedClusters) {
             foreach ($job in $v1Jobs) {
                 $jobName = First-Value @((Get-PropValue -Object $job -Names @("name") -Default ""))
                 if (-not [string]::IsNullOrWhiteSpace($jobName)) {
-                    $jobByName[$jobName.ToLowerInvariant()] = $job
+                    $jobByName[$jobName.Trim().ToLowerInvariant()] = $job
                 }
             }
 
             $finalGroups = @()
+            $matchedV1Count = 0
             foreach ($group in $groups) {
                 $groupName = First-Value @((Get-PropValue -Object $group -Names @("name") -Default ""))
                 $matchingJob = $null
 
                 if (-not [string]::IsNullOrWhiteSpace($groupName)) {
-                    $lookupName = $groupName.ToLowerInvariant()
+                    $lookupName = $groupName.Trim().ToLowerInvariant()
                     if ($jobByName.ContainsKey($lookupName)) {
                         $matchingJob = $jobByName[$lookupName]
+                        $matchedV1Count++
                     }
                 }
 
@@ -396,7 +397,7 @@ foreach ($cluster in $selectedClusters) {
 
             Write-RawJson -Value $finalGroups -Path (Join-Path $pgDir $environment.FileName)
             $counts[$environment.DisplayName]=$finalGroups.Count
-            Write-Host ("  {0}: {1} active PGs" -f $environment.DisplayName,$finalGroups.Count) -ForegroundColor Yellow
+            Write-Host ("  {0}: {1} active PGs; V1 matched {2}/{1}" -f $environment.DisplayName,$finalGroups.Count,$matchedV1Count) -ForegroundColor Yellow
         }
         catch {
             $counts[$environment.DisplayName]=0
