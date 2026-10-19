@@ -149,7 +149,8 @@ function Get-ActiveV1ProtectionJobs {
                "&includeLastRunAndStats=false" +
                "&pruneExcludedSourceIds=false" +
                "&includeSourceNames=true" +
-               "&allUnderHierarchy=true"
+               "&allUnderHierarchy=true" +
+               "&maxResultCount=1000"
 
         $json = Get-Json -Uri $uri -Headers $Headers
         if ($null -eq $json) { throw "V1 Protection Jobs GET returned no JSON for $environment." }
@@ -178,50 +179,16 @@ function Add-V1Supplement {
 
     if ($null -eq $V1Job) { return $V2Group }
 
-    # V2 remains the primary PG object.
-    # Preserve V1 data unless:
-    #   1) the exact same property already exists in V2, or
-    #   2) it is a known semantic duplicate and the corresponding V2 field is present.
-    #
-    # IMPORTANT:
-    # - Do not prune nested V1 structures such as environmentParameters or
-    #   sourceSpecialParameters. They can carry settings that V2 omits.
-    # - Do not remove sourceIds/excludeSourceIds/indexingPolicy here because
-    #   their V2 equivalents are workload-specific and may not be complete.
-
     $v2Names = @{}
     foreach ($property in @($V2Group.PSObject.Properties)) {
         $v2Names[$property.Name.ToLowerInvariant()] = $true
     }
 
-    $semanticDuplicates = @{
-        "qostype"               = "qosPolicy"
-        "abortinblackoutperiod" = "abortInBlackouts"
-        "alertingconfig"        = "alertPolicy"
-        "alertingpolicy"        = "alertPolicy"
-    }
-
     $supplement = [ordered]@{}
-
     foreach ($property in @($V1Job.PSObject.Properties)) {
-        $name = $property.Name
-        $nameKey = $name.ToLowerInvariant()
-
-        # Exact same property already exists in V2.
-        if ($v2Names.ContainsKey($nameKey)) {
-            continue
+        if (-not $v2Names.ContainsKey($property.Name.ToLowerInvariant())) {
+            $supplement[$property.Name] = $property.Value
         }
-
-        # Known semantic duplicate: suppress only when the mapped V2 field
-        # is actually present in this PG.
-        if ($semanticDuplicates.ContainsKey($nameKey)) {
-            $v2Equivalent = $semanticDuplicates[$nameKey]
-            if ($v2Names.ContainsKey($v2Equivalent.ToLowerInvariant())) {
-                continue
-            }
-        }
-
-        $supplement[$name] = $property.Value
     }
 
     if ($supplement.Count -gt 0) {
@@ -230,6 +197,7 @@ function Add-V1Supplement {
 
     return $V2Group
 }
+
 function Get-ActiveProtectionGroups {
     param([string[]]$Environments,[hashtable]$Headers)
 
@@ -374,21 +342,19 @@ foreach ($cluster in $selectedClusters) {
             foreach ($job in $v1Jobs) {
                 $jobName = First-Value @((Get-PropValue -Object $job -Names @("name") -Default ""))
                 if (-not [string]::IsNullOrWhiteSpace($jobName)) {
-                    $jobByName[$jobName.Trim().ToLowerInvariant()] = $job
+                    $jobByName[$jobName.ToLowerInvariant()] = $job
                 }
             }
 
             $finalGroups = @()
-            $matchedV1Count = 0
             foreach ($group in $groups) {
                 $groupName = First-Value @((Get-PropValue -Object $group -Names @("name") -Default ""))
                 $matchingJob = $null
 
                 if (-not [string]::IsNullOrWhiteSpace($groupName)) {
-                    $lookupName = $groupName.Trim().ToLowerInvariant()
+                    $lookupName = $groupName.ToLowerInvariant()
                     if ($jobByName.ContainsKey($lookupName)) {
                         $matchingJob = $jobByName[$lookupName]
-                        $matchedV1Count++
                     }
                 }
 
@@ -397,7 +363,7 @@ foreach ($cluster in $selectedClusters) {
 
             Write-RawJson -Value $finalGroups -Path (Join-Path $pgDir $environment.FileName)
             $counts[$environment.DisplayName]=$finalGroups.Count
-            Write-Host ("  {0}: {1} active PGs; V1 matched {2}/{1}" -f $environment.DisplayName,$finalGroups.Count,$matchedV1Count) -ForegroundColor Yellow
+            Write-Host ("  {0}: {1} active PGs" -f $environment.DisplayName,$finalGroups.Count) -ForegroundColor Yellow
         }
         catch {
             $counts[$environment.DisplayName]=0
@@ -424,7 +390,7 @@ foreach ($cluster in $selectedClusters) {
         ProtectionGroupDirectory="ProtectionGroups"
         V2ProtectionGroupIsPrimary=$true
         V1SupplementOnly=$true
-        V1SupplementRule="V2 is primary. Preserve all V1 top-level properties except exact-name duplicates and four confirmed semantic duplicates when the corresponding V2 field is present: qosType->qosPolicy, abortInBlackoutPeriod->abortInBlackouts, alertingConfig->alertPolicy, alertingPolicy->alertPolicy. Nested V1 configuration remains untouched."
+        V1SupplementRule="Only top-level V1 properties absent from the matching V2 PG are added under v1Supplement."
         PropertyProjectionApplied=$false
         ExternalDependenciesCollected=$false
         ErrorCount=$errors.Count
