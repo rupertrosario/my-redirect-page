@@ -2,12 +2,13 @@
 # STRICTLY READ-ONLY / GET-only
 # PowerShell 5.1 compatible
 #
-# V2 changes:
-#   - Original script preserved separately.
-#   - Explicitly excludes paused PGs.
-#   - Adds environment selection for ALL or one workload.
-#   - Adds paginated SQL/Oracle application-server collection.
-#   - Adds a Claude/DR manifest for machine-readable evidence navigation.
+# V2:
+#   - Original Get-CohesityDRReadyPGConfig.ps1 is preserved unchanged.
+#   - Active PGs explicitly require isDeleted=false, isPaused=false, isActive=true.
+#   - Cluster selection plus ALL/single workload environment selection.
+#   - NAS includes both kGenericNas and kIsilon.
+#   - SQL/Oracle application-server paging follows PaginationInfo.paginationCursor.
+#   - Writes DR_Manifest_v2.json as the entry point for later Claude/human DR analysis.
 #
 # Collects complete GET responses for:
 #   - Active Protection Groups: NAS, SQL, Hyper-V, Nutanix AHV, Oracle, Physical
@@ -95,6 +96,10 @@ function Get-Json {
         [Parameter(Mandatory=$true)][string]$Uri,
         [Parameter(Mandatory=$true)][hashtable]$Headers
     )
+
+    if (-not $Uri.StartsWith($baseUrl,[System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "SAFETY BLOCK: URI is outside Helios: $Uri"
+    }
 
     if ($PSVersionTable.PSVersion.Major -lt 6) {
         $response = Invoke-WebRequest -Uri $Uri -Headers $Headers -Method Get -UseBasicParsing -ErrorAction Stop
@@ -260,12 +265,16 @@ function Get-ActiveProtectionGroups {
             }
 
             $json = Get-Json -Uri $uri -Headers $Headers
-            if ($null -eq $json) { throw "Protection Group GET returned no JSON content for $Environment." }
+            if ($null -eq $json) {
+                throw "Protection Group GET returned no JSON content for $Environment."
+            }
 
             $groups = Get-CollectionItems -Json $json -PropertyNames @("protectionGroups")
             if ($groups.Count -gt 0) { $all += $groups }
 
-            $cookie = First-Value @((Get-PropValue -Object $json -Names @("paginationCookie") -Default ""))
+            $cookie = First-Value @(
+                (Get-PropValue -Object $json -Names @("paginationCookie") -Default "")
+            )
             $truncated = Get-PropValue -Object $json -Names @("isResponseTruncated") -Default $false
 
             if ($truncated -ne $true -and [string]::IsNullOrWhiteSpace($cookie)) { break }
@@ -275,7 +284,6 @@ function Get-ActiveProtectionGroups {
 
     return @($all)
 }
-
 function Get-SourceId {
     param($Source)
 
@@ -320,40 +328,49 @@ function Add-NoCredentialQuery {
 
 function Get-AllApplicationServers {
     param(
-        [string]$RootId,
-        [string]$ApplicationEnvironment,
-        [hashtable]$Headers
+        [Parameter(Mandatory=$true)][string]$RootId,
+        [Parameter(Mandatory=$true)][string]$ApplicationEnvironment,
+        [Parameter(Mandatory=$true)][hashtable]$Headers
     )
 
     $all = @()
-    $paginationCookie = ""
+    [int64]$afterCursorEntityId = 0
+    [int64]$previousCursor = -1
+    $pageSize = 1000
 
-    do {
+    while ($true) {
         $uri = "$baseUrl/v2/data-protect/sources/application-servers" +
                "?rootNodeId=$(Url-Encode $RootId)" +
                "&environment=$(Url-Encode $ApplicationEnvironment)" +
                "&applicationEnvironment=$(Url-Encode $ApplicationEnvironment)" +
-               "&pageSize=1000"
+               "&pageSize=$pageSize"
 
-        if (-not [string]::IsNullOrWhiteSpace($paginationCookie)) {
-            $uri += "&paginationCookie=$(Url-Encode $paginationCookie)"
+        if ($afterCursorEntityId -gt 0) {
+            $uri += "&afterCursorEntityId=$afterCursorEntityId"
         }
 
         $json = Get-Json -Uri $uri -Headers $Headers
         if ($null -eq $json) { break }
 
-        $items = Get-CollectionItems -Json $json -PropertyNames @("applicationServers","servers","items")
+        $items = Get-CollectionItems -Json $json -PropertyNames @("appServers","applicationServers")
         if ($items.Count -gt 0) { $all += $items }
 
-        $paginationCookie = First-Value @(
-            (Get-PropValue -Object $json -Names @("paginationCookie","nextPageToken","nextPaginationCookie") -Default "")
+        $paginationInfo = Get-PropValue -Object $json -Names @("PaginationInfo","paginationInfo") -Default $null
+        $cursor = Get-PropValue -Object $paginationInfo -Names @("paginationCursor") -Default $null
+        $nextAfter = First-Value @(
+            (Get-PropValue -Object $cursor -Names @("afterCursorEntityId") -Default "")
         )
 
-        $truncated = Get-PropValue -Object $json -Names @("isResponseTruncated","hasMore") -Default $false
+        [int64]$nextCursor = 0
+        $hasNextCursor = [int64]::TryParse([string]$nextAfter,[ref]$nextCursor)
 
-        if ($truncated -ne $true -and [string]::IsNullOrWhiteSpace($paginationCookie)) { break }
+        if ($items.Count -lt $pageSize) { break }
+        if (-not $hasNextCursor -or $nextCursor -le 0) { break }
+        if ($nextCursor -eq $afterCursorEntityId -or $nextCursor -eq $previousCursor) { break }
+
+        $previousCursor = $afterCursorEntityId
+        $afterCursorEntityId = $nextCursor
     }
-    while (-not [string]::IsNullOrWhiteSpace($paginationCookie))
 
     return @($all)
 }
@@ -413,14 +430,26 @@ while ($true) {
 Write-Host ""
 Write-Host "Available Workload Environments:" -ForegroundColor Cyan
 for ($i=0; $i -lt $EnvironmentMap.Count; $i++) {
-    Write-Host ("[{0}] {1}" -f ($i + 1), $EnvironmentMap[$i].DisplayName) -ForegroundColor Yellow
+    Write-Host ("[{0}] {1}" -f ($i + 1),$EnvironmentMap[$i].DisplayName) -ForegroundColor Yellow
 }
 Write-Host "[0] All six environments" -ForegroundColor Yellow
 Write-Host "[X] Exit" -ForegroundColor Yellow
 
 while ($true) {
     $envSelection = Read-Host "Select environment: 0 for ALL, 1-$($EnvironmentMap.Count) for single, or X"
-    if ($envSelection -match '^(x|X|q|Q)
+    if ($envSelection -match '^(x|X|q|Q)$') { return }
+
+    $envNumber = 0
+    if ([int]::TryParse($envSelection,[ref]$envNumber) -and $envNumber -ge 0 -and $envNumber -le $EnvironmentMap.Count) {
+        if ($envNumber -eq 0) { $selectedEnvironments = @($EnvironmentMap) }
+        else { $selectedEnvironments = @($EnvironmentMap[$envNumber - 1]) }
+        break
+    }
+
+    Write-Host "Enter 0, 1-$($EnvironmentMap.Count), or X." -ForegroundColor Red
+}
+
+foreach ($cluster in $selectedClusters) {
     $headers = New-Headers -ClusterId $cluster.ClusterId
     $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
 
@@ -445,6 +474,7 @@ while ($true) {
     $errors = New-Object System.Collections.ArrayList
     $allSourceIds = @{}
     $applicationRootIds = @{ "kSQL"=@{}; "kOracle"=@{} }
+    $pgCounts = [ordered]@{}
 
     Write-Host ""
     Write-Host "Collecting DR configuration from $($cluster.ClusterName) ..." -ForegroundColor Cyan
@@ -490,6 +520,7 @@ while ($true) {
                 }
             }
 
+            $pgCounts[$environment.DisplayName] = $groups.Count
             Write-Host ("  {0}: {1} active PGs" -f $environment.DisplayName,$groups.Count) -ForegroundColor Yellow
         }
         catch {
@@ -584,9 +615,9 @@ while ($true) {
     # 5. V1 source trees, root nodes, and registration/application information.
     #    These are retained because they expose workload-specific source information
     #    that is not always present in the V2 source list.
-    foreach ($environment in $EnvironmentMap) {
-        $environmentName = $environment.ApiName
-        $safeEnvironment = Safe-Name $environment.DisplayName
+    foreach ($environment in $selectedEnvironments) {
+        foreach ($environmentName in $environment.ApiNames) {
+            $safeEnvironment = Safe-Name ("{0}_{1}" -f $environment.DisplayName,$environmentName)
 
         try {
             $v1SourcesUri = "$v1BaseUrl/protectionSources" +
@@ -707,14 +738,20 @@ while ($true) {
     $manifest = [pscustomobject][ordered]@{
         SchemaVersion = "2"
         Collector = "Get-CohesityDRReadyPGConfig_v2.ps1"
-        Purpose = "GET-only DR reconstruction evidence package for later human/Claude analysis"
+        Purpose = "GET-only DR reconstruction evidence for later human or Claude analysis"
         GeneratedAt = (Get-Date).ToString("yyyy-MM-ddTHH:mm:ssK")
         HeliosBaseUrl = $baseUrl
         ClusterName = $cluster.ClusterName
         ClusterId = $cluster.ClusterId
         SelectedWorkloads = @($selectedEnvironments | ForEach-Object { $_.DisplayName })
-        WorkloadApiNames = @($selectedEnvironments | ForEach-Object { $_.ApiNames } | ForEach-Object { $_ })
-        EvidenceRoot = $clusterDir
+        WorkloadApiNames = @(
+            $selectedEnvironments |
+                ForEach-Object { $_.ApiNames } |
+                ForEach-Object { $_ }
+        )
+        ProtectionGroupCounts = [pscustomobject]$pgCounts
+        SourceIdCount = $allSourceIds.Count
+        ErrorCount = $errors.Count
         KeyFiles = [ordered]@{
             ProtectionGroups = "Raw\ProtectionGroups"
             Sources = "Raw\Sources"
@@ -722,13 +759,15 @@ while ($true) {
             StorageDomains = "Raw\StorageDomains.json"
             Errors = "Errors.json"
         }
-        Notes = @(
+        ClaudeHandoff = [ordered]@{
+            EntryPoint = "DR_Manifest_v2.json"
+            Instruction = "Treat raw JSON as source of truth. Analyze dependencies and propose a DR reconstruction plan. Do not execute writes without explicit human approval."
+        }
+        Safety = @(
+            "Cohesity collection is GET-only.",
             "Source credentials are not requested.",
-            "Sensitive secret/password/token fields are removed before JSON is written.",
-            "Raw JSON is the source of truth for downstream DR analysis.",
-            "No POST, PUT, PATCH, or DELETE Cohesity operation is implemented."
+            "Sensitive password, secret, token, key, and credential fields are removed before JSON is written."
         )
-        ErrorCount = $errors.Count
     }
 
     Write-Json -Value $manifest -Path (Join-Path $clusterDir "DR_Manifest_v2.json")
@@ -738,306 +777,5 @@ while ($true) {
     Write-Host "Completed: $($cluster.ClusterName)" -ForegroundColor Green
     Write-Host "Output: $clusterDir" -ForegroundColor Green
     Write-Host "Manifest: $(Join-Path $clusterDir 'DR_Manifest_v2.json')" -ForegroundColor Green
-    Write-Host "Errors recorded: $($errors.Count)" -ForegroundColor $(if ($errors.Count -eq 0) { "Green" } else { "Yellow" })
-}
-) { return }
-
-    $envNumber = 0
-    if ([int]::TryParse($envSelection,[ref]$envNumber) -and $envNumber -ge 0 -and $envNumber -le $EnvironmentMap.Count) {
-        if ($envNumber -eq 0) { $selectedEnvironments = @($EnvironmentMap) }
-        else { $selectedEnvironments = @($EnvironmentMap[$envNumber - 1]) }
-        break
-    }
-
-    Write-Host "Enter 0, 1-$($EnvironmentMap.Count), or X." -ForegroundColor Red
-}
-
-foreach ($cluster in $selectedClusters) {
-    $headers = New-Headers -ClusterId $cluster.ClusterId
-    $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
-
-    $clusterDir = Join-Path $OutputDirectory ("{0}_{1}" -f (Safe-Name $cluster.ClusterName),$timestamp)
-    $rawDir = Join-Path $clusterDir "Raw"
-    $pgDir = Join-Path $rawDir "ProtectionGroups"
-    $sourceDir = Join-Path $rawDir "Sources"
-    $sourceDetailsDir = Join-Path $sourceDir "V2_SourceDetails"
-    $sourceObjectsDir = Join-Path $sourceDir "V2_SourceObjects"
-    $registrationDetailsDir = Join-Path $sourceDir "V2_RegistrationDetails"
-    $applicationServersDir = Join-Path $sourceDir "V2_ApplicationServers"
-    $v1SourceDir = Join-Path $sourceDir "V1"
-    $policyDir = Join-Path $rawDir "Policies"
-
-    foreach ($directory in @(
-        $clusterDir,$rawDir,$pgDir,$sourceDir,$sourceDetailsDir,$sourceObjectsDir,
-        $registrationDetailsDir,$applicationServersDir,$v1SourceDir,$policyDir
-    )) {
-        New-Item -Path $directory -ItemType Directory -Force | Out-Null
-    }
-
-    $errors = New-Object System.Collections.ArrayList
-    $allSourceIds = @{}
-    $applicationRootIds = @{ "kSQL"=@{}; "kOracle"=@{} }
-
-    Write-Host ""
-    Write-Host "Collecting DR configuration from $($cluster.ClusterName) ..." -ForegroundColor Cyan
-    Write-Host "Source credentials are not requested. Username/user fields returned by the API are retained." -ForegroundColor DarkYellow
-
-    # 1. Complete Protection Group objects for all six environments.
-    Write-Host ""
-    Write-Host "Protection Groups" -ForegroundColor Cyan
-
-    foreach ($environment in $EnvironmentMap) {
-        try {
-            $groups = @(Get-ActiveProtectionGroups -Environment $environment.ApiName -Headers $headers)
-            Write-Json -Value $groups -Path (Join-Path $pgDir $environment.FileName)
-
-            foreach ($group in $groups) {
-                $paramsName = switch ($environment.ApiName) {
-                    "kGenericNas" { "genericNasParams" }
-                    "kSQL"        { "mssqlParams" }
-                    "kHyperV"     { "hypervParams" }
-                    "kAcropolis"  { "acropolisParams" }
-                    "kOracle"     { "oracleParams" }
-                    "kPhysical"   { "physicalParams" }
-                    default       { "" }
-                }
-
-                if (-not [string]::IsNullOrWhiteSpace($paramsName)) {
-                    $params = Get-PropValue -Object $group -Names @($paramsName) -Default $null
-                    if ($null -ne $params) {
-                        $sourceId = First-Value @((Get-PropValue -Object $params -Names @("sourceId")))
-                        if (-not [string]::IsNullOrWhiteSpace($sourceId)) { $allSourceIds[$sourceId] = $true }
-
-                        foreach ($obj in @(As-Array (Get-PropValue -Object $params -Names @("objects") -Default @()))) {
-                            $objectSourceId = First-Value @((Get-PropValue -Object $obj -Names @("sourceId")))
-                            if (-not [string]::IsNullOrWhiteSpace($objectSourceId)) { $allSourceIds[$objectSourceId] = $true }
-                        }
-                    }
-                }
-            }
-
-            Write-Host ("  {0}: {1} active PGs" -f $environment.DisplayName,$groups.Count) -ForegroundColor Yellow
-        }
-        catch {
-            Add-CollectionError -Errors $errors -Stage "ProtectionGroups" -Environment $environment.DisplayName -ObjectId "" -Message $_.Exception.Message
-            Write-Json -Value @() -Path (Join-Path $pgDir $environment.FileName)
-            Write-Host "  $($environment.DisplayName): GET failed" -ForegroundColor Red
-        }
-    }
-
-    # 2. Complete Protection Policy responses from V2 and V1.
-    Write-Host ""
-    Write-Host "Protection Policies" -ForegroundColor Cyan
-
-    try {
-        $policyV2Uri = "$baseUrl/v2/data-protect/policies?includeReplicatedPolicies=true&includeStats=true"
-        $policyV2 = Get-Json -Uri $policyV2Uri -Headers $headers
-        Write-Json -Value $policyV2 -Path (Join-Path $policyDir "V2_Policies.json")
-        Write-Host "  V2 policies collected" -ForegroundColor Yellow
-    }
-    catch {
-        Add-CollectionError -Errors $errors -Stage "V2Policies" -Environment "" -ObjectId "" -Message $_.Exception.Message
-        Write-Host "  V2 policies GET failed" -ForegroundColor Red
-    }
-
-    try {
-        $policyV1 = Get-Json -Uri "$v1BaseUrl/protectionPolicies" -Headers $headers
-        Write-Json -Value $policyV1 -Path (Join-Path $policyDir "V1_Policies.json")
-        Write-Host "  V1 policies collected" -ForegroundColor Yellow
-    }
-    catch {
-        Add-CollectionError -Errors $errors -Stage "V1Policies" -Environment "" -ObjectId "" -Message $_.Exception.Message
-        Write-Host "  V1 policies GET failed" -ForegroundColor Red
-    }
-
-    # 3. V2 Protection Source list. Source credentials explicitly disabled.
-    Write-Host ""
-    Write-Host "Protection Sources" -ForegroundColor Cyan
-
-    try {
-        $sourceListUri = Add-NoCredentialQuery -Uri "$baseUrl/v2/data-protect/sources?includeTenants=true"
-        $v2Sources = Get-Json -Uri $sourceListUri -Headers $headers
-        Write-Json -Value $v2Sources -Path (Join-Path $sourceDir "V2_Sources.json")
-
-        $sourceItems = @(Get-CollectionItems -Json $v2Sources -PropertyNames @("sources"))
-        foreach ($source in $sourceItems) {
-            $sourceId = Get-SourceId -Source $source
-            if (-not [string]::IsNullOrWhiteSpace($sourceId)) { $allSourceIds[$sourceId] = $true }
-        }
-
-        Write-Host ("  V2 source list collected: {0} entries" -f $sourceItems.Count) -ForegroundColor Yellow
-    }
-    catch {
-        Add-CollectionError -Errors $errors -Stage "V2Sources" -Environment "" -ObjectId "" -Message $_.Exception.Message
-        Write-Host "  V2 source list GET failed" -ForegroundColor Red
-    }
-
-    # 4. V2 source registrations: full list plus each registration detail.
-    #    Credentials are not requested. includeHosts/external metadata remain enabled.
-    try {
-        $registrationsUri = "$baseUrl/v2/data-protect/sources/registrations" +
-                            "?includeTenants=true" +
-                            "&includeExternalMetadata=true" +
-                            "&includeHosts=true" +
-                            "&useCachedData=false"
-        $registrationsUri = Add-NoCredentialQuery -Uri $registrationsUri
-        $registrations = Get-Json -Uri $registrationsUri -Headers $headers
-        Write-Json -Value $registrations -Path (Join-Path $sourceDir "V2_Registrations.json")
-
-        $registrationItems = @(Get-CollectionItems -Json $registrations -PropertyNames @("registrations"))
-        foreach ($registration in $registrationItems) {
-            $registrationId = Get-RegistrationId -Registration $registration
-            $sourceId = Get-SourceId -Source $registration
-            if (-not [string]::IsNullOrWhiteSpace($sourceId)) { $allSourceIds[$sourceId] = $true }
-            if ([string]::IsNullOrWhiteSpace($registrationId)) { continue }
-
-            try {
-                $registrationDetail = Get-Json -Uri "$baseUrl/v2/data-protect/sources/registrations/$(Url-Encode $registrationId)" -Headers $headers
-                Write-Json -Value $registrationDetail -Path (Join-Path $registrationDetailsDir ("{0}.json" -f (Safe-Name $registrationId)))
-            }
-            catch {
-                Add-CollectionError -Errors $errors -Stage "V2RegistrationDetail" -Environment "" -ObjectId $registrationId -Message $_.Exception.Message
-            }
-        }
-
-        Write-Host ("  V2 registrations collected: {0} entries" -f $registrationItems.Count) -ForegroundColor Yellow
-    }
-    catch {
-        Add-CollectionError -Errors $errors -Stage "V2Registrations" -Environment "" -ObjectId "" -Message $_.Exception.Message
-        Write-Host "  V2 registrations GET failed" -ForegroundColor Red
-    }
-
-    # 5. V1 source trees, root nodes, and registration/application information.
-    #    These are retained because they expose workload-specific source information
-    #    that is not always present in the V2 source list.
-    foreach ($environment in $EnvironmentMap) {
-        $environmentName = $environment.ApiName
-        $safeEnvironment = Safe-Name $environment.DisplayName
-
-        try {
-            $v1SourcesUri = "$v1BaseUrl/protectionSources" +
-                            "?environments=$(Url-Encode $environmentName)" +
-                            "&includeObjectProtectionInfo=true" +
-                            "&includeExternalMetadata=true" +
-                            "&pruneNonCriticalInfo=false" +
-                            "&pruneAggregationInfo=false" +
-                            "&useCachedData=false"
-            $v1SourcesUri = Add-NoCredentialQuery -Uri $v1SourcesUri
-            $v1Sources = Get-Json -Uri $v1SourcesUri -Headers $headers
-            Write-Json -Value $v1Sources -Path (Join-Path $v1SourceDir ("ProtectionSources_{0}.json" -f $safeEnvironment))
-        }
-        catch {
-            Add-CollectionError -Errors $errors -Stage "V1ProtectionSources" -Environment $environment.DisplayName -ObjectId "" -Message $_.Exception.Message
-        }
-
-        try {
-            $rootNodes = Get-Json -Uri "$v1BaseUrl/protectionSources/rootNodes?environments=$(Url-Encode $environmentName)" -Headers $headers
-            Write-Json -Value $rootNodes -Path (Join-Path $v1SourceDir ("RootNodes_{0}.json" -f $safeEnvironment))
-
-            foreach ($rootId in @(Get-RootNodeIds -Json $rootNodes)) {
-                $allSourceIds[$rootId] = $true
-                if ($environmentName -eq "kSQL" -or $environmentName -eq "kOracle") {
-                    $applicationRootIds[$environmentName][$rootId] = $true
-                }
-            }
-        }
-        catch {
-            Add-CollectionError -Errors $errors -Stage "V1RootNodes" -Environment $environment.DisplayName -ObjectId "" -Message $_.Exception.Message
-        }
-
-        try {
-            $registrationInfoUri = "$v1BaseUrl/protectionSources/registrationInfo" +
-                                   "?environments=$(Url-Encode $environmentName)" +
-                                   "&includeEntityPermissionInfo=true" +
-                                   "&includeApplicationsTreeInfo=true" +
-                                   "&pruneNonCriticalInfo=false" +
-                                   "&useCachedData=false"
-
-            if ($environmentName -eq "kSQL" -or $environmentName -eq "kOracle") {
-                $registrationInfoUri += "&includeDBApplicationInfo=true&allUnderHierarchy=true&includeData=true"
-            }
-
-            $registrationInfoUri = Add-NoCredentialQuery -Uri $registrationInfoUri
-            $registrationInfo = Get-Json -Uri $registrationInfoUri -Headers $headers
-            Write-Json -Value $registrationInfo -Path (Join-Path $v1SourceDir ("RegistrationInfo_{0}.json" -f $safeEnvironment))
-
-            foreach ($rootId in @(Get-RootNodeIds -Json $registrationInfo)) {
-                $allSourceIds[$rootId] = $true
-                if ($environmentName -eq "kSQL" -or $environmentName -eq "kOracle") {
-                    $applicationRootIds[$environmentName][$rootId] = $true
-                }
-            }
-        }
-        catch {
-            Add-CollectionError -Errors $errors -Stage "V1RegistrationInfo" -Environment $environment.DisplayName -ObjectId "" -Message $_.Exception.Message
-        }
-    }
-
-    # 6. Per-source V2 detail and source object hierarchy.
-    foreach ($sourceId in @($allSourceIds.Keys | Sort-Object)) {
-        if ([string]::IsNullOrWhiteSpace($sourceId)) { continue }
-
-        try {
-            $sourceDetail = Get-Json -Uri "$baseUrl/v2/data-protect/sources/$(Url-Encode $sourceId)" -Headers $headers
-            Write-Json -Value $sourceDetail -Path (Join-Path $sourceDetailsDir ("{0}.json" -f (Safe-Name $sourceId)))
-        }
-        catch {
-            Add-CollectionError -Errors $errors -Stage "V2SourceDetail" -Environment "" -ObjectId $sourceId -Message $_.Exception.Message
-        }
-
-        try {
-            $sourceObjects = Get-Json -Uri "$baseUrl/v2/data-protect/sources/$(Url-Encode $sourceId)/objects?includeTenants=true" -Headers $headers
-            Write-Json -Value $sourceObjects -Path (Join-Path $sourceObjectsDir ("{0}.json" -f (Safe-Name $sourceId)))
-        }
-        catch {
-            Add-CollectionError -Errors $errors -Stage "V2SourceObjects" -Environment "" -ObjectId $sourceId -Message $_.Exception.Message
-        }
-    }
-
-    Write-Host ("  Per-source detail attempted for {0} source IDs" -f $allSourceIds.Count) -ForegroundColor Yellow
-
-    # 7. SQL / Oracle application server trees.
-    foreach ($applicationEnvironment in @("kSQL","kOracle")) {
-        foreach ($rootId in @($applicationRootIds[$applicationEnvironment].Keys | Sort-Object)) {
-            try {
-                $appServerUri = "$baseUrl/v2/data-protect/sources/application-servers" +
-                                "?rootNodeId=$(Url-Encode $rootId)" +
-                                "&environment=$(Url-Encode $applicationEnvironment)" +
-                                "&applicationEnvironment=$(Url-Encode $applicationEnvironment)" +
-                                "&pageSize=1000"
-                $appServers = Get-Json -Uri $appServerUri -Headers $headers
-                $fileName = "{0}_{1}.json" -f (Safe-Name $applicationEnvironment),(Safe-Name $rootId)
-                Write-Json -Value $appServers -Path (Join-Path $applicationServersDir $fileName)
-            }
-            catch {
-                Add-CollectionError -Errors $errors -Stage "V2ApplicationServers" -Environment $applicationEnvironment -ObjectId $rootId -Message $_.Exception.Message
-            }
-        }
-    }
-
-    # 8. Storage Domains with optional detail flags enabled.
-    Write-Host ""
-    Write-Host "Storage Domains" -ForegroundColor Cyan
-
-    try {
-        $storageUri = "$baseUrl/v2/storage-domains" +
-                      "?includeTenants=true" +
-                      "&includeStats=true" +
-                      "&includeTimeSeriesSchema=true" +
-                      "&includeFileCountBySize=true"
-        $storageDomains = Get-Json -Uri $storageUri -Headers $headers
-        Write-Json -Value $storageDomains -Path (Join-Path $rawDir "StorageDomains.json")
-        Write-Host "  Storage domains collected" -ForegroundColor Yellow
-    }
-    catch {
-        Add-CollectionError -Errors $errors -Stage "StorageDomains" -Environment "" -ObjectId "" -Message $_.Exception.Message
-        Write-Host "  Storage domains GET failed" -ForegroundColor Red
-    }
-
-    Write-Json -Value @($errors) -Path (Join-Path $clusterDir "Errors.json")
-
-    Write-Host ""
-    Write-Host "Completed: $($cluster.ClusterName)" -ForegroundColor Green
-    Write-Host "Output: $clusterDir" -ForegroundColor Green
     Write-Host "Errors recorded: $($errors.Count)" -ForegroundColor $(if ($errors.Count -eq 0) { "Green" } else { "Yellow" })
 }
