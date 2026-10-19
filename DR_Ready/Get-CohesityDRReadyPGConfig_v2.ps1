@@ -3,7 +3,9 @@
 # PowerShell 5.1 compatible
 #
 # Scope:
-# - Full raw Protection Group JSON only
+# - V2 Protection Group is the primary raw object
+# - Helios V1 Protection Job is queried only to supplement fields absent from V2
+# - One final JSON record per PG; no duplicate V1/V2 output copies
 # - Active PGs: isDeleted=false, isPaused=false, isActive=true
 # - Workloads: NAS (Generic NAS + Isilon), SQL, Hyper-V, Nutanix AHV, Oracle, Physical
 # - Cluster selection and environment selection
@@ -133,6 +135,69 @@ function Get-CollectionItems {
     return @($Json)
 }
 
+function Get-ActiveV1ProtectionJobs {
+    param([string[]]$Environments,[hashtable]$Headers)
+
+    $all=@()
+
+    foreach ($environment in $Environments) {
+        $uri = "$baseUrl/irisservices/api/v1/public/protectionJobs" +
+               "?environments=$(Url-Encode $environment)" +
+               "&isDeleted=false" +
+               "&isActive=true" +
+               "&onlyReturnBasicSummary=false" +
+               "&includeLastRunAndStats=false" +
+               "&pruneExcludedSourceIds=false" +
+               "&includeSourceNames=true" +
+               "&allUnderHierarchy=true" +
+               "&maxResultCount=1000"
+
+        $json = Get-Json -Uri $uri -Headers $Headers
+        if ($null -eq $json) { throw "V1 Protection Jobs GET returned no JSON for $environment." }
+
+        $jobs = @(
+            Get-CollectionItems -Json $json -PropertyNames @("protectionJobs","jobs") |
+            Where-Object {
+                $null -ne $_ -and
+                (Get-PropValue -Object $_ -Names @("isDeleted") -Default $false) -ne $true -and
+                (Get-PropValue -Object $_ -Names @("isActive") -Default $true) -eq $true -and
+                (Get-PropValue -Object $_ -Names @("isPaused") -Default $false) -ne $true
+            }
+        )
+
+        if ($jobs.Count -gt 0) { $all += $jobs }
+    }
+
+    return @($all)
+}
+
+function Add-V1Supplement {
+    param(
+        [Parameter(Mandatory=$true)]$V2Group,
+        [AllowNull()]$V1Job
+    )
+
+    if ($null -eq $V1Job) { return $V2Group }
+
+    $v2Names = @{}
+    foreach ($property in @($V2Group.PSObject.Properties)) {
+        $v2Names[$property.Name.ToLowerInvariant()] = $true
+    }
+
+    $supplement = [ordered]@{}
+    foreach ($property in @($V1Job.PSObject.Properties)) {
+        if (-not $v2Names.ContainsKey($property.Name.ToLowerInvariant())) {
+            $supplement[$property.Name] = $property.Value
+        }
+    }
+
+    if ($supplement.Count -gt 0) {
+        $V2Group | Add-Member -NotePropertyName "v1Supplement" -NotePropertyValue ([pscustomobject]$supplement) -Force
+    }
+
+    return $V2Group
+}
+
 function Get-ActiveProtectionGroups {
     param([string[]]$Environments,[hashtable]$Headers)
 
@@ -259,15 +324,53 @@ foreach ($cluster in $selectedClusters) {
     foreach ($environment in $selectedEnvironments) {
         try {
             $groups = @(Get-ActiveProtectionGroups -Environments $environment.ApiNames -Headers $headers)
-            Write-RawJson -Value $groups -Path (Join-Path $pgDir $environment.FileName)
-            $counts[$environment.DisplayName]=$groups.Count
-            Write-Host ("  {0}: {1} active PGs" -f $environment.DisplayName,$groups.Count) -ForegroundColor Yellow
+
+            $v1Jobs = @()
+            try {
+                $v1Jobs = @(Get-ActiveV1ProtectionJobs -Environments $environment.ApiNames -Headers $headers)
+            }
+            catch {
+                [void]$errors.Add([pscustomobject][ordered]@{
+                    Cluster=$cluster.ClusterName
+                    Environment=$environment.DisplayName
+                    Stage="V1Supplement"
+                    Error=$_.Exception.Message
+                })
+            }
+
+            $jobByName = @{}
+            foreach ($job in $v1Jobs) {
+                $jobName = First-Value @((Get-PropValue -Object $job -Names @("name") -Default ""))
+                if (-not [string]::IsNullOrWhiteSpace($jobName)) {
+                    $jobByName[$jobName.ToLowerInvariant()] = $job
+                }
+            }
+
+            $finalGroups = @()
+            foreach ($group in $groups) {
+                $groupName = First-Value @((Get-PropValue -Object $group -Names @("name") -Default ""))
+                $matchingJob = $null
+
+                if (-not [string]::IsNullOrWhiteSpace($groupName)) {
+                    $lookupName = $groupName.ToLowerInvariant()
+                    if ($jobByName.ContainsKey($lookupName)) {
+                        $matchingJob = $jobByName[$lookupName]
+                    }
+                }
+
+                $finalGroups += ,(Add-V1Supplement -V2Group $group -V1Job $matchingJob)
+            }
+
+            Write-RawJson -Value $finalGroups -Path (Join-Path $pgDir $environment.FileName)
+            $counts[$environment.DisplayName]=$finalGroups.Count
+            Write-Host ("  {0}: {1} active PGs" -f $environment.DisplayName,$finalGroups.Count) -ForegroundColor Yellow
         }
         catch {
             $counts[$environment.DisplayName]=0
             [void]$errors.Add([pscustomobject][ordered]@{
                 Cluster=$cluster.ClusterName
                 Environment=$environment.DisplayName
+                Stage="V2ProtectionGroups"
                 Error=$_.Exception.Message
             })
             Write-Host ("  {0}: GET failed" -f $environment.DisplayName) -ForegroundColor Red
@@ -285,7 +388,9 @@ foreach ($cluster in $selectedClusters) {
         SelectedWorkloads=@($selectedEnvironments | ForEach-Object { $_.DisplayName })
         ProtectionGroupCounts=[pscustomobject]$counts
         ProtectionGroupDirectory="ProtectionGroups"
-        RawProtectionGroupJsonPreserved=$true
+        V2ProtectionGroupIsPrimary=$true
+        V1SupplementOnly=$true
+        V1SupplementRule="Only top-level V1 properties absent from the matching V2 PG are added under v1Supplement."
         PropertyProjectionApplied=$false
         ExternalDependenciesCollected=$false
         ErrorCount=$errors.Count
