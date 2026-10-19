@@ -147,6 +147,7 @@ function Get-ActiveProtectionGroups {
                    "&isDeleted=false" +
                    "&isPaused=false" +
                    "&isActive=true" +
+                   "&includeTenants=true" +
                    "&includeLastRunInfo=true" +
                    "&pruneSourceIds=false" +
                    "&pruneExcludedSourceIds=false" +
