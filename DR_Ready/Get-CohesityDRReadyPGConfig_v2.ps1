@@ -179,15 +179,25 @@ function Add-V1Supplement {
 
     if ($null -eq $V1Job) { return $V2Group }
 
-    $v2Names = @{}
-    foreach ($property in @($V2Group.PSObject.Properties)) {
-        $v2Names[$property.Name.ToLowerInvariant()] = $true
-    }
+    # Keep V1 only where it provides legacy protection-job configuration
+    # that is not cleanly represented as the same structure in V2.
+    # Do NOT duplicate semantic equivalents such as:
+    #   alertingConfig/alertingPolicy -> V2 alertPolicy
+    #   qosType                      -> V2 qosPolicy
+    #   abortInBlackoutPeriod        -> V2 abortInBlackouts
+    #   sourceIds/excludeSourceIds   -> V2 workload object selections
+    #   indexingPolicy               -> V2 workload-specific indexingPolicy
+    $v1SupplementFields = @(
+        "environmentParameters",
+        "sourceSpecialParameters"
+    )
 
     $supplement = [ordered]@{}
-    foreach ($property in @($V1Job.PSObject.Properties)) {
-        if (-not $v2Names.ContainsKey($property.Name.ToLowerInvariant())) {
-            $supplement[$property.Name] = $property.Value
+
+    foreach ($field in $v1SupplementFields) {
+        $value = Get-PropValue -Object $V1Job -Names @($field) -Default $null
+        if ($null -ne $value) {
+            $supplement[$field] = $value
         }
     }
 
@@ -390,7 +400,7 @@ foreach ($cluster in $selectedClusters) {
         ProtectionGroupDirectory="ProtectionGroups"
         V2ProtectionGroupIsPrimary=$true
         V1SupplementOnly=$true
-        V1SupplementRule="Only top-level V1 properties absent from the matching V2 PG are added under v1Supplement."
+        V1SupplementRule="Only V1 environmentParameters and sourceSpecialParameters are added under v1Supplement; semantic duplicates already represented by V2 are excluded."
         PropertyProjectionApplied=$false
         ExternalDependenciesCollected=$false
         ErrorCount=$errors.Count
