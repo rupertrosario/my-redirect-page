@@ -1,6 +1,7 @@
 # Cohesity Helios - DR Protection Group Reverse Engineering Export V2
 # STRICTLY READ-ONLY / GET-only
 # PowerShell 5.1 compatible
+# Baseline restored from combined V1+V2 collector (39029f63440f25d47aa43cab7475c76ec485e5d2)
 #
 # Scope:
 # - V2 Protection Group is the primary raw object
