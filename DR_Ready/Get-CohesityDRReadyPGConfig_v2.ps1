@@ -3,9 +3,8 @@
 # PowerShell 5.1 compatible
 #
 # Scope:
-# - Full raw V2 Protection Group JSON
-# - Full raw V1 Protection Job JSON for complementary legacy settings
-# - Active objects only: isDeleted=false, isActive=true; paused objects excluded
+# - Full raw Protection Group JSON only
+# - Active PGs: isDeleted=false, isPaused=false, isActive=true
 # - Workloads: NAS (Generic NAS + Isilon), SQL, Hyper-V, Nutanix AHV, Oracle, Physical
 # - Cluster selection and environment selection
 # - No source registration, policy expansion, storage-domain expansion, or credential collection
@@ -134,37 +133,6 @@ function Get-CollectionItems {
     return @($Json)
 }
 
-function Get-V1ProtectionJobs {
-    param([string[]]$Environments,[hashtable]$Headers)
-
-    $all=@()
-
-    foreach ($environment in $Environments) {
-        $uri = "$baseUrl/irisservices/api/v1/public/protectionJobs" +
-               "?environments=$(Url-Encode $environment)" +
-               "&isDeleted=false" +
-               "&isActive=true" +
-               "&onlyReturnBasicSummary=false" +
-               "&includeLastRunAndStats=false" +
-               "&pruneExcludedSourceIds=false" +
-               "&includeSourceNames=true"
-
-        $json = Get-Json -Uri $uri -Headers $Headers
-        if ($null -eq $json) { throw "V1 Protection Jobs GET returned no JSON for $environment." }
-
-        $jobs = @(As-Array $json | Where-Object {
-            $null -ne $_ -and
-            (Get-PropValue -Object $_ -Names @("isDeleted") -Default $false) -ne $true -and
-            (Get-PropValue -Object $_ -Names @("isActive") -Default $false) -eq $true -and
-            (Get-PropValue -Object $_ -Names @("isPaused") -Default $false) -ne $true
-        })
-
-        if ($jobs.Count -gt 0) { $all += $jobs }
-    }
-
-    return @($all)
-}
-
 function Get-ActiveProtectionGroups {
     param([string[]]$Environments,[hashtable]$Headers)
 
@@ -277,16 +245,12 @@ while ($true) {
 foreach ($cluster in $selectedClusters) {
     $headers = New-Headers -ClusterId $cluster.ClusterId
     $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
-    $clusterDir = Join-Path $OutputDirectory ("{0}_{1}_PG_ReverseEngineering" -f (Safe-Name $cluster.ClusterName),$timestamp)
-    $v2Dir = Join-Path $clusterDir "V2_ProtectionGroups"
-    $v1Dir = Join-Path $clusterDir "V1_ProtectionJobs"
+    $clusterDir = Join-Path $OutputDirectory ("{0}_{1}_PG_V2" -f (Safe-Name $cluster.ClusterName),$timestamp)
+    $pgDir = Join-Path $clusterDir "ProtectionGroups"
 
-    foreach ($directory in @($clusterDir,$v2Dir,$v1Dir)) {
-        New-Item -Path $directory -ItemType Directory -Force | Out-Null
-    }
+    New-Item -Path $pgDir -ItemType Directory -Force | Out-Null
 
-    $v2Counts=[ordered]@{}
-    $v1Counts=[ordered]@{}
+    $counts=[ordered]@{}
     $errors=New-Object System.Collections.ArrayList
 
     Write-Host ""
@@ -295,36 +259,18 @@ foreach ($cluster in $selectedClusters) {
     foreach ($environment in $selectedEnvironments) {
         try {
             $groups = @(Get-ActiveProtectionGroups -Environments $environment.ApiNames -Headers $headers)
-            Write-RawJson -Value $groups -Path (Join-Path $v2Dir $environment.FileName)
-            $v2Counts[$environment.DisplayName]=$groups.Count
-            Write-Host ("  V2 {0}: {1} active PGs" -f $environment.DisplayName,$groups.Count) -ForegroundColor Yellow
+            Write-RawJson -Value $groups -Path (Join-Path $pgDir $environment.FileName)
+            $counts[$environment.DisplayName]=$groups.Count
+            Write-Host ("  {0}: {1} active PGs" -f $environment.DisplayName,$groups.Count) -ForegroundColor Yellow
         }
         catch {
-            $v2Counts[$environment.DisplayName]=0
+            $counts[$environment.DisplayName]=0
             [void]$errors.Add([pscustomobject][ordered]@{
-                ApiVersion="V2"
                 Cluster=$cluster.ClusterName
                 Environment=$environment.DisplayName
                 Error=$_.Exception.Message
             })
-            Write-Host ("  V2 {0}: GET failed" -f $environment.DisplayName) -ForegroundColor Red
-        }
-
-        try {
-            $jobs = @(Get-V1ProtectionJobs -Environments $environment.ApiNames -Headers $headers)
-            Write-RawJson -Value $jobs -Path (Join-Path $v1Dir $environment.FileName)
-            $v1Counts[$environment.DisplayName]=$jobs.Count
-            Write-Host ("  V1 {0}: {1} active jobs" -f $environment.DisplayName,$jobs.Count) -ForegroundColor DarkYellow
-        }
-        catch {
-            $v1Counts[$environment.DisplayName]=0
-            [void]$errors.Add([pscustomobject][ordered]@{
-                ApiVersion="V1"
-                Cluster=$cluster.ClusterName
-                Environment=$environment.DisplayName
-                Error=$_.Exception.Message
-            })
-            Write-Host ("  V1 {0}: GET failed" -f $environment.DisplayName) -ForegroundColor Red
+            Write-Host ("  {0}: GET failed" -f $environment.DisplayName) -ForegroundColor Red
         }
     }
 
@@ -335,14 +281,11 @@ foreach ($cluster in $selectedClusters) {
         GeneratedAt=(Get-Date).ToString("yyyy-MM-ddTHH:mm:ssK")
         ClusterName=$cluster.ClusterName
         ClusterId=$cluster.ClusterId
-        ActiveDefinition="V2: isDeleted=false; isPaused=false; isActive=true. V1: isDeleted=false; isActive=true and paused jobs filtered from raw results."
+        ActiveDefinition="isDeleted=false; isPaused=false; isActive=true"
         SelectedWorkloads=@($selectedEnvironments | ForEach-Object { $_.DisplayName })
-        V2ProtectionGroupCounts=[pscustomobject]$v2Counts
-        V1ProtectionJobCounts=[pscustomobject]$v1Counts
-        V2Directory="V2_ProtectionGroups"
-        V1Directory="V1_ProtectionJobs"
-        RawV2ProtectionGroupJsonPreserved=$true
-        RawV1ProtectionJobJsonPreserved=$true
+        ProtectionGroupCounts=[pscustomobject]$counts
+        ProtectionGroupDirectory="ProtectionGroups"
+        RawProtectionGroupJsonPreserved=$true
         PropertyProjectionApplied=$false
         ExternalDependenciesCollected=$false
         ErrorCount=$errors.Count
