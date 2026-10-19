@@ -179,27 +179,19 @@ function Add-V1Supplement {
 
     if ($null -eq $V1Job) { return $V2Group }
 
-    # Keep V1 only where it provides legacy protection-job configuration
-    # that is not cleanly represented as the same structure in V2.
-    # Do NOT duplicate semantic equivalents such as:
-    #   alertingConfig/alertingPolicy -> V2 alertPolicy
-    #   qosType                      -> V2 qosPolicy
-    #   abortInBlackoutPeriod        -> V2 abortInBlackouts
-    #   sourceIds/excludeSourceIds   -> V2 workload object selections
-    #   indexingPolicy               -> V2 workload-specific indexingPolicy
-    $v1SupplementFields = @(
-        "sourceSpecialParameters",
-        "taskTimeouts",
-        "userSpecifiedTags",
-        "ignorableErrorsInErrorDb"
-    )
+    # DR reconstruction bias: preserve V1 evidence unless the exact same
+    # property name already exists in V2. Do not remove fields merely
+    # because they appear semantically similar under a different V2 name.
+    $v2Names = @{}
+    foreach ($property in @($V2Group.PSObject.Properties)) {
+        $v2Names[$property.Name.ToLowerInvariant()] = $true
+    }
 
     $supplement = [ordered]@{}
-
-    foreach ($field in $v1SupplementFields) {
-        $value = Get-PropValue -Object $V1Job -Names @($field) -Default $null
-        if ($null -ne $value) {
-            $supplement[$field] = $value
+    foreach ($property in @($V1Job.PSObject.Properties)) {
+        $name = $property.Name
+        if (-not $v2Names.ContainsKey($name.ToLowerInvariant())) {
+            $supplement[$name] = $property.Value
         }
     }
 
@@ -209,7 +201,6 @@ function Add-V1Supplement {
 
     return $V2Group
 }
-
 function Get-ActiveProtectionGroups {
     param([string[]]$Environments,[hashtable]$Headers)
 
@@ -402,7 +393,7 @@ foreach ($cluster in $selectedClusters) {
         ProtectionGroupDirectory="ProtectionGroups"
         V2ProtectionGroupIsPrimary=$true
         V1SupplementOnly=$true
-        V1SupplementRule="Only V1 fields without a clear V2 top-level equivalent are retained: sourceSpecialParameters, taskTimeouts, userSpecifiedTags, ignorableErrorsInErrorDb. V1 environmentParameters and other semantic duplicates are excluded because V2 workload-specific parameter blocks are primary."
+        V1SupplementRule="Preserve all V1 top-level properties whose exact property name is not already present in the matching V2 PG. Semantically similar fields with different names are retained to avoid losing reconstruction evidence."
         PropertyProjectionApplied=$false
         ExternalDependenciesCollected=$false
         ErrorCount=$errors.Count
