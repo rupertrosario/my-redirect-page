@@ -1,93 +1,42 @@
 # ServiceNow DEV DTSK Automation Defect
 
-## Defect title
+## Short Description
 
-ServiceNow DEV DTSK automation – unable to update CR Required/state or read work notes
+DTSK automation - CR Required/state update and work-note retrieval not working in DEV
 
 ## Description
 
-During testing of the Dynatrace workflow integration with ServiceNow DEV for automated decommission DTSK processing, the integration is able to update the DTSK `work_notes` field successfully.
+During testing of the Dynatrace workflow integration with ServiceNow DEV for decommission DTSK processing, updating `work_notes` on the DTSK is working successfully.
 
-However, the following operations are currently not working:
+The following operations are not working as expected:
 
-- Unable to update CR Required with the required Yes/No value
-- Unable to update the DTSK state
-- Unable to retrieve existing work notes from `sys_journal_field`
-- `assigned_to` / assignment update has not yet been tested
+- Unable to update **CR Required** with the required Yes/No value.
+- Unable to update the DTSK **state**.
+- Unable to retrieve existing DTSK work notes from `sys_journal_field`.
+- `assigned_to` has not yet been tested.
 
-The integration is using the DTSK record `sys_id` and the decommission task table:
+These functions are being tested as part of the DTSK backup-validation workflow so that the validation result can be recorded on the task and the DTSK can be updated appropriately based on the validation outcome.
 
-```text
-x_alfi_decom_decom_task
-```
+## Work Notes
 
-The `work_notes` update works successfully against the DTSK record, confirming that the workflow is able to update the record.
+DEV testing completed so far:
 
-## Current behaviour
+- `work_notes` update on `x_alfi_decom_decom_task` - **Successful**
+- CR Required Yes/No update - **Not working**
+- DTSK state update - **Not working**
+- `assigned_to` update - **Not yet tested**
+- Read existing work notes from `sys_journal_field` - **Not working**
 
-```text
-work_notes        → Update successful
-CR Required       → Update unsuccessful
-state             → Update unsuccessful
-assigned_to       → Not yet tested
-sys_journal_field → Unable to retrieve existing work_notes
-```
+The DTSK record is being addressed using its `sys_id` on:
 
-For reading existing work notes, the query is being made against:
+`x_alfi_decom_decom_task`
 
-```text
-sys_journal_field
-```
+For retrieving existing work notes, the query being tested against `sys_journal_field` is:
 
-using:
+`element_id=<DTSK_SYS_ID>^element=work_notes`
 
-```text
-element_id=<DTSK_SYS_ID>^element=work_notes
-```
+The purpose of reading the existing work notes is to identify previous workflow updates and avoid adding duplicate notes when the workflow is rerun.
 
-## Expected behaviour
+Please review why CR Required and state are not being updated and why existing work notes cannot be retrieved from `sys_journal_field`.
 
-The Dynatrace workflow should be able to:
-
-1. Update `work_notes`
-2. Update CR Required with the appropriate Yes/No value
-3. Update the DTSK state as applicable
-4. Update `assigned_to` when required
-5. Read existing `work_notes` from `sys_journal_field`
-
-These operations are part of the planned automated DTSK backup-validation workflow.
-
-## Impact
-
-At present, the workflow can successfully add the backup validation result to `work_notes`, but it cannot complete the remaining DTSK updates such as CR Required and state.
-
-The workflow is also unable to read the existing work notes from `sys_journal_field`, which is needed to identify previous workflow updates and avoid adding duplicate work notes during reruns.
-
-## Request
-
-Please review the ServiceNow DEV configuration, integration-user permissions, ACLs, field-level access and any applicable business rules for the following:
-
-### Table: `x_alfi_decom_decom_task`
-
-Fields:
-
-- `work_notes`
-- CR Required
-- `state`
-- `assigned_to`
-
-### Table: `sys_journal_field`
-
-Read fields:
-
-- `element_id`
-- `element`
-- `value`
-
-`work_notes` write/update is currently confirmed as working.
-
-CR Required and state updates are currently not working.
-
-Reading existing `work_notes` from `sys_journal_field` is currently not working.
-
-`assigned_to` has not yet been tested.
+`work_notes` update is confirmed working. `assigned_to` will be tested separately.
