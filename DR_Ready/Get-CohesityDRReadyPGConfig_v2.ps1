@@ -188,8 +188,10 @@ function Add-V1Supplement {
     #   sourceIds/excludeSourceIds   -> V2 workload object selections
     #   indexingPolicy               -> V2 workload-specific indexingPolicy
     $v1SupplementFields = @(
-        "environmentParameters",
-        "sourceSpecialParameters"
+        "sourceSpecialParameters",
+        "taskTimeouts",
+        "userSpecifiedTags",
+        "ignorableErrorsInErrorDb"
     )
 
     $supplement = [ordered]@{}
@@ -400,7 +402,7 @@ foreach ($cluster in $selectedClusters) {
         ProtectionGroupDirectory="ProtectionGroups"
         V2ProtectionGroupIsPrimary=$true
         V1SupplementOnly=$true
-        V1SupplementRule="Only V1 environmentParameters and sourceSpecialParameters are added under v1Supplement; semantic duplicates already represented by V2 are excluded."
+        V1SupplementRule="Only V1 fields without a clear V2 top-level equivalent are retained: sourceSpecialParameters, taskTimeouts, userSpecifiedTags, ignorableErrorsInErrorDb. V1 environmentParameters and other semantic duplicates are excluded because V2 workload-specific parameter blocks are primary."
         PropertyProjectionApplied=$false
         ExternalDependenciesCollected=$false
         ErrorCount=$errors.Count
