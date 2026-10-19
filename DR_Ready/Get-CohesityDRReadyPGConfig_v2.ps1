@@ -179,20 +179,50 @@ function Add-V1Supplement {
 
     if ($null -eq $V1Job) { return $V2Group }
 
-    # DR reconstruction bias: preserve V1 evidence unless the exact same
-    # property name already exists in V2. Do not remove fields merely
-    # because they appear semantically similar under a different V2 name.
+    # V2 remains the primary PG object.
+    # Preserve V1 data unless:
+    #   1) the exact same property already exists in V2, or
+    #   2) it is a known semantic duplicate and the corresponding V2 field is present.
+    #
+    # IMPORTANT:
+    # - Do not prune nested V1 structures such as environmentParameters or
+    #   sourceSpecialParameters. They can carry settings that V2 omits.
+    # - Do not remove sourceIds/excludeSourceIds/indexingPolicy here because
+    #   their V2 equivalents are workload-specific and may not be complete.
+
     $v2Names = @{}
     foreach ($property in @($V2Group.PSObject.Properties)) {
         $v2Names[$property.Name.ToLowerInvariant()] = $true
     }
 
+    $semanticDuplicates = @{
+        "qostype"               = "qosPolicy"
+        "abortinblackoutperiod" = "abortInBlackouts"
+        "alertingconfig"        = "alertPolicy"
+        "alertingpolicy"        = "alertPolicy"
+    }
+
     $supplement = [ordered]@{}
+
     foreach ($property in @($V1Job.PSObject.Properties)) {
         $name = $property.Name
-        if (-not $v2Names.ContainsKey($name.ToLowerInvariant())) {
-            $supplement[$name] = $property.Value
+        $nameKey = $name.ToLowerInvariant()
+
+        # Exact same property already exists in V2.
+        if ($v2Names.ContainsKey($nameKey)) {
+            continue
         }
+
+        # Known semantic duplicate: suppress only when the mapped V2 field
+        # is actually present in this PG.
+        if ($semanticDuplicates.ContainsKey($nameKey)) {
+            $v2Equivalent = $semanticDuplicates[$nameKey]
+            if ($v2Names.ContainsKey($v2Equivalent.ToLowerInvariant())) {
+                continue
+            }
+        }
+
+        $supplement[$name] = $property.Value
     }
 
     if ($supplement.Count -gt 0) {
@@ -393,7 +423,7 @@ foreach ($cluster in $selectedClusters) {
         ProtectionGroupDirectory="ProtectionGroups"
         V2ProtectionGroupIsPrimary=$true
         V1SupplementOnly=$true
-        V1SupplementRule="Preserve all V1 top-level properties whose exact property name is not already present in the matching V2 PG. Semantically similar fields with different names are retained to avoid losing reconstruction evidence."
+        V1SupplementRule="V2 is primary. Preserve all V1 top-level properties except exact-name duplicates and four confirmed semantic duplicates when the corresponding V2 field is present: qosType->qosPolicy, abortInBlackoutPeriod->abortInBlackouts, alertingConfig->alertPolicy, alertingPolicy->alertPolicy. Nested V1 configuration remains untouched."
         PropertyProjectionApplied=$false
         ExternalDependenciesCollected=$false
         ErrorCount=$errors.Count
