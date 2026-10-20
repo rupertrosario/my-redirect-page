@@ -1,4 +1,4 @@
-# Cohesity Helios V2 raw-response diagnostic
+# Cohesity cluster-local V2 raw-response diagnostic
 # GET-only; PowerShell 5.1; based on commit 39029f63440f25d47aa43cab7475c76ec485e5d2
 # Raw responses may contain sensitive configuration. Keep output local; do not commit it.
 [CmdletBinding()]
@@ -23,8 +23,8 @@ function New-Headers {
     return $h
 }
 function Get-RawResponse {
-    param([string]$Uri,[hashtable]$Headers)
-    if (-not $Uri.StartsWith("$baseUrl/",[StringComparison]::OrdinalIgnoreCase)) { throw "Non-Helios URI blocked" }
+    param([string]$Uri,[hashtable]$Headers,[string]$AllowedBase = $baseUrl)
+    if (-not $Uri.StartsWith("$AllowedBase/",[StringComparison]::OrdinalIgnoreCase)) { throw "URI outside selected endpoint blocked" }
     return (Invoke-WebRequest -Uri $Uri -Headers $Headers -Method Get -UseBasicParsing -ErrorAction Stop).Content
 }
 function First-Value {
@@ -89,7 +89,70 @@ while ($true) {
 }
 
 foreach ($cluster in $selectedClusters) {
-    $headers=New-Headers -ClusterId $cluster.ClusterId
+    Write-Host ""
+    Write-Host ("Selected cluster: {0}" -f $cluster.ClusterName) -ForegroundColor Cyan
+    $address = Read-Host "Enter this cluster's IP address or FQDN (no path)"
+    $address = $address.Trim()
+    if ($address -match '^https://') { $address = $address.Substring(8) }
+    $address = $address.TrimEnd('/')
+    if ($address -notmatch '^[a-zA-Z0-9][a-zA-Z0-9.:-]*
+    $dir=Join-Path $OutputDirectory ("{0}_{1}_Raw" -f ($cluster.ClusterId -replace '[^a-zA-Z0-9_-]','_'),$timestamp)
+    New-Item -Path $dir -ItemType Directory -Force | Out-Null
+    foreach ($env in $selectedEnvironments) {
+        foreach ($apiEnvironment in $env.ApiNames) {
+            $cookie=""
+            $page=0
+            $found=$false
+            $seenCookies=@{}
+            do {
+                $uri="$clusterBaseUrl/v2/data-protect/protection-groups" +
+                     "?environments=$([uri]::EscapeDataString($apiEnvironment))" +
+                     "&isDeleted=false" +
+                     "&isPaused=false" +
+                     "&isActive=true" +
+                     "&includeTenants=true" +
+                     "&includeLastRunInfo=true" +
+                     "&pruneSourceIds=false" +
+                     "&pruneExcludedSourceIds=false" +
+                     "&useCachedData=false" +
+                     "&maxResultCount=1000"
+                if ($cookie) { $uri += "&paginationCookie=$([uri]::EscapeDataString($cookie))" }
+                $page++
+                $raw=Get-RawResponse -Uri $uri -Headers $headers -AllowedBase $clusterBaseUrl
+                if ([string]::IsNullOrWhiteSpace($raw)) { throw "Empty raw response for $apiEnvironment page $page" }
+                $file=Join-Path $dir ("{0}_Page_{1:D3}.json" -f $apiEnvironment,$page)
+                [System.IO.File]::WriteAllText($file,$raw,(New-Object System.Text.UTF8Encoding($false)))
+                if ($apiEnvironment -eq "kAcropolis") {
+                    $hit=$raw.Contains("backupDirectlyAttachedVolumeGroups")
+                    if ($hit) { $found=$true }
+                    Write-Host ("{0} page {1}: AHV field {2}" -f $cluster.ClusterName,$page,$(if ($hit) {"PRESENT"} else {"ABSENT"}))
+                }
+                # JSON is parsed only for pagination, after the raw body is saved.
+                $parsed=$raw | ConvertFrom-Json
+                $nextCookie=First-Value @($parsed.paginationCookie)
+                if ($nextCookie -and $seenCookies.ContainsKey($nextCookie)) { throw "Repeated pagination cookie; collection incomplete." }
+                if ($nextCookie) { $seenCookies[$nextCookie]=$true }
+                $cookie=$nextCookie
+                if ($parsed.isResponseTruncated -eq $true -and -not $cookie) {
+                    throw "Response truncated without pagination cookie; collection incomplete."
+                }
+            } while ($cookie)
+            if ($apiEnvironment -eq "kAcropolis") {
+                Write-Host ("RESULT: {0} | backupDirectlyAttachedVolumeGroups {1} in raw cluster response ({2} pages)" -f $cluster.ClusterName,$(if ($found) {"PRESENT"} else {"ABSENT"}),$page) -ForegroundColor Cyan
+            }
+            else { Write-Host ("{0} | {1} | {2} raw page(s)" -f $cluster.ClusterName,$apiEnvironment,$page) }
+        }
+    }
+    Write-Host "Raw output: $dir"
+}
+Write-Host "CAUTION: Raw JSON may contain sensitive data. Do not commit or share unredacted files." -ForegroundColor Yellow
+ -or $address.Contains('..')) {
+        throw "Invalid cluster address. Enter only an IP address or FQDN."
+    }
+    $clusterBaseUrl = "https://$address"
+    # API key is loaded through the existing AES helper. Local-cluster API key
+    # support depends on your cluster configuration; HTTP 401/403 will surface.
+    $headers = New-Headers
     $timestamp=Get-Date -Format "yyyyMMdd_HHmmss"
     $dir=Join-Path $OutputDirectory ("{0}_{1}_Raw" -f ($cluster.ClusterId -replace '[^a-zA-Z0-9_-]','_'),$timestamp)
     New-Item -Path $dir -ItemType Directory -Force | Out-Null
