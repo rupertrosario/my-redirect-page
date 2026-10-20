@@ -1,8 +1,8 @@
-# Cohesity Helios AHV V2 raw-response diagnostic
+# Cohesity Helios V2 raw-response diagnostic
 # GET-only; PowerShell 5.1; based on commit 39029f63440f25d47aa43cab7475c76ec485e5d2
 # Raw responses may contain sensitive configuration. Keep output local; do not commit it.
 [CmdletBinding()]
-param([string]$OutputDirectory = "X:\PowerShell\Cohesity_API_Scripts\DR_Ready\AHV_Raw_Diagnostic")
+param([string]$OutputDirectory = "X:\PowerShell\Cohesity_API_Scripts\DR_Ready\Raw_Diagnostic")
 
 $ErrorActionPreference = "Stop"
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
@@ -44,56 +44,100 @@ if ($clusters.Count -eq 0) { throw "Helios returned no clusters." }
 $menu = for ($i=0; $i -lt $clusters.Count; $i++) {
     [pscustomobject]@{ Index=$i+1; ClusterName=$clusters[$i].ClusterName; ClusterId=$clusters[$i].ClusterId }
 }
-$menu | Format-Table -AutoSize
-Write-Host "[X] Exit"
-do {
-    $selection = Read-Host "Select ONE AHV cluster (1-$($menu.Count)), or X"
-    if ($selection -match '^[xX]$') { return }
-    $number = 0
-    $valid = [int]::TryParse($selection,[ref]$number) -and $number -ge 1 -and $number -le $menu.Count
-} until ($valid)
-$cluster = $clusters[$number-1]
-$headers = New-Headers -ClusterId $cluster.ClusterId
-$timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
-$dir = Join-Path $OutputDirectory ("AHV_{0}_{1}" -f ($cluster.ClusterId -replace '[^a-zA-Z0-9_-]','_'),$timestamp)
-New-Item -Path $dir -ItemType Directory -Force | Out-Null
-$cookie = ""
-$page = 0
-$found = $false
-$seenCookies = @{}
-do {
-    $uri = "$baseUrl/v2/data-protect/protection-groups" +
-           "?environments=kAcropolis" +
-           "&isDeleted=false" +
-           "&isPaused=false" +
-           "&isActive=true" +
-           "&includeTenants=true" +
-           "&includeLastRunInfo=true" +
-           "&pruneSourceIds=false" +
-           "&pruneExcludedSourceIds=false" +
-           "&useCachedData=false" +
-           "&maxResultCount=1000"
-    if ($cookie) { $uri += "&paginationCookie=$([uri]::EscapeDataString($cookie))" }
-    $page++
-    # Save exactly the HTTP response text BEFORE ConvertFrom-Json or ConvertTo-Json.
-    $raw = Get-RawResponse -Uri $uri -Headers $headers
-    if ([string]::IsNullOrWhiteSpace($raw)) { throw "Empty AHV response on page $page" }
-    $file = Join-Path $dir ("AHV_V2_Raw_Page_{0:D3}.json" -f $page)
-    [System.IO.File]::WriteAllText($file,$raw,(New-Object System.Text.UTF8Encoding($false)))
-    $hit = $raw.Contains("backupDirectlyAttachedVolumeGroups")
-    if ($hit) { $found = $true }
-    Write-Host ("Page {0}: property {1} | {2}" -f $page,$(if ($hit) {"PRESENT"} else {"ABSENT"}),$file)
-    # Parsing is only for pagination, never for the written raw response.
-    $parsed = $raw | ConvertFrom-Json
-    $nextCookie = First-Value @($parsed.paginationCookie)
-    if ($nextCookie -and $seenCookies.ContainsKey($nextCookie)) { throw "Repeated paginationCookie: stopped to avoid loop." }
-    if ($nextCookie) { $seenCookies[$nextCookie] = $true }
-    $cookie = $nextCookie
-    if ($parsed.isResponseTruncated -eq $true -and -not $cookie) {
-        throw "Response truncated without paginationCookie; diagnostic incomplete."
-    }
-} while ($cookie)
 Write-Host ""
-Write-Host ("RESULT: backupDirectlyAttachedVolumeGroups {0} in raw Helios HTTP response ({1} page(s))." -f $(if ($found) {"PRESENT"} else {"ABSENT"}),$page) -ForegroundColor Cyan
-Write-Host "Raw output: $dir"
-Write-Host "Do not upload raw files to GitHub; inspect for sensitive fields before sharing." -ForegroundColor Yellow
+Write-Host "Available Helios Clusters (sorted):" -ForegroundColor Cyan
+$menu | Format-Table -AutoSize
+Write-Host "[0] All clusters" -ForegroundColor Yellow
+Write-Host "[X] Exit" -ForegroundColor Yellow
+while ($true) {
+    $choice = Read-Host "Select cluster: 0 for ALL, 1-$($clusters.Count) for single, or X"
+    if ($choice -match '^(?i:x|q)$') { return }
+    $number=0
+    if ([int]::TryParse($choice,[ref]$number) -and $number -ge 0 -and $number -le $clusters.Count) {
+        if ($number -eq 0) { $selectedClusters=@($clusters) }
+        else { $selectedClusters=@($clusters[$number-1]) }
+        break
+    }
+    Write-Host "Invalid selection." -ForegroundColor Red
+}
+
+$EnvironmentMap = @(
+    [pscustomobject]@{ Name="NAS"; ApiNames=@("kGenericNas","kIsilon") },
+    [pscustomobject]@{ Name="SQL"; ApiNames=@("kSQL") },
+    [pscustomobject]@{ Name="Hyper-V"; ApiNames=@("kHyperV") },
+    [pscustomobject]@{ Name="Nutanix AHV"; ApiNames=@("kAcropolis") },
+    [pscustomobject]@{ Name="Oracle"; ApiNames=@("kOracle") },
+    [pscustomobject]@{ Name="Physical"; ApiNames=@("kPhysical") }
+)
+Write-Host ""
+Write-Host "Available Workload Environments:" -ForegroundColor Cyan
+for ($i=0; $i -lt $EnvironmentMap.Count; $i++) {
+    Write-Host ("[{0}] {1}" -f ($i+1),$EnvironmentMap[$i].Name) -ForegroundColor Yellow
+}
+Write-Host "[0] All six environments" -ForegroundColor Yellow
+Write-Host "[X] Exit" -ForegroundColor Yellow
+while ($true) {
+    $choice = Read-Host "Select environment: 0 for ALL, 1-6 for single, or X"
+    if ($choice -match '^(?i:x|q)$') { return }
+    $number=0
+    if ([int]::TryParse($choice,[ref]$number) -and $number -ge 0 -and $number -le $EnvironmentMap.Count) {
+        if ($number -eq 0) { $selectedEnvironments=@($EnvironmentMap) }
+        else { $selectedEnvironments=@($EnvironmentMap[$number-1]) }
+        break
+    }
+    Write-Host "Invalid selection." -ForegroundColor Red
+}
+
+foreach ($cluster in $selectedClusters) {
+    $headers=New-Headers -ClusterId $cluster.ClusterId
+    $timestamp=Get-Date -Format "yyyyMMdd_HHmmss"
+    $dir=Join-Path $OutputDirectory ("{0}_{1}_Raw" -f ($cluster.ClusterId -replace '[^a-zA-Z0-9_-]','_'),$timestamp)
+    New-Item -Path $dir -ItemType Directory -Force | Out-Null
+    foreach ($env in $selectedEnvironments) {
+        foreach ($apiEnvironment in $env.ApiNames) {
+            $cookie=""
+            $page=0
+            $found=$false
+            $seenCookies=@{}
+            do {
+                $uri="$baseUrl/v2/data-protect/protection-groups" +
+                     "?environments=$([uri]::EscapeDataString($apiEnvironment))" +
+                     "&isDeleted=false" +
+                     "&isPaused=false" +
+                     "&isActive=true" +
+                     "&includeTenants=true" +
+                     "&includeLastRunInfo=true" +
+                     "&pruneSourceIds=false" +
+                     "&pruneExcludedSourceIds=false" +
+                     "&useCachedData=false" +
+                     "&maxResultCount=1000"
+                if ($cookie) { $uri += "&paginationCookie=$([uri]::EscapeDataString($cookie))" }
+                $page++
+                $raw=Get-RawResponse -Uri $uri -Headers $headers
+                if ([string]::IsNullOrWhiteSpace($raw)) { throw "Empty raw response for $apiEnvironment page $page" }
+                $file=Join-Path $dir ("{0}_Page_{1:D3}.json" -f $apiEnvironment,$page)
+                [System.IO.File]::WriteAllText($file,$raw,(New-Object System.Text.UTF8Encoding($false)))
+                if ($apiEnvironment -eq "kAcropolis") {
+                    $hit=$raw.Contains("backupDirectlyAttachedVolumeGroups")
+                    if ($hit) { $found=$true }
+                    Write-Host ("{0} page {1}: AHV field {2}" -f $cluster.ClusterName,$page,$(if ($hit) {"PRESENT"} else {"ABSENT"}))
+                }
+                # JSON is parsed only for pagination, after the raw body is saved.
+                $parsed=$raw | ConvertFrom-Json
+                $nextCookie=First-Value @($parsed.paginationCookie)
+                if ($nextCookie -and $seenCookies.ContainsKey($nextCookie)) { throw "Repeated pagination cookie; collection incomplete." }
+                if ($nextCookie) { $seenCookies[$nextCookie]=$true }
+                $cookie=$nextCookie
+                if ($parsed.isResponseTruncated -eq $true -and -not $cookie) {
+                    throw "Response truncated without pagination cookie; collection incomplete."
+                }
+            } while ($cookie)
+            if ($apiEnvironment -eq "kAcropolis") {
+                Write-Host ("RESULT: {0} | backupDirectlyAttachedVolumeGroups {1} in raw Helios response ({2} pages)" -f $cluster.ClusterName,$(if ($found) {"PRESENT"} else {"ABSENT"}),$page) -ForegroundColor Cyan
+            }
+            else { Write-Host ("{0} | {1} | {2} raw page(s)" -f $cluster.ClusterName,$apiEnvironment,$page) }
+        }
+    }
+    Write-Host "Raw output: $dir"
+}
+Write-Host "CAUTION: Raw JSON may contain sensitive data. Do not commit or share unredacted files." -ForegroundColor Yellow
