@@ -1,4 +1,4 @@
-# Cohesity Helios V2 raw-response diagnostic
+# Cohesity Helios V2 and V1 raw-response diagnostic
 # GET-only; PowerShell 5.1; based on commit 39029f63440f25d47aa43cab7475c76ec485e5d2
 # Raw responses may contain sensitive configuration. Keep output local; do not commit it.
 [CmdletBinding()]
@@ -89,7 +89,7 @@ while ($true) {
 }
 
 foreach ($cluster in $selectedClusters) {
-    $headers = New-Headers
+    $headers = New-Headers -ClusterId $cluster.ClusterId
     $timestamp=Get-Date -Format "yyyyMMdd_HHmmss"
     $dir=Join-Path $OutputDirectory ("{0}_{1}_Raw" -f ($cluster.ClusterId -replace '[^a-zA-Z0-9_-]','_'),$timestamp)
     New-Item -Path $dir -ItemType Directory -Force | Out-Null
@@ -136,6 +136,33 @@ foreach ($cluster in $selectedClusters) {
                 Write-Host ("RESULT: {0} | backupDirectlyAttachedVolumeGroups {1} in raw Helios response ({2} pages)" -f $cluster.ClusterName,$(if ($found) {"PRESENT"} else {"ABSENT"}),$page) -ForegroundColor Cyan
             }
             else { Write-Host ("{0} | {1} | {2} raw page(s)" -f $cluster.ClusterName,$apiEnvironment,$page) }
+
+            # Supplemental V1 list request from baseline 39029f...
+            # Kept separate from V2 output: do not merge or infer missing properties.
+            $v1Uri = "$baseUrl/irisservices/api/v1/public/protectionJobs" +
+                     "?environments=$([uri]::EscapeDataString($apiEnvironment))" +
+                     "&isDeleted=false" +
+                     "&isActive=true" +
+                     "&onlyReturnBasicSummary=false" +
+                     "&includeLastRunAndStats=false" +
+                     "&pruneExcludedSourceIds=false" +
+                     "&includeSourceNames=true" +
+                     "&allUnderHierarchy=true" +
+                     "&maxResultCount=1000"
+            try {
+                $v1Raw = Get-RawResponse -Uri $v1Uri -Headers $headers
+                if ([string]::IsNullOrWhiteSpace($v1Raw)) { throw "Empty V1 response" }
+                $v1File = Join-Path $dir ("{0}_V1_ProtectionJobs_Raw.json" -f $apiEnvironment)
+                [System.IO.File]::WriteAllText($v1File,$v1Raw,(New-Object System.Text.UTF8Encoding($false)))
+                if ($apiEnvironment -eq "kAcropolis") {
+                    $v1Hit = $v1Raw.Contains("backupDirectlyAttachedVolumeGroups")
+                    Write-Host ("RESULT: {0} | V1 AHV field {1}" -f $cluster.ClusterName,$(if ($v1Hit) {"PRESENT"} else {"ABSENT"})) -ForegroundColor Cyan
+                }
+                Write-Host ("  V1 Protection Jobs raw response saved: {0}" -f $v1File)
+            }
+            catch {
+                Write-Warning ("V1 GET failed for {0} on {1}: {2}" -f $apiEnvironment,$cluster.ClusterName,$_.Exception.Message)
+            }
         }
     }
     Write-Host "Raw output: $dir"
