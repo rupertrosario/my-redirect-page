@@ -1,5 +1,7 @@
-- Dynatrace workflow implemented for ServiceNow CR backup validation.
-- Validates affected CIs against Cohesity and generates one email report per CR.
-- Multiple clusters and backup types per CI are handled in the report.
-- Sample email reports attached for review.
-- Next step: test with more CR/CI scenarios for correctness, collect feedback on the report format, then schedule the workflow for regular execution.
+- Parent/child Dynatrace workflow design implemented and tested successfully.
+- Parent workflow identifies eligible Windows/Linux patching CRs.
+- Child workflow processes one CR per execution, validates all affected CIs, and sends one email report per CR.
+- Multiple CIs, backup types, and Cohesity clusters are handled correctly.
+- Scheduled execution is working as expected.
+- Next improvement is to skip already successfully processed CRs on subsequent schedules.
+- Idea for ServiceNow team: allow/update work_notes with the backup validation result so approvers can review the backup status directly in the CR without relying only on email.
