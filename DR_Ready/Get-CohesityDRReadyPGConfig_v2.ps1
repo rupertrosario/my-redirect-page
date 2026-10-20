@@ -3,7 +3,7 @@
 # PowerShell 5.1 compatible
 #
 # Scope:
-# - Full raw V2 Protection Group JSON
+# - Full V2 Protection Group JSON fetched by ID after active PG discovery
 # - Matching full raw V1 Protection Job kept beside the V2 object in the SAME record
 # - No V1/V2 field pruning or semantic filtering
 # - Active objects only: isDeleted=false, isActive=true; paused objects excluded
@@ -166,6 +166,22 @@ function Get-V1ProtectionJobs {
     return @($all)
 }
 
+function Get-ProtectionGroupById {
+    param(
+        [Parameter(Mandatory=$true)][string]$ProtectionGroupId,
+        [Parameter(Mandatory=$true)][hashtable]$Headers
+    )
+
+    $uri = "$baseUrl/v2/data-protect/protection-groups/$(Url-Encode $ProtectionGroupId)" +
+           "?includeTenants=true" +
+           "&useCachedData=false"
+
+    $json = Get-Json -Uri $uri -Headers $Headers
+    if ($null -eq $json) { throw "Protection Group GET by id returned no JSON for $ProtectionGroupId." }
+
+    return $json
+}
+
 function Get-ActiveProtectionGroups {
     param([string[]]$Environments,[hashtable]$Headers)
 
@@ -306,7 +322,28 @@ foreach ($cluster in $selectedClusters) {
 
             $records = @()
             foreach ($group in $groups) {
-                $groupName = First-Value @((Get-PropValue -Object $group -Names @("name") -Default ""))
+                $groupId = First-Value @((Get-PropValue -Object $group -Names @("id") -Default ""))
+                $detailedGroup = $group
+
+                if (-not [string]::IsNullOrWhiteSpace($groupId)) {
+                    try {
+                        $detailedGroup = Get-ProtectionGroupById -ProtectionGroupId $groupId -Headers $headers
+                    }
+                    catch {
+                        [void]$errors.Add([pscustomobject][ordered]@{
+                            Cluster=$cluster.ClusterName
+                            Environment=$environment.DisplayName
+                            Stage="V2ProtectionGroupById"
+                            ProtectionGroupId=$groupId
+                            Error=$_.Exception.Message
+                        })
+                    }
+                }
+
+                $groupName = First-Value @(
+                    (Get-PropValue -Object $detailedGroup -Names @("name") -Default ""),
+                    (Get-PropValue -Object $group -Names @("name") -Default "")
+                )
                 $matchingV1 = $null
 
                 if (-not [string]::IsNullOrWhiteSpace($groupName)) {
@@ -318,7 +355,7 @@ foreach ($cluster in $selectedClusters) {
 
                 $records += [pscustomobject][ordered]@{
                     name = $groupName
-                    v2ProtectionGroup = $group
+                    v2ProtectionGroup = $detailedGroup
                     v1ProtectionJob = $matchingV1
                 }
             }
