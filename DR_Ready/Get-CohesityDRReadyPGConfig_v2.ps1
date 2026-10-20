@@ -9,6 +9,7 @@
 # - Active PGs: isDeleted=false, isPaused=false, isActive=true
 # - Workloads: NAS (Generic NAS + Isilon), SQL, Hyper-V, Nutanix AHV, Oracle, Physical
 # - Cluster selection and environment selection
+# - Policy and Storage Domain names are resolved from Helios V2 GET endpoints
 # - No source registration, policy expansion, storage-domain expansion, or credential collection
 # - Original Get-CohesityDRReadyPGConfig.ps1 remains unchanged
 
@@ -198,6 +199,30 @@ function Add-V1Supplement {
     return $V2Group
 }
 
+function Get-ProtectionPolicies {
+    param([hashtable]$Headers)
+
+    $json = Get-Json -Uri "$baseUrl/v2/data-protect/policies?includeTenants=true" -Headers $Headers
+    if ($null -eq $json) { throw "Protection Policies GET returned no JSON." }
+
+    return @(
+        Get-CollectionItems -Json $json -PropertyNames @("policies","protectionPolicies") |
+        Where-Object { $null -ne $_ }
+    )
+}
+
+function Get-StorageDomains {
+    param([hashtable]$Headers)
+
+    $json = Get-Json -Uri "$baseUrl/v2/storage-domains?includeTenants=true&includeStats=false" -Headers $Headers
+    if ($null -eq $json) { throw "Storage Domains GET returned no JSON." }
+
+    return @(
+        Get-CollectionItems -Json $json -PropertyNames @("storageDomains","viewBoxes") |
+        Where-Object { $null -ne $_ }
+    )
+}
+
 function Get-ActiveProtectionGroups {
     param([string[]]$Environments,[hashtable]$Headers)
 
@@ -318,6 +343,49 @@ foreach ($cluster in $selectedClusters) {
     $counts=[ordered]@{}
     $errors=New-Object System.Collections.ArrayList
 
+    $policyById=@{}
+    $storageDomainById=@{}
+
+    try {
+        foreach ($policy in @(Get-ProtectionPolicies -Headers $headers)) {
+            $policyId = First-Value @((Get-PropValue -Object $policy -Names @("id") -Default ""))
+            $policyName = First-Value @(
+                (Get-PropValue -Object $policy -Names @("name","policyName") -Default "")
+            )
+            if (-not [string]::IsNullOrWhiteSpace($policyId)) {
+                $policyById[$policyId] = $policyName
+            }
+        }
+    }
+    catch {
+        [void]$errors.Add([pscustomobject][ordered]@{
+            Cluster=$cluster.ClusterName
+            Environment="All"
+            Stage="ProtectionPolicies"
+            Error=$_.Exception.Message
+        })
+    }
+
+    try {
+        foreach ($storageDomain in @(Get-StorageDomains -Headers $headers)) {
+            $storageDomainId = First-Value @((Get-PropValue -Object $storageDomain -Names @("id") -Default ""))
+            $storageDomainName = First-Value @(
+                (Get-PropValue -Object $storageDomain -Names @("name","storageDomainName") -Default "")
+            )
+            if (-not [string]::IsNullOrWhiteSpace($storageDomainId)) {
+                $storageDomainById[$storageDomainId] = $storageDomainName
+            }
+        }
+    }
+    catch {
+        [void]$errors.Add([pscustomobject][ordered]@{
+            Cluster=$cluster.ClusterName
+            Environment="All"
+            Stage="StorageDomains"
+            Error=$_.Exception.Message
+        })
+    }
+
     Write-Host ""
     Write-Host "Collecting raw PG configuration from $($cluster.ClusterName) ..." -ForegroundColor Cyan
 
@@ -349,6 +417,21 @@ foreach ($cluster in $selectedClusters) {
             $finalGroups = @()
             foreach ($group in $groups) {
                 $groupName = First-Value @((Get-PropValue -Object $group -Names @("name") -Default ""))
+
+                $policyId = First-Value @((Get-PropValue -Object $group -Names @("policyId") -Default ""))
+                $policyName = ""
+                if (-not [string]::IsNullOrWhiteSpace($policyId) -and $policyById.ContainsKey($policyId)) {
+                    $policyName = $policyById[$policyId]
+                }
+                $group | Add-Member -NotePropertyName "policyName" -NotePropertyValue $policyName -Force
+
+                $storageDomainId = First-Value @((Get-PropValue -Object $group -Names @("storageDomainId") -Default ""))
+                $storageDomainName = ""
+                if (-not [string]::IsNullOrWhiteSpace($storageDomainId) -and $storageDomainById.ContainsKey($storageDomainId)) {
+                    $storageDomainName = $storageDomainById[$storageDomainId]
+                }
+                $group | Add-Member -NotePropertyName "storageDomainName" -NotePropertyValue $storageDomainName -Force
+
                 $matchingJob = $null
 
                 if (-not [string]::IsNullOrWhiteSpace($groupName)) {
@@ -392,6 +475,8 @@ foreach ($cluster in $selectedClusters) {
         V1SupplementOnly=$true
         V1SupplementRule="Only top-level V1 properties absent from the matching V2 PG are added under v1Supplement."
         PropertyProjectionApplied=$false
+        PolicyNamesResolved=$true
+        StorageDomainNamesResolved=$true
         ExternalDependenciesCollected=$false
         ErrorCount=$errors.Count
     }
