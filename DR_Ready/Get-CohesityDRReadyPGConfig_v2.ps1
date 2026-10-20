@@ -1,15 +1,19 @@
-# Cohesity Helios V2 and V1 raw-response diagnostic
-# GET-only; PowerShell 5.1; based on commit 39029f63440f25d47aa43cab7475c76ec485e5d2
-# Raw responses may contain sensitive configuration. Keep output local; do not commit it.
+# Cohesity DR Ready - Helios V2 Protection Group configuration export
+# PowerShell 5.1 | GET-only | Full nested V2 PG properties
+# Output: <run>\<cluster>\ProtectionGroups\<workload>.json
+# Exported configuration can contain sensitive information. Keep output access restricted.
+
 [CmdletBinding()]
-param([string]$OutputDirectory = "X:\PowerShell\Cohesity_API_Scripts\DR_Ready\Raw_Diagnostic")
+param([string]$OutputDirectory = "X:\PowerShell\Cohesity_API_Scripts\DR_Ready")
 
 $ErrorActionPreference = "Stop"
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
 $baseUrl = "https://helios.cohesity.com"
 $root = "X:\PowerShell\Cohesity_API_Scripts"
 $helperPath = Join-Path $root "Common\ApiKeyAesHelper.ps1"
 $keyFile = Join-Path $root "Common\Secure\cohesity_apikey.enc"
+
 if (-not (Test-Path $helperPath -PathType Leaf)) { throw "Missing API key helper: $helperPath" }
 if (-not (Test-Path $keyFile -PathType Leaf)) { throw "Missing encrypted API key file: $keyFile" }
 . $helperPath
@@ -18,153 +22,170 @@ if ([string]::IsNullOrWhiteSpace([string]$apiKey)) { throw "API key helper retur
 
 function New-Headers {
     param([string]$ClusterId)
-    $h = @{ accept = "application/json"; apiKey = $apiKey }
-    if (-not [string]::IsNullOrWhiteSpace($ClusterId)) { $h["accessClusterId"] = $ClusterId }
-    return $h
+    $headers = @{ accept = "application/json"; apiKey = $apiKey }
+    if (-not [string]::IsNullOrWhiteSpace($ClusterId)) { $headers["accessClusterId"] = $ClusterId }
+    return $headers
 }
-function Get-RawResponse {
-    param([string]$Uri,[hashtable]$Headers)
-    if (-not $Uri.StartsWith("$baseUrl/",[StringComparison]::OrdinalIgnoreCase)) { throw "Non-Helios URL blocked" }
-    return (Invoke-WebRequest -Uri $Uri -Headers $Headers -Method Get -UseBasicParsing -ErrorAction Stop).Content
+
+function Get-HeliosJson {
+    param([string]$Uri, [hashtable]$Headers)
+    if (-not $Uri.StartsWith("$baseUrl/", [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "Only Helios requests are allowed."
+    }
+    $response = Invoke-WebRequest -Uri $Uri -Headers $Headers -Method Get -UseBasicParsing -ErrorAction Stop
+    if ([string]::IsNullOrWhiteSpace($response.Content)) { throw "Empty Helios HTTP response." }
+    return ($response.Content | ConvertFrom-Json)
 }
+
 function First-Value {
     param($Values)
-    foreach ($v in @($Values)) { if ($null -ne $v -and "$v".Trim()) { return [string]$v } }
-    return ""
-}
-$clusterJson = Get-RawResponse -Uri "$baseUrl/v2/mcm/cluster-mgmt/info" -Headers (New-Headers) | ConvertFrom-Json
-$clusters = @(
-    $clusterJson.cohesityClusters | ForEach-Object {
-        $id = First-Value @($_.clusterId,$_.id)
-        $name = First-Value @($_.clusterName,$_.displayName,$_.name)
-        if ($id) { [pscustomobject]@{ ClusterName=$name; ClusterId=$id } }
-    } | Sort-Object ClusterName
-)
-if ($clusters.Count -eq 0) { throw "Helios returned no clusters." }
-$menu = for ($i=0; $i -lt $clusters.Count; $i++) {
-    [pscustomobject]@{ Index=$i+1; ClusterName=$clusters[$i].ClusterName; ClusterId=$clusters[$i].ClusterId }
-}
-Write-Host ""
-Write-Host "Available Helios Clusters (sorted):" -ForegroundColor Cyan
-$menu | Format-Table -AutoSize
-Write-Host "[0] All clusters" -ForegroundColor Yellow
-Write-Host "[X] Exit" -ForegroundColor Yellow
-while ($true) {
-    $choice = Read-Host "Select cluster: 0 for ALL, 1-$($clusters.Count) for single, or X"
-    if ($choice -match '^(?i:x|q)$') { return }
-    $number=0
-    if ([int]::TryParse($choice,[ref]$number) -and $number -ge 0 -and $number -le $clusters.Count) {
-        if ($number -eq 0) { $selectedClusters=@($clusters) }
-        else { $selectedClusters=@($clusters[$number-1]) }
-        break
-    }
-    Write-Host "Invalid selection." -ForegroundColor Red
-}
-
-$EnvironmentMap = @(
-    [pscustomobject]@{ Name="NAS"; ApiNames=@("kGenericNas","kIsilon") },
-    [pscustomobject]@{ Name="SQL"; ApiNames=@("kSQL") },
-    [pscustomobject]@{ Name="Hyper-V"; ApiNames=@("kHyperV") },
-    [pscustomobject]@{ Name="Nutanix AHV"; ApiNames=@("kAcropolis") },
-    [pscustomobject]@{ Name="Oracle"; ApiNames=@("kOracle") },
-    [pscustomobject]@{ Name="Physical"; ApiNames=@("kPhysical") }
-)
-Write-Host ""
-Write-Host "Available Workload Environments:" -ForegroundColor Cyan
-for ($i=0; $i -lt $EnvironmentMap.Count; $i++) {
-    Write-Host ("[{0}] {1}" -f ($i+1),$EnvironmentMap[$i].Name) -ForegroundColor Yellow
-}
-Write-Host "[0] All six environments" -ForegroundColor Yellow
-Write-Host "[X] Exit" -ForegroundColor Yellow
-while ($true) {
-    $choice = Read-Host "Select environment: 0 for ALL, 1-6 for single, or X"
-    if ($choice -match '^(?i:x|q)$') { return }
-    $number=0
-    if ([int]::TryParse($choice,[ref]$number) -and $number -ge 0 -and $number -le $EnvironmentMap.Count) {
-        if ($number -eq 0) { $selectedEnvironments=@($EnvironmentMap) }
-        else { $selectedEnvironments=@($EnvironmentMap[$number-1]) }
-        break
-    }
-    Write-Host "Invalid selection." -ForegroundColor Red
-}
-
-foreach ($cluster in $selectedClusters) {
-    $headers = New-Headers -ClusterId $cluster.ClusterId
-    $timestamp=Get-Date -Format "yyyyMMdd_HHmmss"
-    $dir=Join-Path $OutputDirectory ("{0}_{1}_Raw" -f ($cluster.ClusterId -replace '[^a-zA-Z0-9_-]','_'),$timestamp)
-    New-Item -Path $dir -ItemType Directory -Force | Out-Null
-    foreach ($env in $selectedEnvironments) {
-        foreach ($apiEnvironment in $env.ApiNames) {
-            $cookie=""
-            $page=0
-            $found=$false
-            $seenCookies=@{}
-            do {
-                $uri="$baseUrl/v2/data-protect/protection-groups" +
-                     "?environments=$([uri]::EscapeDataString($apiEnvironment))" +
-                     "&isDeleted=false" +
-                     "&isPaused=false" +
-                     "&isActive=true" +
-                     "&includeTenants=true" +
-                     "&includeLastRunInfo=true" +
-                     "&pruneSourceIds=false" +
-                     "&pruneExcludedSourceIds=false" +
-                     "&useCachedData=false" +
-                     "&maxResultCount=1000"
-                if ($cookie) { $uri += "&paginationCookie=$([uri]::EscapeDataString($cookie))" }
-                $page++
-                $raw=Get-RawResponse -Uri $uri -Headers $headers
-                if ([string]::IsNullOrWhiteSpace($raw)) { throw "Empty raw response for $apiEnvironment page $page" }
-                $file=Join-Path $dir ("{0}_Page_{1:D3}.json" -f $apiEnvironment,$page)
-                [System.IO.File]::WriteAllText($file,$raw,(New-Object System.Text.UTF8Encoding($false)))
-                if ($apiEnvironment -eq "kAcropolis") {
-                    $hit=$raw.Contains("backupDirectlyAttachedVolumeGroups")
-                    if ($hit) { $found=$true }
-                    Write-Host ("{0} page {1}: AHV field {2}" -f $cluster.ClusterName,$page,$(if ($hit) {"PRESENT"} else {"ABSENT"}))
-                }
-                # JSON is parsed only for pagination, after the raw body is saved.
-                $parsed=$raw | ConvertFrom-Json
-                $nextCookie=First-Value @($parsed.paginationCookie)
-                if ($nextCookie -and $seenCookies.ContainsKey($nextCookie)) { throw "Repeated pagination cookie; collection incomplete." }
-                if ($nextCookie) { $seenCookies[$nextCookie]=$true }
-                $cookie=$nextCookie
-                if ($parsed.isResponseTruncated -eq $true -and -not $cookie) {
-                    throw "Response truncated without pagination cookie; collection incomplete."
-                }
-            } while ($cookie)
-            if ($apiEnvironment -eq "kAcropolis") {
-                Write-Host ("RESULT: {0} | backupDirectlyAttachedVolumeGroups {1} in raw Helios response ({2} pages)" -f $cluster.ClusterName,$(if ($found) {"PRESENT"} else {"ABSENT"}),$page) -ForegroundColor Cyan
-            }
-            else { Write-Host ("{0} | {1} | {2} raw page(s)" -f $cluster.ClusterName,$apiEnvironment,$page) }
-
-            # Supplemental V1 list request from baseline 39029f...
-            # Kept separate from V2 output: do not merge or infer missing properties.
-            $v1Uri = "$baseUrl/irisservices/api/v1/public/protectionJobs" +
-                     "?environments=$([uri]::EscapeDataString($apiEnvironment))" +
-                     "&isDeleted=false" +
-                     "&isActive=true" +
-                     "&onlyReturnBasicSummary=false" +
-                     "&includeLastRunAndStats=false" +
-                     "&pruneExcludedSourceIds=false" +
-                     "&includeSourceNames=true" +
-                     "&allUnderHierarchy=true" +
-                     "&maxResultCount=1000"
-            try {
-                $v1Raw = Get-RawResponse -Uri $v1Uri -Headers $headers
-                if ([string]::IsNullOrWhiteSpace($v1Raw)) { throw "Empty V1 response" }
-                $v1File = Join-Path $dir ("{0}_V1_ProtectionJobs_Raw.json" -f $apiEnvironment)
-                [System.IO.File]::WriteAllText($v1File,$v1Raw,(New-Object System.Text.UTF8Encoding($false)))
-                if ($apiEnvironment -eq "kAcropolis") {
-                    $v1Hit = $v1Raw.Contains("backupDirectlyAttachedVolumeGroups")
-                    Write-Host ("RESULT: {0} | V1 AHV field {1}" -f $cluster.ClusterName,$(if ($v1Hit) {"PRESENT"} else {"ABSENT"})) -ForegroundColor Cyan
-                }
-                Write-Host ("  V1 Protection Jobs raw response saved: {0}" -f $v1File)
-            }
-            catch {
-                Write-Warning ("V1 GET failed for {0} on {1}: {2}" -f $apiEnvironment,$cluster.ClusterName,$_.Exception.Message)
-            }
+    foreach ($value in @($Values)) {
+        if ($null -ne $value -and -not [string]::IsNullOrWhiteSpace([string]$value)) {
+            return [string]$value
         }
     }
-    Write-Host "Raw output: $dir"
+    return ""
 }
-Write-Host "CAUTION: Raw JSON may contain sensitive data. Do not commit or share unredacted files." -ForegroundColor Yellow
+
+function Select-Number {
+    param([string]$Prompt, [int]$Maximum)
+    while ($true) {
+        $answer = Read-Host $Prompt
+        if ($answer -match '^(?i:x|q)$') { return -1 }
+        $selected = 0
+        if ([int]::TryParse($answer, [ref]$selected) -and $selected -ge 0 -and $selected -le $Maximum) {
+            return $selected
+        }
+        Write-Host "Invalid selection." -ForegroundColor Red
+    }
+}
+
+function Get-ActiveGroups {
+    param([string]$Environment, [hashtable]$Headers)
+    $groups = New-Object System.Collections.ArrayList
+    $seenCookies = @{}
+    $seenIds = @{}
+    $cookie = ""
+    do {
+        $uri = "$baseUrl/v2/data-protect/protection-groups" +
+               "?environments=$([uri]::EscapeDataString($Environment))" +
+               "&isDeleted=false" +
+               "&isPaused=false" +
+               "&isActive=true" +
+               "&includeTenants=true" +
+               "&includeLastRunInfo=true" +
+               "&pruneSourceIds=false" +
+               "&pruneExcludedSourceIds=false" +
+               "&useCachedData=false" +
+               "&maxResultCount=1000"
+        if ($cookie) { $uri += "&paginationCookie=$([uri]::EscapeDataString($cookie))" }
+
+        $response = Get-HeliosJson -Uri $uri -Headers $Headers
+        if ($null -eq $response -or $null -eq $response.protectionGroups) {
+            throw "Unexpected V2 response: protectionGroups missing for $Environment."
+        }
+        foreach ($group in @($response.protectionGroups)) {
+            if ($null -eq $group) { continue }
+            # Keep only explicitly active PGs. Missing status flags are not assumed safe.
+            if ($group.isDeleted -ne $false -or $group.isPaused -ne $false -or $group.isActive -ne $true) {
+                continue
+            }
+            $id = [string]$group.id
+            if ([string]::IsNullOrWhiteSpace($id)) { throw "PG without id in $Environment; cannot verify completeness." }
+            if ($seenIds.ContainsKey($id)) { throw "Duplicate PG id $id in $Environment; export halted." }
+            $seenIds[$id] = $true
+            [void]$groups.Add($group)
+        }
+
+        $nextCookie = First-Value @($response.paginationCookie)
+        if ($response.isResponseTruncated -eq $true -and -not $nextCookie) {
+            throw "Truncated $Environment response without paginationCookie."
+        }
+        if ($nextCookie -and $seenCookies.ContainsKey($nextCookie)) {
+            throw "Repeated paginationCookie for $Environment."
+        }
+        if ($nextCookie) { $seenCookies[$nextCookie] = $true }
+        $cookie = $nextCookie
+    } while ($cookie)
+
+    # Unary comma preserves empty and single-element arrays across function output.
+    return ,@($groups.ToArray())
+}
+
+function Save-JsonArray {
+    param([object[]]$Groups, [string]$Path)
+    $json = ConvertTo-Json -InputObject $Groups -Depth 100
+    $check = $json | ConvertFrom-Json
+    if ($null -eq $check -or $check -isnot [array]) { throw "JSON validation failed: $Path" }
+    [System.IO.File]::WriteAllText($Path, $json, (New-Object System.Text.UTF8Encoding($false)))
+}
+
+$environments = @(
+    [pscustomobject]@{ Name="NAS";          Types=@("kGenericNas","kIsilon"); File="NAS.json" },
+    [pscustomobject]@{ Name="SQL";          Types=@("kSQL"); File="SQL.json" },
+    [pscustomobject]@{ Name="Hyper-V";      Types=@("kHyperV"); File="HyperV.json" },
+    [pscustomobject]@{ Name="Nutanix AHV";  Types=@("kAcropolis"); File="AHV.json" },
+    [pscustomobject]@{ Name="Oracle";       Types=@("kOracle"); File="Oracle.json" },
+    [pscustomobject]@{ Name="Physical";     Types=@("kPhysical"); File="Physical.json" }
+)
+
+$clusterResponse = Get-HeliosJson -Uri "$baseUrl/v2/mcm/cluster-mgmt/info" -Headers (New-Headers)
+$clusters = @(
+    $clusterResponse.cohesityClusters | ForEach-Object {
+        $id = First-Value @($_.clusterId, $_.id)
+        $name = First-Value @($_.clusterName, $_.displayName, $_.name)
+        if ($id) {
+            if (-not $name) { $name = "Unknown-$id" }
+            [pscustomobject]@{ ClusterName=$name; ClusterId=$id }
+        }
+    } | Sort-Object ClusterName
+)
+if ($clusters.Count -eq 0) { throw "No clusters returned by Helios." }
+
+Write-Host ""
+Write-Host "Available Helios Clusters:" -ForegroundColor Cyan
+for ($i = 0; $i -lt $clusters.Count; $i++) {
+    Write-Host ("[{0}] {1}" -f ($i + 1), $clusters[$i].ClusterName)
+}
+Write-Host "[0] All clusters"
+Write-Host "[X] Exit"
+$clusterChoice = Select-Number -Prompt "Select cluster" -Maximum $clusters.Count
+if ($clusterChoice -lt 0) { return }
+if ($clusterChoice -eq 0) { $selectedClusters = @($clusters) }
+else { $selectedClusters = @($clusters[$clusterChoice - 1]) }
+
+Write-Host ""
+Write-Host "Available Workload Environments:" -ForegroundColor Cyan
+for ($i = 0; $i -lt $environments.Count; $i++) {
+    Write-Host ("[{0}] {1}" -f ($i + 1), $environments[$i].Name)
+}
+Write-Host "[0] All six environments"
+Write-Host "[X] Exit"
+$environmentChoice = Select-Number -Prompt "Select environment" -Maximum $environments.Count
+if ($environmentChoice -lt 0) { return }
+if ($environmentChoice -eq 0) { $selectedEnvironments = @($environments) }
+else { $selectedEnvironments = @($environments[$environmentChoice - 1]) }
+
+$runFolder = Join-Path $OutputDirectory ("PG_Config_V2_{0}" -f (Get-Date -Format "yyyyMMdd_HHmmss"))
+New-Item -Path $runFolder -ItemType Directory -Force | Out-Null
+
+foreach ($cluster in $selectedClusters) {
+    $clusterFolderName = ("{0}_{1}" -f ($cluster.ClusterName -replace '[\\/:*?"<>|]', '_'), $cluster.ClusterId)
+    $pgFolder = Join-Path (Join-Path $runFolder $clusterFolderName) "ProtectionGroups"
+    New-Item -Path $pgFolder -ItemType Directory -Force | Out-Null
+    $headers = New-Headers -ClusterId $cluster.ClusterId
+    Write-Host ("Cluster: {0}" -f $cluster.ClusterName) -ForegroundColor Cyan
+
+    foreach ($environment in $selectedEnvironments) {
+        $all = New-Object System.Collections.ArrayList
+        foreach ($apiType in $environment.Types) {
+            $collected = Get-ActiveGroups -Environment $apiType -Headers $headers
+            foreach ($pg in $collected) { [void]$all.Add($pg) }
+        }
+        $destination = Join-Path $pgFolder $environment.File
+        Save-JsonArray -Groups ([object[]]$all.ToArray()) -Path $destination
+        Write-Host ("  {0}: {1} active PGs -> {2}" -f $environment.Name, $all.Count, $environment.File)
+    }
+}
+Write-Host ("Export complete: {0}" -f $runFolder) -ForegroundColor Green
+Write-Host "Treat exported JSON as sensitive configuration; do not commit it to Git." -ForegroundColor Yellow
