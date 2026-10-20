@@ -115,8 +115,8 @@ function Get-ActiveGroups {
 function Save-JsonArray {
     param([object[]]$Groups, [string]$Path)
     $json = ConvertTo-Json -InputObject $Groups -Depth 100
-    $check = $json | ConvertFrom-Json
-    if ($null -eq $check -or $check -isnot [array]) { throw "JSON validation failed: $Path" }
+    $null = ConvertFrom-Json -InputObject $json -ErrorAction Stop
+    if (-not $json.TrimStart().StartsWith("[")) { throw "Expected JSON array: $Path" }
     [System.IO.File]::WriteAllText($Path, $json, (New-Object System.Text.UTF8Encoding($false)))
 }
 
