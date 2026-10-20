@@ -4,7 +4,8 @@
 #
 # Scope:
 # - Full raw V2 Protection Group JSON
-# - Full raw V1 Protection Job JSON for complementary legacy settings
+# - Matching full raw V1 Protection Job kept beside the V2 object in the SAME record
+# - No V1/V2 field pruning or semantic filtering
 # - Active objects only: isDeleted=false, isActive=true; paused objects excluded
 # - Workloads: NAS (Generic NAS + Isilon), SQL, Hyper-V, Nutanix AHV, Oracle, Physical
 # - Cluster selection and environment selection
@@ -278,15 +279,13 @@ foreach ($cluster in $selectedClusters) {
     $headers = New-Headers -ClusterId $cluster.ClusterId
     $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
     $clusterDir = Join-Path $OutputDirectory ("{0}_{1}_PG_ReverseEngineering" -f (Safe-Name $cluster.ClusterName),$timestamp)
-    $v2Dir = Join-Path $clusterDir "V2_ProtectionGroups"
-    $v1Dir = Join-Path $clusterDir "V1_ProtectionJobs"
+    $pgDir = Join-Path $clusterDir "ProtectionGroups"
 
-    foreach ($directory in @($clusterDir,$v2Dir,$v1Dir)) {
+    foreach ($directory in @($clusterDir,$pgDir)) {
         New-Item -Path $directory -ItemType Directory -Force | Out-Null
     }
 
-    $v2Counts=[ordered]@{}
-    $v1Counts=[ordered]@{}
+    $counts=[ordered]@{}
     $errors=New-Object System.Collections.ArrayList
 
     Write-Host ""
@@ -295,36 +294,47 @@ foreach ($cluster in $selectedClusters) {
     foreach ($environment in $selectedEnvironments) {
         try {
             $groups = @(Get-ActiveProtectionGroups -Environments $environment.ApiNames -Headers $headers)
-            Write-RawJson -Value $groups -Path (Join-Path $v2Dir $environment.FileName)
-            $v2Counts[$environment.DisplayName]=$groups.Count
-            Write-Host ("  V2 {0}: {1} active PGs" -f $environment.DisplayName,$groups.Count) -ForegroundColor Yellow
-        }
-        catch {
-            $v2Counts[$environment.DisplayName]=0
-            [void]$errors.Add([pscustomobject][ordered]@{
-                ApiVersion="V2"
-                Cluster=$cluster.ClusterName
-                Environment=$environment.DisplayName
-                Error=$_.Exception.Message
-            })
-            Write-Host ("  V2 {0}: GET failed" -f $environment.DisplayName) -ForegroundColor Red
-        }
+            $jobs   = @(Get-V1ProtectionJobs -Environments $environment.ApiNames -Headers $headers)
 
-        try {
-            $jobs = @(Get-V1ProtectionJobs -Environments $environment.ApiNames -Headers $headers)
-            Write-RawJson -Value $jobs -Path (Join-Path $v1Dir $environment.FileName)
-            $v1Counts[$environment.DisplayName]=$jobs.Count
-            Write-Host ("  V1 {0}: {1} active jobs" -f $environment.DisplayName,$jobs.Count) -ForegroundColor DarkYellow
+            $jobsByName = @{}
+            foreach ($job in $jobs) {
+                $jobName = First-Value @((Get-PropValue -Object $job -Names @("name") -Default ""))
+                if (-not [string]::IsNullOrWhiteSpace($jobName)) {
+                    $jobsByName[$jobName.Trim().ToLowerInvariant()] = $job
+                }
+            }
+
+            $records = @()
+            foreach ($group in $groups) {
+                $groupName = First-Value @((Get-PropValue -Object $group -Names @("name") -Default ""))
+                $matchingV1 = $null
+
+                if (-not [string]::IsNullOrWhiteSpace($groupName)) {
+                    $key = $groupName.Trim().ToLowerInvariant()
+                    if ($jobsByName.ContainsKey($key)) {
+                        $matchingV1 = $jobsByName[$key]
+                    }
+                }
+
+                $records += [pscustomobject][ordered]@{
+                    name = $groupName
+                    v2ProtectionGroup = $group
+                    v1ProtectionJob = $matchingV1
+                }
+            }
+
+            Write-RawJson -Value $records -Path (Join-Path $pgDir $environment.FileName)
+            $counts[$environment.DisplayName]=$records.Count
+            Write-Host ("  {0}: {1} active PGs" -f $environment.DisplayName,$records.Count) -ForegroundColor Yellow
         }
         catch {
-            $v1Counts[$environment.DisplayName]=0
+            $counts[$environment.DisplayName]=0
             [void]$errors.Add([pscustomobject][ordered]@{
-                ApiVersion="V1"
                 Cluster=$cluster.ClusterName
                 Environment=$environment.DisplayName
                 Error=$_.Exception.Message
             })
-            Write-Host ("  V1 {0}: GET failed" -f $environment.DisplayName) -ForegroundColor Red
+            Write-Host ("  {0}: GET failed" -f $environment.DisplayName) -ForegroundColor Red
         }
     }
 
@@ -337,13 +347,12 @@ foreach ($cluster in $selectedClusters) {
         ClusterId=$cluster.ClusterId
         ActiveDefinition="V2: isDeleted=false; isPaused=false; isActive=true. V1: isDeleted=false; isActive=true and paused jobs filtered from raw results."
         SelectedWorkloads=@($selectedEnvironments | ForEach-Object { $_.DisplayName })
-        V2ProtectionGroupCounts=[pscustomobject]$v2Counts
-        V1ProtectionJobCounts=[pscustomobject]$v1Counts
-        V2Directory="V2_ProtectionGroups"
-        V1Directory="V1_ProtectionJobs"
+        ProtectionGroupCounts=[pscustomobject]$counts
+        ProtectionGroupDirectory="ProtectionGroups"
+        OutputModel="One record per V2 Protection Group containing the full raw V2 object and its matching full raw V1 Protection Job."
         RawV2ProtectionGroupJsonPreserved=$true
         RawV1ProtectionJobJsonPreserved=$true
-        PropertyProjectionApplied=$false
+        V1V2PruningApplied=$false
         ExternalDependenciesCollected=$false
         ErrorCount=$errors.Count
     }
