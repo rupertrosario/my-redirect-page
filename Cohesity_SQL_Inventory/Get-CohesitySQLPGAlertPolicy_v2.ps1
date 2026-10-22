@@ -159,42 +159,55 @@ function Convert-AuditTime {
 function Get-CreateAuditRecords {
     param([string]$ClusterId)
 
-    $allLogs = New-Object System.Collections.Generic.List[object]
+    # Audit response is { auditLogs: [...], count: <total matching records> }.
+    # Explicit time range is required: otherwise only recent logs may be shown.
+    $records = New-Object System.Collections.Generic.List[object]
     $pageSize = 500
     $startIndex = 0
-    $finished = $false
+    $total = $null
+    $complete = $false
+    $endTimeUsecs = [long]([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() * 1000)
 
-    # The response has auditLogs[] and count. count is a page-size
-    # parameter, not a guaranteed total count across all pages.
     for ($page = 0; $page -lt $MaxAuditPages; $page++) {
         $uri = "$baseUrl/v2/audit-logs?entityTypes=ProtectionGroup&actions=Create" +
-               "&includeTenants=true&startIndex=$startIndex&count=$pageSize"
+               "&includeTenants=true&startTimeUsecs=0&endTimeUsecs=$endTimeUsecs" +
+               "&startIndex=$startIndex&count=$pageSize"
 
         $response = Get-Helios -Uri $uri -ClusterId $ClusterId
         if ($null -eq $response -or -not $response.PSObject.Properties['auditLogs']) {
-            throw "GET /v2/audit-logs did not return the expected auditLogs field."
+            throw "The GET response did not contain the expected auditLogs property."
         }
 
         $batch = @($response.auditLogs | Where-Object { $null -ne $_ })
+        if ($null -ne $response.count) {
+            $total = [long]$response.count
+        }
+
         foreach ($entry in $batch) {
-            if ([string]$entry.action -ine 'Create') { continue }
-            if ([string]$entry.entityType -ine 'ProtectionGroup') { continue }
+            if ($entry.action -and [string]$entry.action -ine 'Create') { continue }
+            if ($entry.entityType -and [string]$entry.entityType -ine 'ProtectionGroup') { continue }
             if ([string]::IsNullOrWhiteSpace([string]$entry.entityName)) { continue }
-            $allLogs.Add($entry)
+            $records.Add($entry)
         }
 
         $startIndex += $batch.Count
-        if ($batch.Count -lt $pageSize) {
-            $finished = $true
+        if (($null -ne $total -and $startIndex -ge $total) -or
+            ($null -eq $total -and $batch.Count -lt $pageSize)) {
+            $complete = $true
             break
+        }
+        if ($batch.Count -eq 0) {
+            throw "Audit pagination ended prematurely: fetched $startIndex of $total entries."
         }
     }
 
-    if (-not $finished) {
-        throw "Audit log pagination incomplete after $MaxAuditPages pages."
+    if (-not $complete) {
+        throw "Audit pagination incomplete after $MaxAuditPages pages."
     }
 
-    return @($allLogs.ToArray())
+    Write-Host ("  Audit records returned : {0}" -f $startIndex) -ForegroundColor Gray
+    Write-Host ("  Creation events indexed: {0}" -f $records.Count) -ForegroundColor Gray
+    return @($records.ToArray())
 }
 
 function Get-CreationByName {
