@@ -145,7 +145,21 @@ Write-Host "[X] Exit" -ForegroundColor Yellow
 
 while ($true) {
     $choice = Read-Host "Select cluster (0=all, 1-$($clusters.Count)=single, X=exit)"
-    if ($choice -match '^(x|q)
+    if ($choice -match '^(x|q)$') { return }
+
+    $index = -1
+    if ([int]::TryParse($choice, [ref]$index) -and $index -ge 0 -and $index -le $clusters.Count) {
+        break
+    }
+    Write-Host "Invalid selection. Please try again." -ForegroundColor Yellow
+}
+
+$selected = if ($index -eq 0) { @($clusters) } else { @($clusters[$index - 1]) }
+
+Write-Host ""
+Write-Host "COLLECTING ACTIVE SQL PROTECTION GROUPS" -ForegroundColor Cyan
+
+$raw=New-Object System.Collections.Generic.List[object]
 $columns=New-Object System.Collections.Generic.List[string]
 $errors=New-Object System.Collections.Generic.List[object]
 foreach($cluster in $selected){
