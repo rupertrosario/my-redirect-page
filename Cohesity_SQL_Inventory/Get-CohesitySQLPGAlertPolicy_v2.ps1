@@ -158,39 +158,46 @@ function Convert-AuditTime {
 function Get-CreateAuditRecords {
     param([string]$ClusterId)
 
-    # Response format: { auditLogs: [...], count: N }.
-    # Retrieve PG creation records with pagination; only exact entityName
-    # matches will be associated with active SQL protection groups.
+    # Documented GET response: auditLogs[] and count (total matching).
     $records = New-Object System.Collections.Generic.List[object]
-    $pageSize = 1000
+    $pageSize = 500
     $startIndex = 0
     $complete = $false
+    $total = $null
 
     for ($page = 0; $page -lt $MaxAuditPages; $page++) {
         $uri = "$baseUrl/v2/audit-logs?entityTypes=ProtectionGroup&actions=Create" +
-               "&startIndex=$startIndex&count=$pageSize"
+               "&includeTenants=true&startIndex=$startIndex&count=$pageSize"
 
         $response = Get-Helios -Uri $uri -ClusterId $ClusterId
-        if ($null -eq $response -or $null -eq $response.auditLogs) {
-            throw "Audit response does not contain auditLogs."
+        if ($null -eq $response -or $null -eq $response.PSObject.Properties['auditLogs']) {
+            throw "Expected auditLogs property was not returned by the audit API."
         }
 
         $batch = @($response.auditLogs | Where-Object { $null -ne $_ })
+        if ($null -ne $response.count) {
+            $total = [long]$response.count
+        }
+
         foreach ($entry in $batch) {
-            if ([string]$entry.entityType -and [string]$entry.entityType -ne 'ProtectionGroup') { continue }
-            if ([string]$entry.action -and [string]$entry.action -ne 'Create') { continue }
+            if ($entry.action -and [string]$entry.action -ine 'Create') { continue }
+            if ($entry.entityType -and [string]$entry.entityType -ine 'ProtectionGroup') { continue }
             $records.Add($entry)
         }
 
         $startIndex += $batch.Count
-        if ($batch.Count -eq 0 -or $batch.Count -lt $pageSize) {
+        if (($null -ne $total -and $startIndex -ge $total) -or
+            ($null -eq $total -and $batch.Count -lt $pageSize)) {
             $complete = $true
             break
+        }
+        if ($batch.Count -eq 0) {
+            throw "Audit pagination stopped before retrieving the reported total of $total records."
         }
     }
 
     if (-not $complete) {
-        throw "Audit pagination reached MaxAuditPages=$MaxAuditPages before completion."
+        throw "Audit pagination incomplete after $MaxAuditPages pages."
     }
 
     return @($records.ToArray())
@@ -199,7 +206,8 @@ function Get-CreateAuditRecords {
 function Find-CreationRecord {
     param(
         [object[]]$AuditRecords,
-        [string]$ProtectionGroupName
+        [string]$ProtectionGroupName,
+        [long]$CreationTimeUsecs
     )
 
     if ([string]::IsNullOrWhiteSpace($ProtectionGroupName)) { return $null }
@@ -213,9 +221,20 @@ function Find-CreationRecord {
         }
     )
 
-    # EntityName alone cannot distinguish a deleted PG recreated with the
-    # same name. Leave creator details blank rather than attribute incorrectly.
-    if ($matched.Count -ne 1) { return $null }
+    if ($matched.Count -eq 0) { return $null }
+
+    if ($matched.Count -gt 1) {
+        # Creation timestamp distinguishes recreated PGs sharing an entityName.
+        # Use a one-minute tolerance for event logging delay.
+        if ($CreationTimeUsecs -le 0) { return $null }
+        $matched = @(
+            $matched | Where-Object {
+                $null -ne $_.timestampUsecs -and
+                [math]::Abs(([double]$_.timestampUsecs) - $CreationTimeUsecs) -le 60000000
+            }
+        )
+        if ($matched.Count -ne 1) { return $null }
+    }
 
     $audit = $matched[0]
     return [pscustomobject]@{
@@ -314,6 +333,7 @@ foreach($cluster in $selected){
          Languages=(@($targets|ForEach-Object{$_.language}) -join '; ')
          Status=$(if($null -eq $policy){'ALERT POLICY MISSING'}elseif(!$failure){'FAILURE NOT CONFIGURED'}elseif(!$addresses.Count){'NO EMAIL RECIPIENTS'}else{'CONFIGURED'})
          CreatedBy=$createdBy;CreatedOn=$createdOn
+         CreationTimeUsecs=$(if($pg.creationTimeUsecs){[long]$pg.creationTimeUsecs}else{[long]0})
          Fields=$fields
        })
      }
@@ -343,7 +363,8 @@ foreach ($cluster in $selected) {
 
         foreach ($pgRow in $clusterRows) {
             $creation = Find-CreationRecord -AuditRecords $auditRecords `
-                -ProtectionGroupName ([string]$pgRow.ProtectionGroup)
+                -ProtectionGroupName ([string]$pgRow.ProtectionGroup) `
+                -CreationTimeUsecs ([long]$pgRow.CreationTimeUsecs)
 
             if ($null -ne $creation) {
                 $pgRow.CreatedBy = $creation.CreatedBy
