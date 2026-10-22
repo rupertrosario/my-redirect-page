@@ -143,7 +143,64 @@ function Convert-AuditTime {
     if ($null -eq $value) { return '' }
     $text = [string]$value
     try {
-        if ($text -match '^\\d+
+        if ($text -match '^\d+$') {
+            $number = [double]$text
+            if ($number -ge 1e15) { return [DateTimeOffset]::FromUnixTimeMilliseconds([long][math]::Floor($number / 1000)).ToLocalTime().ToString('yyyy-MM-dd HH:mm:ss') }
+            if ($number -ge 1e12) { return [DateTimeOffset]::FromUnixTimeMilliseconds([long]$number).ToLocalTime().ToString('yyyy-MM-dd HH:mm:ss') }
+            if ($number -ge 1e9)  { return [DateTimeOffset]::FromUnixTimeSeconds([long]$number).ToLocalTime().ToString('yyyy-MM-dd HH:mm:ss') }
+        }
+        return ([datetime]::Parse($text)).ToString('yyyy-MM-dd HH:mm:ss')
+    }
+    catch { return '' }
+}
+
+function Get-CreateAuditByPgId {
+    param([string]$ClusterId)
+    $auditMap = @{}
+    $count = 500
+    $start = 0
+    $completed = $false
+
+    for ($page = 0; $page -lt $MaxAuditPages; $page++) {
+        $uri = "$baseUrl/v2/audit-logs?entityTypes=ProtectionGroup&actions=Create&includeTenants=true&startIndex=$start&count=$count"
+        $response = Get-Helios -Uri $uri -ClusterId $ClusterId
+
+        $records = @()
+        if ($response -is [array]) { $records = @($response) }
+        else {
+            $collection = Get-PropertyCandidate $response @('auditLogs','auditLogEntries','logs','entries','items')
+            if ($null -eq $collection) { throw 'Unrecognized audit log response; cannot establish creator details.' }
+            $records = @($collection | Where-Object { $null -ne $_ })
+        }
+        if ($records.Count -eq 0) { $completed = $true; break }
+
+        foreach ($audit in $records) {
+            $action = Get-PropertyCandidate $audit @('action','actionType')
+            $entityType = Get-PropertyCandidate $audit @('entityType')
+            if ($action -and [string]$action -ne 'Create') { continue }
+            if ($entityType -and [string]$entityType -ne 'ProtectionGroup') { continue }
+
+            $id = Get-PropertyCandidate $audit @('entityId','entityIdStr','entity.id','entity.entityId')
+            if ($null -eq $id -or [string]::IsNullOrWhiteSpace([string]$id)) { continue }
+            $id = ([string]$id).Trim()
+            $actor = Get-PropertyCandidate $audit @('username','userName','user.username','user.name','actor.username','actor.name')
+            $time = Convert-AuditTime $audit
+            $entry = [pscustomobject]@{ CreatedBy=$(if($actor){[string]$actor}else{''});CreatedOn=$time }
+
+            # Retain the first creation record that has a timestamp/username.
+            if (-not $auditMap.ContainsKey($id)) { $auditMap[$id] = $entry }
+            elseif (-not $auditMap[$id].CreatedOn -and $time) { $auditMap[$id] = $entry }
+        }
+
+        $start += $records.Count
+        if ($records.Count -lt $count) { $completed = $true; break }
+    }
+    if (-not $completed) { throw "Audit history exceeds MaxAuditPages=$MaxAuditPages; creator coverage is incomplete." }
+    return $auditMap
+}
+
+# ------------------------------------------------------------
+# Discover clusters and choose scope
 # ------------------------------------------------------------
 Write-Host ""
 Write-Host "==============================================" -ForegroundColor Cyan
@@ -300,225 +357,6 @@ if ($rows.Count -gt 0) {
     }
     $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
     $excelPath = Join-Path $OutputDirectory "Cohesity_SQL_PG_AlertPolicy_v2_$timestamp.xlsx"
-    Save-Xlsx -Rows $rows -Path $excelPath
-}
-
-Write-Host ""
-Write-Host "==============================================" -ForegroundColor Cyan
-Write-Host " AUDIT SUMMARY" -ForegroundColor White
-Write-Host "==============================================" -ForegroundColor Cyan
-Write-Host ("Clusters selected          : {0}" -f $selected.Count)
-Write-Host ("Clusters failed            : {0}" -f $errors.Count)
-Write-Host ("Active SQL PGs             : {0}" -f $rows.Count)
-Write-Host ("Failure emails configured  : {0}" -f $configuredCount) -ForegroundColor Green
-Write-Host ("Require configuration check: {0}" -f $reviewCount) -ForegroundColor Yellow
-
-if ($excelPath) {
-    Write-Host ("Excel output               : {0}" -f $excelPath) -ForegroundColor Green
-}
-if ($errors.Count -gt 0) {
-    Write-Warning "Partial report: some cluster queries failed."
-}
-) {
-            $number = [double]$text
-            if ($number -ge 1e15) { return [DateTimeOffset]::FromUnixTimeMilliseconds([long][math]::Floor($number / 1000)).ToLocalTime().ToString('yyyy-MM-dd HH:mm:ss') }
-            if ($number -ge 1e12) { return [DateTimeOffset]::FromUnixTimeMilliseconds([long]$number).ToLocalTime().ToString('yyyy-MM-dd HH:mm:ss') }
-            if ($number -ge 1e9)  { return [DateTimeOffset]::FromUnixTimeSeconds([long]$number).ToLocalTime().ToString('yyyy-MM-dd HH:mm:ss') }
-        }
-        return ([datetime]::Parse($text)).ToString('yyyy-MM-dd HH:mm:ss')
-    }
-    catch { return '' }
-}
-
-function Get-CreateAuditByPgId {
-    param([string]$ClusterId)
-    $auditMap = @{}
-    $count = 500
-    $start = 0
-    $completed = $false
-
-    for ($page = 0; $page -lt $MaxAuditPages; $page++) {
-        $uri = "$baseUrl/v2/audit-logs?entityTypes=ProtectionGroup&actions=Create&includeTenants=true&startIndex=$start&count=$count"
-        $response = Get-Helios -Uri $uri -ClusterId $ClusterId
-
-        $records = @()
-        if ($response -is [array]) { $records = @($response) }
-        else {
-            $collection = Get-PropertyCandidate $response @('auditLogs','auditLogEntries','logs','entries','items')
-            if ($null -eq $collection) { throw 'Unrecognized audit log response; cannot establish creator details.' }
-            $records = @($collection | Where-Object { $null -ne $_ })
-        }
-        if ($records.Count -eq 0) { $completed = $true; break }
-
-        foreach ($audit in $records) {
-            $action = Get-PropertyCandidate $audit @('action','actionType')
-            $entityType = Get-PropertyCandidate $audit @('entityType')
-            if ($action -and [string]$action -ne 'Create') { continue }
-            if ($entityType -and [string]$entityType -ne 'ProtectionGroup') { continue }
-
-            $id = Get-PropertyCandidate $audit @('entityId','entityIdStr','entity.id','entity.entityId')
-            if ($null -eq $id -or [string]::IsNullOrWhiteSpace([string]$id)) { continue }
-            $id = ([string]$id).Trim()
-            $actor = Get-PropertyCandidate $audit @('username','userName','user.username','user.name','actor.username','actor.name')
-            $time = Convert-AuditTime $audit
-            $entry = [pscustomobject]@{ CreatedBy=$(if($actor){[string]$actor}else{''});CreatedOn=$time }
-
-            # Retain the first creation record that has a timestamp/username.
-            if (-not $auditMap.ContainsKey($id)) { $auditMap[$id] = $entry }
-            elseif (-not $auditMap[$id].CreatedOn -and $time) { $auditMap[$id] = $entry }
-        }
-
-        $start += $records.Count
-        if ($records.Count -lt $count) { $completed = $true; break }
-    }
-    if (-not $completed) { throw "Audit history exceeds MaxAuditPages=$MaxAuditPages; creator coverage is incomplete." }
-    return $auditMap
-}
-
-# ------------------------------------------------------------
-# Discover clusters and choose scope
-# ------------------------------------------------------------
-Write-Host ""
-Write-Host "==============================================" -ForegroundColor Cyan
-Write-Host " COHESITY SQL PG ALERT CONFIGURATION AUDIT" -ForegroundColor White
-Write-Host "==============================================" -ForegroundColor Cyan
-
-$inventory=Get-Helios "$baseUrl/v2/mcm/cluster-mgmt/info"
-$items=@()
-if($inventory.cohesityClusters){$items=@($inventory.cohesityClusters)}
-elseif($inventory.clusters){$items=@($inventory.clusters)}
-elseif($inventory.clusterInfos){$items=@($inventory.clusterInfos)}
-elseif($inventory.mcmInfo -and $inventory.mcmInfo.clusterInfos){$items=@($inventory.mcmInfo.clusterInfos)}
-elseif($inventory -is [array]){$items=@($inventory)}
-$clusters=@(foreach($c in $items){
- $id=if($c.clusterId){$c.clusterId}else{$c.id}
- $name=if($c.clusterName){$c.clusterName}elseif($c.displayName){$c.displayName}else{$c.name}
- if($id){[pscustomobject]@{Name=[string]$name;Id=[string]$id}}
-})
-$clusters=@($clusters|Sort-Object Name,Id -Unique)
-if(!$clusters.Count){throw 'No Helios clusters found'}
-Write-Host ""
-Write-Host "AVAILABLE HELIOS CLUSTERS" -ForegroundColor Cyan
-$clusterMenu = for ($i=0; $i -lt $clusters.Count; $i++) {
-    [pscustomobject]@{
-        Index   = $i + 1
-        Cluster = $clusters[$i].Name
-    }
-}
-$clusterMenu | Format-Table -AutoSize | Out-Host
-Write-Host "[0] All clusters" -ForegroundColor Yellow
-Write-Host "[X] Exit" -ForegroundColor Yellow
-
-while ($true) {
-    $choice = Read-Host "Select cluster (0=all, 1-$($clusters.Count)=single, X=exit)"
-    if ($choice -match '^(x|q)$') { return }
-
-    $index = -1
-    if ([int]::TryParse($choice, [ref]$index) -and $index -ge 0 -and $index -le $clusters.Count) {
-        break
-    }
-    Write-Host "Invalid selection. Please try again." -ForegroundColor Yellow
-}
-
-$selected = if ($index -eq 0) { @($clusters) } else { @($clusters[$index - 1]) }
-
-Write-Host ""
-Write-Host "COLLECTING ACTIVE SQL PROTECTION GROUPS" -ForegroundColor Cyan
-
-$raw=New-Object System.Collections.Generic.List[object]
-$columns=New-Object System.Collections.Generic.List[string]
-$errors=New-Object System.Collections.Generic.List[object]
-foreach($cluster in $selected){
- Write-Host ("Checking {0}..." -f $cluster.Name) -ForegroundColor Gray
- try{
-   $cookie=$null;$seen=@{}
-   do{
-     $uri="$baseUrl/v2/data-protect/protection-groups?environments=kSQL&isActive=true&isDeleted=false&isPaused=false&includeTenants=true&useCachedData=false&maxResultCount=1000"
-     if($cookie){$uri+='&paginationCookie='+[uri]::EscapeDataString($cookie)}
-     $response=Get-Helios -Uri $uri -ClusterId $cluster.Id
-     if ($null -eq $response) { throw "Empty protection group response" }
-     if ($null -eq $response.protectionGroups) { throw "Missing protectionGroups in response" }
-     foreach($pg in @($response.protectionGroups)){
-       if($null -eq $pg -or $pg.environment -ne 'kSQL' -or $pg.isActive -ne $true -or $pg.isDeleted -eq $true -or $pg.isPaused -eq $true){continue}
-       $policy=$pg.alertPolicy
-       # An absent policy must remain visible as a configuration finding.
-       $fields=Flatten-Policy $policy
-       foreach($key in $fields.Keys){if(!$columns.Contains($key)){$columns.Add($key)}}
-       $targets=@()
-       if($null -ne $policy -and $null -ne $policy.alertTargets){$targets=@($policy.alertTargets | Where-Object{$null -ne $_})}
-       $statuses=@()
-       if ($null -ne $policy) {
-         if ($null -ne $policy.alertPolicy) { $statuses += @($policy.alertPolicy) }
-         if ($null -ne $policy.backupRunStatus) { $statuses += @($policy.backupRunStatus) }
-       }
-       $statusText=(@($statuses|ForEach-Object{[string]$_}) -join '; ')
-       $failure=($statusText -match '(^|[^A-Za-z])kFailure([^A-Za-z]|$)')
-       $addresses=@($targets|ForEach-Object{$_.emailAddress}|Where-Object{$_})
-       $raw.Add([pscustomobject]@{
-         Cluster=$cluster.Name;ClusterId=$cluster.Id
-         ProtectionGroup=$(if($pg.name){$pg.name}else{$pg.protectionGroupName})
-         ProtectionGroupId=$pg.id;FailureAlert=$(if($failure){'Yes'}else{'No'})
-         AlertTargets=($addresses -join '; ')
-         RecipientTypes=(@($targets|ForEach-Object{$_.recipientType}) -join '; ')
-         Languages=(@($targets|ForEach-Object{$_.language}) -join '; ')
-         Status=$(if($null -eq $policy){'ALERT POLICY MISSING'}elseif(!$failure){'FAILURE NOT CONFIGURED'}elseif(!$addresses.Count){'NO EMAIL RECIPIENTS'}else{'CONFIGURED'})
-         Fields=$fields
-       })
-     }
-     $cookie=[string]$response.paginationCookie
-     if($cookie){if($seen.ContainsKey($cookie)){throw 'Repeated pagination cookie'};$seen[$cookie]=$true}
-   }while($cookie)
- }catch{
-   $errors.Add([pscustomobject]@{Cluster=$cluster.Name;Error=$_.Exception.Message})
-   Write-Warning "Cluster $($cluster.Name): $($_.Exception.Message)"
- }
-}
-$rows=@(foreach($item in $raw){
- $record=[ordered]@{
-  Cluster=$item.Cluster;ClusterId=$item.ClusterId;ProtectionGroup=$item.ProtectionGroup
-  ProtectionGroupId=$item.ProtectionGroupId;FailureAlert=$item.FailureAlert
-  AlertTargets=$item.AlertTargets;RecipientTypes=$item.RecipientTypes
-  Languages=$item.Languages;Status=$item.Status
- }
- foreach($key in $columns){$record[$key]=if($item.Fields.Contains($key)){$item.Fields[$key]}else{''}}
- [pscustomobject]$record
-})
-# ------------------------------------------------------------
-# Display and export
-# ------------------------------------------------------------
-$rows = @($rows | Sort-Object Cluster, ProtectionGroup)
-$configuredCount = @($rows | Where-Object { $_.Status -eq "CONFIGURED" }).Count
-$reviewCount = $rows.Count - $configuredCount
-
-Write-Host ""
-Write-Host "==============================================" -ForegroundColor Cyan
-Write-Host " SQL PG FAILURE ALERT CONFIGURATION" -ForegroundColor White
-Write-Host "==============================================" -ForegroundColor Cyan
-
-if ($rows.Count -gt 0) {
-    $rows |
-        Select-Object Cluster, ProtectionGroup, FailureAlert,
-                      AlertTargets, RecipientTypes, Languages, Status |
-        Format-Table -AutoSize -Wrap |
-        Out-Host
-}
-else {
-    Write-Host "No active SQL protection groups were returned." -ForegroundColor Yellow
-}
-
-if ($errors.Count -gt 0) {
-    Write-Host ""
-    Write-Host "CLUSTER COLLECTION ISSUES" -ForegroundColor Yellow
-    $errors | Format-Table -AutoSize -Wrap | Out-Host
-}
-
-$excelPath = $null
-if ($rows.Count -gt 0) {
-    if (-not (Test-Path $OutputDirectory -PathType Container)) {
-        New-Item -Path $OutputDirectory -ItemType Directory -Force | Out-Null
-    }
-    $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
-    $excelPath = Join-Path $OutputDirectory "Cohesity_SQL_PG_AlertPolicy_$timestamp.xlsx"
     Save-Xlsx -Rows $rows -Path $excelPath
 }
 
