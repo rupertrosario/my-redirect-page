@@ -160,17 +160,15 @@ function Get-CreateAuditRecords {
     param([string]$ClusterId)
 
     # Audit response is { auditLogs: [...], count: <total matching records> }.
-    # Explicit time range is required: otherwise only recent logs may be shown.
+    # No start/end-time restrictions: use the caller-requested audit filters.
     $records = New-Object System.Collections.Generic.List[object]
     $pageSize = 500
     $startIndex = 0
     $total = $null
     $complete = $false
-    $endTimeUsecs = [long]([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() * 1000)
 
     for ($page = 0; $page -lt $MaxAuditPages; $page++) {
         $uri = "$baseUrl/v2/audit-logs?entityTypes=ProtectionGroup&actions=Create" +
-               "&includeTenants=true&startTimeUsecs=0&endTimeUsecs=$endTimeUsecs" +
                "&startIndex=$startIndex&count=$pageSize"
 
         $response = Get-Helios -Uri $uri -ClusterId $ClusterId
