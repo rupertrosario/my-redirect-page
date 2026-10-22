@@ -10,6 +10,7 @@
 #   GET /v2/mcm/cluster-mgmt/info
 #   GET /v2/data-protect/protection-groups?environments=kSQL...
 #   GET /v2/audit-logs?entityTypes=ProtectionGroup&actions=Create
+#   Match by auditLogs[].entityName; creator=username; time=timestampUsecs
 #
 # Excel export requires either ImportExcel module or Microsoft Excel desktop.
 
@@ -157,115 +158,69 @@ function Convert-AuditTime {
 function Get-CreateAuditRecords {
     param([string]$ClusterId)
 
-    # Retrieve all available PG creation records for this cluster.
-    # Setting startTimeUsecs=0 avoids the API's possible default time window.
+    # Response format: { auditLogs: [...], count: N }.
+    # Retrieve PG creation records with pagination; only exact entityName
+    # matches will be associated with active SQL protection groups.
     $records = New-Object System.Collections.Generic.List[object]
     $pageSize = 1000
     $startIndex = 0
     $complete = $false
-    $endTimeUsecs = [long]([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() * 1000)
 
     for ($page = 0; $page -lt $MaxAuditPages; $page++) {
         $uri = "$baseUrl/v2/audit-logs?entityTypes=ProtectionGroup&actions=Create" +
-               "&includeTenants=true&startTimeUsecs=0&endTimeUsecs=$endTimeUsecs" +
                "&startIndex=$startIndex&count=$pageSize"
 
         $response = Get-Helios -Uri $uri -ClusterId $ClusterId
-        if ($null -eq $response) {
-            throw "Audit endpoint returned an empty response."
+        if ($null -eq $response -or $null -eq $response.auditLogs) {
+            throw "Audit response does not contain auditLogs."
         }
 
-        $batch = @()
-        if ($response -is [array]) {
-            $batch = @($response)
-        }
-        else {
-            $collection = Get-PropertyCandidate $response @(
-                'auditLogs', 'clusterAuditLogs', 'auditLogEntries',
-                'logs', 'entries', 'items', 'data.auditLogs'
-            )
-            if ($null -eq $collection) {
-                throw "Unknown audit response format. Check the returned property names from GET /v2/audit-logs."
-            }
-            $batch = @($collection | Where-Object { $null -ne $_ })
+        $batch = @($response.auditLogs | Where-Object { $null -ne $_ })
+        foreach ($entry in $batch) {
+            if ([string]$entry.entityType -and [string]$entry.entityType -ne 'ProtectionGroup') { continue }
+            if ([string]$entry.action -and [string]$entry.action -ne 'Create') { continue }
+            $records.Add($entry)
         }
 
-        foreach ($item in $batch) {
-            $records.Add($item)
-        }
-
-        $totalCount = Get-PropertyCandidate $response @('totalCount', 'total', 'totalResults')
         $startIndex += $batch.Count
-
-        if ($batch.Count -eq 0 -or
-            ($null -ne $totalCount -and $startIndex -ge [long]$totalCount) -or
-            ($null -eq $totalCount -and $batch.Count -lt $pageSize)) {
+        if ($batch.Count -eq 0 -or $batch.Count -lt $pageSize) {
             $complete = $true
             break
         }
     }
 
     if (-not $complete) {
-        throw "Creation audit history not fully retrieved within $MaxAuditPages pages."
+        throw "Audit pagination reached MaxAuditPages=$MaxAuditPages before completion."
     }
+
     return @($records.ToArray())
 }
 
 function Find-CreationRecord {
-    param([object[]]$AuditRecords, [string]$ProtectionGroupId, [string]$ProtectionGroupName)
-
-    $idMatches = @()
-    $nameMatches = @()
-
-    foreach ($audit in $AuditRecords) {
-        $auditId = [string](Get-PropertyCandidate $audit @(
-            'entityId', 'entityIdStr', 'entity.id', 'entity.entityId'
-        ))
-        $auditName = [string](Get-PropertyCandidate $audit @(
-            'entityName', 'entity.name'
-        ))
-        $action = [string](Get-PropertyCandidate $audit @('action', 'actionType'))
-
-        if ($action -and $action -ine 'Create') { continue }
-
-        if ($ProtectionGroupId -and $auditId -and $auditId -eq $ProtectionGroupId) {
-            $idMatches += $audit
-        }
-        elseif ($ProtectionGroupName -and $auditName -and
-                $auditName -ieq $ProtectionGroupName) {
-            $nameMatches += $audit
-        }
-    }
-
-    $matched = @($idMatches)
-    if ($matched.Count -eq 0) {
-        # Do not guess if the same PG name was created more than once.
-        if ($nameMatches.Count -ne 1) { return $null }
-        $matched = @($nameMatches)
-    }
-
-    # Multiple creation events for the same ID: earliest timestamp wins.
-    $selected = @(
-        $matched | Sort-Object {
-            $time = Get-PropertyCandidate $_ @('timestampUsecs', 'timestamp', 'createdTime')
-            if ($null -eq $time) { [double]::MaxValue } else {
-                try { [double]$time } catch { [double]::MaxValue }
-            }
-        }
-    )[0]
-
-    $actor = Get-PropertyCandidate $selected @(
-        'userName', 'username', 'user.name', 'user.username',
-        'actor.name', 'actor.username'
+    param(
+        [object[]]$AuditRecords,
+        [string]$ProtectionGroupName
     )
 
-    $createdOn = Convert-AuditTime $selected
-    if (-not $createdOn) {
-        $createdOn = [string](Get-PropertyCandidate $selected @('humanTimestamp'))
-    }
+    if ([string]::IsNullOrWhiteSpace($ProtectionGroupName)) { return $null }
+
+    $matched = @(
+        $AuditRecords | Where-Object {
+            $_.entityName -and
+            ([string]$_.entityName).Trim() -ieq $ProtectionGroupName.Trim() -and
+            ([string]$_.action -ieq 'Create') -and
+            ([string]$_.entityType -ieq 'ProtectionGroup')
+        }
+    )
+
+    # EntityName alone cannot distinguish a deleted PG recreated with the
+    # same name. Leave creator details blank rather than attribute incorrectly.
+    if ($matched.Count -ne 1) { return $null }
+
+    $audit = $matched[0]
     return [pscustomobject]@{
-        CreatedBy = $(if ($actor) { [string]$actor } else { '' })
-        CreatedOn = $createdOn
+        CreatedBy = [string]$audit.username
+        CreatedOn = Convert-AuditTime $audit
     }
 }
 
@@ -388,7 +343,6 @@ foreach ($cluster in $selected) {
 
         foreach ($pgRow in $clusterRows) {
             $creation = Find-CreationRecord -AuditRecords $auditRecords `
-                -ProtectionGroupId ([string]$pgRow.ProtectionGroupId) `
                 -ProtectionGroupName ([string]$pgRow.ProtectionGroup)
 
             if ($null -ne $creation) {
