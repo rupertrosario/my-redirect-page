@@ -159,52 +159,40 @@ function Convert-AuditTime {
 function Get-CreateAuditRecords {
     param([string]$ClusterId)
 
-    # Audit response is { auditLogs: [...], count: <total matching records> }.
-    # No start/end-time restrictions: use the caller-requested audit filters.
+    # Keep every record exactly as returned under auditLogs[].
+    # Filtering is performed by the GET endpoint, not by this function.
     $records = New-Object System.Collections.Generic.List[object]
     $pageSize = 500
     $startIndex = 0
-    $total = $null
     $complete = $false
 
     for ($page = 0; $page -lt $MaxAuditPages; $page++) {
         $uri = "$baseUrl/v2/audit-logs?entityTypes=ProtectionGroup&actions=Create" +
-               "&startIndex=$startIndex&count=$pageSize"
-
+               "&includeTenants=true&startIndex=$startIndex&count=$pageSize"
         $response = Get-Helios -Uri $uri -ClusterId $ClusterId
         if ($null -eq $response -or -not $response.PSObject.Properties['auditLogs']) {
-            throw "The GET response did not contain the expected auditLogs property."
+            throw "GET /v2/audit-logs did not return auditLogs."
         }
 
         $batch = @($response.auditLogs | Where-Object { $null -ne $_ })
-        if ($null -ne $response.count) {
-            $total = [long]$response.count
-        }
+        Write-Host ("  Audit page {0}: API returned {1} records" -f ($page+1), $batch.Count) -ForegroundColor Gray
 
-        foreach ($entry in $batch) {
-            if ($entry.action -and [string]$entry.action -ine 'Create') { continue }
-            if ($entry.entityType -and [string]$entry.entityType -ine 'ProtectionGroup') { continue }
-            if ([string]::IsNullOrWhiteSpace([string]$entry.entityName)) { continue }
-            $records.Add($entry)
-        }
-
+        foreach ($entry in $batch) { $records.Add($entry) }
         $startIndex += $batch.Count
-        if (($null -ne $total -and $startIndex -ge $total) -or
-            ($null -eq $total -and $batch.Count -lt $pageSize)) {
+
+        # Do not interpret response.count as the number retrieved or
+        # as a total: finish only when the API returns a short page.
+        if ($batch.Count -lt $pageSize) {
             $complete = $true
             break
-        }
-        if ($batch.Count -eq 0) {
-            throw "Audit pagination ended prematurely: fetched $startIndex of $total entries."
         }
     }
 
     if (-not $complete) {
-        throw "Audit pagination incomplete after $MaxAuditPages pages."
+        throw "Audit retrieval stopped after $MaxAuditPages pages; results may be incomplete."
     }
 
-    Write-Host ("  Audit records returned : {0}" -f $startIndex) -ForegroundColor Gray
-    Write-Host ("  Creation events indexed: {0}" -f $records.Count) -ForegroundColor Gray
+    Write-Host ("  Total auditLogs[] entries retrieved: {0}" -f $records.Count) -ForegroundColor Cyan
     return @($records.ToArray())
 }
 
@@ -215,6 +203,9 @@ function Get-CreationByName {
     # Recreated PG names use the most recent creation event.
     $byName = @{}
     foreach ($audit in $AuditRecords) {
+        # Only named, matching creation events are used for PG enrichment.
+        if ([string]$audit.action -ine 'Create' -or
+            [string]$audit.entityType -ine 'ProtectionGroup') { continue }
         $name = ([string]$audit.entityName).Trim()
         if (-not $name) { continue }
         $time = [long]$audit.timestampUsecs
@@ -311,7 +302,7 @@ foreach ($cluster in $selected) {
         Write-Host ""
         $auditIndex[$cluster.Id] = Get-CreationByName -AuditRecords $auditRecords
         $auditReady[$cluster.Id] = $true
-        Write-Host ("{0}: {1} PG creation records retrieved" -f $cluster.Name, $auditRecords.Count) -ForegroundColor Gray
+        Write-Host ("{0}: {1} raw audit records, {2} distinct matching PG names" -f $cluster.Name, $auditRecords.Count, $auditIndex[$cluster.Id].Count) -ForegroundColor Gray
     }
     catch {
         $auditIndex[$cluster.Id] = @{}
