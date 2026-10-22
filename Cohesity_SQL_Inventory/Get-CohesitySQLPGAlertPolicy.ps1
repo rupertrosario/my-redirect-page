@@ -1,17 +1,46 @@
-# Get-CohesitySQLPGAlertPolicy.ps1
-# Cohesity Helios | GET only | PowerShell 5.1 | Active SQL Protection Groups
-$ErrorActionPreference='Stop'
-[Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12
-$baseUrl='https://helios.cohesity.com'
-# Existing local AES helper paths from Cohesity scripts; change if your workstation differs.
-$helperPath='X:\PowerShell\Cohesity_API_Scripts\Common\ApiKeyAesHelper.ps1'
-$keyFile='X:\PowerShell\Cohesity_API_Scripts\Common\Secure\cohesity_apikey.enc'
-$outputDirectory=if($PSScriptRoot){$PSScriptRoot}else{(Get-Location).Path}
-if(!(Test-Path $helperPath)){throw "Helper missing: $helperPath"}
-if(!(Test-Path $keyFile)){throw "Encrypted key missing: $keyFile"}
+# Cohesity Helios - SQL Protection Group Alert Configuration Audit
+# GET-only | PowerShell 5.1 compatible
+#
+# Scope:
+#   - Active SQL PGs only (not deleted or paused)
+#   - Entire alertPolicy section, including each alert target and recipient metadata
+#   - Console summary + Excel workbook, no JSON files and no API writes
+#
+# APIs:
+#   GET /v2/mcm/cluster-mgmt/info
+#   GET /v2/data-protect/protection-groups?environments=kSQL...
+#
+# Excel export requires either ImportExcel module or Microsoft Excel desktop.
+
+[CmdletBinding()]
+param(
+    [string]$OutputDirectory = "X:\PowerShell\Data\Cohesity\SQLInventory"
+)
+
+$ErrorActionPreference = "Stop"
+$FormatEnumerationLimit = -1
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
+# ------------------------------------------------------------
+# Helios and local authentication configuration
+# ------------------------------------------------------------
+$baseUrl             = "https://helios.cohesity.com"
+$helperPath          = "X:\PowerShell\Cohesity_API_Scripts\Common\ApiKeyAesHelper.ps1"
+$encryptedApiKeyPath = "X:\PowerShell\Cohesity_API_Scripts\Common\Secure\cohesity_apikey.enc"
+
+if (-not (Test-Path $helperPath -PathType Leaf)) {
+    throw "API key helper not found: $helperPath"
+}
+if (-not (Test-Path $encryptedApiKeyPath -PathType Leaf)) {
+    throw "Encrypted API key file not found: $encryptedApiKeyPath"
+}
+
 . $helperPath
-$apiKey=Get-CohesityApiKeyFromAes -EncryptedFile $keyFile
-if([string]::IsNullOrWhiteSpace($apiKey)){throw 'API key is empty'}
+$apiKey = Get-CohesityApiKeyFromAes -EncryptedFile $encryptedApiKeyPath
+if ([string]::IsNullOrWhiteSpace([string]$apiKey)) {
+    throw "AES API key helper returned an empty value."
+}
+
 function Get-Helios {
  param([string]$Uri,[string]$ClusterId)
  $h=@{accept='application/json';apiKey=$script:apiKey}
@@ -22,6 +51,9 @@ function Get-Helios {
  if(!$r.Content){throw "Empty API response: $Uri"}
  return ($r.Content|ConvertFrom-Json)
 }
+# ------------------------------------------------------------
+# Flatten nested alertPolicy properties into readable Excel columns
+# ------------------------------------------------------------
 function Flatten-Policy {
  param($Value,[string]$Prefix='alertPolicy')
  $o=[ordered]@{}
@@ -44,6 +76,9 @@ function Flatten-Policy {
  $o[$Prefix]=[string]$Value
  return $o
 }
+# ------------------------------------------------------------
+# Excel report (ImportExcel preferred, Excel COM fallback)
+# ------------------------------------------------------------
 function Save-Xlsx {
  param([object[]]$Rows,[string]$Path)
  if(Get-Module -ListAvailable ImportExcel){
@@ -74,6 +109,14 @@ function Save-Xlsx {
    foreach($obj in @($sheet,$book,$excel)){if($null -ne $obj){[void][Runtime.InteropServices.Marshal]::ReleaseComObject($obj)}}
  }
 }
+# ------------------------------------------------------------
+# Discover clusters and choose scope
+# ------------------------------------------------------------
+Write-Host ""
+Write-Host "==============================================" -ForegroundColor Cyan
+Write-Host " COHESITY SQL PG ALERT CONFIGURATION AUDIT" -ForegroundColor White
+Write-Host "==============================================" -ForegroundColor Cyan
+
 $inventory=Get-Helios "$baseUrl/v2/mcm/cluster-mgmt/info"
 $items=@()
 if($inventory.cohesityClusters){$items=@($inventory.cohesityClusters)}
@@ -88,37 +131,48 @@ $clusters=@(foreach($c in $items){
 })
 $clusters=@($clusters|Sort-Object Name,Id -Unique)
 if(!$clusters.Count){throw 'No Helios clusters found'}
-Write-Host '[0] All clusters'
-for($i=0;$i -lt $clusters.Count;$i++){Write-Host "[$($i+1)] $($clusters[$i].Name)"}
-$choice=Read-Host 'Select cluster number (0=all)'
-[int]$index=-1
-if(![int]::TryParse($choice,[ref]$index) -or $index -lt 0 -or $index -gt $clusters.Count){throw 'Invalid selection'}
-$selected=if($index -eq 0){@($clusters)}else{@($clusters[$index-1])}
-$raw=New-Object System.Collections.Generic.List[object]
+Write-Host ""
+Write-Host "AVAILABLE HELIOS CLUSTERS" -ForegroundColor Cyan
+$clusterMenu = for ($i=0; $i -lt $clusters.Count; $i++) {
+    [pscustomobject]@{
+        Index   = $i + 1
+        Cluster = $clusters[$i].Name
+    }
+}
+$clusterMenu | Format-Table -AutoSize | Out-Host
+Write-Host "[0] All clusters" -ForegroundColor Yellow
+Write-Host "[X] Exit" -ForegroundColor Yellow
+
+while ($true) {
+    $choice = Read-Host "Select cluster (0=all, 1-$($clusters.Count)=single, X=exit)"
+    if ($choice -match '^(x|q)
 $columns=New-Object System.Collections.Generic.List[string]
 $errors=New-Object System.Collections.Generic.List[object]
 foreach($cluster in $selected){
- Write-Host "Checking $($cluster.Name)..." -ForegroundColor Cyan
+ Write-Host ("Checking {0}..." -f $cluster.Name) -ForegroundColor Gray
  try{
    $cookie=$null;$seen=@{}
    do{
-     $uri="$baseUrl/v2/data-protect/protection-groups?environments=kSQL&isActive=true&isDeleted=false&isPaused=false&maxResultCount=200"
+     $uri="$baseUrl/v2/data-protect/protection-groups?environments=kSQL&isActive=true&isDeleted=false&isPaused=false&includeTenants=true&useCachedData=false&maxResultCount=1000"
      if($cookie){$uri+='&paginationCookie='+[uri]::EscapeDataString($cookie)}
      $response=Get-Helios -Uri $uri -ClusterId $cluster.Id
-     if($null -eq $response.protectionGroups){throw 'Missing protectionGroups in response'}
+     if ($null -eq $response) { throw "Empty protection group response" }
+     if ($null -eq $response.protectionGroups) { throw "Missing protectionGroups in response" }
      foreach($pg in @($response.protectionGroups)){
        if($null -eq $pg -or $pg.environment -ne 'kSQL' -or $pg.isActive -ne $true -or $pg.isDeleted -eq $true -or $pg.isPaused -eq $true){continue}
        $policy=$pg.alertPolicy
+       # An absent policy must remain visible as a configuration finding.
        $fields=Flatten-Policy $policy
        foreach($key in $fields.Keys){if(!$columns.Contains($key)){$columns.Add($key)}}
        $targets=@()
        if($null -ne $policy -and $null -ne $policy.alertTargets){$targets=@($policy.alertTargets | Where-Object{$null -ne $_})}
        $statuses=@()
-       if($null -ne $policy){
-         if($null -ne $policy.alertPolicy){$statuses+=@($policy.alertPolicy)}
-         if($null -ne $policy.backupRunStatus){$statuses+=@($policy.backupRunStatus)}
+       if ($null -ne $policy) {
+         if ($null -ne $policy.alertPolicy) { $statuses += @($policy.alertPolicy) }
+         if ($null -ne $policy.backupRunStatus) { $statuses += @($policy.backupRunStatus) }
        }
-       $failure=(@($statuses|ForEach-Object{[string]$_}) -join '; ') -match '(^|[^A-Za-z])kFailure([^A-Za-z]|$)'
+       $statusText=(@($statuses|ForEach-Object{[string]$_}) -join '; ')
+       $failure=($statusText -match '(^|[^A-Za-z])kFailure([^A-Za-z]|$)')
        $addresses=@($targets|ForEach-Object{$_.emailAddress}|Where-Object{$_})
        $raw.Add([pscustomobject]@{
          Cluster=$cluster.Name;ClusterId=$cluster.Id
@@ -127,7 +181,7 @@ foreach($cluster in $selected){
          AlertTargets=($addresses -join '; ')
          RecipientTypes=(@($targets|ForEach-Object{$_.recipientType}) -join '; ')
          Languages=(@($targets|ForEach-Object{$_.language}) -join '; ')
-         Status=$(if($null -eq $policy){'Policy missing'}elseif(!$failure){'kFailure not configured'}elseif(!$addresses.Count){'No email recipients'}else{'Failure email configured'})
+         Status=$(if($null -eq $policy){'ALERT POLICY MISSING'}elseif(!$failure){'FAILURE NOT CONFIGURED'}elseif(!$addresses.Count){'NO EMAIL RECIPIENTS'}else{'CONFIGURED'})
          Fields=$fields
        })
      }
@@ -149,12 +203,58 @@ $rows=@(foreach($item in $raw){
  foreach($key in $columns){$record[$key]=if($item.Fields.Contains($key)){$item.Fields[$key]}else{''}}
  [pscustomobject]$record
 })
-Write-Host "`nACTIVE SQL PG ALERT CONFIGURATION" -ForegroundColor Cyan
-if($rows.Count){
- $rows|Select-Object Cluster,ProtectionGroup,FailureAlert,AlertTargets,RecipientTypes,Languages,Status|Format-Table -AutoSize -Wrap|Out-Host
- $path=Join-Path $outputDirectory ("Cohesity_SQL_PG_AlertPolicy_{0}.xlsx" -f (Get-Date -Format 'yyyyMMdd_HHmmss'))
- Save-Xlsx -Rows $rows -Path $path
- Write-Host "Excel report: $path" -ForegroundColor Green
-}else{Write-Warning 'No matching active SQL PGs; no spreadsheet created'}
-Write-Host "SQL PGs: $($rows.Count); failed clusters: $($errors.Count)"
-if($errors.Count){$errors|Format-Table -AutoSize -Wrap|Out-Host;Write-Warning 'Report incomplete: one or more clusters failed'}
+# ------------------------------------------------------------
+# Display and export
+# ------------------------------------------------------------
+$rows = @($rows | Sort-Object Cluster, ProtectionGroup)
+$configuredCount = @($rows | Where-Object { $_.Status -eq "CONFIGURED" }).Count
+$reviewCount = $rows.Count - $configuredCount
+
+Write-Host ""
+Write-Host "==============================================" -ForegroundColor Cyan
+Write-Host " SQL PG FAILURE ALERT CONFIGURATION" -ForegroundColor White
+Write-Host "==============================================" -ForegroundColor Cyan
+
+if ($rows.Count -gt 0) {
+    $rows |
+        Select-Object Cluster, ProtectionGroup, FailureAlert,
+                      AlertTargets, RecipientTypes, Languages, Status |
+        Format-Table -AutoSize -Wrap |
+        Out-Host
+}
+else {
+    Write-Host "No active SQL protection groups were returned." -ForegroundColor Yellow
+}
+
+if ($errors.Count -gt 0) {
+    Write-Host ""
+    Write-Host "CLUSTER COLLECTION ISSUES" -ForegroundColor Yellow
+    $errors | Format-Table -AutoSize -Wrap | Out-Host
+}
+
+$excelPath = $null
+if ($rows.Count -gt 0) {
+    if (-not (Test-Path $OutputDirectory -PathType Container)) {
+        New-Item -Path $OutputDirectory -ItemType Directory -Force | Out-Null
+    }
+    $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
+    $excelPath = Join-Path $OutputDirectory "Cohesity_SQL_PG_AlertPolicy_$timestamp.xlsx"
+    Save-Xlsx -Rows $rows -Path $excelPath
+}
+
+Write-Host ""
+Write-Host "==============================================" -ForegroundColor Cyan
+Write-Host " AUDIT SUMMARY" -ForegroundColor White
+Write-Host "==============================================" -ForegroundColor Cyan
+Write-Host ("Clusters selected          : {0}" -f $selected.Count)
+Write-Host ("Clusters failed            : {0}" -f $errors.Count)
+Write-Host ("Active SQL PGs             : {0}" -f $rows.Count)
+Write-Host ("Failure emails configured  : {0}" -f $configuredCount) -ForegroundColor Green
+Write-Host ("Require configuration check: {0}" -f $reviewCount) -ForegroundColor Yellow
+
+if ($excelPath) {
+    Write-Host ("Excel output               : {0}" -f $excelPath) -ForegroundColor Green
+}
+if ($errors.Count -gt 0) {
+    Write-Warning "Partial report: some cluster queries failed."
+}
