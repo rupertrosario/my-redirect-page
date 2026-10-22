@@ -294,6 +294,21 @@ $auditReady = @{}
 foreach ($cluster in $selected) {
     try {
         $auditRecords = @(Get-CreateAuditRecords -ClusterId $cluster.Id)
+        Write-Host ""
+        Write-Host ("AUDIT RECORDS RETRIEVED - {0}" -f $cluster.Name) -ForegroundColor Cyan
+        if ($auditRecords.Count -gt 0) {
+            $auditRecords |
+                Select-Object @{Name='EntityName';Expression={$_.entityName}},
+                              @{Name='Action';Expression={$_.action}},
+                              @{Name='EntityType';Expression={$_.entityType}},
+                              @{Name='Username';Expression={$_.username}},
+                              @{Name='TimestampUsecs';Expression={$_.timestampUsecs}} |
+                Format-Table -AutoSize -Wrap | Out-Host
+        }
+        else {
+            Write-Host "No matching creation audit records returned." -ForegroundColor Yellow
+        }
+        Write-Host ""
         $auditIndex[$cluster.Id] = Get-CreationByName -AuditRecords $auditRecords
         $auditReady[$cluster.Id] = $true
         Write-Host ("{0}: {1} PG creation records retrieved" -f $cluster.Name, $auditRecords.Count) -ForegroundColor Gray
