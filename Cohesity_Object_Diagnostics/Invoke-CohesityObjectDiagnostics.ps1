@@ -69,12 +69,12 @@ function GetJson([string]$path,[hashtable]$headers,[string]$key) {
     }
 }
 function Objects($j) {return @(Arr (P $j @('objects','searchResults','results','entities','items','data') @()))}
-function Flatten($node,[string]$parent='', [string]$environment='', [string]$host='', [int]$depth=0) {
+function Flatten($node,[string]$parent='', [string]$environment='', [string]$SourceHost='', [int]$depth=0) {
     if (-not $node -or $depth -gt 12) { return @() }
     $name=First @((P $node @('name','displayName','databaseName','dbName','dbUniqueName') ''))
     $env=First @((P $node @('environment','sourceInfo.environment') ''),$environment)
     $type=First @((P $node @('objectType','type','entityType') ''))
-    $sqlHost=First @((P $node @('mssqlParams.hostInfo.name','sqlParams.hostInfo.name','oracleParams.hostInfo.name','hostInfo.name','sourceInfo.name','sourceName','hostName','serverName') ''),$host)
+    $sqlHost=First @((P $node @('mssqlParams.hostInfo.name','sqlParams.hostInfo.name','oracleParams.hostInfo.name','hostInfo.name','sourceInfo.name','sourceName','hostName','serverName') ''),$SourceHost)
     $out=@([pscustomobject]@{ Name=$name; Host=$sqlHost; Parent=$parent; Environment=$env; Type=$type; Raw=$node })
     foreach ($child in (Arr (P $node @('childObjects') @()))) { $out += Flatten $child $name $env $sqlHost ($depth+1) }
     return $out
