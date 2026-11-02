@@ -202,29 +202,48 @@ foreach($m in $matchedObjects) {
             if ((Get-PropertyValue $pg @('name') '') -eq $m.PG) {$pgId=Get-FirstNonBlank @((Get-PropertyValue $pg @('id') ''));break}
         }
     }
-    # Registration is supplementary evidence; do not infer source health from protected-object search.
-    $sourceName=Get-FirstNonBlank @($m.Host,$m.Name)
-    $sourceState='UNKNOWN - not established'
-    $refreshState='UNKNOWN - not established'
-    $authState='UNKNOWN - not established'
+    # Match registered root identity; do not equate a protected FS child with its root.
+    $sourceState='UNKNOWN - source unresolved'
+    $refreshState='UNKNOWN - refresh not established'
+    $authState='UNKNOWN - authentication not established'
     $refreshAt='Unknown'
+    $registeredName='Unknown'; $registeredId='Unknown'; $registeredEndpoint='Unknown'
+    $sourceMatchMethod='None'; $authError=''; $refreshError=''
     if (-not $sourceCache.ContainsKey($m.ClusterId)) {
         $sourceCache[$m.ClusterId]=Invoke-HeliosGetJson '/irisservices/api/v1/public/protectionSources/registrationInfo?includeApplicationsTreeInfo=false' $headers "SOURCES_$($m.ClusterId)"
     }
-    $sourceRoots=@(ConvertTo-ObjectArray (Get-PropertyValue $sourceCache[$m.ClusterId] @('rootNodes') @()))
-    foreach($src in $sourceRoots) {
+    $rootCandidates=@()
+    foreach($src in (ConvertTo-ObjectArray (Get-PropertyValue $sourceCache[$m.ClusterId] @('rootNodes') @()))) {
         $root=Get-PropertyValue $src @('rootNode') $null
         $reg=Get-PropertyValue $src @('registrationInfo') $null
-        $registeredName=Get-FirstNonBlank @((Get-PropertyValue $root @('name','displayName','physicalParams.hostName','sourceInfo.name') ''),(Get-PropertyValue $src @('name') ''))
-        if (-not (Test-ObjectNameMatch $registeredName $sourceName)) {continue}
+        $rootId=Get-FirstNonBlank @((Get-PropertyValue $root @('id','sourceId','protectionSource.id','physicalProtectionSource.id') ''),(Get-PropertyValue $src @('id','sourceId','rootNodeId') ''))
+        $rootName=Get-FirstNonBlank @((Get-PropertyValue $root @('name','displayName','physicalProtectionSource.name','physicalProtectionSource.hostName','genericNasProtectionSource.name','protectionSource.name') ''),(Get-PropertyValue $reg @('accessInfo.endpoint') ''),(Get-PropertyValue $src @('name') ''))
+        $rootCandidates += [pscustomobject]@{Id="$rootId";Name="$rootName";Registration=$reg}
+    }
+    $sourceIds=@((Get-PropertyValue $m.Raw @('rootSourceId','registeredSourceId','registrationId','sourceId','sourceInfo.rootSourceId','sourceInfo.sourceId','sourceInfo.id','parentSourceId') '')) | Where-Object { $_ -and "$($_)".Trim() } | ForEach-Object { "$($_)".Trim() } | Select-Object -Unique
+    $matches=@()
+    if ($sourceIds.Count) {
+        $matches=@($rootCandidates | Where-Object { $_.Id -and ($sourceIds -contains $_.Id) })
+        if ($matches.Count -eq 1) {$sourceMatchMethod='Unique source ID'}
+    }
+    if ($matches.Count -eq 0) {
+        $sourceNames=@($m.Host,(Get-PropertyValue $m.Raw @('sourceInfo.name','registeredSourceName','registrationSourceName','physicalParams.hostName','sourceName') '')) | Where-Object { $_ -and "$($_)".Trim() } | ForEach-Object { "$($_)".Trim().TrimEnd('.') } | Select-Object -Unique
+        $candidateNames=@($sourceNames | ForEach-Object { $_.ToLowerInvariant() })
+        $namesMatched=@($rootCandidates | Where-Object { $_.Name -and ($candidateNames -contains $_.Name.Trim().TrimEnd('.').ToLowerInvariant()) })
+        if ($namesMatched.Count -eq 1) {$matches=$namesMatched;$sourceMatchMethod='Unique exact source name'}
+    }
+    if ($matches.Count -eq 1) {
+        $found=$matches[0];$reg=$found.Registration
+        $registeredId=$found.Id;$registeredName=$found.Name
+        $registeredEndpoint=Get-FirstNonBlank @((Get-PropertyValue $reg @('accessInfo.endpoint') ''),'Unknown')
         $sourceState='Registered source matched'
+        $authState=Get-FirstNonBlank @((Get-PropertyValue $reg @('authenticationStatus') ''),'Unknown')
+        $authError=Get-FirstNonBlank @((Get-PropertyValue $reg @('authenticationErrorMessage') ''))
         $refreshError=Get-FirstNonBlank @((Get-PropertyValue $reg @('refreshErrorMessage') ''))
-        $refreshState=if ($refreshError) {"Refresh error: $refreshError"} else {'UNKNOWN - no explicit refresh result'}
-        $authState=Get-FirstNonBlank @((Get-PropertyValue $reg @('authenticationStatus','authenticationErrorMessage') ''),'Unknown')
+        $refreshState=if($refreshError){"Refresh error: $refreshError"}else{'UNKNOWN - no explicit refresh status'}
         $refreshTime=Convert-UsecsToUtc (Get-PropertyValue $reg @('refreshTimeUsecs') 0)
         if($refreshTime){$refreshAt=$refreshTime.ToString('o')}
-        break
-    }
+    } elseif ($matches.Count -gt 1) { $sourceState='AMBIGUOUS - multiple source ID matches' }
     if ($pgId) {
         $pgKey="PG_$($m.ClusterId)_$pgId"
         if (-not $pgCache.ContainsKey($pgKey)) {$pgCache[$pgKey]=Invoke-HeliosGetJson "/v2/data-protect/protection-groups/$([uri]::EscapeDataString($pgId))" $headers $pgKey}
@@ -253,7 +272,7 @@ foreach($m in $matchedObjects) {
                 $lsi=Get-PropertyValue $ob @('localSnapshotInfo') $null
                 $snapInfo=Get-PropertyValue $lsi @('snapshotInfo') $null
                 $attempts=@(ConvertTo-ObjectArray (Get-PropertyValue $lsi @('failedAttempts') @()))
-                $msgs=@($attempts | ForEach-Object {First @((Get-PropertyValue $_ @('message','error') ''))} | Where-Object {$_})
+                $msgs=@($attempts | ForEach-Object {Get-FirstNonBlank @((Get-PropertyValue $_ @('message','error') ''))} | Where-Object {$_})
                 $statusRaw=Get-FirstNonBlank @((Get-PropertyValue $lsi @('status') ''),(Get-PropertyValue $snapInfo @('status') ''))
                 $st=Status $statusRaw
                 if ($attempts.Count -gt 0 -and $st -ne 'PASS') {$st='FAIL'}
@@ -264,7 +283,7 @@ foreach($m in $matchedObjects) {
             }
         }
     }
-    $profiles+= [pscustomobject]@{Name=$m.Name;Host=$m.Host;Parent=$m.Parent;Cluster=$m.Cluster;ClusterId=$m.ClusterId;Environment=$m.Environment;Type=$m.Type;ObjectId=$m.ObjectId;ProtectionGroup=$m.PG;ProtectionGroupId=$pgId;Policy=$policy;StorageDomain=$domain;SourceRegistration=$sourceState;DiscoveryRefresh=$refreshState;SourceAuthentication=$authState;LastSourceRefreshUtc=$refreshAt}
+    $profiles+= [pscustomobject]@{Name=$m.Name;Host=$m.Host;Parent=$m.Parent;Cluster=$m.Cluster;ClusterId=$m.ClusterId;Environment=$m.Environment;Type=$m.Type;ObjectId=$m.ObjectId;ProtectionGroup=$m.PG;ProtectionGroupId=$pgId;Policy=$policy;StorageDomain=$domain;SourceRegistration=$sourceState;SourceMatchMethod=$sourceMatchMethod;RegisteredSourceName=$registeredName;RegisteredSourceId=$registeredId;RegisteredEndpoint=$registeredEndpoint;DiscoveryRefresh=$refreshState;SourceAuthentication=$authState;AuthenticationError=$authError;RefreshError=$refreshError;LastSourceRefreshUtc=$refreshAt}
 }
 $profiles=@($profiles | Sort-Object Cluster,ObjectId,Name -Unique)
 $allRecords=@($allRecords | Sort-Object Cluster,ObjectId,RunId,Type,StartUtc -Unique)
@@ -292,7 +311,7 @@ if ($null -ne $logFailures -and $logFailures -gt 0) {
 if (@($dataRuns | Where-Object {$_.Status -eq 'UNKNOWN'}).Count) {$findings+=[pscustomobject]@{Severity='UNKNOWN';Area='Evidence quality';Finding='Some runs have no confirmed object-level status';Evidence='PG-level success intentionally not treated as object success';Action='Inspect raw run JSON and workload-specific status fields.'}}
 if ($errors.Count) {$findings+=[pscustomobject]@{Severity='WARN';Area='API coverage';Finding="$($errors.Count) request(s) failed or returned no data";Evidence=($errors -join ' | ');Action='Check Helios permissions, version and API response schema.'}}
 if (-not $findings.Count) {$findings+= [pscustomobject]@{Severity='UNKNOWN';Area='Diagnosis';Finding='No confirmed failure pattern in collected evidence';Evidence='Seven-day, object-level sample';Action='Review remaining unknowns and recovery-point health before declaring recoverable.'}}
-$report=[ordered]@{Title='Cohesity Object Diagnostics';RequestedObject=$ObjectName;GeneratedUtc=(Get-Date).ToUniversalTime().ToString('o');WindowDays=$Days;WindowStartUtc=$cutoff.ToString('o');RunCapPerPG=$MaxRunsPerPG;Profiles=$profiles;Runs=$allRecords;Summary=[ordered]@{DataConsecutiveFailures=$dataFailures;LogConsecutiveFailures=$logFailures;LastSuccessfulDataBackup=if($lastData.Count){$lastData[0].StartUtc}else{$null};LastSuccessfulLogBackup=if($lastLog.Count){$lastLog[0].StartUtc}else{$null};LastSuccessfulRestore='UNKNOWN - restore history not queried';Replication='UNKNOWN - replication not queried'};Findings=$findings;Limitations=@('A 7-day run window cannot prove an older last successful backup.','Object-level statuses are not inferred from successful PG runs.','Source registration is checked only for an exact host/source match; VM and SQL child objects may require parent-source resolution. Restore and replication APIs are not queried in this version.','MaxRunsPerPG can truncate high-frequency log history; missing runs are not classified as skipped.');Errors=@($errors)}
+$report=[ordered]@{Title='Cohesity Object Diagnostics';RequestedObject=$ObjectName;GeneratedUtc=(Get-Date).ToUniversalTime().ToString('o');WindowDays=$Days;WindowStartUtc=$cutoff.ToString('o');RunCapPerPG=$MaxRunsPerPG;Profiles=$profiles;Runs=$allRecords;Summary=[ordered]@{DataConsecutiveFailures=$dataFailures;LogConsecutiveFailures=$logFailures;LastSuccessfulDataBackup=if($lastData.Count){$lastData[0].StartUtc}else{$null};LastSuccessfulLogBackup=if($lastLog.Count){$lastLog[0].StartUtc}else{$null};LastSuccessfulRestore='UNKNOWN - restore history not queried';Replication='UNKNOWN - replication not queried'};Findings=$findings;Limitations=@('A 7-day run window cannot prove an older last successful backup.','Object-level statuses are not inferred from successful PG runs.','Source registration is matched by unique source ID or unique exact registered root name; unresolved sources remain UNKNOWN. Restore and replication APIs are not queried in this version.','MaxRunsPerPG can truncate high-frequency log history; missing runs are not classified as skipped.');Errors=@($errors)}
 if (-not (Test-Path -LiteralPath $OutputRoot)) {New-Item -Path $OutputRoot -ItemType Directory -Force | Out-Null}
 $stamp=Get-Date -Format yyyyMMdd_HHmmss
 $safe=$ObjectName -replace '[^a-zA-Z0-9_.-]','_'
@@ -339,7 +358,7 @@ $('calendar').innerHTML=days.map(date=>{const rows=D.Runs.filter(r=>r.Date===dat
 $('findings').innerHTML=D.Findings.map(f=>`<div class="card">${badge(f.Severity)} <b>${esc(f.Area)}: ${esc(f.Finding)}</b><p><small>Evidence:</small> ${esc(f.Evidence||'No definitive evidence returned')}</p><p><small>Next action:</small> ${esc(f.Action)}</p></div>`).join('');
 $('runs').innerHTML=D.Runs.length?D.Runs.slice().sort((a,b)=>b.StartUtc.localeCompare(a.StartUtc)).map(r=>`<tr><td>${esc(r.StartUtc)}</td><td>${esc(r.Object)}</td><td>${esc(r.Type)} (${esc(r.RunType)})</td><td>${badge(r.Status)}</td><td>${esc(r.PG)}</td><td>${esc(r.Message||'No object message')}<br><small>${esc(r.RunId)}</small></td></tr>`).join(''):'<tr><td colspan="6">No confirmed object runs returned for this window.</td></tr>';
 $('limits').innerHTML=D.Limitations.map(s=>`<p class="note">• ${esc(s)}</p>`).join('')+(D.Errors.length?`<p>${badge('WARN',D.Errors.length+' API collection warnings')} See JSON evidence.</p>`:'');
-$('profileCards').innerHTML=D.Profiles.length?D.Profiles.map(p=>`<div class="card"><div class="grid">${Object.entries({'Object name':p.Name,'Source host':p.Host,'Parent object':p.Parent,'Cluster':p.Cluster,'Cluster ID':p.ClusterId,'Environment':p.Environment,'Object type':p.Type,'Object ID':p.ObjectId,'Protection Group':p.ProtectionGroup,'Protection Group ID':p.ProtectionGroupId,'Policy':p.Policy,'Storage domain':p.StorageDomain,'Registration':p.SourceRegistration,'Discovery refresh':p.DiscoveryRefresh,'Source authentication':p.SourceAuthentication,'Last source refresh':p.LastSourceRefreshUtc}).map(([k,v])=>field(k,v)).join('')}</div></div>`).join(''):'<div class="card">No protected-object profile identified.</div>';
+$('profileCards').innerHTML=D.Profiles.length?D.Profiles.map(p=>`<div class="card"><div class="grid">${Object.entries({'Object name':p.Name,'Source host':p.Host,'Parent object':p.Parent,'Cluster':p.Cluster,'Cluster ID':p.ClusterId,'Environment':p.Environment,'Object type':p.Type,'Object ID':p.ObjectId,'Protection Group':p.ProtectionGroup,'Protection Group ID':p.ProtectionGroupId,'Policy':p.Policy,'Storage domain':p.StorageDomain,'Registration':p.SourceRegistration,'Source match':p.SourceMatchMethod,'Registered source':p.RegisteredSourceName,'Registered source ID':p.RegisteredSourceId,'Endpoint':p.RegisteredEndpoint,'Discovery refresh':p.DiscoveryRefresh,'Refresh error':p.RefreshError,'Source authentication':p.SourceAuthentication,'Authentication error':p.AuthenticationError,'Last source refresh':p.LastSourceRefreshUtc}).map(([k,v])=>field(k,v)).join('')}</div></div>`).join(''):'<div class="card">No protected-object profile identified.</div>';
 </script></body></html>
 '@
 $html=$template.Replace('__REPORT__',$payload)
