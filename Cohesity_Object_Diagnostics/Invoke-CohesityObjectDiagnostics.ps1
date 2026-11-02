@@ -23,6 +23,9 @@ param(
     [string]$HelperPath = 'X:\PowerShell\Cohesity_API_Scripts\Common\ApiKeyAesHelper.ps1',
     [string]$EncryptedFile = 'X:\PowerShell\Cohesity_API_Scripts\Common\Secure\cohesity_apikey.enc'
 )
+# Design conventions: Helios GET only, AES helper, accessClusterId, PowerShell 5.1.
+# Object matching follows the existing DTSK backup validation discovery sequence.
+# This script does not execute remediation or certify restore recoverability.
 $ErrorActionPreference = 'Stop'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 if ($Days -lt 1 -or $Days -gt 7) { throw 'Days must be 1-7.' }
@@ -30,7 +33,7 @@ if ($MaxRunsPerPG -lt 1 -or $MaxRunsPerPG -gt 1000) { throw 'MaxRunsPerPG must b
 $BaseUrl = $BaseUrl.TrimEnd('/')
 $errors = New-Object 'System.Collections.Generic.List[string]'
 $evidence = [ordered]@{}
-function P($o, [string[]]$names, $default=$null) {
+function Get-PropertyValue($o, [string[]]$names, $default=$null) {
     if ($null -eq $o) { return $default }
     foreach ($name in $names) {
         $v=$o
@@ -43,19 +46,19 @@ function P($o, [string[]]$names, $default=$null) {
     }
     return $default
 }
-function Arr($v) { if ($null -eq $v) { return @() }; return @($v) }
-function First($v) { foreach($x in (Arr $v)) { if ($null -ne $x -and "$x".Trim()) {return "$x".Trim()} }; return '' }
-function NameKey([string]$s) { return $s.Trim().TrimEnd('.').ToLowerInvariant() }
-function Short([string]$s) { if ($s -match '@') {$s=($s -split '@',2)[1]}; return ($s -split '\.')[0] }
-function MatchName([string]$a,[string]$b) {
+function ConvertTo-ObjectArray($v) { if ($null -eq $v) { return @() }; return @($v) }
+function Get-FirstNonBlank($v) { foreach($x in (ConvertTo-ObjectArray $v)) { if ($null -ne $x -and "$x".Trim()) {return "$x".Trim()} }; return '' }
+function Normalize-ObjectName([string]$s) { return $s.Trim().TrimEnd('.').ToLowerInvariant() }
+function Get-ShortName([string]$s) { if ($s -match '@') {$s=($s -split '@',2)[1]}; return ($s -split '\.')[0] }
+function Test-ObjectNameMatch([string]$a,[string]$b) {
     if (-not $a -or -not $b) {return $false}
-    $a=NameKey $a; $b=NameKey $b
-    return ($a -eq $b -or $a -eq (Short $b) -or (Short $a) -eq (Short $b))
+    $a=Normalize-ObjectName $a; $b=Normalize-ObjectName $b
+    return ($a -eq $b -or $a -eq (Get-ShortName $b) -or (Get-ShortName $a) -eq (Get-ShortName $b))
 }
-function UtcTime($usecs) {
+function Convert-UsecsToUtc($usecs) {
     try { if (-not $usecs -or [double]$usecs -le 0) {return $null}; return [DateTimeOffset]::FromUnixTimeMilliseconds([long]([double]$usecs / 1000)).UtcDateTime } catch {return $null}
 }
-function GetJson([string]$path,[hashtable]$headers,[string]$key) {
+function Invoke-HeliosGetJson([string]$path,[hashtable]$headers,[string]$key) {
     $uri= if ($path.StartsWith('http')) {$path} else {"$BaseUrl$path"}
     try {
         $r=Invoke-WebRequest -Method Get -Uri $uri -Headers $headers -UseBasicParsing -TimeoutSec $TimeoutSec -ErrorAction Stop
@@ -68,18 +71,18 @@ function GetJson([string]$path,[hashtable]$headers,[string]$key) {
         return $null
     }
 }
-function Objects($j) {return @(Arr (P $j @('objects','searchResults','results','entities','items','data') @()))}
-function Flatten($node,[string]$parent='', [string]$environment='', [string]$SourceHost='', [int]$depth=0) {
+function Get-SearchObjects($j) {return @(ConvertTo-ObjectArray (Get-PropertyValue $j @('objects','searchResults','results','entities','items','data') @()))}
+function Expand-ProtectedObject($node,[string]$parent='', [string]$environment='', [string]$SourceHost='', [int]$depth=0) {
     if (-not $node -or $depth -gt 12) { return @() }
-    $name=First @((P $node @('name','displayName','databaseName','dbName','dbUniqueName') ''))
-    $env=First @((P $node @('environment','sourceInfo.environment') ''),$environment)
-    $type=First @((P $node @('objectType','type','entityType') ''))
-    $sqlHost=First @((P $node @('mssqlParams.hostInfo.name','sqlParams.hostInfo.name','oracleParams.hostInfo.name','hostInfo.name','sourceInfo.name','sourceName','hostName','serverName') ''),$SourceHost)
+    $name=Get-FirstNonBlank @((Get-PropertyValue $node @('name','displayName','databaseName','dbName','dbUniqueName') ''))
+    $env=Get-FirstNonBlank @((Get-PropertyValue $node @('environment','sourceInfo.environment') ''),$environment)
+    $type=Get-FirstNonBlank @((Get-PropertyValue $node @('objectType','type','entityType') ''))
+    $sqlHost=Get-FirstNonBlank @((Get-PropertyValue $node @('mssqlParams.hostInfo.name','sqlParams.hostInfo.name','oracleParams.hostInfo.name','hostInfo.name','sourceInfo.name','sourceName','hostName','serverName') ''),$SourceHost)
     $out=@([pscustomobject]@{ Name=$name; Host=$sqlHost; Parent=$parent; Environment=$env; Type=$type; Raw=$node })
-    foreach ($child in (Arr (P $node @('childObjects') @()))) { $out += Flatten $child $name $env $sqlHost ($depth+1) }
+    foreach ($child in (ConvertTo-ObjectArray (Get-PropertyValue $node @('childObjects') @()))) { $out += Expand-ProtectedObject $child $name $env $sqlHost ($depth+1) }
     return $out
 }
-function ClusterId($node) {return First @((P $node @('clusterId','clusterID','accessClusterId','sourceClusterId','cluster.id','cluster.clusterId','clusterInfo.id','clusterInfo.clusterId') ''))}
+function Get-ClusterIdFromObject($node) {return Get-FirstNonBlank @((Get-PropertyValue $node @('clusterId','clusterID','accessClusterId','sourceClusterId','cluster.id','cluster.clusterId','clusterInfo.id','clusterInfo.clusterId') ''))}
 function Status($s) {
     $t=("$s").ToLowerInvariant()
     if ($t -match 'fail|error|cancel') {return 'FAIL'}
@@ -95,12 +98,12 @@ function Kind($s) {
     if ($t -match 'increment|incre|differential|diff') {return 'Incre'}
     return 'Data'
 }
-function GetSnapshot($node) {
-    $s=@(Arr (P $node @('latestSnapshotsInfo') @()))
-    $s=@($s | Sort-Object { [double](P $_ @('protectionRunStartTimeUsecs','runStartTimeUsecs','startTimeUsecs','snapshotTimestampUsecs') 0) } -Descending)
+function Get-LatestSnapshot($node) {
+    $s=@(ConvertTo-ObjectArray (Get-PropertyValue $node @('latestSnapshotsInfo') @()))
+    $s=@($s | Sort-Object { [double](Get-PropertyValue $_ @('protectionRunStartTimeUsecs','runStartTimeUsecs','startTimeUsecs','snapshotTimestampUsecs') 0) } -Descending)
     if ($s.Count) {return $s[0]};return $null
 }
-function FailStreak($runs) {
+function Get-ConsecutiveFailures($runs) {
     $streak=0
     foreach ($r in @($runs | Sort-Object StartUtc -Descending)) {
         if ($r.Status -eq 'FAIL') {$streak++}
@@ -115,38 +118,38 @@ if (-not (Test-Path -LiteralPath $EncryptedFile -PathType Leaf)) {throw "Missing
 $apiKey=Get-CohesityApiKeyFromAes -EncryptedFile $EncryptedFile
 if ([string]::IsNullOrWhiteSpace($apiKey)) {throw 'AES helper returned empty API key.'}
 $common=@{accept='application/json';apiKey=$apiKey}
-$clustersJson=GetJson '/v2/mcm/cluster-mgmt/info' $common 'clusters'
-$clusters=@(Arr (P $clustersJson @('cohesityClusters','clusters') @()))
+$clustersJson=Invoke-HeliosGetJson '/v2/mcm/cluster-mgmt/info' $common 'clusters'
+$clusters=@(ConvertTo-ObjectArray (Get-PropertyValue $clustersJson @('cohesityClusters','clusters') @()))
 if (-not $clusters.Count) {throw 'Helios returned no clusters. See API access/response.'}
 $clusterMap=@{}
 foreach($c in $clusters) {
-    $id=First @((P $c @('clusterId','id') ''))
-    if ($id) {$clusterMap[$id]=First @((P $c @('clusterName','name','displayName') ''),$id)}
+    $id=Get-FirstNonBlank @((Get-PropertyValue $c @('clusterId','id') ''))
+    if ($id) {$clusterMap[$id]=Get-FirstNonBlank @((Get-PropertyValue $c @('clusterName','name','displayName') ''),$id)}
 }
 $terms=New-Object 'System.Collections.Generic.List[string]'
 $terms.Add($ObjectName)
 $parts=$ObjectName -split '@',2
-if ($parts.Count -eq 2) {$terms.Add($parts[0]);$terms.Add($parts[1]);$terms.Add((Short $parts[1]))}
-else {$terms.Add((Short $ObjectName))}
+if ($parts.Count -eq 2) {$terms.Add($parts[0]);$terms.Add($parts[1]);$terms.Add((Get-ShortName $parts[1]))}
+else {$terms.Add((Get-ShortName $ObjectName))}
 $terms=@($terms | Where-Object {$_} | Sort-Object -Unique)
 $globalObjects=@()
 foreach($term in $terms) {
     $q=[uri]::EscapeDataString($term)
-    $j=GetJson "/v2/data-protect/search/objects?searchString=$q&includeTenants=true&count=100" $common "search_global_$([array]::IndexOf($terms,$term))"
-    $globalObjects+=Objects $j
+    $j=Invoke-HeliosGetJson "/v2/data-protect/search/objects?searchString=$q&includeTenants=true&count=100" $common "search_global_$([array]::IndexOf($terms,$term))"
+    $globalObjects+=Get-SearchObjects $j
 }
 $candidateIds=@()
 foreach($g in $globalObjects) {
-    $candidateIds+=ClusterId $g
-    foreach($opi in (Arr (P $g @('objectProtectionInfos') @()))) {
-        $candidateIds+=ClusterId $opi
-        foreach($pg in (Arr (P $opi @('protectionGroups') @()))) {$candidateIds+=ClusterId $pg}
+    $candidateIds+=Get-ClusterIdFromObject $g
+    foreach($opi in (ConvertTo-ObjectArray (Get-PropertyValue $g @('objectProtectionInfos') @()))) {
+        $candidateIds+=Get-ClusterIdFromObject $opi
+        foreach($pg in (ConvertTo-ObjectArray (Get-PropertyValue $opi @('protectionGroups') @()))) {$candidateIds+=Get-ClusterIdFromObject $pg}
     }
-    foreach($pg in (Arr (P $g @('protectionGroups') @()))) {$candidateIds+=ClusterId $pg}
+    foreach($pg in (ConvertTo-ObjectArray (Get-PropertyValue $g @('protectionGroups') @()))) {$candidateIds+=Get-ClusterIdFromObject $pg}
 }
 $candidateIds=@($candidateIds | Where-Object {$_ -and $clusterMap.ContainsKey("$_")} | Sort-Object -Unique)
 if ($ClusterName) {
-    $candidateIds=@($clusterMap.Keys | Where-Object { (MatchName $clusterMap[$_] $ClusterName) -or $_ -eq $ClusterName })
+    $candidateIds=@($clusterMap.Keys | Where-Object { (Test-ObjectNameMatch $clusterMap[$_] $ClusterName) -or $_ -eq $ClusterName })
     if (-not $candidateIds.Count) {throw "Cluster not found: $ClusterName"}
 } elseif (-not $candidateIds.Count) {
     $candidateIds=@($clusterMap.Keys) # same all-cluster fallback as dtsk, only if discovery found none
@@ -157,18 +160,24 @@ foreach($cid in $candidateIds) {
     $headers=@{accept='application/json';apiKey=$apiKey;accessClusterId=$cid}
     foreach($term in $terms) {
         $q=[uri]::EscapeDataString($term)
-        $j=GetJson "/v2/data-protect/search/protected-objects?searchString=$q" $headers "protected_${cid}_$([array]::IndexOf($terms,$term))"
-        foreach($root in (Objects $j)) {
-            foreach($entry in (Flatten $root)) {
+        $j=Invoke-HeliosGetJson "/v2/data-protect/search/protected-objects?searchString=$q" $headers "protected_${cid}_$([array]::IndexOf($terms,$term))"
+        foreach($root in (Get-SearchObjects $j)) {
+            foreach($entry in (Expand-ProtectedObject $root)) {
                 if (-not $entry.Name) {continue}
                 $target=if ($parts.Count -eq 2) {$parts[0]} else {$ObjectName}
                 $server=if ($parts.Count -eq 2) {$parts[1]} else {$ObjectName}
-                if (-not ((MatchName $entry.Name $target) -or (MatchName $entry.Host $server) -or (MatchName $entry.Parent $target))) {continue}
+                if ($parts.Count -eq 2) {
+                    # A database@server lookup must match both database and owning host.
+                    if (-not ((Test-ObjectNameMatch $entry.Name $target) -and (Test-ObjectNameMatch $entry.Host $server))) { continue }
+                }
+                elseif (-not ((Test-ObjectNameMatch $entry.Name $target) -or (Test-ObjectNameMatch $entry.Host $server) -or (Test-ObjectNameMatch $entry.Parent $target))) {
+                    continue
+                }
                 $raw=$entry.Raw
-                $objId=First @((P $raw @('id','objectId','entityId') ''))
-                $snap=GetSnapshot $raw
-                $pgName=First @((P $snap @('protectionGroupName','protectionGroup.name','protectionGroupInfo.name') ''),(P $raw @('protectionGroupName','protectionGroup.name','protectionGroupInfo.name') ''))
-                $pgId=First @((P $snap @('protectionGroupId','protectionGroup.id','protectionGroupInfo.id') ''),(P $raw @('protectionGroupId','protectionGroup.id','protectionGroupInfo.id') ''))
+                $objId=Get-FirstNonBlank @((Get-PropertyValue $raw @('id','objectId','entityId') ''))
+                $snap=Get-LatestSnapshot $raw
+                $pgName=Get-FirstNonBlank @((Get-PropertyValue $snap @('protectionGroupName','protectionGroup.name','protectionGroupInfo.name') ''),(Get-PropertyValue $raw @('protectionGroupName','protectionGroup.name','protectionGroupInfo.name') ''))
+                $pgId=Get-FirstNonBlank @((Get-PropertyValue $snap @('protectionGroupId','protectionGroup.id','protectionGroupInfo.id') ''),(Get-PropertyValue $raw @('protectionGroupId','protectionGroup.id','protectionGroupInfo.id') ''))
                 $identity="$cid|$objId|$($entry.Name)|$($entry.Host)|$pgName"
                 if ($seen.ContainsKey($identity)) {continue};$seen[$identity]=$true
                 $matchedObjects+= [pscustomobject]@{ClusterId=$cid;Cluster=$clusterMap[$cid];Name=$entry.Name;Host=$entry.Host;Parent=$entry.Parent;Environment=$entry.Environment;Type=$entry.Type;ObjectId=$objId;PG=$pgName;PGId=$pgId;Raw=$raw}
@@ -182,68 +191,70 @@ $allRecords=@();$profiles=@();$pgCache=@{};$sourceCache=@{}
 foreach($m in $matchedObjects) {
     $headers=@{accept='application/json';apiKey=$apiKey;accessClusterId=$m.ClusterId}
     $pgId=$m.PGId
+    $policy='Unknown'
+    $domain='Unknown'
     if (-not $pgId -and $m.PG) {
         $pk="PGS_$($m.ClusterId)"
         if (-not $pgCache.ContainsKey($pk)) {
-            $pgCache[$pk]=GetJson '/v2/data-protect/protection-groups?isDeleted=false&includeTenants=true' $headers $pk
+            $pgCache[$pk]=Invoke-HeliosGetJson '/v2/data-protect/protection-groups?isDeleted=false&includeTenants=true' $headers $pk
         }
-        foreach($pg in (Arr (P $pgCache[$pk] @('protectionGroups') @()))) {
-            if ((P $pg @('name') '') -eq $m.PG) {$pgId=First @((P $pg @('id') ''));break}
+        foreach($pg in (ConvertTo-ObjectArray (Get-PropertyValue $pgCache[$pk] @('protectionGroups') @()))) {
+            if ((Get-PropertyValue $pg @('name') '') -eq $m.PG) {$pgId=Get-FirstNonBlank @((Get-PropertyValue $pg @('id') ''));break}
         }
     }
     # Registration is supplementary evidence; do not infer source health from protected-object search.
-    $sourceName=First @($m.Host,$m.Name)
+    $sourceName=Get-FirstNonBlank @($m.Host,$m.Name)
     $sourceState='UNKNOWN - not established'
     $refreshState='UNKNOWN - not established'
     $authState='UNKNOWN - not established'
     $refreshAt='Unknown'
     if (-not $sourceCache.ContainsKey($m.ClusterId)) {
-        $sourceCache[$m.ClusterId]=GetJson '/irisservices/api/v1/public/protectionSources/registrationInfo?includeApplicationsTreeInfo=false' $headers "SOURCES_$($m.ClusterId)"
+        $sourceCache[$m.ClusterId]=Invoke-HeliosGetJson '/irisservices/api/v1/public/protectionSources/registrationInfo?includeApplicationsTreeInfo=false' $headers "SOURCES_$($m.ClusterId)"
     }
-    $sourceRoots=@(Arr (P $sourceCache[$m.ClusterId] @('rootNodes') @()))
+    $sourceRoots=@(ConvertTo-ObjectArray (Get-PropertyValue $sourceCache[$m.ClusterId] @('rootNodes') @()))
     foreach($src in $sourceRoots) {
-        $root=P $src @('rootNode') $null
-        $reg=P $src @('registrationInfo') $null
-        $registeredName=First @((P $root @('name','displayName','physicalParams.hostName','sourceInfo.name') ''),(P $src @('name') ''))
-        if (-not (MatchName $registeredName $sourceName)) {continue}
+        $root=Get-PropertyValue $src @('rootNode') $null
+        $reg=Get-PropertyValue $src @('registrationInfo') $null
+        $registeredName=Get-FirstNonBlank @((Get-PropertyValue $root @('name','displayName','physicalParams.hostName','sourceInfo.name') ''),(Get-PropertyValue $src @('name') ''))
+        if (-not (Test-ObjectNameMatch $registeredName $sourceName)) {continue}
         $sourceState='Registered source matched'
-        $refreshError=First @((P $reg @('refreshErrorMessage') ''))
+        $refreshError=Get-FirstNonBlank @((Get-PropertyValue $reg @('refreshErrorMessage') ''))
         $refreshState=if ($refreshError) {"Refresh error: $refreshError"} else {'UNKNOWN - no explicit refresh result'}
-        $authState=First @((P $reg @('authenticationStatus','authenticationErrorMessage') ''),'Unknown')
-        $refreshTime=UtcTime (P $reg @('refreshTimeUsecs') 0)
+        $authState=Get-FirstNonBlank @((Get-PropertyValue $reg @('authenticationStatus','authenticationErrorMessage') ''),'Unknown')
+        $refreshTime=Convert-UsecsToUtc (Get-PropertyValue $reg @('refreshTimeUsecs') 0)
         if($refreshTime){$refreshAt=$refreshTime.ToString('o')}
         break
     }
     if ($pgId) {
         $pgKey="PG_$($m.ClusterId)_$pgId"
-        if (-not $pgCache.ContainsKey($pgKey)) {$pgCache[$pgKey]=GetJson "/v2/data-protect/protection-groups/$([uri]::EscapeDataString($pgId))" $headers $pgKey}
-        $pgData=P $pgCache[$pgKey] @('protectionGroup') $pgCache[$pgKey]
-        $policy=First @((P $pgData @('policy.name','protectionPolicy.name','policyName') ''),'Unknown')
-        $domain=First @((P $pgData @('storageDomain.name','storageDomainName') ''),'Unknown')
+        if (-not $pgCache.ContainsKey($pgKey)) {$pgCache[$pgKey]=Invoke-HeliosGetJson "/v2/data-protect/protection-groups/$([uri]::EscapeDataString($pgId))" $headers $pgKey}
+        $pgData=Get-PropertyValue $pgCache[$pgKey] @('protectionGroup') $pgCache[$pgKey]
+        $policy=Get-FirstNonBlank @((Get-PropertyValue $pgData @('policy.name','protectionPolicy.name','policyName') ''),'Unknown')
+        $domain=Get-FirstNonBlank @((Get-PropertyValue $pgData @('storageDomain.name','storageDomainName') ''),'Unknown')
         $rk="RUNS_$($m.ClusterId)_$pgId"
         if (-not $pgCache.ContainsKey($rk)) {
-            $pgCache[$rk]=GetJson "/v2/data-protect/protection-groups/$([uri]::EscapeDataString($pgId))/runs?numRuns=$MaxRunsPerPG&excludeNonRestorableRuns=false&includeObjectDetails=true" $headers $rk
+            $pgCache[$rk]=Invoke-HeliosGetJson "/v2/data-protect/protection-groups/$([uri]::EscapeDataString($pgId))/runs?numRuns=$MaxRunsPerPG&excludeNonRestorableRuns=false&includeObjectDetails=true" $headers $rk
         }
-        foreach($run in (Arr (P $pgCache[$rk] @('runs') @()))) {
-            $info=P $run @('localBackupInfo') $null
+        foreach($run in (ConvertTo-ObjectArray (Get-PropertyValue $pgCache[$rk] @('runs') @()))) {
+            $info=Get-PropertyValue $run @('localBackupInfo') $null
             if ($info -is [array]) {$info=if ($info.Count) {$info[0]} else {$null}}
-            $runId=First @((P $run @('id') ''))
-            $typeRaw=First @((P $info @('runType') ''),(P $run @('runType') ''))
-            $runStatus=Status (P $info @('status') '')
-            $start=UtcTime (P $info @('startTimeUsecs') 0)
+            $runId=Get-FirstNonBlank @((Get-PropertyValue $run @('id') ''))
+            $typeRaw=Get-FirstNonBlank @((Get-PropertyValue $info @('runType') ''),(Get-PropertyValue $run @('runType') ''))
+            $runStatus=Status (Get-PropertyValue $info @('status') '')
+            $start=Convert-UsecsToUtc (Get-PropertyValue $info @('startTimeUsecs') 0)
             if (-not $start -or $start -lt $cutoff -or $start -gt $now) {continue}
-            foreach($ob in (Arr (P $run @('objects') @()))) {
-                $object=P $ob @('object') $null
-                $oid=First @((P $object @('id','objectId') ''))
-                $oname=First @((P $object @('name','displayName') ''))
-                $ohost=First @((P $object @('mssqlParams.hostInfo.name','hostName','sourceName') ''))
+            foreach($ob in (ConvertTo-ObjectArray (Get-PropertyValue $run @('objects') @()))) {
+                $object=Get-PropertyValue $ob @('object') $null
+                $oid=Get-FirstNonBlank @((Get-PropertyValue $object @('id','objectId') ''))
+                $oname=Get-FirstNonBlank @((Get-PropertyValue $object @('name','displayName') ''))
+                $ohost=Get-FirstNonBlank @((Get-PropertyValue $object @('mssqlParams.hostInfo.name','hostName','sourceName') ''))
                 if ($m.ObjectId -and $oid) {if ($oid -ne $m.ObjectId) {continue}}
-                elseif (-not ((MatchName $oname $m.Name) -or ((MatchName $ohost $m.Host) -and (MatchName $oname $m.Name)))) {continue}
-                $lsi=P $ob @('localSnapshotInfo') $null
-                $snapInfo=P $lsi @('snapshotInfo') $null
-                $attempts=@(Arr (P $lsi @('failedAttempts') @()))
-                $msgs=@($attempts | ForEach-Object {First @((P $_ @('message','error') ''))} | Where-Object {$_})
-                $statusRaw=First @((P $lsi @('status') ''),(P $snapInfo @('status') ''))
+                elseif (-not ((Test-ObjectNameMatch $oname $m.Name) -or ((Test-ObjectNameMatch $ohost $m.Host) -and (Test-ObjectNameMatch $oname $m.Name)))) {continue}
+                $lsi=Get-PropertyValue $ob @('localSnapshotInfo') $null
+                $snapInfo=Get-PropertyValue $lsi @('snapshotInfo') $null
+                $attempts=@(ConvertTo-ObjectArray (Get-PropertyValue $lsi @('failedAttempts') @()))
+                $msgs=@($attempts | ForEach-Object {First @((Get-PropertyValue $_ @('message','error') ''))} | Where-Object {$_})
+                $statusRaw=Get-FirstNonBlank @((Get-PropertyValue $lsi @('status') ''),(Get-PropertyValue $snapInfo @('status') ''))
                 $st=Status $statusRaw
                 if ($attempts.Count -gt 0 -and $st -ne 'PASS') {$st='FAIL'}
                 # Never use a PG-level PASS as evidence of object success.
