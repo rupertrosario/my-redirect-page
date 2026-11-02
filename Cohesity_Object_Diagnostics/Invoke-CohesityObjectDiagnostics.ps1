@@ -315,11 +315,7 @@ $report=[ordered]@{Title='Cohesity Object Diagnostics';RequestedObject=$ObjectNa
 if (-not (Test-Path -LiteralPath $OutputRoot)) {New-Item -Path $OutputRoot -ItemType Directory -Force | Out-Null}
 $stamp=Get-Date -Format yyyyMMdd_HHmmss
 $safe=$ObjectName -replace '[^a-zA-Z0-9_.-]','_'
-$jsonPath=Join-Path $OutputRoot "Object_Diagnostics_${safe}_${stamp}.json"
 $htmlPath=Join-Path $OutputRoot "Object_Diagnostics_${safe}_${stamp}.html"
-$rawPath=Join-Path $OutputRoot "Object_Diagnostics_${safe}_${stamp}_raw.json"
-[IO.File]::WriteAllText($jsonPath,($report | ConvertTo-Json -Depth 90),[Text.Encoding]::UTF8)
-[IO.File]::WriteAllText($rawPath,($evidence | ConvertTo-Json -Depth 100),[Text.Encoding]::UTF8)
 $payload=($report | ConvertTo-Json -Depth 90 -Compress).Replace('<','\u003c').Replace('>','\u003e').Replace('&','\u0026')
 $template=@'
 <!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Cohesity Object Diagnostics</title>
@@ -357,7 +353,7 @@ let days=[];const now=new Date(D.GeneratedUtc);const base=new Date(Date.UTC(now.
 $('calendar').innerHTML=days.map(date=>{const rows=D.Runs.filter(r=>r.Date===date);const data=rows.filter(r=>r.Type!=='Log');const logs=rows.filter(r=>r.Type==='Log');const type=data.some(r=>r.Type==='Full')?'Full':data.some(r=>r.Type==='Incre')?'Incre':'Data';return `<div class="day"><b>${esc(date.slice(5))}</b>${badge(agg(data),data.length?type:'No data')}${hasLog?(logs.length?badge(agg(logs),'Log'):badge('UNKNOWN','Log —')):''}</div>`}).join('');
 $('findings').innerHTML=D.Findings.map(f=>`<div class="card">${badge(f.Severity)} <b>${esc(f.Area)}: ${esc(f.Finding)}</b><p><small>Evidence:</small> ${esc(f.Evidence||'No definitive evidence returned')}</p><p><small>Next action:</small> ${esc(f.Action)}</p></div>`).join('');
 $('runs').innerHTML=D.Runs.length?D.Runs.slice().sort((a,b)=>b.StartUtc.localeCompare(a.StartUtc)).map(r=>`<tr><td>${esc(r.StartUtc)}</td><td>${esc(r.Object)}</td><td>${esc(r.Type)} (${esc(r.RunType)})</td><td>${badge(r.Status)}</td><td>${esc(r.PG)}</td><td>${esc(r.Message||'No object message')}<br><small>${esc(r.RunId)}</small></td></tr>`).join(''):'<tr><td colspan="6">No confirmed object runs returned for this window.</td></tr>';
-$('limits').innerHTML=D.Limitations.map(s=>`<p class="note">• ${esc(s)}</p>`).join('')+(D.Errors.length?`<p>${badge('WARN',D.Errors.length+' API collection warnings')} See JSON evidence.</p>`:'');
+$('limits').innerHTML=D.Limitations.map(s=>`<p class="note">• ${esc(s)}</p>`).join('')+(D.Errors.length?`<p>${badge('WARN',D.Errors.length+' API collection warnings')} Review API warnings displayed in this report.</p>`:'');
 $('profileCards').innerHTML=D.Profiles.length?D.Profiles.map(p=>`<div class="card"><div class="grid">${Object.entries({'Object name':p.Name,'Source host':p.Host,'Parent object':p.Parent,'Cluster':p.Cluster,'Cluster ID':p.ClusterId,'Environment':p.Environment,'Object type':p.Type,'Object ID':p.ObjectId,'Protection Group':p.ProtectionGroup,'Protection Group ID':p.ProtectionGroupId,'Policy':p.Policy,'Storage domain':p.StorageDomain,'Registration':p.SourceRegistration,'Source match':p.SourceMatchMethod,'Registered source':p.RegisteredSourceName,'Registered source ID':p.RegisteredSourceId,'Endpoint':p.RegisteredEndpoint,'Discovery refresh':p.DiscoveryRefresh,'Refresh error':p.RefreshError,'Source authentication':p.SourceAuthentication,'Authentication error':p.AuthenticationError,'Last source refresh':p.LastSourceRefreshUtc}).map(([k,v])=>field(k,v)).join('')}</div></div>`).join(''):'<div class="card">No protected-object profile identified.</div>';
 </script></body></html>
 '@
@@ -367,6 +363,13 @@ Write-Host "`nCOHESITY OBJECT DIAGNOSTICS" -ForegroundColor Cyan
 Write-Host "Object: $ObjectName | Profiles: $($profiles.Count) | Object runs: $($allRecords.Count)"
 Write-Host "Data failure streak: $(if($null -eq $dataFailures){'UNKNOWN'}else{$dataFailures}) | Log failure streak: $(if($null -eq $logFailures){'UNKNOWN'}else{$logFailures})"
 Write-Host "HTML: $htmlPath"
-Write-Host "JSON: $jsonPath"
-Write-Host "Raw evidence: $rawPath"
-if($errors.Count){Write-Warning "$($errors.Count) API request(s) failed; inspect JSON and HTML limitations."}
+if ($errors.Count) {
+    Write-Warning "$($errors.Count) API request(s) failed; see HTML report for details."
+}
+try {
+    Start-Process -FilePath $htmlPath -ErrorAction Stop
+}
+catch {
+    Write-Warning "Could not open HTML automatically: $($_.Exception.Message)"
+    Write-Host "Open report manually: $htmlPath"
+}
