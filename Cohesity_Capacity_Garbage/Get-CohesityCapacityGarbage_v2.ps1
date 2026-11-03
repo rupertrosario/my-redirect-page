@@ -10,16 +10,15 @@
   Reclaimed metric uses MRCounters / bytes_value, entityId and entityName
   both ReclaimedBytesPhysical.
 .EXAMPLE
-  .\Get-CohesityCapacityGarbage_v2.ps1 -AllClusters
+  .\Get-CohesityCapacityGarbage_v2.ps1
 .EXAMPLE
-  .\Get-CohesityCapacityGarbage_v2.ps1 -AllClusters -OutputCsv C:\Temp\CohesityCapacityGC.csv
+  .\Get-CohesityCapacityGarbage_v2.ps1 -OutputCsv C:\Temp\CohesityCapacityGC.csv
 #>
 [CmdletBinding()]
 param(
     [string]$HeliosUrl = 'https://helios.cohesity.com',
     [string]$ApiKeyHelperPath = 'X:\PowerShell\Cohesity_API_Scripts\common\ApiKeyAesHelper.ps1',
     [string]$EncryptedApiKeyPath = 'X:\PowerShell\Cohesity_API_Scripts\common\secure\cohesity_apikey.enc',
-    [switch]$AllClusters,
     [string]$OutputCsv = (Join-Path (Get-Location).Path 'Cohesity_GC_Capacity_Details.csv'),
     [ValidateSet('latest','average')][string]$RollupFunction = 'latest',
     [ValidateRange(1,86400)][int]$RollupIntervalSecs = 30,
@@ -114,12 +113,7 @@ function To-GiB([object]$Bytes) { if ($null -eq $Bytes) { return $null }; return
 $inventory = Invoke-HeliosRead -Path '/v2/mcm/cluster-mgmt/info' -Headers $baseHeaders
 $clusters = @($inventory.cohesityClusters | Where-Object { $null -ne $_.clusterId } | Sort-Object clusterName)
 if ($clusters.Count -eq 0) { throw 'No clusters returned by Helios.' }
-if (-not $AllClusters) {
-    Write-Host 'Select cluster (0 = all clusters):' -ForegroundColor Cyan
-    for ($i=0; $i -lt $clusters.Count; $i++) { Write-Host ('{0,3}. {1}' -f ($i+1),$clusters[$i].clusterName) }
-    do { $selection = Read-Host 'Cluster number'; $selectedNumber = 0; $valid = [int]::TryParse($selection,[ref]$selectedNumber) -and $selectedNumber -ge 0 -and $selectedNumber -le $clusters.Count } until ($valid)
-    if ($selectedNumber -gt 0) { $clusters = @($clusters[$selectedNumber-1]) }
-}
+Write-Host ("Retrieving capacity and GC statistics for all {0} Helios clusters." -f $clusters.Count) -ForegroundColor Cyan
 
 $rows = foreach ($cluster in $clusters) {
     $id = [string]$cluster.clusterId
