@@ -7,7 +7,7 @@
   and /irisservices/api/v1/public/statistics/timeSeriesStats.
   ALL Cohesity HTTP operations are GET only. No POST, PATCH, PUT, or DELETE.
   Uses the existing local AES helper and encrypted .enc file shown in your PowerShell script.
-  Metric ReclaimedBytesPhysical / MRCounters must be validated against
+  MRCounters / bytes_value / entityName=ReclaimedBytesPhysical must be validated against
   a raw API response for your cluster/version before interpreting the figures.
 .EXAMPLE
   .\Get-CohesityCapacityGarbage.ps1 -AllClusters
@@ -25,7 +25,7 @@ param(
     [ValidateRange(1,86400)][int]$RollupIntervalSecs = 30,
     [string]$GarbageSchema = 'ApolloV2ClusterStats',
     [string]$ReclaimedSchema = 'MRCounters',
-    [string]$ReclaimedMetric = 'ReclaimedBytesPhysical'
+    [string]$ReclaimedMetric = 'bytes_value'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -52,7 +52,7 @@ function Invoke-HeliosRead {
     Invoke-RestMethod -Uri ($HeliosUrl.TrimEnd('/') + $Path) -Headers $Headers -Method Get -TimeoutSec 60
 }
 function Get-LatestMetric {
-    param([string]$ClusterName,[string]$ClusterId,[hashtable]$Headers,[string]$Schema,[string]$Metric)
+    param([string]$ClusterName,[string]$ClusterId,[hashtable]$Headers,[string]$Schema,[string]$Metric,[string]$EntityName = '')
     $safeName = $ClusterName -replace '\s+',''
     # Preserve the entity-ID alternatives used in the existing PowerShell implementation.
     $variants = @(
@@ -61,9 +61,15 @@ function Get-LatestMetric {
         [uri]::EscapeDataString("$ClusterName(ID $ClusterId)")
     ) | Select-Object -Unique
     $lastError = 'No data points returned'
+    if ($EntityName) { $variants = @('') }
     foreach ($entity in $variants) {
-        $query = '?schemaName={0}&metricName={1}&startTimeMsecs=2&entityId={2}&rollupFunction={3}&rollupIntervalSecs={4}&metricUnitType=0&range=day' -f `
-            [uri]::EscapeDataString($Schema),[uri]::EscapeDataString($Metric),$entity,$RollupFunction,$RollupIntervalSecs
+        $query = '?schemaName={0}&metricName={1}&startTimeMsecs=2&rollupFunction={2}&rollupIntervalSecs={3}&metricUnitType=0&range=day' -f `
+            [uri]::EscapeDataString($Schema),[uri]::EscapeDataString($Metric),$RollupFunction,$RollupIntervalSecs
+        if ($EntityName) {
+            # Diagnostics counter selection: metricName=bytes_value.
+            # schema=MRCounters, entityName=ReclaimedBytesPhysical, metric=bytes_value.
+            $query += '&entityName=' + [uri]::EscapeDataString($EntityName)
+        } else { $query += '&entityId=' + $entity }
         try {
             $response = Invoke-HeliosRead -Path ("/irisservices/api/v1/public/statistics/timeSeriesStats"+$query) -Headers $Headers
             $points = @($response.dataPointVec | Where-Object { $null -ne $_ })
@@ -122,7 +128,7 @@ $rows = foreach ($cluster in $clusters) {
         if ($null -eq $total -or $null -eq $used) { $capacityError = 'Missing totalCapacityBytes or localUsageBytes' }
     }
     $garbage = Get-LatestMetric -ClusterName $name -ClusterId $id -Headers $headers -Schema $GarbageSchema -Metric 'EstimatedGarbageBytes'
-    $reclaimed = Get-LatestMetric -ClusterName $name -ClusterId $id -Headers $headers -Schema $ReclaimedSchema -Metric $ReclaimedMetric
+    $reclaimed = Get-LatestMetric -ClusterName $name -ClusterId $id -Headers $headers -Schema $ReclaimedSchema -Metric $ReclaimedMetric -EntityName 'ReclaimedBytesPhysical'
     [pscustomobject]@{
         Cluster = $name
         ClusterId = $id
