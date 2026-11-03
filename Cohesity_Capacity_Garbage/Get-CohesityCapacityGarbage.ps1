@@ -7,7 +7,7 @@
   and /irisservices/api/v1/public/statistics/timeSeriesStats.
   ALL Cohesity HTTP operations are GET only. No POST, PATCH, PUT, or DELETE.
   Uses the existing local AES helper and encrypted .enc file shown in your PowerShell script.
-  MRCounters / entityName=ReclaimedBytesPhysical must be validated against
+  MRCounters / metricName=ReclaimedBytesPhysical must be validated against
   a raw API response for your cluster/version before interpreting the figures.
 .EXAMPLE
   .\Get-CohesityCapacityGarbage.ps1 -AllClusters
@@ -65,8 +65,8 @@ function Get-LatestMetric {
         $query = '?schemaName={0}&startTimeMsecs=2&rollupFunction={1}&rollupIntervalSecs={2}&metricUnitType=0&range=day' -f `
             [uri]::EscapeDataString($Schema),$RollupFunction,$RollupIntervalSecs
         if ($EntityName) {
-            # MRCounters: filter by entityName only; no metricName parameter.
-            $query += '&entityName=' + [uri]::EscapeDataString($EntityName)
+            # MRCounters: ReclaimedBytesPhysical is the metricName, not entityName.
+            $query += '&metricName=' + [uri]::EscapeDataString($EntityName)
         } else {
             # ApolloV2ClusterStats: retain original metricName and cluster entityId.
             $query += '&metricName=' + [uri]::EscapeDataString($Metric)
