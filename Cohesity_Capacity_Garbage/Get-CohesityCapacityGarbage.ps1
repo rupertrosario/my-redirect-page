@@ -7,8 +7,9 @@
   and /irisservices/api/v1/public/statistics/timeSeriesStats.
   ALL Cohesity HTTP operations are GET only. No POST, PATCH, PUT, or DELETE.
   Uses the existing local AES helper and encrypted .enc file shown in your PowerShell script.
-  Reclaimed metric uses MRCounters / bytes_value, entityId and entityName
-  both ReclaimedBytesPhysical. Interpret counter semantics only after validation.
+  Reclaimed metric: MRCounters, entityId=ReclaimedBytesPhysical,
+  entityName=bytes_value, per the supplied working API URL.
+  Only latest data-point values are reported; no aggregation of reclaimed totals.
 .EXAMPLE
   .\Get-CohesityCapacityGarbage.ps1 -AllClusters
 .EXAMPLE
@@ -65,10 +66,10 @@ function Get-LatestMetric {
         $query = '?schemaName={0}&startTimeMsecs=2&rollupFunction={1}&rollupIntervalSecs={2}&metricUnitType=0&range=day' -f `
             [uri]::EscapeDataString($Schema),$RollupFunction,$RollupIntervalSecs
         if ($EntityName) {
-            # MRCounters: counter identity is in entityId and entityName; metricName is bytes_value.
-            $query += '&metricName=bytes_value'
+            # Supplied MRCounters URL: entityId=ReclaimedBytesPhysical&entityName=bytes_value.
+            # Do not substitute metricName=bytes_value or repeat the entity ID as entityName.
             $query += '&entityId=' + [uri]::EscapeDataString($EntityName)
-            $query += '&entityName=' + [uri]::EscapeDataString($EntityName)
+            $query += '&entityName=bytes_value'
             # Mirror the validated MR counter URL with an explicit 24-hour time window.
             $endTimeMsecs = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
             $startTimeMsecs = $endTimeMsecs - 86400000
