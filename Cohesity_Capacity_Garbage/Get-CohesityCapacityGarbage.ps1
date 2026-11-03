@@ -7,7 +7,7 @@
   and /irisservices/api/v1/public/statistics/timeSeriesStats.
   ALL Cohesity HTTP operations are GET only. No POST, PATCH, PUT, or DELETE.
   Uses the existing local AES helper and encrypted .enc file shown in your PowerShell script.
-  MRCounters / bytes_value / entityName=ReclaimedBytesPhysical must be validated against
+  MRCounters / metricName=Recal / entityName=ReclaimedBytesPhysical must be validated against
   a raw API response for your cluster/version before interpreting the figures.
 .EXAMPLE
   .\Get-CohesityCapacityGarbage.ps1 -AllClusters
@@ -25,7 +25,7 @@ param(
     [ValidateRange(1,86400)][int]$RollupIntervalSecs = 30,
     [string]$GarbageSchema = 'ApolloV2ClusterStats',
     [string]$ReclaimedSchema = 'MRCounters',
-    [string]$ReclaimedMetric = 'bytes_value'
+    [string]$ReclaimedMetric = 'Recal'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -66,8 +66,8 @@ function Get-LatestMetric {
         $query = '?schemaName={0}&metricName={1}&startTimeMsecs=2&rollupFunction={2}&rollupIntervalSecs={3}&metricUnitType=0&range=day' -f `
             [uri]::EscapeDataString($Schema),[uri]::EscapeDataString($Metric),$RollupFunction,$RollupIntervalSecs
         if ($EntityName) {
-            # Diagnostics counter selection: metricName=bytes_value.
-            # schema=MRCounters, entityName=ReclaimedBytesPhysical, metric=bytes_value.
+            # Diagnostics counter selection: metricName=Recal.
+            # schema=MRCounters, entityName=ReclaimedBytesPhysical, metric=Recal.
             $query += '&entityName=' + [uri]::EscapeDataString($EntityName)
         } else { $query += '&entityId=' + $entity }
         try {
