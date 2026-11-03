@@ -51,41 +51,39 @@ function Invoke-HeliosRead {
     Invoke-RestMethod -Uri ($HeliosUrl.TrimEnd('/') + $Path) -Headers $Headers -Method Get -TimeoutSec 60
 }
 function Get-LatestMetric {
-    param(
-        [string]$ClusterName,[string]$ClusterId,[hashtable]$Headers,
-        [string]$Schema,[string]$Metric,[string]$CounterEntityId = '',
-        [string]$Range = 'day'
-    )
-    # Use actual current UTC boundaries, not the fixed epoch values from the sample URLs.
-    $endMsecs = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
-    $rangeMillis = if ($Range -eq 'week') { 7L * 24 * 60 * 60 * 1000 } else { 24L * 60 * 60 * 1000 }
-    $startMsecs = $endMsecs - $rangeMillis
-    if ($CounterEntityId) {
-        # MRCounters URL: entityId=entityName=<counter>, metricName=bytes_value.
-        # Cluster selection is applied via the accessClusterId header.
-        $variants = @($CounterEntityId)
-        $entityName = $CounterEntityId
-    } else {
-        # Original ApolloV2ClusterStats lookup remains unchanged.
-        $safeName = $ClusterName -replace '\s+',''
-        $variants = @(
-            "$safeName+(ID+$ClusterId)",
-            [uri]::EscapeDataString("$ClusterName (ID $ClusterId)"),
-            [uri]::EscapeDataString("$ClusterName(ID $ClusterId)")
-        ) | Select-Object -Unique
-        $entityName = ''
-    }
+    param([string]$ClusterName,[string]$ClusterId,[hashtable]$Headers,[string]$Schema,[string]$Metric = '',[string]$EntityName = '')
+    $safeName = $ClusterName -replace '\s+',''
+    # Preserve the entity-ID alternatives used in the existing PowerShell implementation.
+    $variants = @(
+        "$safeName+(ID+$ClusterId)",
+        [uri]::EscapeDataString("$ClusterName (ID $ClusterId)"),
+        [uri]::EscapeDataString("$ClusterName(ID $ClusterId)")
+    ) | Select-Object -Unique
     $lastError = 'No data points returned'
+    if ($EntityName) { $variants = @('') }
     foreach ($entity in $variants) {
-        $query = '?schemaName={0}&metricName={1}&entityId={2}&startTimeMsecs={3}&endTimeMsecs={4}&rollupFunction={5}&rollupIntervalSecs={6}&metricUnitType=0&range={7}' -f `
-            [uri]::EscapeDataString($Schema),[uri]::EscapeDataString($Metric),
-            $(if ($CounterEntityId) { [uri]::EscapeDataString($entity) } else { $entity }),
-            $startMsecs,$endMsecs,$RollupFunction,$RollupIntervalSecs,$Range
-        if ($CounterEntityId) { $query += '&entityName=' + [uri]::EscapeDataString($entityName) }
+        $query = '?schemaName={0}&startTimeMsecs=2&rollupFunction={1}&rollupIntervalSecs={2}&metricUnitType=0&range=day' -f `
+            [uri]::EscapeDataString($Schema),$RollupFunction,$RollupIntervalSecs
+        if ($EntityName) {
+            # MRCounters: counter identity is in entityId and entityName; metricName is bytes_value.
+            $query += '&metricName=bytes_value'
+            $query += '&entityId=' + [uri]::EscapeDataString($EntityName)
+            $query += '&entityName=' + [uri]::EscapeDataString($EntityName)
+            # Mirror the validated MR counter URL with an explicit 24-hour time window.
+            $endTimeMsecs = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+            $startTimeMsecs = $endTimeMsecs - 86400000
+            $query += '&endTimeMsecs=' + $endTimeMsecs
+            $query = $query -replace 'startTimeMsecs=2', ('startTimeMsecs=' + $startTimeMsecs)
+        } else {
+            # ApolloV2ClusterStats: retain original metricName and cluster entityId.
+            $query += '&metricName=' + [uri]::EscapeDataString($Metric)
+            $query += '&entityId=' + $entity
+        }
         try {
             $response = Invoke-HeliosRead -Path ("/irisservices/api/v1/public/statistics/timeSeriesStats"+$query) -Headers $Headers
             $points = @($response.dataPointVec | Where-Object { $null -ne $_ })
             if ($points.Count -eq 0) { continue }
+            # Do not assume API returns points in chronological order when timestamps exist.
             $withTimestamp = @($points | Where-Object { $null -ne $_.timestampMsecs -or $null -ne $_.timestamp })
             if ($withTimestamp.Count -gt 0) {
                 $point = $withTimestamp | Sort-Object -Property @{Expression = {
@@ -139,15 +137,12 @@ $rows = foreach ($cluster in $clusters) {
         if ($null -eq $total -or $null -eq $used) { $capacityError = 'Missing totalCapacityBytes or localUsageBytes' }
     }
     $garbage = Get-LatestMetric -ClusterName $name -ClusterId $id -Headers $headers -Schema $GarbageSchema -Metric 'EstimatedGarbageBytes'
-    $reclaimable = Get-LatestMetric -ClusterName $name -ClusterId $id -Headers $headers -Schema 'MRCounters' -Metric 'bytes_value' -CounterEntityId 'EstimatedGarbageBytesToReclaim' -Range 'week'
-    $reclaimed = Get-LatestMetric -ClusterName $name -ClusterId $id -Headers $headers -Schema $ReclaimedSchema -Metric 'bytes_value' -CounterEntityId 'ReclaimedBytesPhysical' -Range 'day'
+    $reclaimed = Get-LatestMetric -ClusterName $name -ClusterId $id -Headers $headers -Schema $ReclaimedSchema -EntityName 'ReclaimedBytesPhysical'
     [pscustomobject]@{
         Cluster = $name
         ClusterId = $id
         Garbage_Data_In_GB = (To-GiB $garbage.Bytes)
         Garbage_Data_In_TB = (To-TiB $garbage.Bytes)
-        MR_Reclaimable_Physical_GB = (To-GiB $reclaimable.Bytes)
-        MR_Reclaimable_Physical_TB = (To-TiB $reclaimable.Bytes)
         Reclaimed_Physical_In_GB = (To-GiB $reclaimed.Bytes)
         Reclaimed_Physical_In_TB = (To-TiB $reclaimed.Bytes)
         Total_Capacity_Bytes_TiB = (To-TiB $total)
@@ -155,16 +150,14 @@ $rows = foreach ($cluster in $clusters) {
         Local_Available_Bytes_TiB = (To-TiB $available)
         Consumed = $percent
         Garbage_Timestamp = $garbage.Timestamp
-        MR_Reclaimable_Timestamp = $reclaimable.Timestamp
         Reclaimed_Timestamp = $reclaimed.Timestamp
         CapacityError = $capacityError
         GarbageError = $garbage.Error
-        MR_ReclaimableError = $reclaimable.Error
         ReclaimedError = $reclaimed.Error
     }
 }
 $rows = @($rows | Sort-Object -Property Consumed -Descending)
-$rows | Format-Table Cluster,Garbage_Data_In_GB,MR_Reclaimable_Physical_GB,Reclaimed_Physical_In_GB,Total_Capacity_Bytes_TiB,Local_Usage_Bytes_TiB,Local_Available_Bytes_TiB,Consumed -AutoSize
+$rows | Format-Table Cluster,Garbage_Data_In_GB,Reclaimed_Physical_In_GB,Total_Capacity_Bytes_TiB,Local_Usage_Bytes_TiB,Local_Available_Bytes_TiB,Consumed -AutoSize
 $folder = Split-Path -Parent $OutputCsv
 if ($folder -and -not (Test-Path -LiteralPath $folder)) { New-Item -ItemType Directory -Path $folder -Force | Out-Null }
 $rows | Export-Csv -LiteralPath $OutputCsv -NoTypeInformation -Encoding UTF8
