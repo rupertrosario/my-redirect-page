@@ -146,8 +146,8 @@ $rows = foreach ($cluster in $clusters) {
         ClusterId = $id
         Garbage_Data_In_GB = (To-GiB $garbage.Bytes)
         Garbage_Data_In_TB = (To-TiB $garbage.Bytes)
-        MR_Reclaimable_Physical_GB = (To-GiB $reclaimable.Bytes)
-        MR_Reclaimable_Physical_TB = (To-TiB $reclaimable.Bytes)
+        Reclaimable_physical_GB = (To-GiB $reclaimable.Bytes)
+        Reclaimable_physical_TB = (To-TiB $reclaimable.Bytes)
         Reclaimed_Physical_In_GB = (To-GiB $reclaimed.Bytes)
         Reclaimed_Physical_In_TB = (To-TiB $reclaimed.Bytes)
         Total_Capacity_Bytes_TiB = (To-TiB $total)
@@ -170,7 +170,7 @@ $rows = @($rows | Sort-Object -Property @{ Expression = {
 # Print all original capacity columns and both GB/TB conversions without PowerShell truncation.
 $displayColumns = @(
     'Cluster', 'Garbage_Data_In_GB', 'Garbage_Data_In_TB',
-    'MR_Reclaimable_Physical_GB', 'MR_Reclaimable_Physical_TB',
+    'Reclaimable_physical_GB', 'Reclaimable_physical_TB',
     'Reclaimed_Physical_In_GB', 'Reclaimed_Physical_In_TB',
     'Total_Capacity_Bytes_TiB', 'Local_Usage_Bytes_TiB',
     'Local_Available_Bytes_TiB', 'Consumed'
