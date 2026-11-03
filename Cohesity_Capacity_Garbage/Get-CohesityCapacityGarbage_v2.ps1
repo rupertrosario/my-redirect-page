@@ -153,6 +153,92 @@ $rows = foreach ($cluster in $clusters) {
     }
 }
 # Sort on numeric utilization while retaining the percentage sign in output/CSV.
+
+# Excel can auto-convert CSV timestamps and IDs, or misinterpret decimals.
+# Produce a typed XLSX alongside the CSV without Excel or external PowerShell modules.
+function Export-TypedXlsx {
+    param([object[]]$Rows,[string]$Path)
+    Add-Type -AssemblyName System.IO.Compression
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $folderXlsx = Split-Path -Parent $Path
+    if ($folderXlsx -and -not (Test-Path -LiteralPath $folderXlsx)) {
+        New-Item -Path $folderXlsx -ItemType Directory -Force | Out-Null
+    }
+    $culture = [Globalization.CultureInfo]::InvariantCulture
+    $columns = @(
+        'Cluster','ClusterId','Garbage_Data_In_GB','Garbage_Data_In_TB',
+        'Reclaimed_Physical_In_GB','Reclaimed_Physical_In_TB',
+        'Total_Capacity_Bytes_TiB','Local_Usage_Bytes_TiB',
+        'Local_Available_Bytes_TiB','Consumed','Garbage_Timestamp',
+        'Reclaimed_Timestamp','CapacityError','GarbageError','ReclaimedError'
+    )
+    $stringColumns = @('Cluster','ClusterId','Garbage_Timestamp','Reclaimed_Timestamp',
+        'CapacityError','GarbageError','ReclaimedError')
+    $ns = 'http://schemas.openxmlformats.org/spreadsheetml/2006/main'
+    $sb = New-Object System.Text.StringBuilder
+    [void]$sb.Append('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>')
+    [void]$sb.Append('<worksheet xmlns="' + $ns + '"><sheetViews><sheetView workbookViewId="0"><pane ySplit="1" topLeftCell="A2" activePane="bottomLeft" state="frozen"/></sheetView></sheetViews><sheetData>')
+    $rowNum = 0
+    foreach ($record in @($null) + @($Rows)) {
+        $rowNum++
+        [void]$sb.Append('<row r="' + $rowNum + '">')
+        for ($col = 0; $col -lt $columns.Count; $col++) {
+            $index = $col + 1
+            $letters = ''
+            while ($index -gt 0) {
+                $index--
+                $letters = [char](65 + ($index % 26)) + $letters
+                $index = [math]::Floor($index / 26)
+            }
+            $cellRef = $letters + $rowNum
+            if ($rowNum -eq 1) {
+                $v = $columns[$col]
+                $escaped = [Security.SecurityElement]::Escape($v)
+                [void]$sb.Append('<c r="' + $cellRef + '" s="1" t="inlineStr"><is><t>' + $escaped + '</t></is></c>')
+                continue
+            }
+            $value = $record.($columns[$col])
+            if ($null -eq $value -or [string]::IsNullOrWhiteSpace([string]$value)) { continue }
+            if ($stringColumns -contains $columns[$col]) {
+                $v = [Security.SecurityElement]::Escape([string]$value)
+                [void]$sb.Append('<c r="' + $cellRef + '" t="inlineStr"><is><t>' + $v + '</t></is></c>')
+            } else {
+                $raw = ([string]$value).TrimEnd('%')
+                $numeric = 0.0
+                if ([double]::TryParse($raw,[Globalization.NumberStyles]::Any,$culture,[ref]$numeric)) {
+                    [void]$sb.Append('<c r="' + $cellRef + '"><v>' + $numeric.ToString('R',$culture) + '</v></c>')
+                } else {
+                    $v = [Security.SecurityElement]::Escape([string]$value)
+                    [void]$sb.Append('<c r="' + $cellRef + '" t="inlineStr"><is><t>' + $v + '</t></is></c>')
+                }
+            }
+        }
+        [void]$sb.Append('</row>')
+    }
+    [void]$sb.Append('</sheetData></worksheet>')
+    $sheetXml = $sb.ToString()
+    $entries = @{
+        '[Content_Types].xml' = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/><Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/></Types>'
+        '_rels/.rels' = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>'
+        'xl/workbook.xml' = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="Capacity and GC" sheetId="1" r:id="rId1"/></sheets></workbook>'
+        'xl/_rels/workbook.xml.rels' = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/></Relationships>'
+        'xl/styles.xml' = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><fonts count="2"><font><sz val="11"/><name val="Calibri"/></font><font><b/><sz val="11"/><name val="Calibri"/></font></fonts><fills count="1"><fill><patternFill patternType="none"/></fill></fills><borders count="1"><border/></borders><cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs><cellXfs count="2"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/><xf numFmtId="0" fontId="1" fillId="0" borderId="0" xfId="0"/></cellXfs></styleSheet>'
+        'xl/worksheets/sheet1.xml' = $sheetXml
+    }
+    $fullPath = [IO.Path]::GetFullPath($Path)
+    $zipStream = [IO.File]::Open($fullPath,[IO.FileMode]::Create,[IO.FileAccess]::Write)
+    try {
+        $zip = New-Object IO.Compression.ZipArchive($zipStream,[IO.Compression.ZipArchiveMode]::Create,$false)
+        try {
+            foreach ($entryPath in $entries.Keys) {
+                $entry = $zip.CreateEntry($entryPath,[IO.Compression.CompressionLevel]::Optimal)
+                $writer = New-Object IO.StreamWriter($entry.Open(),(New-Object Text.UTF8Encoding($false)))
+                try { $writer.Write($entries[$entryPath]) } finally { $writer.Dispose() }
+            }
+        } finally { $zip.Dispose() }
+    } finally { $zipStream.Dispose() }
+}
+
 $rows = @($rows | Sort-Object -Property @{ Expression = {
     if ($null -eq $_.Consumed) { -1 } else { [double]($_.Consumed -replace '%', '') }
 } } -Descending)
@@ -168,4 +254,12 @@ $rows | Format-Table -Property $displayColumns -AutoSize |
 $folder = Split-Path -Parent $OutputCsv
 if ($folder -and -not (Test-Path -LiteralPath $folder)) { New-Item -ItemType Directory -Path $folder -Force | Out-Null }
 $rows | Export-Csv -LiteralPath $OutputCsv -NoTypeInformation -Encoding UTF8
+$xlsxPath = [IO.Path]::ChangeExtension($OutputCsv, '.xlsx')
+try {
+    Export-TypedXlsx -Rows $rows -Path $xlsxPath
+    Write-Host "Excel workbook saved to: $xlsxPath" -ForegroundColor Green
+} catch {
+    Write-Host ("XLSX export failed; CSV remains available: " + $_.Exception.Message) -ForegroundColor Yellow
+}
+
 Write-Host "CSV saved to: $OutputCsv" -ForegroundColor Green
