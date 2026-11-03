@@ -7,7 +7,7 @@
   and /irisservices/api/v1/public/statistics/timeSeriesStats.
   ALL Cohesity HTTP operations are GET only. No POST, PATCH, PUT, or DELETE.
   Uses the existing local AES helper and encrypted .enc file shown in your PowerShell script.
-  Metric ReclaimedBytesPhysical / ApolloV2ClusterStats must be validated against
+  Metric ReclaimedBytesPhysical / MRCounters must be validated against
   a raw API response for your cluster/version before interpreting the figures.
 .EXAMPLE
   .\Get-CohesityCapacityGarbage.ps1 -AllClusters
@@ -24,7 +24,7 @@ param(
     [ValidateSet('latest','average')][string]$RollupFunction = 'latest',
     [ValidateRange(1,86400)][int]$RollupIntervalSecs = 30,
     [string]$GarbageSchema = 'ApolloV2ClusterStats',
-    [string]$ReclaimedSchema = 'ApolloV2ClusterStats',
+    [string]$ReclaimedSchema = 'MRCounters',
     [string]$ReclaimedMetric = 'ReclaimedBytesPhysical'
 )
 
