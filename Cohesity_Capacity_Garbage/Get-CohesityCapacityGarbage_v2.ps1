@@ -139,15 +139,12 @@ $rows = foreach ($cluster in $clusters) {
         if ($null -eq $total -or $null -eq $used) { $capacityError = 'Missing totalCapacityBytes or localUsageBytes' }
     }
     $garbage = Get-LatestMetric -ClusterName $name -ClusterId $id -Headers $headers -Schema $GarbageSchema -Metric 'EstimatedGarbageBytes'
-    $reclaimable = Get-LatestMetric -ClusterName $name -ClusterId $id -Headers $headers -Schema 'MRCounters' -Metric 'bytes_value' -CounterEntityId 'EstimatedGarbageBytesToReclaim' -Range 'week'
     $reclaimed = Get-LatestMetric -ClusterName $name -ClusterId $id -Headers $headers -Schema $ReclaimedSchema -Metric 'bytes_value' -CounterEntityId 'ReclaimedBytesPhysical' -Range 'day'
     [pscustomobject]@{
         Cluster = $name
         ClusterId = $id
         Garbage_Data_In_GB = (To-GiB $garbage.Bytes)
         Garbage_Data_In_TB = (To-TiB $garbage.Bytes)
-        Reclaimable_physical_GB = (To-GiB $reclaimable.Bytes)
-        Reclaimable_physical_TB = (To-TiB $reclaimable.Bytes)
         Reclaimed_Physical_In_GB = (To-GiB $reclaimed.Bytes)
         Reclaimed_Physical_In_TB = (To-TiB $reclaimed.Bytes)
         Total_Capacity_Bytes_TiB = (To-TiB $total)
@@ -155,11 +152,9 @@ $rows = foreach ($cluster in $clusters) {
         Local_Available_Bytes_TiB = (To-TiB $available)
         Consumed = if ($null -ne $percent) { '{0}%' -f $percent } else { $null }
         Garbage_Timestamp = $garbage.Timestamp
-        MR_Reclaimable_Timestamp = $reclaimable.Timestamp
         Reclaimed_Timestamp = $reclaimed.Timestamp
         CapacityError = $capacityError
         GarbageError = $garbage.Error
-        MR_ReclaimableError = $reclaimable.Error
         ReclaimedError = $reclaimed.Error
     }
 }
@@ -170,7 +165,6 @@ $rows = @($rows | Sort-Object -Property @{ Expression = {
 # Print all original capacity columns and both GB/TB conversions without PowerShell truncation.
 $displayColumns = @(
     'Cluster', 'Garbage_Data_In_GB', 'Garbage_Data_In_TB',
-    'Reclaimable_physical_GB', 'Reclaimable_physical_TB',
     'Reclaimed_Physical_In_GB', 'Reclaimed_Physical_In_TB',
     'Total_Capacity_Bytes_TiB', 'Local_Usage_Bytes_TiB',
     'Local_Available_Bytes_TiB', 'Consumed'
