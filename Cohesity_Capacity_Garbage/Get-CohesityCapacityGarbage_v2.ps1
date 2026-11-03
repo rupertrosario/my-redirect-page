@@ -153,7 +153,7 @@ $rows = foreach ($cluster in $clusters) {
         Total_Capacity_Bytes_TiB = (To-TiB $total)
         Local_Usage_Bytes_TiB = (To-TiB $used)
         Local_Available_Bytes_TiB = (To-TiB $available)
-        Consumed = $percent
+        Consumed = if ($null -ne $percent) { '{0}%' -f $percent } else { $null }
         Garbage_Timestamp = $garbage.Timestamp
         MR_Reclaimable_Timestamp = $reclaimable.Timestamp
         Reclaimed_Timestamp = $reclaimed.Timestamp
@@ -163,8 +163,20 @@ $rows = foreach ($cluster in $clusters) {
         ReclaimedError = $reclaimed.Error
     }
 }
-$rows = @($rows | Sort-Object -Property Consumed -Descending)
-$rows | Format-Table Cluster,Garbage_Data_In_GB,MR_Reclaimable_Physical_GB,Reclaimed_Physical_In_GB,Total_Capacity_Bytes_TiB,Local_Usage_Bytes_TiB,Local_Available_Bytes_TiB,Consumed -AutoSize
+# Sort on numeric utilization while retaining the percentage sign in output/CSV.
+$rows = @($rows | Sort-Object -Property @{ Expression = {
+    if ($null -eq $_.Consumed) { -1 } else { [double]($_.Consumed -replace '%', '') }
+} } -Descending)
+# Print all original capacity columns and both GB/TB conversions without PowerShell truncation.
+$displayColumns = @(
+    'Cluster', 'Garbage_Data_In_GB', 'Garbage_Data_In_TB',
+    'MR_Reclaimable_Physical_GB', 'MR_Reclaimable_Physical_TB',
+    'Reclaimed_Physical_In_GB', 'Reclaimed_Physical_In_TB',
+    'Total_Capacity_Bytes_TiB', 'Local_Usage_Bytes_TiB',
+    'Local_Available_Bytes_TiB', 'Consumed'
+)
+$rows | Format-Table -Property $displayColumns -AutoSize |
+    Out-String -Width 260 | Write-Host
 $folder = Split-Path -Parent $OutputCsv
 if ($folder -and -not (Test-Path -LiteralPath $folder)) { New-Item -ItemType Directory -Path $folder -Force | Out-Null }
 $rows | Export-Csv -LiteralPath $OutputCsv -NoTypeInformation -Encoding UTF8
