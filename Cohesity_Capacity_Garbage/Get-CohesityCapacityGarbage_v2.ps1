@@ -8,7 +8,7 @@
   ALL Cohesity HTTP operations are GET only. No POST, PATCH, PUT, or DELETE.
   Uses the existing local AES helper and encrypted .enc file shown in your PowerShell script.
   Reclaimed metric uses MRCounters / bytes_value, entityId and entityName
-  both ReclaimedBytesPhysical. Interpret counter semantics only after validation.
+  both ReclaimedBytesPhysical.
 .EXAMPLE
   .\Get-CohesityCapacityGarbage_v2.ps1 -AllClusters
 .EXAMPLE
@@ -169,4 +169,3 @@ $folder = Split-Path -Parent $OutputCsv
 if ($folder -and -not (Test-Path -LiteralPath $folder)) { New-Item -ItemType Directory -Path $folder -Force | Out-Null }
 $rows | Export-Csv -LiteralPath $OutputCsv -NoTypeInformation -Encoding UTF8
 Write-Host "CSV saved to: $OutputCsv" -ForegroundColor Green
-Write-Warning 'ReclaimedBytesPhysical counter semantics (interval vs cumulative) must be confirmed against its raw timestamped readings before treating its value as reclaimed during the last day.'
