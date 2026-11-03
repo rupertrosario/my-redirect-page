@@ -1,25 +1,26 @@
 #requires -Version 5.1
 <#
 .SYNOPSIS
-  Read-only Helios cluster capacity and garbage metrics report.
+  GET-ONLY Helios capacity and garbage collection report (AES API key).
 .DESCRIPTION
   Reads /v2/mcm/cluster-mgmt/info, /irisservices/api/v1/public/stats/storage,
   and /irisservices/api/v1/public/statistics/timeSeriesStats.
-  No Cohesity POST, PATCH, PUT, or DELETE requests are made.
+  ALL Cohesity HTTP operations are GET only. No POST, PATCH, PUT, or DELETE.
+  Uses the existing local AES helper and encrypted .enc file shown in your PowerShell script.
   Metric ReclaimedBytesPhysical / ApolloV2ClusterStats must be validated against
   a raw API response for your cluster/version before interpreting the figures.
 .EXAMPLE
-  $env:COHESITY_API_KEY = '<key from your secure local session>'
-  .\Get-CohesityCapacityGarbage.ps1
+  .\Get-CohesityCapacityGarbage.ps1 -AllClusters
 .EXAMPLE
   .\Get-CohesityCapacityGarbage.ps1 -AllClusters -OutputCsv C:\Temp\CohesityCapacityGC.csv
 #>
 [CmdletBinding()]
 param(
     [string]$HeliosUrl = 'https://helios.cohesity.com',
-    [string]$ApiKey = $env:COHESITY_API_KEY,
+    [string]$ApiKeyHelperPath = 'X:\PowerShell\Cohesity_API_Scripts\common\ApiKeyAesHelper.ps1',
+    [string]$EncryptedApiKeyPath = 'X:\PowerShell\Cohesity_API_Scripts\common\secure\cohesity_apikey.enc',
     [switch]$AllClusters,
-    [string]$OutputCsv = (Join-Path (Get-Location).Path ("Cohesity_Capacity_GC_{0}.csv" -f (Get-Date -Format 'yyyyMMdd_HHmmss'))),
+    [string]$OutputCsv = (Join-Path (Get-Location).Path 'Cohesity_GC_Capacity_Details.csv'),
     [ValidateSet('latest','average')][string]$RollupFunction = 'latest',
     [ValidateRange(1,86400)][int]$RollupIntervalSecs = 30,
     [string]$GarbageSchema = 'ApolloV2ClusterStats',
@@ -28,13 +29,19 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-if ([string]::IsNullOrWhiteSpace($ApiKey)) {
-    $secureKey = Read-Host 'Enter Cohesity Helios API key (not stored)' -AsSecureString
-    $ptr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secureKey)
-    try { $ApiKey = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($ptr) }
-    finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($ptr) }
+# Same AES-based API key loading pattern as Cohesity_GC_Capacity_Details.ps1.
+# Neither a plaintext apikey.txt nor an interactive key prompt is used.
+if (-not (Test-Path -LiteralPath $ApiKeyHelperPath -PathType Leaf)) {
+    throw "Missing API key helper: $ApiKeyHelperPath"
 }
-if ([string]::IsNullOrWhiteSpace($ApiKey)) { throw 'Missing Helios API key.' }
+if (-not (Test-Path -LiteralPath $EncryptedApiKeyPath -PathType Leaf)) {
+    throw "Missing encrypted API key: $EncryptedApiKeyPath"
+}
+. $ApiKeyHelperPath
+$ApiKey = Get-CohesityApiKeyFromAes -EncryptedFile $EncryptedApiKeyPath
+if ([string]::IsNullOrWhiteSpace($ApiKey)) {
+    throw 'AES key helper returned an empty Helios API key.'
+}
 
 $baseHeaders = @{ accept = 'application/json'; apiKey = $ApiKey }
 $TiB = [math]::Pow(1024,4)
@@ -117,15 +124,25 @@ $rows = foreach ($cluster in $clusters) {
     $garbage = Get-LatestMetric -ClusterName $name -ClusterId $id -Headers $headers -Schema $GarbageSchema -Metric 'EstimatedGarbageBytes'
     $reclaimed = Get-LatestMetric -ClusterName $name -ClusterId $id -Headers $headers -Schema $ReclaimedSchema -Metric $ReclaimedMetric
     [pscustomobject]@{
-        Cluster=$name; ClusterId=$id
-        TotalTiB=(To-TiB $total); UsedTiB=(To-TiB $used); AvailableTiB=(To-TiB $available); UsedPercent=$percent
-        EstimatedGarbageGiB=(To-GiB $garbage.Bytes); EstimatedGarbageTiB=(To-TiB $garbage.Bytes)
-        ReclaimedPhysicalGiB=(To-GiB $reclaimed.Bytes); ReclaimedPhysicalTiB=(To-TiB $reclaimed.Bytes)
-        GarbageTimestamp=$garbage.Timestamp; ReclaimedTimestamp=$reclaimed.Timestamp
-        CapacityError=$capacityError; GarbageError=$garbage.Error; ReclaimedError=$reclaimed.Error
+        Cluster = $name
+        ClusterId = $id
+        Garbage_Data_In_GB = (To-GiB $garbage.Bytes)
+        Garbage_Data_In_TB = (To-TiB $garbage.Bytes)
+        Reclaimed_Physical_In_GB = (To-GiB $reclaimed.Bytes)
+        Reclaimed_Physical_In_TB = (To-TiB $reclaimed.Bytes)
+        Total_Capacity_Bytes_TiB = (To-TiB $total)
+        Local_Usage_Bytes_TiB = (To-TiB $used)
+        Local_Available_Bytes_TiB = (To-TiB $available)
+        Consumed = $percent
+        Garbage_Timestamp = $garbage.Timestamp
+        Reclaimed_Timestamp = $reclaimed.Timestamp
+        CapacityError = $capacityError
+        GarbageError = $garbage.Error
+        ReclaimedError = $reclaimed.Error
     }
 }
-$rows | Format-Table Cluster,TotalTiB,UsedTiB,AvailableTiB,UsedPercent,EstimatedGarbageGiB,ReclaimedPhysicalGiB -AutoSize
+$rows = @($rows | Sort-Object -Property Consumed -Descending)
+$rows | Format-Table Cluster,Garbage_Data_In_GB,Reclaimed_Physical_In_GB,Total_Capacity_Bytes_TiB,Local_Usage_Bytes_TiB,Local_Available_Bytes_TiB,Consumed -AutoSize
 $folder = Split-Path -Parent $OutputCsv
 if ($folder -and -not (Test-Path -LiteralPath $folder)) { New-Item -ItemType Directory -Path $folder -Force | Out-Null }
 $rows | Export-Csv -LiteralPath $OutputCsv -NoTypeInformation -Encoding UTF8
