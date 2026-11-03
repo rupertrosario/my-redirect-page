@@ -7,8 +7,8 @@
   and /irisservices/api/v1/public/statistics/timeSeriesStats.
   ALL Cohesity HTTP operations are GET only. No POST, PATCH, PUT, or DELETE.
   Uses the existing local AES helper and encrypted .enc file shown in your PowerShell script.
-  MRCounters / metricName=ReclaimedBytesPhysical must be validated against
-  a raw API response for your cluster/version before interpreting the figures.
+  Reclaimed metric uses MRCounters / bytes_value, entityId and entityName
+  both ReclaimedBytesPhysical. Interpret counter semantics only after validation.
 .EXAMPLE
   .\Get-CohesityCapacityGarbage.ps1 -AllClusters
 .EXAMPLE
@@ -65,8 +65,15 @@ function Get-LatestMetric {
         $query = '?schemaName={0}&startTimeMsecs=2&rollupFunction={1}&rollupIntervalSecs={2}&metricUnitType=0&range=day' -f `
             [uri]::EscapeDataString($Schema),$RollupFunction,$RollupIntervalSecs
         if ($EntityName) {
-            # MRCounters: ReclaimedBytesPhysical is the metricName, not entityName.
-            $query += '&metricName=' + [uri]::EscapeDataString($EntityName)
+            # MRCounters: counter identity is in entityId and entityName; metricName is bytes_value.
+            $query += '&metricName=bytes_value'
+            $query += '&entityId=' + [uri]::EscapeDataString($EntityName)
+            $query += '&entityName=' + [uri]::EscapeDataString($EntityName)
+            # Mirror the validated MR counter URL with an explicit 24-hour time window.
+            $endTimeMsecs = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+            $startTimeMsecs = $endTimeMsecs - 86400000
+            $query += '&endTimeMsecs=' + $endTimeMsecs
+            $query = $query -replace 'startTimeMsecs=2', ('startTimeMsecs=' + $startTimeMsecs)
         } else {
             # ApolloV2ClusterStats: retain original metricName and cluster entityId.
             $query += '&metricName=' + [uri]::EscapeDataString($Metric)
@@ -155,4 +162,4 @@ $folder = Split-Path -Parent $OutputCsv
 if ($folder -and -not (Test-Path -LiteralPath $folder)) { New-Item -ItemType Directory -Path $folder -Force | Out-Null }
 $rows | Export-Csv -LiteralPath $OutputCsv -NoTypeInformation -Encoding UTF8
 Write-Host "CSV saved to: $OutputCsv" -ForegroundColor Green
-Write-Warning 'ReclaimedBytesPhysical counter semantics (interval vs cumulative) and schema must be confirmed on your cluster before interpreting its value as reclaimed during the last day.'
+Write-Warning 'ReclaimedBytesPhysical counter semantics (interval vs cumulative) must be confirmed against its raw timestamped readings before treating its value as reclaimed during the last day.'
